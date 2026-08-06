@@ -82,8 +82,8 @@ Every monitor that you write waits for a **proxy**: a pattern in the process
 list, a line in a log file, a file that appears. A proxy can become permanently
 false, and nothing tells the monitor. It then waits for ever.
 
-These waits were measured on one machine in one day. Together they slept for 95
-hours, and not one of the conditions could ever become true:
+Four monitors were measured on one machine in one day, and together they slept
+for 95 hours. Not one of the conditions could ever become true. Three of them:
 
 ```sh
 while pgrep -f "solve.py"; do sleep 60; done      # matches its own command line
@@ -91,9 +91,24 @@ until grep -q "DONE" run.log; do sleep 60; done   # the writer was killed
 until grep -q "READY" ~/other.log; do sleep 60; done  # that file never existed
 ```
 
-The second and the third hold no pattern fault. They are careful commands. The
-fault is the proxy: a log line is evidence of the work, and evidence stops when
-the work stops, in a way that the monitor cannot see.
+A different user found another kind later, on a machine that two agents shared.
+It had slept for 63 hours:
+
+```sh
+while true; do M=$(ps -Ao args | grep -c solver)
+               K=$(ssh other-host 'ps -Ao args | grep -c solver')
+               [ $M -eq 0 ] && [ $K -eq 0 ] && break; sleep 300; done
+```
+
+It waits for a COUNT to reach zero. The work of its author finished two days
+before, and the work of the OTHER agent held the count above zero. It also
+opened about 750 connections to the other machine while it waited.
+
+The last three hold no pattern fault. They are careful commands. The fault is
+the proxy: a log line is evidence of the work, and evidence stops when the work
+stops, in a way that the monitor cannot see. On a machine that two agents share,
+"wait until nothing matches" can never become true, because the condition
+depends on somebody else.
 
 qex waits for the process, and not for a proxy of the process.
 

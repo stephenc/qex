@@ -138,12 +138,38 @@ fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
     let reserve = cfg.reserve_mem().unwrap_or(0);
     let available = sys::available_memory();
     if available < reserve + spec.mem {
-        return Admit::No(format!(
-            "waits for memory: the machine has {} free, and the job needs {} with {} in reserve",
+        // Say what this number is, and what it is not.
+        //
+        // A machine can be healthy and still report a small number here: the
+        // kernel writes the memory of an idle program to swap and keeps it
+        // there, and that memory is NOT in this number. A user then sees a job
+        // that waits while the machine has capacity, and the cause is not
+        // visible in the words "waits for memory".
+        //
+        // The pressure, where the system supplies it, is the measurement that
+        // separates the two cases. A machine with a small number here and no
+        // pressure is a machine that parked memory that nobody wants.
+        let mut reason = format!(
+            "waits for memory: the machine reports {} that a new program can use, and the job \
+             needs {} with {} in reserve",
             format_size(available),
             format_size(spec.mem),
             format_size(reserve)
-        ));
+        );
+        match sys::memory_pressure() {
+            Some(p) if p < 1.0 => reason.push_str(&format!(
+                ". The memory pressure is {p:.1}, so the machine is NOT short of memory now: \
+                 this number counts the memory that a program can use with no operation to the \
+                 disk, and it does not count the memory that the kernel parked in swap. Give a \
+                 smaller claim, or lower `reserve_mem` in the configuration, if this job waits \
+                 and the machine is healthy"
+            )),
+            _ => reason.push_str(
+                ". Use `qex info` to see the load of the machine, and `qex list` to see what \
+                 holds the memory",
+            ),
+        }
+        return Admit::No(reason);
     }
 
     if let Some(pressure) = sys::memory_pressure() {

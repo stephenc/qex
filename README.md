@@ -26,8 +26,8 @@ claim, and it waits when the machine does not.
 false.** An agent with no way to wait writes a monitor. That monitor watches a
 *proxy* for the work — a pattern in the process list, a line in a log, a file
 that should appear — and a proxy can stop being reachable without anything
-noticing. Three real watchers on one machine, in one day, slept for **54 hours
-combined** on conditions that could never become true:
+noticing. Four real watchers on one machine, in one day, slept for **95 hours
+combined** on conditions that could never become true. Three of them:
 
 ```sh
 while pgrep -f "solve.py"; do sleep 60; done      # matches its own command line
@@ -35,10 +35,16 @@ until grep -q "DONE" run.log; do sleep 60; done   # the writer was killed
 until grep -q "READY" ~/other.log; do sleep 60; done  # that file never existed
 ```
 
-Only the first is the classic `pgrep -f` self-match. The other two contain no
+A different user later found a fourth kind, on a machine two agents shared. It
+had slept for 63 hours waiting for `ps -Ao args | grep -c solver` to reach zero
+on that machine and on one reached over `ssh`. Its own work had finished two days
+earlier; the *other* agent's work held the count above zero. On a shared machine,
+"wait until nothing matches" is unsatisfiable by construction.
+
+Only the first is the classic `pgrep -f` self-match. The others contain no
 pattern bug at all — they are careful commands whose evidence simply stopped
-arriving. That is the general failure, and it is why the fix is not "write a
-better pattern".
+arriving, or whose condition depended on somebody else. That is the general
+failure, and it is why the fix is not "write a better pattern".
 
 qex waits on the **process**, not on a proxy for it. qex is the parent of your
 task and calls `waitpid` on that exact process: it exits or it does not, and
@@ -122,6 +128,14 @@ The queue controls the number of cores instead.
 **qex does not limit the memory of a job by default.** A claim controls the
 queue only. Linux can apply a real limit with cgroup v2; set `[enforce] mode`.
 qex never reports a limit that it did not apply.
+
+**qex does not divide the machine between agents.** The budget controls the
+total load, and the queue is the order of submission. A fan-out of 11 jobs from
+one agent takes the capacity, and the 2 jobs of a second agent wait for it.
+There is no share for each agent.
+
+**qex controls one machine.** Two machines that farm work to each other are not
+coordinated.
 
 **A claim is a promise, and not a measurement.** A job that claims 2GB and uses
 20GB can still fill the machine. qex tests the free memory before each start,

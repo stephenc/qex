@@ -14,6 +14,12 @@
 //! This command knows its own process id, its own process group and its own
 //! ancestors, so it removes them before it reports anything. It cannot find
 //! itself.
+//!
+//! # What this command cannot see
+//!
+//! It reads the command line of each process. A monitor that a user wrote
+//! INSIDE A SCRIPT FILE gives the name of that script in its command line, and
+//! not the loop, so this command cannot classify it. The report says so.
 
 use serde::Serialize;
 
@@ -45,11 +51,46 @@ pub fn classify(command: &str) -> Option<(&'static str, &'static str)> {
         return None;
     }
 
-    if lower.contains("pgrep")
+    let reads_processes = lower.contains("pgrep")
         || lower.contains("pidof")
         || lower.contains("ps -ef")
         || lower.contains("ps aux")
-    {
+        || lower.contains("ps -a");
+
+    // A COUNT of the processes that match, and not a test of one process.
+    //
+    // This one is the worst of the group, and a careful author writes it. It
+    // has no pattern fault: the monitor waits until NOTHING matches. On a
+    // machine that two agents share, that condition is not satisfiable, because
+    // the work of the other agent holds the count above zero for ever. The work
+    // of this author is already complete, and the monitor cannot see the
+    // difference.
+    //
+    // A user found one of these after 63 hours. It counted a program over
+    // `ssh` on a machine that another agent also used, and it opened about 750
+    // connections to that machine while it waited.
+    let counts = lower.contains("grep -c") || lower.contains("wc -l") || lower.contains("--count");
+
+    if reads_processes && counts {
+        return Some((
+            "a count of the processes that match, which another user holds above zero",
+            "This monitor waits until NOTHING matches, and it has no pattern fault. On a \
+             machine that two agents share, the work of the other agent keeps the count above \
+             zero for ever, and your own work is already complete. Wait for YOUR job instead: \
+             `qex wait <id>` reads one process, and that process belongs to you.",
+        ));
+    }
+
+    if reads_processes && lower.contains("ssh") {
+        return Some((
+            "a pattern in the process list of another machine",
+            "That pattern also matches the work of the other users of that machine, and each \
+             test opens a connection. Start the task with `qex submit` on that machine, and \
+             wait for its id.",
+        ));
+    }
+
+    if reads_processes {
         return Some((
             "a pattern in the process list",
             "This monitor can match its own command line. Use `qex submit` and \
@@ -305,7 +346,9 @@ pub fn report(json: bool) -> anyhow::Result<i32> {
             "This command removes its own process and the processes that started it \
              before it reports anything, so it never finds itself.\nStop one with \
              `kill <pid>`. A kill of the shell does not stop the processes that the shell \
-             started; those go to the init process and continue."
+             started; those go to the init process and continue.\nA monitor INSIDE A SCRIPT \
+             FILE gives the name of the script in its command line, and not the loop, so this \
+             command cannot see it. Read the script."
         )
     );
     Ok(1)
@@ -322,12 +365,45 @@ mod tests {
         assert_eq!(proxy, "a pattern in the process list");
 
         let (proxy, _) =
-            classify("bash -c until grep -q 'COOP written' run.log; do sleep 60; done").unwrap();
+            classify("bash -c until grep -q 'DONE' run.log; do sleep 60; done").unwrap();
         assert_eq!(proxy, "a line in a log file");
 
         let (proxy, _) =
             classify("sh -c until [ -f /tmp/done.marker ]; do sleep 30; done").unwrap();
         assert_eq!(proxy, "a file that appears");
+    }
+
+    /// The fourth kind, which a user measured at 63 hours.
+    ///
+    /// This monitor has NO PATTERN FAULT. It waits until nothing matches, and
+    /// on a machine that two agents share that condition is not satisfiable:
+    /// the work of the other agent holds the count above zero for ever, while
+    /// the work of the author is already complete. A careful author writes this
+    /// one, which is the reason that it has its own words.
+    #[test]
+    fn a_count_that_another_user_holds_above_zero_is_recognised() {
+        let (proxy, advice) = classify(
+            "bash -c while true; do M=$(ps -Ao args | grep -c solver); \
+             K=$(ssh host ps -Ao args | grep -c solver); sleep 300; done",
+        )
+        .unwrap();
+        assert!(
+            proxy.contains("count"),
+            "a count of the matches is its own fault: {proxy}"
+        );
+        assert!(
+            advice.contains("two agents share"),
+            "the advice must name the cause: {advice}"
+        );
+
+        // A pattern on another machine, with no count, is its own kind as well.
+        let (proxy, _) =
+            classify("sh -c until ssh host pgrep -f train.py; do sleep 60; done").unwrap();
+        assert!(proxy.contains("another machine"), "got: {proxy}");
+
+        // The ordinary self-match keeps its own words.
+        let (proxy, _) = classify("bash -c while pgrep -f solve.py; do sleep 60; done").unwrap();
+        assert_eq!(proxy, "a pattern in the process list");
     }
 
     /// A command that does its work must not look like a monitor.

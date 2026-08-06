@@ -132,3 +132,75 @@ The jobs that operate now continue; a new coordinator reads the same records.
 
 The jobs are safe in that operation. A coordinator holds no result: the record
 of each job is on the disk, and a new coordinator reads the same records.
+
+## Three questions that a user asked, with the answers
+
+### Does the memory test understand swap and reclaimable cache?
+
+**Reclaimable cache: yes. Swap: deliberately not.**
+
+On Linux the number is `MemAvailable`, which the kernel calculates. It counts
+the page cache that the kernel can reclaim, so a machine with 12GB of cache does
+not look full. On macOS the number is the free pages, the inactive pages, the
+purgeable pages and the speculative pages, which is the nearest equivalent.
+
+Memory that the kernel wrote to swap is **not** in that number, and this is the
+case to know about:
+
+```
+MemAvailable 1.6GB, 10GB in swap, no page operations, the machine is healthy
+```
+
+A job that claims 6.5GB waits there, although the machine can supply the memory
+by taking it back from swap. qex now says so in the reason: when the pressure is
+low, the reason states that the machine is not short of memory, that the number
+does not count the memory in swap, and that a smaller claim or a lower
+`reserve_mem` corrects it.
+
+The pressure, and not the free memory, is the measurement that separates a
+machine that is full from a machine that parked memory nobody wants. qex reads
+it (`/proc/pressure/memory`, Linux only) as a second test with `max_pressure`.
+**qex does not yet use the pressure to RELEASE a job that the free-memory test
+holds.** That is the correct change for this case, and it needs a machine in
+that state to test it, so it waits.
+
+### Does the learned claim record the peak memory?
+
+**Yes. The peak, and the largest peak of the samples.**
+
+The measurement is `max_rss` from `getrusage(RUSAGE_CHILDREN)`, which is the
+highest memory that the job reached, and not its memory at the end and not an
+average. qex keeps several samples and uses the **largest** of them with a
+margin.
+
+This is deliberate, and the reason is the job that climbs for hours: a claim
+that is too small stops the job, and a claim that is a little large costs
+capacity only.
+
+qex records a job that COMPLETED only. A job that somebody stopped, or that the
+out-of-memory killer stopped, shows the memory that it reached and not the
+memory that it needs, and that number would teach qex the wrong size.
+
+### Is there fairness between agents?
+
+**No. It is capacity, and then the order of submission.**
+
+Each user has one coordinator, and each coordinator holds its own queue in the
+order of submission, with the priority first. Between users, the coordinators
+publish their claims to `/tmp/qex` and each one subtracts the claims of the
+others from its budget.
+
+That controls the total load, and it does NOT divide the load. A fan-out of 11
+jobs from one agent takes the capacity, and the 2 jobs of the other agent wait
+until it ends. Nothing gives a share to each agent, and nothing reserves a slot
+for the agent that arrives second.
+
+Use `--priority` inside one queue. Between agents there is no answer in qex
+today, and a user who needs one must divide the budget by hand, with `[budget]`
+in the configuration of each user.
+
+## The boundary: one machine
+
+qex controls one machine. Two machines that farm work to each other are not
+coordinated, and the accounting on each machine sees its own jobs and the jobs
+of the other users OF THAT MACHINE only.

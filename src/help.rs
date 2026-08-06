@@ -65,8 +65,8 @@ Every monitor that you write waits for a PROXY: a pattern in the process list, a
 line in a log file, a file that appears. A proxy can become permanently false,
 and nothing tells the monitor. It then waits for ever.
 
-These waits were measured on one machine in one day. Together they slept for 95
-hours, and not one of the conditions could ever become true:
+Four monitors were measured on one machine in one day, and together they slept
+for 95 hours. Not one of the conditions could ever become true. Three of them:
 
     while pgrep -f \"solve.py\"; do sleep 60; done
         The command line of this shell holds the letters `solve.py`, so the
@@ -80,9 +80,24 @@ hours, and not one of the conditions could ever become true:
     until grep -q \"READY\" ~/other.log; do sleep 60; done
         That file was never made. This monitor slept for 41 hours.
 
-The second and the third hold no pattern fault. They are careful commands. The
-fault is the proxy: a log line is evidence of the work, and evidence stops when
-the work stops, in a way that the monitor cannot see.
+A different user found this one later, on a machine that two agents shared. It
+had slept for 63 hours:
+
+    while true; do M=$(ps -Ao args | grep -c solver)
+                   K=$(ssh other-host 'ps -Ao args | grep -c solver')
+                   [ $M -eq 0 ] && [ $K -eq 0 ] && break; sleep 300; done
+        A COUNT, and not a test of one process. This monitor waits until nothing
+        matches. On a machine that two agents share, that condition is not
+        satisfiable: the work of the other agent holds the count above zero for
+        ever. The work of this author finished two days before, and the
+        monitor opened about 750 connections to the other machine while it
+        waited.
+
+The last three hold NO PATTERN FAULT. They are careful commands. The fault is
+the proxy: a log line is evidence of the work, and evidence stops when the work
+stops, in a way that the monitor cannot see. The last one is the most dangerous,
+because a careful author writes it: on a machine that two agents share, \"wait
+until nothing matches\" can never become true.
 
 qex waits for the process, and not for a proxy of the process. qex is the parent
 of your task and it uses `waitpid` on that exact process. A process ends or it
