@@ -130,6 +130,18 @@ id.
 Choose a key that names the work **and** the place: `build:$(pwd)`. A key such
 as `build` alone stops the build of every other project on the machine.
 
+**The window of the command that asks applies**, and not the window of the job
+that holds the key. The window is a question: how old an answer do you accept? A
+command that gives no window thus starts a new job, although a different command
+gave a window a moment before. Give the same window in each command that shares
+a key. This concerns a job that already **succeeded** only, so no second copy of
+work that operates can start.
+
+**`qex run --dedupe-key` waits for the job that the key gives, and Ctrl-C then
+stops your wait only.** A different agent can be the owner of that job. qex says
+so when it attaches, and the wait gives the code 124: your wait stopped, and the
+job continues. Use `qex kill <id>` to stop the job itself.
+
 `qex status <id>` shows the key of a job. You can thus see which key gave you an
 id, and the same command gives the result of a job that stopped.
 

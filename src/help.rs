@@ -160,6 +160,11 @@ job before it could finish, and it does not say that your work failed. Do not
 start the work again before you read the line on stderr. Run
 `qex help exit-codes` for the full table.
 
+A job that a dedupe key gave you is the one exception. This command did not
+start that job, so Ctrl-C stops this wait only, and the job continues. `qex run`
+then gives 124, which says that YOUR WAIT ended. Read the section on the key
+below.
+
 The three commands you need
 ---------------------------
 
@@ -277,6 +282,18 @@ ONE step. Two commands in the same moment thus give one job and one id.
 
 Choose a key that names the work AND the place: `build:$(pwd)`. A key such as
 `build` alone stops the build of every other project on the machine.
+
+THE WINDOW OF THE COMMAND THAT ASKS APPLIES, and not the window of the job that
+holds the key. The window is a question: how old an answer do you accept? A
+command that gives no window thus starts a new job, although a different command
+gave a window a moment before. Give the same window in each command that shares
+a key. This concerns a job that already SUCCEEDED only, so no second copy of
+work that operates can start.
+
+`qex run --dedupe-key` waits for the job that the key gives. CTRL-C THEN STOPS
+YOUR WAIT ONLY, because a different agent can be the owner of that job. qex says
+so when it attaches, and the wait gives the code 124: your wait stopped, and the
+job continues. Use `qex kill <id>` to stop the job itself.
 
 `qex status <id>` shows the key of a job. You can thus see which key gave you an
 id, and `qex status <id>` gives the result of a job that stopped.

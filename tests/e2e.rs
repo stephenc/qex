@@ -590,6 +590,115 @@ fn submit_json_says_if_this_command_started_the_work() {
     h.stop(&id);
 }
 
+/// A signal to `qex run` must not stop a job that a different caller started.
+///
+/// A dedupe key gives `qex run` the job of somebody else. Before this rule, a
+/// SIGTERM to that command stopped the job of the first agent: the job went
+/// from `running` to `killed`, and the first agent lost a run of four hours
+/// with no cause that it could see.
+#[test]
+fn a_signal_to_a_deduplicated_run_stops_the_wait_and_not_the_job() {
+    let h = Harness::with_default_config("dedupe-run");
+
+    // The first agent starts the work.
+    let owner = h.submit(&["submit", "--dedupe-key", "shared", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&owner)
+    });
+
+    // The second agent runs the same script. The key gives it the first job.
+    let err_path = h.root.join("run.err");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qex"))
+        .args(["run", "--dedupe-key", "shared", "--", "sleep", "30"])
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("qex did not start");
+
+    // Wait for the message that says the rule is active. qex writes it after it
+    // installs the handler, so this text is proof that a signal now meets the
+    // rule and not the default behaviour of the system.
+    h.until(
+        "qex run attaches to the job",
+        Duration::from_secs(45),
+        || {
+            std::fs::read_to_string(&err_path)
+                .map(|t| t.contains("did not start it"))
+                .unwrap_or(false)
+        },
+    );
+
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let code = child.wait().unwrap().code();
+    assert_eq!(
+        code,
+        Some(124),
+        "the wait must give the code that says `the job continues`"
+    );
+
+    // The job of the first agent must continue.
+    let state = h.state_of(&owner);
+    assert_eq!(
+        state, "running",
+        "a signal to the second agent stopped the job of the first agent"
+    );
+
+    let message = std::fs::read_to_string(&err_path).unwrap();
+    assert!(
+        message.contains(&format!("qex kill {owner}")),
+        "the message must give the way to stop the job: {message}"
+    );
+
+    h.stop(&owner);
+}
+
+/// A signal to `qex run` that OWNS its job must still stop that job.
+///
+/// This is the behaviour that a user expects, because `qex run` goes in front
+/// of a command that Ctrl-C stops. The rule for a deduplicated job must not
+/// change it.
+#[test]
+fn a_signal_to_a_run_that_started_its_job_stops_the_job() {
+    let h = Harness::with_default_config("run-signal");
+
+    let out_path = h.root.join("run.out");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_qex"))
+        .args(["run", "--", "sh", "-c", "echo ready; sleep 30"])
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("qex did not start");
+
+    // The output of the job arrives from the loop that follows the log file,
+    // and that loop starts after the handler exists. This text is thus proof
+    // that a signal now meets the handler.
+    h.until("the job writes its output", Duration::from_secs(45), || {
+        std::fs::read_to_string(&out_path)
+            .map(|t| t.contains("ready"))
+            .unwrap_or(false)
+    });
+
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    child.wait().unwrap();
+
+    let id = h.list_json()[0]["id"].as_str().unwrap().to_string();
+    h.until("the job stops", Duration::from_secs(45), || {
+        h.state_of(&id) == "killed"
+    });
+}
+
 /// A coordinator that starts again must give each key back to its job.
 ///
 /// The key is in the record of the job. Without that, a restart would free

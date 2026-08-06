@@ -242,6 +242,10 @@ pub struct JobSpec {
     /// nothing else.**
     ///
     /// `dedupe_window` extends the rule for a caller that wants more.
+    ///
+    /// THIS FIELD IS THE ONE THAT RECOVERY READS. A coordinator that starts
+    /// again reads `spec.json` and gives each key back to its job. The field
+    /// with the same name in `JobStatus` is for a reader of `qex status`.
     #[serde(default)]
     pub dedupe_key: Option<String>,
     /// The seconds for which a job that SUCCEEDED keeps its key.
@@ -254,6 +258,13 @@ pub struct JobSpec {
     /// memory, is work that a caller must be able to start again immediately.
     /// A window that blocked that would make the option dangerous: the one
     /// remedy for a failure is another run.
+    ///
+    /// THE WINDOW OF THE SUBMISSION THAT ASKS APPLIES, and not the window of
+    /// the job that holds the key. The window is thus a question ("how old an
+    /// answer do I accept?") and not a property of the earlier job. A caller
+    /// that gives no window therefore starts a new job, although a different
+    /// caller gave a window a moment before. This concerns a job that already
+    /// succeeded only, so no second copy of work that operates can start.
     #[serde(default)]
     pub dedupe_window: u64,
     pub submitted_at: u64,

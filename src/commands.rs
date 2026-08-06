@@ -2716,14 +2716,18 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     require_capabilities(&mut client, &spec)?;
 
-    let id = match client.call(&Request::Submit {
+    let (id, deduplicated) = match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
-        Response::Submitted { id, warning, .. } => {
+        Response::Submitted {
+            id,
+            warning,
+            deduplicated,
+        } => {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
-            id
+            (id, deduplicated)
         }
         other => return report(other),
     };
@@ -2746,8 +2750,25 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         libc::signal(libc::SIGTERM, handler);
     }
 
+    // Say now what Ctrl-C will do, because a dedupe key changed it.
+    //
+    // This command started no job, so it is not the owner of this job, and a
+    // different agent can be the owner. The user must know that before the
+    // moment of the signal, and not after it.
+    //
+    // This message comes AFTER the handler exists. The message is thus proof
+    // that the rule is active, and a signal that arrives immediately after it
+    // meets the rule and not the default behaviour of the system.
+    if deduplicated {
+        eprintln!(
+            "qex: this command waits for that job. It did not start it, so Ctrl-C stops \
+             this wait only.\n\
+             qex: to stop the job itself, run `qex kill {id}`."
+        );
+    }
+
     let dir = paths::job_dir(&id)?;
-    stream_until_done(&mut client, id, &dir)
+    stream_until_done(&mut client, id, &dir, !deduplicated)
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
@@ -2805,7 +2826,16 @@ fn stop_own_job(client: &mut Client, id: uuid::Uuid) -> bool {
 }
 
 /// Writes the output of a job as it arrives, until the job stops.
-fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path) -> Result<i32> {
+///
+/// `owns_job` says if THIS command started the job. Ctrl-C stops the job only
+/// when that is true. A dedupe key gives the job of a different caller, and a
+/// signal to this command must never stop the work of somebody else.
+fn stream_until_done(
+    client: &mut Client,
+    id: uuid::Uuid,
+    dir: &std::path::Path,
+    owns_job: bool,
+) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let mut handles: Vec<(bool, Option<std::fs::File>)> = vec![(false, None), (true, None)];
@@ -2817,8 +2847,22 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
 
     loop {
         if RUN_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!("\nqex: stopping the job {id}");
             RUN_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            if !owns_job {
+                // A dedupe key gave this job to this command. A different agent
+                // started the work, and it can be a run of four hours. A signal
+                // to this command stops this wait, and nothing else.
+                eprintln!(
+                    "\nqex: this wait stops. The job {id} continues, because this command \
+                     did not start it.\n\
+                     qex: to stop the job, run `qex kill {id}`. \
+                     To wait again, run `qex status {id} --wait`."
+                );
+                return Ok(EXIT_TIMEOUT);
+            }
+
+            eprintln!("\nqex: stopping the job {id}");
             // Set the flag from the ANSWER, and not from the attempt. A stop
             // that failed leaves the job for a different command to stop, and
             // this command must then not tell the user that it stopped the job.

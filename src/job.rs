@@ -327,11 +327,14 @@ pub struct JobStatus {
     pub locks: Vec<String>,
     /// The key that made this submission idempotent, if the user gave one.
     ///
-    /// The key is in the record, and not in the memory of the coordinator
-    /// only. `qex list` and `qex status` can thus show it, and a coordinator
-    /// that starts again reads the key of each job that it recovers. Without
-    /// the key on the disk, a restart would free every key, and a second
-    /// submission would start a second copy of the work.
+    /// THIS FIELD IS FOR A READER, AND NOT FOR THE COORDINATOR. `qex list` and
+    /// `qex status` show it, and the JSON schema names it.
+    ///
+    /// A coordinator that starts again reads the key from `spec.json`, and not
+    /// from here. See `recover` in the `daemon` module, which reads
+    /// `spec.dedupe_key`. DO NOT DELETE `dedupe_key` FROM `JobSpec`: a restart
+    /// would then free every key, and the next submission would start a second
+    /// copy of work that operates.
     #[serde(default)]
     pub dedupe_key: Option<String>,
     /// The number of times that qex started this job.

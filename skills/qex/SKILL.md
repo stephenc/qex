@@ -135,8 +135,13 @@ makes the test and the submission one step.
 
 The key is free when the job stops. Add `--dedupe-window 1h` to keep the key of
 a job that **succeeded** for an hour also; a job that did not succeed never
-keeps its key. Add `--json` when your script must know if **it** started the
-work.
+keeps its key. The window of the command that asks applies, so give the same
+window in each command that shares a key. Add `--json` when your script must
+know if **it** started the work.
+
+`qex run --dedupe-key` waits for the job that the key gives, and Ctrl-C then
+stops your wait only: a different agent can be the owner of that job. Use
+`qex kill <id>` to stop the job itself.
 
 ## Claims
 

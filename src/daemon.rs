@@ -685,7 +685,9 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     //
     // Without this step, a coordinator that starts again frees every key, and
     // the next submission starts a second copy of work that already operates.
-    // The key is in the record of the job, so the disk holds the truth.
+    // The key comes from `spec.json`, which the CLI wrote at the submission.
+    // (`JobStatus` holds the key also, but that copy is for a reader of
+    // `qex status`.)
     //
     // Two jobs can hold one key: the job of yesterday stopped, and the job of
     // today operates. The job that has not stopped wins, and after that the

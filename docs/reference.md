@@ -165,7 +165,7 @@ read and the submission, and both agents start a job in that gap.
 | -------------------- | ------------------------------ |
 | waits in the queue, or operates | gets that job's id, and starts nothing |
 | stopped, for any reason | starts a new job |
-| succeeded inside `--dedupe-window` | gets that job's id, and starts nothing |
+| succeeded inside the `--dedupe-window` of the **new** submission | gets that job's id, and starts nothing |
 | its record is deleted | starts a new job |
 
 A key that held a job for ever would give an agent the id of a job of yesterday,
@@ -176,6 +176,23 @@ work, and it does nothing else.
 to count. A job that did **not** succeed never keeps its key, whatever the
 window is: the remedy for a failure is another run, and a window that blocked it
 would make the option dangerous.
+
+**The window of the submission that asks applies, and not the window of the job
+that holds the key.** The window is a question — "how old an answer do I
+accept?" — and it is not a property of the earlier job. A submission that gives
+no window thus starts a new job, although a different submission gave a window a
+moment before:
+
+```sh
+A=$(qex submit --dedupe-key w1 -- true); qex wait $A
+B=$(qex submit --dedupe-key w1 --dedupe-window 1h -- true)   # B is A
+C=$(qex submit --dedupe-key w1 -- true)                      # C is a new job
+```
+
+Each caller thus states its own rule, and the coordinator holds no policy of its
+own. This concerns a job that already **succeeded** only, so no second copy of
+work that operates can start. Give the same window in each command that shares a
+key.
 
 The key is in the record of the job, so `qex status` and `qex list --json` show
 it, and a coordinator that starts again gives each key back to its job.
@@ -196,8 +213,27 @@ qex submit --json --dedupe-key build:$(pwd) -- make
 `qex rerun <id>` never keeps the key of the first job. That command exists to
 run the work again.
 
+### `qex run` with a key
+
 `qex run` accepts `--dedupe-key` and waits for the job that the key gives. It
 does not accept `--json`, because its stdout holds the output of the job.
+
+**Ctrl-C stops the job only when this command started the job.** A key can give
+the job of a different caller. `qex run` says so when it attaches, and a signal
+then stops the wait and nothing else:
+
+```
+qex: this command waits for that job. It did not start it, so Ctrl-C stops
+this wait only.
+qex: to stop the job itself, run `qex kill 7f3c8a12-...`.
+```
+
+The exit code of that wait is 124, the code that says "your wait stopped, and
+the job continues". Without this rule, Ctrl-C in one agent would stop a
+four-hour run that a different agent started, and neither agent would know why.
+
+`qex run` that started the job keeps its earlier behaviour: Ctrl-C stops the
+job.
 
 A pipeline stage has no dedupe key. A key on one stage would answer for that
 stage alone, and the stages after it would wait for a job of an earlier run.
