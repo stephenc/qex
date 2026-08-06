@@ -506,14 +506,26 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // only, where no code can act on it.
     status.pid = None;
     status.last_pid = Some(pid);
-    job::write_status(&dir, &status)?;
 
     // Run the job again when it failed and a retry is left.
     //
     // The job keeps one id and one record, so `qex wait` gives the final result
     // and an agent needs no extra command. A new job for each attempt would
     // give the agent an id that answers only for one attempt.
-    if status.state == JobState::Failed && status.retries_left > 0 {
+    //
+    // The decision comes BEFORE the write, and the record goes to the disk one
+    // time.
+    //
+    // An earlier version wrote `failed`, and then wrote `queued` a moment
+    // later. A reader between the two writes saw a state that the job never
+    // reached. The coordinator is such a reader: it reads the record of each
+    // job, it keeps the state that it reads, and it stops reading a job that
+    // stopped. It thus kept `failed` for a job that continued, and it kept it
+    // for ever. `qex list` then showed `failed` for a job that was running,
+    // `qex wait` gave the result of an attempt that was not the last one, and
+    // every rule that asks "did this job stop?" received the wrong answer.
+    let retrying = status.state == JobState::Failed && status.retries_left > 0;
+    if retrying {
         status.retries_left -= 1;
         status.state = JobState::Queued;
         status.error = Some(format!(
@@ -521,10 +533,11 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             status.attempts,
             code.unwrap_or(-1)
         ));
-        status.pid = None;
         status.finished_at = None;
-        job::write_status(&dir, &status)?;
+    }
+    job::write_status(&dir, &status)?;
 
+    if retrying {
         log(&format!(
             "job {id} failed and starts again; {} attempt(s) left",
             status.retries_left

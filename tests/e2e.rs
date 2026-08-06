@@ -2571,4 +2571,91 @@ fn the_status_gives_the_measured_use_of_a_job() {
     );
 }
 
+/// A job that starts again must never show the state of the attempt that
+/// failed.
+///
+/// The supervisor wrote the record two times: `failed`, and then `queued` a
+/// moment later. A reader between the two writes saw a state that the job never
+/// reached, and the coordinator is such a reader. It keeps the state that it
+/// reads and it stops reading a job that stopped, so it kept `failed` for a job
+/// that continued, and it kept it for ever.
+///
+/// The measured result was a coordinator that reported `failed` while the job
+/// operated, and `qex wait` that gave the result of an attempt that was not the
+/// last one. Every rule that asks "did this job stop?" then receives the wrong
+/// answer.
+///
+/// This test reads the record and the list many times while the job starts
+/// again. Neither must ever say that the job stopped.
+#[test]
+fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
+    let h = Harness::with_default_config("retrylatch");
+
+    // The first attempt fails, and the second one takes long enough for the
+    // test to read the record many times.
+    let counter = h.root.join("attempts");
+    let script = format!(
+        "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; \
+         if [ $n -lt 2 ]; then exit 3; fi; sleep 5",
+        c = counter.display()
+    );
+    let id = h.submit(&["submit", "--retries", "4", "--", "sh", "-c", &script]);
+
+    // Read the record FILE, and not `qex status`.
+    //
+    // The window between the two writes is short. A reader that starts a
+    // process for each sample takes far longer than the window, so it would
+    // pass whether the fault is there or not. A file read takes microseconds
+    // and it samples the same record that the coordinator reads.
+    let record = h.root.join("state/qex/jobs").join(&id).join("status.json");
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut saw_a_later_attempt = false;
+    let mut samples = 0u64;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                samples += 1;
+                let state = v["state"].as_str().unwrap_or("");
+                let attempts = v["attempts"].as_u64().unwrap_or(0);
+
+                // The final attempt succeeds, so the only terminal state that
+                // this record may ever hold is `completed`.
+                assert_ne!(
+                    state, "failed",
+                    "the record must never hold the state of an attempt that starts \
+                     again; it held `failed` at attempt {attempts}"
+                );
+
+                if state == "running" && attempts > 1 {
+                    saw_a_later_attempt = true;
+                }
+                if state == "completed" {
+                    break;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the job did not finish after {samples} samples"
+        );
+    }
+
+    assert!(
+        saw_a_later_attempt,
+        "the test must see an attempt after the first one, or it tests nothing"
+    );
+    assert!(
+        samples > 100,
+        "the test must sample the record often enough to meet the window; it took \
+         {samples} samples"
+    );
+
+    // The result is the result of the LAST attempt.
+    let status = h.status_json(&id);
+    assert_eq!(status["state"], "completed", "got: {status}");
+    assert_eq!(status["attempts"], 2, "got: {status}");
+    assert_eq!(status["exit_code"], 0, "got: {status}");
+}
+
 fn _unused(_: &Path) {}
