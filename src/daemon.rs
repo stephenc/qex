@@ -432,6 +432,9 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
     match request {
         Request::Ping => Response::Ok,
         Request::Info => handle_info(coord),
+        Request::Capabilities => Response::Capabilities {
+            names: crate::capabilities::ALL.iter().map(|s| s.to_string()).collect(),
+        },
         Request::Submit { spec } => handle_submit(coord, *spec),
         Request::List => {
             let mut state = coord.state.lock().unwrap();

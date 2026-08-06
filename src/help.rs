@@ -345,6 +345,33 @@ Other useful options
     qex wait A B --any   give control back when the FIRST job stops.
     qex rerun <id>       submit the same job again, with a new id.
 
+If the coordinator is older than your command
+---------------------------------------------
+
+A coordinator operates for hours, and a new build can replace the qex program.
+The coordinator then holds earlier code.
+
+qex asks the coordinator what it can do, and it REFUSES a job that the
+coordinator cannot obey:
+
+    qex: the coordinator (pid 3507877) is version 0.3.0, and it cannot
+    obey --lock.
+
+    qex refuses this job. The coordinator would ignore that option in
+    silence, give you a job id, and run the job without the rule that you
+    asked for.
+
+A refusal is safer than a job that starts. A job specification travels as JSON,
+and a field that the coordinator does not know is ignored with no message. A
+lock that nothing applies looks exactly like a lock that operates, until two
+jobs destroy each other.
+
+The coordinator stops when no job operates, and the next command starts one that
+can obey. `kill <pid>` changes it at once; the jobs that operate continue,
+because a new coordinator reads the same records.
+
+`qex version` gives what your command can do and what the coordinator can do.
+
 Other commands
 --------------
 

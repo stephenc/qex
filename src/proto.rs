@@ -36,6 +36,11 @@ pub enum Request {
     Clean { id: uuid::Uuid },
     /// Gives the state of the coordinator.
     Info,
+    /// Gives the list of the things that the coordinator can do.
+    ///
+    /// A CLI sends this request only to a coordinator that is new enough to
+    /// answer it. See the `capabilities` module for the reason.
+    Capabilities,
 }
 
 /// A message from the coordinator to the CLI.
@@ -78,6 +83,8 @@ pub enum Response {
         cpu_claimed: u64,
         mem_claimed: u64,
     },
+    /// The things that the coordinator can do.
+    Capabilities { names: Vec<String> },
     /// The command failed.
     Error { message: String, kind: ErrorKind },
 }

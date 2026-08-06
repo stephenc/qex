@@ -65,6 +65,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     // end for a job that does not exist.
     spec.needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
+    require_capabilities(&mut client, &spec)?;
+
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
@@ -1454,6 +1456,16 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     warn_if_version_differs(&mut client);
 
+    // Test the coordinator once, before the first job. A pipeline that stops
+    // in the middle leaves jobs with no end.
+    {
+        let mut probe = crate::pipeline::stage_spec(&file.jobs[0], &cfg, group, &group_name)?;
+        probe.group = Some(group);
+        // A pipeline always needs the groups and the dependencies.
+        probe.needs.push(uuid::Uuid::new_v4());
+        require_capabilities(&mut client, &probe)?;
+    }
+
     // The id of each stage that qex already submitted, by its name in the file.
     let mut ids: std::collections::BTreeMap<String, uuid::Uuid> = Default::default();
     let mut submitted: Vec<(String, uuid::Uuid)> = Vec::new();
@@ -1574,9 +1586,25 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     }
 
     println!("qex {mine}");
+    println!("can do:      {}", crate::capabilities::ALL.join(", "));
     match coordinator {
         None => println!("coordinator: none operates"),
         Some((version, pid, replaced)) => {
+            // Say what the coordinator can do, and name anything that this
+            // build can do and the coordinator cannot.
+            if let Some(mut c) = Client::connect_existing() {
+                let (have, _, _) = coordinator_capabilities(&mut c);
+                let missing: Vec<&&str> = crate::capabilities::ALL
+                    .iter()
+                    .filter(|name| !have.iter().any(|h| h == *name))
+                    .collect();
+                if !missing.is_empty() {
+                    println!(
+                        "cannot do:   {} (this coordinator is older)",
+                        missing.iter().map(|s| **s).collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
             if version == mine {
                 println!("coordinator: {version} (pid {pid})");
             } else {
@@ -1698,6 +1726,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     warn_if_version_differs(&mut client);
     spec.needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
+    require_capabilities(&mut client, &spec)?;
 
     let id = match client.call(&Request::Submit {
         spec: Box::new(spec),
@@ -1865,4 +1894,43 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
         }
         other => report(other),
     }
+}
+
+/// Asks the coordinator what it can do.
+///
+/// The `Capabilities` request did not exist in the first versions, and an
+/// earlier coordinator gives an error for a request that it cannot read. This
+/// function thus reads the version first, because every version answers `Info`,
+/// and it uses a table for an earlier coordinator.
+fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
+    let (version, pid) = match client.call(&Request::Info) {
+        Ok(Response::Info { version, pid, .. }) => (version, pid),
+        _ => return (Vec::new(), String::from("unknown"), 0),
+    };
+
+    if crate::capabilities::parse(&version) >= crate::capabilities::ASK_FROM_VERSION {
+        if let Ok(Response::Capabilities { names }) = client.call(&Request::Capabilities) {
+            return (names, version, pid);
+        }
+    }
+
+    // An earlier coordinator. Its version says what it can do.
+    let names = crate::capabilities::implied_by_version(&version)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    (names, version, pid)
+}
+
+/// Refuses a job that the coordinator cannot obey.
+///
+/// A field that the coordinator does not know travels in the JSON and is
+/// ignored in silence. A user would then receive a job id for a job that runs
+/// without the rule that the user asked for.
+fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
+    if crate::capabilities::required_by(spec).is_empty() {
+        return Ok(());
+    }
+    let (have, version, pid) = coordinator_capabilities(client);
+    crate::capabilities::check(&have, &version, pid, spec).map_err(|e| anyhow::anyhow!("{e}"))
 }

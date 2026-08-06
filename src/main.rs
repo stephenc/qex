@@ -14,6 +14,7 @@
 //! 3. qex uses the resource claims to select the jobs that operate together.
 //!    Two agents on one machine thus do not start the out-of-memory killer.
 
+mod capabilities;
 mod claim;
 mod cli;
 mod client;
