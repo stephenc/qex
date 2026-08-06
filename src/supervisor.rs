@@ -284,14 +284,20 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // The job continues, because the work of the user is more important than the
     // file. The fault goes into the record of the job, where `qex status` shows
     // it, and into the log of the supervisor.
+    //
+    // This message goes into a record, so it takes the SHORT form of the fault.
+    // `Config::load` gives a long message about an upgrade of the coordinator,
+    // which is correct for a person whose command stopped, and wrong here: it
+    // would fill the `error:` field of a job that ran with advice, and it would
+    // hide the words that matter — that no limit operates.
     let mut config_fault: Option<String> = None;
-    let cfg = match crate::config::Config::load() {
+    let cfg = match crate::config::Config::load_for_job_record() {
         Ok(cfg) => cfg,
         Err(e) => {
             let message = format!(
                 "qex could not read the configuration ({e}). This job uses the default values, \
                  SO NO LIMIT OPERATES. Correct the file, and start the job again with \
-                 `qex rerun {id}`."
+                 `qex rerun {id}`. Run `qex config show` for the complete message."
             );
             log(&message);
             eprintln!("{message}");

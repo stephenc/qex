@@ -243,6 +243,54 @@ timeout = "0"         # the default is no limit
 With no `[defaults]` section, a job gets 1 core and an equal part of the machine
 memory. The default job size thus scales with the machine.
 
+### Update the coordinator before you use a new option
+
+qex refuses a field that it does not know. That rule finds a name with a
+spelling fault, and a name with a spelling fault must not be ignored in silence.
+
+It has a second cause. A new option belongs in the config file only **after the
+coordinator is the new build**:
+
+```sh
+qex info                # the version and the pid of the coordinator
+# install the new qex
+kill <pid>              # the jobs that operate continue
+qex info                # the new version now
+# NOW put the new option in ~/.config/qex.toml
+```
+
+**The program on the disk is not sufficient.** A coordinator operates for hours,
+it holds the code that started it, and it reads the config file once, when it
+starts. A new option that you write before that moment has no effect, and qex
+ignores it in silence. The coordinator stops by itself when no job operates,
+and `kill <pid>` changes it at once.
+
+**Install the new qex before you kill the coordinator.** While the old qex is
+the program on the disk, no coordinator can start from a file that holds the new
+option, and the commands in the next paragraph that need a coordinator go with
+it.
+
+In the other order, `qex submit`, `qex run`, `qex pipeline`, `qex gc`, `qex du`
+and `qex config show` stop, and qex cannot start a coordinator — so a queue whose
+coordinator retires stays where it is. The jobs that operate continue. These are
+the commands you keep, and the second group is the larger one:
+
+| Continue in every state | Continue while a coordinator operates |
+| --- | --- |
+| `qex wait`, `qex top`, `qex logs`, `qex version` | `qex info`, `qex list`, `qex status`, `qex kill`, `qex cancel`, `qex clean`, `qex rerun` |
+
+`qex rerun` is in the second group, so you can still start work even though `qex
+submit` stops: it asks the coordinator for a job that the records already hold,
+and it needs no config file. With no coordinator, each command in the second
+group waits 10 seconds and then reports that the coordinator did not start. That
+message names no cause, which is the second reason to install the new qex first.
+
+A job that starts in this state uses the default values, and `qex status` says
+so. Remove the section from the file to go back.
+
+Two people or two agents that share a machine each run their own coordinator, so
+each must make this change for itself.
+
 Run `qex help config` for every field.
 
 ## More help inside the tool
