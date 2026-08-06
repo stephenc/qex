@@ -9,11 +9,12 @@ pub fn schema(which: &str) -> Option<&'static str> {
     match which.trim().to_ascii_lowercase().as_str() {
         "job" | "job-file" | "spec" => Some(JOB),
         "status" | "job-status" => Some(STATUS),
+        "pipeline" | "pipelines" | "pipeline-file" => Some(PIPELINE),
         _ => None,
     }
 }
 
-pub const NAMES: &[&str] = &["job", "status"];
+pub const NAMES: &[&str] = &["job", "status", "pipeline"];
 
 pub const JOB: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -94,6 +95,83 @@ pub const JOB: &str = r##"{
       "items": { "type": "string" },
       "description": "The jobs that must stop before this job starts. Their result is not important. Use this field for a cleanup step that must run also when an earlier stage fails.",
       "examples": [["build"]]
+    }
+  }
+}
+"##;
+
+pub const PIPELINE: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qex/schema/pipeline.json",
+  "title": "qex pipeline file",
+  "description": "Several stages for `qex pipeline FILE`. qex reads TOML, YAML and JSON. The names in this file belong to this file and to one submission: qex changes each one into the id of the job that it just made, so two runs of the same file never share a name.",
+  "type": "object",
+  "required": ["jobs"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "A name for the whole pipeline, for `qex list --group` to use. The default is the name of the file."
+    },
+    "jobs": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The stages. qex reads the whole file before it submits anything, so a circle of stages or a name that no stage has gives an error and no job starts.",
+      "items": {
+        "type": "object",
+        "required": ["name", "command"],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of this stage. The other stages use it in `needs` and `after`. Each name in one file must be different, and a name must not have the form of a job id."
+          },
+          "command": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "The program and its arguments. This is not a shell command line.",
+            "examples": [["make", "test"]]
+          },
+          "needs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "The stages of THIS file that must succeed before this stage. If one of them does not succeed, this stage does not run and its state becomes skipped.",
+            "examples": [["build"]]
+          },
+          "after": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "The stages of THIS file that must stop before this stage, whatever their result. Use it for a cleanup stage.",
+            "examples": [["ship"]]
+          },
+          "cwd": { "type": "string", "description": "The directory for this stage." },
+          "timeout": { "type": "string", "description": "The time limit. Use s, m, h or d." },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "priority": { "type": "integer" },
+          "env_capture": {
+            "type": "string",
+            "enum": ["all", "minimal", "none"]
+          },
+          "resources": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "cpu": {
+                "anyOf": [
+                  { "type": "integer", "minimum": 1 },
+                  { "type": "string", "enum": ["half", "guess", "auto", "full", "max", "all"] }
+                ]
+              },
+              "mem": { "type": "string" }
+            }
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
     }
   }
 }
@@ -192,6 +270,36 @@ pub const STATUS: &str = r##"{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pipeline schema must list every field that a stage accepts. A field
+    /// that the schema does not name looks unsupported, and the parser refuses
+    /// a field that the schema names but the code does not accept.
+    #[test]
+    fn the_pipeline_schema_lists_every_field_of_a_stage() {
+        let parsed: serde_json::Value = serde_json::from_str(PIPELINE).unwrap();
+        let props = parsed["properties"]["jobs"]["items"]["properties"]
+            .as_object()
+            .unwrap();
+        for field in [
+            "name", "command", "needs", "after", "cwd", "timeout", "tags", "priority",
+            "env_capture", "resources", "env",
+        ] {
+            assert!(props.contains_key(field), "the schema has no field `{field}`");
+        }
+        assert_eq!(props.len(), 11, "the schema has a field that a stage does not accept");
+    }
+
+    /// The example in the schema must parse as a pipeline file.
+    #[test]
+    fn the_pipeline_schema_example_parses() {
+        let file: crate::pipeline::PipelineFile = serde_json::from_str(
+            r#"{"jobs":[{"name":"build","command":["make"]},
+                       {"name":"test","command":["make","test"],"needs":["build"]}]}"#,
+        )
+        .unwrap();
+        file.validate().unwrap();
+        assert_eq!(file.jobs.len(), 2);
+    }
 
     #[test]
     fn each_schema_is_valid_json() {

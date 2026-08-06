@@ -99,6 +99,14 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     if let Some(tag) = &args.tag {
         jobs.retain(|j| j.tags.iter().any(|t| t == tag));
     }
+    if let Some(group) = &args.group {
+        // A group takes its id or its name. A name is easier to type, and the
+        // names of a pipeline belong to one submission.
+        jobs.retain(|j| {
+            j.group.map(|g| g.to_string().starts_with(group)).unwrap_or(false)
+                || j.group_name.as_deref() == Some(group.as_str())
+        });
+    }
     // Show the jobs in the order of submission. A pipeline then reads from the
     // first stage to the last stage.
     jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
@@ -1264,6 +1272,8 @@ mod tests {
             cpu: 1,
             mem: 1 << 30,
             claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
@@ -1326,4 +1336,170 @@ mod tests {
         assert_eq!(short_id(&id).len(), 8);
         assert!(id.to_string().starts_with(&short_id(&id)));
     }
+}
+
+/// Submits every stage of a pipeline file with one command.
+///
+/// The names in the file belong to that file and to this submission. qex reads
+/// each one and changes it into the id that it made a moment before, so no name
+/// leaves the file. A second run of the same file makes new jobs with new ids,
+/// and the two runs never meet. That is the fault that a dependency by name has
+/// on the command line.
+pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
+    let cfg = Config::load()?;
+    cfg.validate()?;
+
+    let file = crate::pipeline::PipelineFile::load(&args.file)?;
+    let order = file.order()?;
+
+    let group = uuid::Uuid::new_v4();
+    let group_name = args
+        .name
+        .clone()
+        .or_else(|| file.name.clone())
+        .unwrap_or_else(|| {
+            args.file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pipeline")
+                .to_string()
+        });
+
+    let mut client = Client::connect()?;
+    warn_if_version_differs(&mut client);
+
+    // The id of each stage that qex already submitted, by its name in the file.
+    let mut ids: std::collections::BTreeMap<String, uuid::Uuid> = Default::default();
+    let mut submitted: Vec<(String, uuid::Uuid)> = Vec::new();
+
+    for position in order {
+        let stage = &file.jobs[position];
+        let mut spec = crate::pipeline::stage_spec(stage, &cfg, group, &group_name)?;
+
+        // Change each name of this file into the id of the stage that qex just
+        // made. The order puts every stage after the stages that it waits for,
+        // so each id is ready.
+        for name in &stage.needs {
+            match ids.get(name) {
+                Some(id) => spec.needs.push(*id),
+                None => bail!("the stage `{}` waits for `{name}`, which qex did not submit", stage.name),
+            }
+        }
+        for name in &stage.after {
+            match ids.get(name) {
+                Some(id) => spec.after.push(*id),
+                None => bail!("the stage `{}` waits for `{name}`, which qex did not submit", stage.name),
+            }
+        }
+
+        let id = spec.id;
+        match client.call(&Request::Submit {
+            spec: Box::new(spec),
+        })? {
+            Response::Submitted { id: given, warning } => {
+                if let Some(text) = warning {
+                    eprintln!("qex: {}: {text}", stage.name);
+                }
+                ids.insert(stage.name.clone(), given);
+                submitted.push((stage.name.clone(), given));
+            }
+            other => {
+                eprintln!(
+                    "qex: the stage `{}` was refused. The stages before it are in the queue; \
+                     use `qex cancel --group {group}` to remove them.",
+                    stage.name
+                );
+                let _ = id;
+                return report(other);
+            }
+        }
+    }
+
+    if args.json {
+        let jobs: Vec<serde_json::Value> = submitted
+            .iter()
+            .map(|(name, id)| serde_json::json!({ "name": name, "id": id.to_string() }))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "group": group.to_string(),
+                "group_name": group_name,
+                "jobs": jobs,
+            }))?
+        );
+    } else {
+        // The group id goes on stdout alone, so `GROUP=$(qex pipeline f.toml)`
+        // operates in the same way as `ID=$(qex submit ...)`.
+        for (name, id) in &submitted {
+            eprintln!("{name}: {id}");
+        }
+        println!("{group}");
+    }
+    Ok(0)
+}
+
+/// Writes the version of this command, and of the coordinator when one operates.
+///
+/// A user reads `qex version` and `qex --version`. The two must agree, and the
+/// long form also gives the version of the coordinator, because a coordinator
+/// that holds an earlier build behaves differently.
+pub fn version(args: cli::VersionArgs) -> Result<i32> {
+    let mine = env!("CARGO_PKG_VERSION");
+
+    // Do not start a coordinator. A question about a version must not change
+    // the machine.
+    let coordinator = Client::connect_existing().and_then(|mut c| {
+        match c.call(&Request::Info) {
+            Ok(Response::Info {
+                version,
+                pid,
+                program_replaced,
+                ..
+            }) => Some((version, pid, program_replaced)),
+            _ => None,
+        }
+    });
+
+    if args.json {
+        let value = match &coordinator {
+            Some((version, pid, replaced)) => serde_json::json!({
+                "version": mine,
+                "coordinator": {
+                    "running": true,
+                    "version": version,
+                    "pid": pid,
+                    "program_replaced": replaced,
+                    "matches": version == mine,
+                }
+            }),
+            None => serde_json::json!({
+                "version": mine,
+                "coordinator": { "running": false }
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
+    }
+
+    println!("qex {mine}");
+    match coordinator {
+        None => println!("coordinator: none operates"),
+        Some((version, pid, replaced)) => {
+            if version == mine {
+                println!("coordinator: {version} (pid {pid})");
+            } else {
+                println!("coordinator: {version} (pid {pid})");
+                println!(
+                    "WARNING: the coordinator holds a different version. It stops when no \
+                     job operates, and the next command starts one with this version. \
+                     Stop it now with `kill {pid}` if you need this version immediately."
+                );
+            }
+            if replaced {
+                println!("the qex program changed after this coordinator started");
+            }
+        }
+    }
+    Ok(0)
 }

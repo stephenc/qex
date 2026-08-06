@@ -29,10 +29,12 @@ mod lifecycle;
 mod logsel;
 mod paths;
 mod peers;
+mod pipeline;
 mod proto;
 mod sched;
 mod schema;
 mod spec;
+mod style;
 mod supervisor;
 mod sys;
 mod top;
@@ -87,6 +89,7 @@ fn run() -> Result<i32> {
         Command::Schema(args) => cmd_schema(args.which.as_deref()),
         Command::Config(args) => cmd_config(args),
         Command::Submit(args) => commands::submit(args),
+        Command::Pipeline(args) => commands::pipeline(args),
         Command::List(args) => commands::list(args),
         Command::Status(args) => commands::status(args),
         Command::Wait(args) => commands::wait(args),
@@ -95,6 +98,7 @@ fn run() -> Result<i32> {
         Command::Cancel(args) => commands::cancel(args),
         Command::Clean(args) => commands::clean(args),
         Command::Info(args) => commands::info(args),
+        Command::Version(args) => commands::version(args),
         Command::Top(args) => top::run(args),
         Command::Daemon(_) => {
             daemon::run()?;

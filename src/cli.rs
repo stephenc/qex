@@ -28,6 +28,9 @@ pub enum Command {
     /// Put a job in the queue. Writes the job id to stdout.
     Submit(SubmitArgs),
 
+    /// Submit several stages from one file, as a pipeline.
+    Pipeline(PipelineArgs),
+
     /// Show the jobs and their states.
     List(ListArgs),
 
@@ -63,6 +66,9 @@ pub enum Command {
 
     /// Explain a topic. Agents: run `qex help agents` first.
     Help(HelpArgs),
+
+    /// Show the version of this command and of the coordinator.
+    Version(VersionArgs),
 
     /// Run the coordinator. qex starts this process for you.
     #[command(hide = true)]
@@ -140,6 +146,20 @@ pub struct SubmitArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct PipelineArgs {
+    /// The file that describes the stages. TOML, YAML or JSON.
+    pub file: PathBuf,
+
+    /// A name for this pipeline, to show in `qex list`.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Write the ids as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct ListArgs {
     /// Show the jobs in this state only.
     #[arg(long, value_name = "STATE")]
@@ -148,6 +168,10 @@ pub struct ListArgs {
     /// Show the jobs with this tag only.
     #[arg(long, value_name = "TAG")]
     pub tag: Option<String>,
+
+    /// Show the jobs of one pipeline only. Give its id or its name.
+    #[arg(long, value_name = "GROUP")]
+    pub group: Option<String>,
 
     /// Write the output as JSON.
     #[arg(long)]
@@ -277,6 +301,10 @@ pub struct TopArgs {
     /// Write the page one time and stop. Use this option in a script.
     #[arg(long)]
     pub once: bool,
+
+    /// Write no colour. qex also writes no colour into a file or a pipe.
+    #[arg(long)]
+    pub no_color: bool,
 }
 
 #[derive(Debug, Args)]
@@ -321,6 +349,13 @@ pub struct SchemaArgs {
     /// The schema to write: job or status.
     #[arg(value_name = "WHICH")]
     pub which: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct VersionArgs {
+    /// Write the output as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

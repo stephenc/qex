@@ -30,6 +30,7 @@ pub const TOPICS: &[&str] = &[
     "states",
     "output",
     "exit-codes",
+    "pipeline",
 ];
 
 /// Gives the text for one topic.
@@ -44,6 +45,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "states" | "state" => Some(STATES),
         "output" | "json" => Some(OUTPUT),
         "exit-codes" | "exit" | "exitcodes" => Some(EXIT_CODES),
+        "pipeline" | "pipelines" => Some(PIPELINE),
         _ => None,
     }
 }
@@ -283,8 +285,9 @@ Other commands
     qex clean --state done     delete the records of the jobs that stopped
     qex info                   the coordinator and the free capacity
 
-Every command that reads data accepts `--json`. Use `qex schema status` and
-`qex schema job` to get the JSON Schema for these two formats.
+Every command that reads data accepts `--json`. Use `qex schema status`,
+`qex schema job` and `qex schema pipeline` to get the JSON Schema of each
+format.
 
 Short forms of a job id
 -----------------------
@@ -306,6 +309,13 @@ Start with a job file for a complex task
     qex submit --job train.toml
 
 Run `qex help job-file` for the fields.
+
+For several stages in one file, use a pipeline:
+
+    qex pipeline ci.toml
+
+Run `qex help pipeline`. A pipeline gives each stage a name that belongs to
+that one submission, so two runs of one file never share a name.
 ";
 
 pub const JOB_FILE: &str = "\
@@ -319,6 +329,9 @@ environment variables, or to keep the job in your repository.
 
 qex reads TOML, YAML and JSON. The file extension selects the format. TOML is
 the format in this documentation.
+
+One job file holds ONE job. For several stages in one file, use a pipeline file
+and the command `qex pipeline`. Run `qex help pipeline`.
 
 A minimal file
 --------------
@@ -667,6 +680,71 @@ after a deletion. Change that time with `[history] keep` in the config file.
 `qex clean --all` deletes the record of EVERY job of this user, including the
 jobs of a different agent that shares this machine. Use `qex clean <id>` when
 another agent uses qex at the same time.
+";
+
+pub const PIPELINE: &str = "\
+qex pipelines
+=============
+
+A pipeline file describes several stages, and one command submits them all:
+
+    qex pipeline ci.toml
+
+The command writes the group id to stdout, and the id of each stage to stderr,
+so `GROUP=$(qex pipeline ci.toml)` operates.
+
+    name = \"ci\"
+
+    [[jobs]]
+    name = \"build\"
+    command = [\"make\"]
+
+    [[jobs]]
+    name = \"unit\"
+    command = [\"make\", \"test\"]
+    needs = [\"build\"]
+
+    [[jobs]]
+    name = \"lint\"
+    command = [\"make\", \"lint\"]
+    needs = [\"build\"]
+
+    [[jobs]]
+    name = \"ship\"
+    command = [\"./deploy.sh\"]
+    needs = [\"unit\", \"lint\"]
+
+    [[jobs]]
+    name = \"cleanup\"
+    command = [\"./clean.sh\"]
+    after = [\"ship\"]
+
+Each stage takes every field of a job file: `cwd`, `env`, `timeout`, `tags`,
+`priority`, `env_capture` and `[resources]`.
+
+Why a pipeline file, and not several submissions
+------------------------------------------------
+
+A name is easy to write, and a name is not unique in time. If you run the same
+four stages twice with `qex submit --needs build`, that name gives two jobs.
+
+The names in a pipeline file belong to that file and to that one submission.
+qex changes each one into the id that it made a moment before, and no name
+leaves the file. A second run of the same file makes new jobs with new ids, and
+the two runs never meet.
+
+One command for the whole pipeline
+----------------------------------
+
+Every stage of one submission shares a group id:
+
+    GROUP=$(qex pipeline ci.toml)
+    qex list --group $GROUP
+
+qex reads the whole file before it submits anything. A circle of stages, a name
+that no stage has, and a stage with no command each give an error, and no job
+starts.
+
 ";
 
 pub const EXIT_CODES: &str = "\

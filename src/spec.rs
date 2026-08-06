@@ -151,6 +151,13 @@ pub struct JobSpec {
     /// Where the claim came from: `explicit`, `learned` or `default`.
     #[serde(default)]
     pub claim_source: String,
+    /// The pipeline that this job belongs to, when one command submitted
+    /// several jobs together.
+    #[serde(default)]
+    pub group: Option<uuid::Uuid>,
+    /// The name of that pipeline, for a person to read.
+    #[serde(default)]
+    pub group_name: Option<String>,
     /// The jobs that must succeed before this job starts.
     #[serde(default)]
     pub needs: Vec<uuid::Uuid>,
@@ -195,6 +202,18 @@ impl JobSpec {
             Some(p) => JobFile::load(p)?,
             None => JobFile::default(),
         };
+        Self::resolve_from_file(opts, cfg, file)
+    }
+
+    /// Makes a specification from a job file that the caller already read.
+    ///
+    /// `qex pipeline` uses this form, because it reads one file that holds
+    /// several stages.
+    pub fn resolve_from_file(
+        opts: &SubmitOptions,
+        cfg: &Config,
+        file: JobFile,
+    ) -> Result<(Self, DependencyNames)> {
 
         let command = if !opts.command.is_empty() {
             opts.command.clone()
@@ -358,6 +377,8 @@ impl JobSpec {
             priority: opts.priority.or(file.priority).unwrap_or(0),
             env_capture: capture,
             claim_source: source.to_string(),
+            group: None,
+            group_name: None,
             // The CLI changes each name into an id after this function, because
             // that step needs the coordinator.
             needs: Vec::new(),

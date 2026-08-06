@@ -153,6 +153,12 @@ pub struct JobStatus {
     /// not look like a value that the agent chose.
     #[serde(default)]
     pub claim_source: String,
+    /// The pipeline that this job belongs to.
+    #[serde(default)]
+    pub group: Option<uuid::Uuid>,
+    /// The name of that pipeline, for a person to read.
+    #[serde(default)]
+    pub group_name: Option<String>,
     pub usage: Usage,
     /// Shows that qex started the job although it is larger than the budget.
     ///
@@ -213,6 +219,8 @@ impl JobStatus {
             cpu: spec.cpu,
             mem: spec.mem,
             claim_source: spec.claim_source.clone(),
+            group: spec.group,
+            group_name: spec.group_name.clone(),
             usage: Usage::default(),
             forced: false,
             forced_reason: None,

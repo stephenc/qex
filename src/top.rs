@@ -26,6 +26,9 @@ struct Previous {
 }
 
 pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
+    if args.no_color {
+        crate::style::turn_off();
+    }
     let interval = Duration::from_secs_f64(args.interval.max(0.2));
     let mut previous: HashMap<uuid::Uuid, Previous> = HashMap::new();
 
@@ -120,12 +123,13 @@ fn render(
         // build, and that difference caused a fault that named no cause.
         let mine = env!("CARGO_PKG_VERSION");
         if version != mine {
-            out.push_str(&format!(
-                "      WARNING: the coordinator is version {version} and this command is \
-                 {mine}\n"
-            ));
+            out.push_str(&crate::style::warning(&format!(
+                "      WARNING: the coordinator is version {version} and this command is {mine}"
+            )));
+            out.push('\n');
         } else {
-            out.push_str(&format!("      version {version}\n"));
+            out.push_str(&crate::style::faint(&format!("      version {version}")));
+            out.push('\n');
         }
         if *program_replaced {
             out.push_str(
@@ -168,11 +172,12 @@ fn render(
 
     let (ordered, hidden) = arrange(jobs);
 
-    out.push_str(&format!(
-        "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}\n",
+    out.push_str(&crate::style::heading(&format!(
+        "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}",
         "ID", "STATE", "NAME", "CPU CLAIM", "CPU NOW", "MEMORY CLAIM/NOW", "RUNTIME", "SINCE",
         "NOTE"
-    ));
+    )));
+    out.push('\n');
 
     if ordered.is_empty() {
         out.push_str("\nno jobs\n");
@@ -233,8 +238,11 @@ fn render(
 
         let note = note_for(job);
 
-        out.push_str(&format!(
-            "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}\n",
+        // Write the state in its colour, and make a line of a job that
+        // succeeded faint. That job needs no attention, and the eye must go to
+        // the jobs that operate and to the failures.
+        let line = format!(
+            "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}",
             &job.id.to_string()[..8],
             job.state.as_str(),
             job.name,
@@ -244,7 +252,26 @@ fn render(
             elapsed,
             since_text(job),
             note
-        ));
+        );
+
+        let styled = match job.state {
+            JobState::Completed | JobState::Cancelled => crate::style::faint(&line),
+            JobState::Running | JobState::Starting => {
+                // Colour the state word only, so the numbers stay easy to read.
+                line.replacen(
+                    job.state.as_str(),
+                    &crate::style::state(job.state.as_str(), job.state.as_str()),
+                    1,
+                )
+            }
+            _ => line.replacen(
+                job.state.as_str(),
+                &crate::style::state(job.state.as_str(), job.state.as_str()),
+                1,
+            ),
+        };
+        out.push_str(&styled);
+        out.push('\n');
     }
 
     if hidden > 0 {
@@ -253,10 +280,11 @@ fn render(
         ));
     }
 
-    out.push_str(
+    out.push_str(&crate::style::faint(
         "\nCPU NOW gives cores in use. SINCE gives the time since the job was queued, \
-         started or stopped.\n",
-    );
+         started or stopped.",
+    ));
+    out.push('\n');
     if sys::stdin_is_terminal() {
         out.push_str("Press q to stop.\n");
     }
@@ -370,6 +398,8 @@ mod tests {
             cpu,
             mem,
             claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
