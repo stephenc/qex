@@ -12,6 +12,7 @@ description: Every command, option, claim word and configuration field.
 ```
 qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
            [--after ID,ID] [--name NAME] [--job FILE] -- COMMAND...
+qex submit --each-line FILE [--max-jobs N] -- COMMAND... {}
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
@@ -196,6 +197,122 @@ shell feature, name the shell: `["bash", "-lc", "a | b > c.txt"]`.
 
 A field name with a spelling error gives an error. qex does not ignore it.
 
+## One job for each line of a file
+
+`--each-line` reads a file and submits one job for each line. Put `{}` in the
+command. Each job gets the text of one line in the place of `{}`.
+
+```sh
+GROUP=$(qex submit --each-line inputs.txt -- ./process {})
+qex list --group $GROUP
+```
+
+The jobs share one group id. The group id goes to stdout, and the name and the
+id of each job go to stderr, so `GROUP=$(qex submit --each-line ...)` operates
+in the same way as `qex pipeline`.
+
+The name `-` reads the lines from standard input:
+
+```sh
+ls *.parquet | qex submit --each-line - -- ./convert {}
+```
+
+### A line is data, and never a command
+
+qex starts no shell. Each line becomes exactly **one** argument, whatever it
+holds: a space, a quotation mark, a semicolon, a dollar sign or a newline. A
+file of names that came from a directory listing, a database or another program
+is therefore safe.
+
+```
+a b"; rm -rf ~; echo $HOME
+```
+
+That line gives one argument with those characters in it. Nothing reads them.
+
+To use a shell feature, name the shell, and give the line as an argument. Do
+not put `{}` inside the text of the script:
+
+```sh
+qex submit --each-line names.txt -- bash -c 'echo "$1" | tr a-z A-Z' _ {}
+```
+
+### Where `{}` goes
+
+`{}` goes in any argument, in the program name, or inside an argument:
+
+```sh
+qex submit --each-line urls.txt -- curl -o {}.html https://{}/
+```
+
+Every `{}` takes the line. A command with **no** `{}` gives an error and
+submits nothing, because each job would then be the same command and the lines
+would have no effect. Write `{{}}` for a literal `{}`. Nothing else in the
+command changes.
+
+### Which lines give a job
+
+| The line | The result |
+| -------- | ---------- |
+| ordinary text | one job |
+| an empty line | no job |
+| a line that starts with `#` | no job, it is a comment |
+| space at the start or the end | qex removes it |
+| a CRLF ending | the same job as an LF ending |
+| no final newline | the last line still gives a job |
+
+qex writes to stderr how many lines it passed over. A line that you expected to
+run never goes away in silence.
+
+A file that is not UTF-8 gives an error with the line number, and qex submits
+nothing. The command of a job is text, so qex cannot run such a line.
+
+### All or nothing
+
+qex tests the command, reads the whole input and makes every job specification
+before it submits the first job. A fault in the input gives an error and no job
+at all, in the same way as `qex pipeline`. A fan-out that stopped in the middle
+would leave a part of the work in the queue and a part with no job.
+
+### The limit
+
+`--each-line` submits 1000 jobs at most. Each job holds a directory in the
+state of qex, so a file with 100000 lines would fill the disk. The limit asks
+no question, because an agent cannot answer one. Raise it when you need to:
+
+```sh
+qex submit --each-line big.txt --max-jobs 5000 -- ./process {}
+```
+
+### The name of each job
+
+Each job gets a name for `qex list`: the program name, the position in the
+file, and as much of the line as fits.
+
+```
+process-01-data-a.csv
+process-02-data-b.csv
+```
+
+The position comes before the line and it has the same width for every job, so
+the names sort in the order of the file and two long lines never give one name.
+Give `--name` to change the first part and the name of the group.
+
+### The other options
+
+`--cpu`, `--mem`, `--timeout`, `--lock`, `--tag`, `--priority`, `--env`,
+`--needs`, `--after` and `--retries` apply to every job of the fan-out.
+
+qex calculates the claim one time, from the command of the **first** line, and
+gives it to every job. The lines of a fan-out are the same kind of work, so one
+claim is correct for them.
+
+`--id-file` writes the group id and the id of each job. A name that ends in
+`.json` gives a JSON object.
+
+`qex run` does not accept `--each-line`. It waits for one job and gives the
+output and the exit code of that job.
+
 ## The environment and the directory
 
 `qex submit` copies your environment and your current directory. Your job thus
@@ -253,6 +370,7 @@ Each topic below is also in the binary, so an agent needs no network:
 qex help agents      the one page for an agent
 qex help job-file    the fields of a job file
 qex help resources   claims, the budget and the several-user accounting
+qex help each-line   one job for each line of a file
 qex help states      each job state and what causes it
 qex help exit-codes  the exit code of each command
 qex help config      each configuration field
