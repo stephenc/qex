@@ -49,18 +49,24 @@ qex logs "$ID" --tail 100
 `qex submit` writes the id to stdout and nothing else, so `ID=$(...)` is safe. A
 warning goes to stderr.
 
-For work that you wait for right now, put `qex run` in front instead. The output
-arrives as it happens and the exit code is the exit code of the job:
+For work that is **short and heavy** and that you wait for right now, put
+`qex run` in front instead. The output arrives as it happens and the exit code
+is the exit code of the job:
 
 ```sh
 qex run -- cargo test
 ```
 
+**`qex run` ties the job to that command.** Ctrl-C stops the job, and a harness
+that stops you signals the process group, which stops the job too. That is right
+for work you are waiting for, and wrong for work that outlives your attention —
+use `qex submit` for anything you might come back to.
+
 ## Which command to wait with
 
 | Your situation | Use |
 | --- | --- |
-| You wait now, in this command | `qex run -- CMD` |
+| You wait now, in this command, and the work is short | `qex run -- CMD` (the job stops if you are stopped) |
 | Your harness reports background commands | `qex status <id> --wait` in the background |
 | A script needs the exit code only | `qex wait <id>` |
 

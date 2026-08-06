@@ -95,8 +95,9 @@ Put `qex run -- make test` in front of a command when the work is **short and
 heavy** and you wait for it now: it takes its turn in the queue, so everyone
 else on the machine keeps the capacity they claimed, the output arrives as it
 happens, and the exit code is the exit code of the job. It ties the job to that
-command — Ctrl-C stops the job, and stopping your session stops it too — so use
-`qex submit` for anything you might come back to.
+command: Ctrl-C stops the job, and a harness that stops your agent signals the
+process group, which stops it too. Use `qex submit` for anything you might come
+back to.
 
 A pipeline gives each stage its own log, its own exit code and its own claim:
 

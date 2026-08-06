@@ -137,7 +137,8 @@ else in your script changes.
 WHAT YOU GIVE UP. `qex run` ties the job to this command:
 
     Ctrl-C stops the job, and not this command only.
-    Somebody stops your session, and the job stops with it.
+    A harness that stops you signals the process group, and the job
+    stops with it.
 
 That is correct for work that you are waiting for, and it is WRONG for work that
 lives longer than your attention. `qex submit` gives the job a life of its own:

@@ -49,7 +49,10 @@ stop.**
 The job is not a child of your shell, and it is not a child of your agent. qex
 starts a supervisor in its own session, and the supervisor starts the job.
 
-| What happens | The job |
+This is about `qex submit`. `qex run` ties the job to the command that waits for
+it; see above.
+
+| What happens to a job of `qex submit` | The job |
 | ------------ | ------- |
 | Somebody stops your agent | continues |
 | Your terminal closes | continues |
