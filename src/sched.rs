@@ -74,6 +74,19 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
     if spec.locks.is_empty() {
         return None;
     }
+
+    // A person can hold a lock, in the same way as a job holds it.
+    //
+    // This test comes first. When a person asks for a lock that a job holds,
+    // the person is next: the job keeps the lock, and no other job takes it in
+    // the time between. The reason must therefore name the person, whatever job
+    // holds the lock at this moment.
+    for name in &spec.locks {
+        if state.paused.locks.contains_key(name) {
+            return Some(crate::pause::lock_reason(name));
+        }
+    }
+
     for job in state.jobs.values() {
         if !job.status.state.is_active() {
             continue;
@@ -231,6 +244,21 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<usize> {
         let choice = {
             let mut state = coord.state.lock().unwrap();
 
+            // End a pause that reached the time of `--for`.
+            //
+            // The scheduler is the correct place: it is the code that reads the
+            // pause, so a pause can never end in the record and continue in the
+            // decision.
+            if state.paused.expire(sys::now_secs()) {
+                state.save_pause();
+                // Start the settle timer again, for the same reason as
+                // `qex resume`: a paused queue is idle by construction, and
+                // without this the first job to start would be an oversized
+                // one, alone, in front of everything that waited.
+                state.idle_since = Some(Instant::now());
+                log("a pause reached its end; qex starts the queue again");
+            }
+
             let active = state.count_state(|s| s.is_active());
             if active == 0 && state.idle_since.is_none() {
                 state.idle_since = Some(Instant::now());
@@ -373,6 +401,7 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     let cfg = state.cfg.clone();
     let active = state.count_state(|s| s.is_active());
     let idle_since = state.idle_since;
+    let paused = state.paused.queue.clone();
 
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
@@ -409,6 +438,27 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
 
     // Pass 2: choose one job from the jobs that have no dependency left.
     //
+    // A paused queue starts NOTHING, so this pass does not run at all.
+    //
+    // The test is here, and not before pass 1, for two reasons that a later
+    // change must not lose:
+    //
+    //   * Pass 1 must still run. A job whose dependency failed must become
+    //     `skipped` while the queue is paused. Skipping starts no process, and
+    //     a job that stays in the queue makes `qex wait` block for ever.
+    //   * The test comes before the oversized branch below. A paused queue is
+    //     idle by construction, so a pause would otherwise start every job that
+    //     is larger than the budget — the opposite of a quiet machine.
+    if let Some(record) = &paused {
+        let reason = crate::pause::queue_reason(record);
+        for id in ready.iter().copied() {
+            reasons.push((id, Some(reason.clone())));
+        }
+        // Pass 2 now has no job to test, so it chooses nothing and it starts
+        // nothing. The reasons above are already the whole reason.
+        ready.clear();
+    }
+
     // The scheduler starts one job for each call, so a lock that this pass gives
     // away cannot be given again: the next call sees the job as active.
     for id in ready.iter().copied() {
