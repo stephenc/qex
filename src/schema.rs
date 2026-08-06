@@ -1,0 +1,226 @@
+//! This module holds the JSON Schema for the two formats that qex publishes.
+//!
+//! An agent reads a schema to write a job file, or to read the `--json` output.
+//! The schemas are text in this file. qex does not build them from the Rust
+//! types, because the text also holds the descriptions and the examples.
+
+/// Gives the schema for one name.
+pub fn schema(which: &str) -> Option<&'static str> {
+    match which.trim().to_ascii_lowercase().as_str() {
+        "job" | "job-file" | "spec" => Some(JOB),
+        "status" | "job-status" => Some(STATUS),
+        _ => None,
+    }
+}
+
+pub const NAMES: &[&str] = &["job", "status"];
+
+pub const JOB: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qex/schema/job.json",
+  "title": "qex job file",
+  "description": "One job for `qex submit --job FILE`. qex reads TOML, YAML and JSON.",
+  "type": "object",
+  "required": ["command"],
+  "additionalProperties": false,
+  "properties": {
+    "command": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "The program and its arguments. This is not a shell command line. To use a shell feature, name the shell: [\"bash\", \"-lc\", \"a | b\"].",
+      "examples": [["uv", "run", "train.py", "--epochs", "50"]]
+    },
+    "name": {
+      "type": "string",
+      "description": "The name in `qex list`. The default is the program name."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "The directory for the job. The default is the directory of the `qex submit` command."
+    },
+    "timeout": {
+      "type": "string",
+      "description": "The time limit. Use s, m, h or d. Use \"0\" for no limit. The default is no limit.",
+      "examples": ["30s", "5m", "4h", "0"]
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Tags for `qex list --tag`."
+    },
+    "priority": {
+      "type": "integer",
+      "description": "The queue priority. A larger number starts earlier. The default is 0."
+    },
+    "env_capture": {
+      "type": "string",
+      "enum": ["all", "minimal", "none"],
+      "description": "The environment that the job receives. \"all\" copies your shell. \"minimal\" copies PATH, HOME, USER, LOGNAME, SHELL, LANG and TZ. \"none\" copies nothing. The default is \"all\"."
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The claim for this job. qex uses the claim to decide how many jobs operate together.",
+      "properties": {
+        "cpu": {
+          "anyOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "string", "enum": ["half", "guess", "auto", "full", "max", "all"] }
+          ],
+          "description": "The number of cores. Give an integer, or a word: \"half\" and \"guess\" give one half of the budget, and \"full\" and \"max\" give the full budget. The default is 1.",
+          "examples": [2, "guess", "full"]
+        },
+        "mem": {
+          "type": "string",
+          "description": "The memory. Give a size, or a word: \"half\" and \"guess\" give one half of the budget, and \"full\" and \"max\" give the full budget. One unit step is 1024. The default is the machine memory divided by the core count.",
+          "examples": ["8GB", "512MB", "guess", "full"]
+        }
+      }
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Environment variables. These values replace the values from your shell."
+    }
+  }
+}
+"##;
+
+pub const STATUS: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qex/schema/status.json",
+  "title": "qex job status",
+  "description": "The output of `qex status --json`. The file status.json of each job has this format. `qex list --json` gives an array of these objects.",
+  "type": "object",
+  "required": ["id", "name", "state", "submitted_at", "cpu", "mem", "usage", "tags"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid", "description": "The job id." },
+    "name": { "type": "string", "description": "The job name." },
+    "state": {
+      "type": "string",
+      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled"],
+      "description": "The job state. The states queued, starting and running are not final. Each other state is final."
+    },
+    "pid": {
+      "type": ["integer", "null"],
+      "description": "The process id of the job. The value is null before the job starts."
+    },
+    "exit_code": {
+      "type": ["integer", "null"],
+      "description": "The exit code, if the job stopped without a signal."
+    },
+    "signal": {
+      "type": ["integer", "null"],
+      "description": "The signal number, if a signal stopped the job."
+    },
+    "submitted_at": { "type": "integer", "description": "The submission time, in seconds after the Unix epoch." },
+    "started_at": { "type": ["integer", "null"], "description": "The start time, in seconds after the Unix epoch." },
+    "finished_at": { "type": ["integer", "null"], "description": "The stop time, in seconds after the Unix epoch." },
+    "cpu": { "type": "integer", "description": "The number of cores that the job claimed." },
+    "mem": { "type": "integer", "description": "The memory in bytes that the job claimed." },
+    "usage": {
+      "type": "object",
+      "description": "The resources that the job used. Compare these values with the claim, then correct your next claim.",
+      "properties": {
+        "max_rss": { "type": "integer", "description": "The maximum memory in bytes." },
+        "cpu_secs": { "type": "number", "description": "The CPU time in seconds for all the processes of the job." }
+      }
+    },
+    "forced": {
+      "type": "boolean",
+      "description": "True if qex started the job although the claim is larger than the budget. qex starts such a job alone. The job can swap or stop with an out-of-memory error."
+    },
+    "forced_reason": {
+      "type": ["string", "null"],
+      "description": "The reason for a forced start."
+    },
+    "blocked_reason": {
+      "type": ["string", "null"],
+      "description": "The reason that the job waits in the queue."
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The tags of the job."
+    }
+  }
+}
+"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_schema_is_valid_json() {
+        for name in NAMES {
+            let text = schema(name).unwrap_or_else(|| panic!("no schema for `{name}`"));
+            let parsed: serde_json::Value = serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("the schema `{name}` is not valid JSON: {e}"));
+            assert!(parsed.get("$schema").is_some(), "`{name}` has no $schema");
+            assert!(parsed.get("title").is_some(), "`{name}` has no title");
+        }
+    }
+
+    /// The status schema must list each state. A missing state gives an agent
+    /// an incorrect list.
+    #[test]
+    fn the_status_schema_lists_every_state() {
+        use crate::job::JobState;
+        let parsed: serde_json::Value = serde_json::from_str(STATUS).unwrap();
+        let listed = parsed["properties"]["state"]["enum"]
+            .as_array()
+            .expect("the state property has no enum");
+
+        for state in [
+            JobState::Queued,
+            JobState::Starting,
+            JobState::Running,
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Killed,
+            JobState::Timeout,
+            JobState::Oom,
+            JobState::Cancelled,
+        ] {
+            assert!(
+                listed.iter().any(|v| v == state.as_str()),
+                "the schema does not list the state `{state}`"
+            );
+        }
+        assert_eq!(listed.len(), 9, "the schema lists a state that qex does not use");
+    }
+
+    /// The job schema must list each field of the job file. A missing field
+    /// gives an error, because the parser refuses an unknown field.
+    #[test]
+    fn the_job_schema_lists_every_field_of_the_job_file() {
+        let parsed: serde_json::Value = serde_json::from_str(JOB).unwrap();
+        let props = parsed["properties"].as_object().unwrap();
+        for field in [
+            "command",
+            "name",
+            "cwd",
+            "timeout",
+            "tags",
+            "priority",
+            "env_capture",
+            "resources",
+            "env",
+        ] {
+            assert!(props.contains_key(field), "the schema has no field `{field}`");
+        }
+        assert_eq!(props.len(), 9, "the schema has a field that the job file does not accept");
+    }
+
+    /// The example in the job schema must parse as a job file.
+    #[test]
+    fn the_job_schema_example_is_a_valid_job_file() {
+        let parsed: serde_json::Value = serde_json::from_str(JOB).unwrap();
+        let example = &parsed["properties"]["command"]["examples"][0];
+        let doc = serde_json::json!({ "command": example });
+        let job: crate::spec::JobFile = serde_json::from_value(doc).unwrap();
+        assert_eq!(job.command[0], "uv");
+    }
+}

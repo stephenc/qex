@@ -1,0 +1,198 @@
+//! This module stops jobs and deletes job records.
+//!
+//! qex signals the process group of a job, and not the first process only. A
+//! job that forks children thus stops completely, and no process stays and
+//! holds memory that qex counted.
+
+use crate::daemon::{log, Coordinator};
+use crate::job::JobState;
+use crate::paths;
+use crate::proto::{ErrorKind, Response};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Reads a signal name such as `TERM`, `SIGTERM`, `KILL` or `9`.
+pub fn parse_signal(s: &str) -> Result<i32, String> {
+    let t = s.trim().to_ascii_uppercase();
+    let t = t.strip_prefix("SIG").unwrap_or(&t);
+
+    if let Ok(n) = t.parse::<i32>() {
+        if (1..=64).contains(&n) {
+            return Ok(n);
+        }
+        return Err(format!("the signal number {n} is not in the range 1 to 64"));
+    }
+
+    match t {
+        "TERM" => Ok(libc::SIGTERM),
+        "KILL" => Ok(libc::SIGKILL),
+        "INT" => Ok(libc::SIGINT),
+        "HUP" => Ok(libc::SIGHUP),
+        "QUIT" => Ok(libc::SIGQUIT),
+        "USR1" => Ok(libc::SIGUSR1),
+        "USR2" => Ok(libc::SIGUSR2),
+        other => Err(format!(
+            "unknown signal `{other}`. Use TERM, KILL, INT, HUP, QUIT, USR1, USR2, or a number."
+        )),
+    }
+}
+
+/// Stops one job.
+///
+/// qex sends the first signal, waits for the grace time, then sends `KILL`.
+/// A job that handles `SIGTERM` can thus write its files before it stops.
+pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u64) -> Response {
+    let pid = {
+        let mut state = coord.state.lock().unwrap();
+        // Read the status file first. The supervisor writes the process id
+        // there, and this command needs that value to signal the job.
+        state.refresh_active();
+        let Some(job) = state.jobs.get(&id) else {
+            return Response::error(
+                ErrorKind::NoSuchJob,
+                format!("there is no job with the id {id}"),
+            );
+        };
+
+        match job.status.state {
+            JobState::Queued => {
+                return Response::error(
+                    ErrorKind::WrongState,
+                    format!("the job {id} waits in the queue. Use `qex cancel {id}`."),
+                )
+            }
+            s if s.is_terminal() => {
+                return Response::error(
+                    ErrorKind::WrongState,
+                    format!("the job {id} stopped. Its state is `{s}`."),
+                )
+            }
+            _ => {}
+        }
+
+        match job.status.pid {
+            Some(p) => p,
+            None => {
+                return Response::error(
+                    ErrorKind::WrongState,
+                    format!("the job {id} starts now. Try the command again."),
+                )
+            }
+        }
+    };
+
+    // Signal the process group. The supervisor put the job in its own group,
+    // so this call reaches each child of the job.
+    let sent = unsafe { libc::killpg(pid, signal) };
+    if sent != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ESRCH) {
+            return Response::error(
+                ErrorKind::Internal,
+                format!("qex could not signal the job {id}: {e}"),
+            );
+        }
+    }
+
+    log(&format!("job {id} received the signal {signal}"));
+
+    // Send KILL after the grace time. The job cannot avoid that signal.
+    if signal != libc::SIGKILL && grace_secs > 0 {
+        let coord = Arc::clone(coord);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(grace_secs));
+
+            let still_active = {
+                let state = coord.state.lock().unwrap();
+                state
+                    .jobs
+                    .get(&id)
+                    .map(|j| j.status.state.is_active())
+                    .unwrap_or(false)
+            };
+
+            if still_active {
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+                log(&format!(
+                    "job {id} did not stop in {grace_secs} seconds; qex sent KILL"
+                ));
+            }
+        });
+    }
+
+    Response::Ok
+}
+
+/// Deletes the record of one job.
+///
+/// This command does not stop a job. A job that operates keeps its record.
+pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
+    {
+        let state = coord.state.lock().unwrap();
+        match state.jobs.get(&id) {
+            None => {
+                return Response::error(
+                    ErrorKind::NoSuchJob,
+                    format!("there is no job with the id {id}"),
+                )
+            }
+            Some(job) if !job.status.state.is_terminal() => {
+                return Response::error(
+                    ErrorKind::WrongState,
+                    format!(
+                        "the job {id} is in the state `{}`. Stop it first with `qex kill {id}`.",
+                        job.status.state
+                    ),
+                )
+            }
+            Some(_) => {}
+        }
+    }
+
+    let dir = match paths::job_dir(&id) {
+        Ok(d) => d,
+        Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),
+    };
+
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Response::error(
+                ErrorKind::Internal,
+                format!("qex could not delete {}: {e}", dir.display()),
+            );
+        }
+    }
+
+    let mut state = coord.state.lock().unwrap();
+    state.jobs.remove(&id);
+    state.queue.retain(|q| *q != id);
+    drop(state);
+
+    coord.notify();
+    Response::Ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_names_parse_in_each_usual_form() {
+        assert_eq!(parse_signal("TERM").unwrap(), libc::SIGTERM);
+        assert_eq!(parse_signal("SIGTERM").unwrap(), libc::SIGTERM);
+        assert_eq!(parse_signal("term").unwrap(), libc::SIGTERM);
+        assert_eq!(parse_signal("KILL").unwrap(), libc::SIGKILL);
+        assert_eq!(parse_signal("9").unwrap(), 9);
+        assert_eq!(parse_signal("INT").unwrap(), libc::SIGINT);
+    }
+
+    #[test]
+    fn an_unknown_signal_gives_a_message_with_the_permitted_names() {
+        let err = parse_signal("BANANA").unwrap_err();
+        assert!(err.contains("TERM"), "the error must list the names: {err}");
+        assert!(parse_signal("0").is_err(), "the signal 0 tests a process only");
+        assert!(parse_signal("99").is_err());
+    }
+}
