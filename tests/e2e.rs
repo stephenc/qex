@@ -255,7 +255,9 @@ fn many_submissions_at_once_start_one_coordinator_only() {
     assert_eq!(h.list_json().len(), 20, "qex lost a job during the race");
 
     // Count the job directories. Each submission must have exactly one.
-    let dirs = std::fs::read_dir(h.root.join("state/qex/jobs")).unwrap().count();
+    let dirs = std::fs::read_dir(h.root.join("state/qex/jobs"))
+        .unwrap()
+        .count();
     assert_eq!(dirs, 20);
 }
 
@@ -312,7 +314,9 @@ fn a_job_that_is_too_large_runs_when_the_queue_is_empty() {
         h.state_of(&small) == "running"
     });
 
-    let out = h.qex(&["submit", "--cpu", "64", "--mem", "64GB", "--", "echo", "big"]);
+    let out = h.qex(&[
+        "submit", "--cpu", "64", "--mem", "64GB", "--", "echo", "big",
+    ]);
     assert!(out.status.success());
     let big = String::from_utf8_lossy(&out.stdout).trim().to_string();
 
@@ -323,7 +327,10 @@ fn a_job_that_is_too_large_runs_when_the_queue_is_empty() {
         warning.contains("64 cores") && warning.contains("budget"),
         "qex must warn at the submission: {warning}"
     );
-    assert!(big.parse::<uuid::Uuid>().is_ok(), "stdout must hold the id only");
+    assert!(
+        big.parse::<uuid::Uuid>().is_ok(),
+        "stdout must hold the id only"
+    );
 
     // The large job must wait while the small job operates.
     assert_eq!(h.state_of(&big), "queued");
@@ -341,7 +348,10 @@ fn a_job_that_is_too_large_runs_when_the_queue_is_empty() {
     let status = h.status_json(&big);
     assert_eq!(status["forced"], true, "qex must mark a forced job");
     assert!(
-        status["forced_reason"].as_str().unwrap_or("").contains("budget"),
+        status["forced_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("budget"),
         "the reason must name the budget"
     );
     assert!(h.ok(&["logs", &big]).contains("big"), "the job did not run");
@@ -360,7 +370,10 @@ fn the_reject_policy_refuses_a_job_that_is_too_large() {
     let out = h.qex(&["submit", "--cpu", "64", "--", "true"]);
     assert!(!out.status.success(), "qex must refuse this job");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("64 cores"), "the error must name the claim: {err}");
+    assert!(
+        err.contains("64 cores"),
+        "the error must name the claim: {err}"
+    );
 }
 
 /// A job that starts children must stop completely. A process that stays holds
@@ -381,20 +394,27 @@ fn a_kill_stops_every_process_of_a_job() {
     });
 
     let pid = h.status_json(&id)["pid"].as_i64().unwrap() as i32;
-    assert!(count_in_group(pid) >= 2, "the job did not start its children");
+    assert!(
+        count_in_group(pid) >= 2,
+        "the job did not start its children"
+    );
 
     h.ok(&["kill", &id, "--grace", "1s"]);
 
-    h.until("every process of the job stops", Duration::from_secs(20), || {
-        count_in_group(pid) == 0
-    });
+    h.until(
+        "every process of the job stops",
+        Duration::from_secs(20),
+        || count_in_group(pid) == 0,
+    );
 
     // The supervisor writes the result after the job stops, and the coordinator
     // reads that file. Give the record time to arrive. A job that stays in the
     // state `running` is a fault, and the time limit here finds it.
-    h.until("the record shows the job stopped", Duration::from_secs(20), || {
-        h.state_of(&id) == "killed"
-    });
+    h.until(
+        "the record shows the job stopped",
+        Duration::from_secs(20),
+        || h.state_of(&id) == "killed",
+    );
 }
 
 /// Counts the processes of one process group.
@@ -522,8 +542,14 @@ fn the_environment_mode_none_removes_the_variables_of_the_shell() {
 
     h.ok(&["wait", &id]);
     let logs = h.ok(&["logs", &id]);
-    assert!(logs.contains("MARK= "), "a variable of the shell leaked: {logs}");
-    assert!(logs.contains("KEPT=yes"), "the --env value is missing: {logs}");
+    assert!(
+        logs.contains("MARK= "),
+        "a variable of the shell leaked: {logs}"
+    );
+    assert!(
+        logs.contains("KEPT=yes"),
+        "the --env value is missing: {logs}"
+    );
 }
 
 /// A captured environment can hold secrets, so the files must not be readable
@@ -613,7 +639,10 @@ fn cancel_removes_a_job_from_the_queue() {
     let out = h.qex(&["cancel", &first]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("kill"), "the error must give the correct command: {err}");
+    assert!(
+        err.contains("kill"),
+        "the error must give the correct command: {err}"
+    );
 
     h.ok(&["kill", &first, "--grace", "1s"]);
 }
@@ -672,7 +701,10 @@ fn a_command_that_does_not_exist_gives_a_clear_message() {
         reason.contains("this-program-does-not-exist"),
         "the message must name the program: {reason}"
     );
-    assert!(reason.contains("PATH"), "the message must give the correction: {reason}");
+    assert!(
+        reason.contains("PATH"),
+        "the message must give the correction: {reason}"
+    );
 }
 
 /// A short id is easier to copy from `qex list`, so each command accepts one.
@@ -698,8 +730,14 @@ fn the_first_screen_points_to_the_topic_for_agents() {
     );
 
     let agents = h.ok(&["help", "agents"]);
-    assert!(agents.contains("pgrep"), "the topic must warn about the pgrep fault");
-    assert!(agents.contains("qex wait"), "the topic must give the solution");
+    assert!(
+        agents.contains("pgrep"),
+        "the topic must warn about the pgrep fault"
+    );
+    assert!(
+        agents.contains("qex wait"),
+        "the topic must give the solution"
+    );
 }
 
 /// The schemas must be valid JSON, because an agent reads them with a parser.
@@ -753,15 +791,27 @@ fn the_claim_word_guess_gives_one_half_of_the_budget() {
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
     );
 
-    let a = h.submit(&["submit", "--cpu", "guess", "--mem", "guess", "--", "sleep", "3"]);
+    let a = h.submit(&[
+        "submit", "--cpu", "guess", "--mem", "guess", "--", "sleep", "3",
+    ]);
     let status = h.status_json(&a);
     assert_eq!(status["cpu"], 4, "one half of 8 cores is 4 cores");
-    assert_eq!(status["mem"], 2u64 * 1024 * 1024 * 1024, "one half of 4GB is 2GB");
+    assert_eq!(
+        status["mem"],
+        2u64 * 1024 * 1024 * 1024,
+        "one half of 4GB is 2GB"
+    );
 
     // A second job of the same size must operate at the same time.
-    let b = h.submit(&["submit", "--cpu", "half", "--mem", "half", "--", "sleep", "3"]);
+    let b = h.submit(&[
+        "submit", "--cpu", "half", "--mem", "half", "--", "sleep", "3",
+    ]);
     h.until("both jobs operate", Duration::from_secs(45), || {
-        h.list_json().iter().filter(|j| j["state"] == "running").count() == 2
+        h.list_json()
+            .iter()
+            .filter(|j| j["state"] == "running")
+            .count()
+            == 2
     });
 
     // A third job must wait, because the budget is full.
@@ -784,7 +834,9 @@ fn the_claim_word_full_gives_the_whole_budget() {
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
     );
 
-    let big = h.submit(&["submit", "--cpu", "full", "--mem", "max", "--", "sleep", "3"]);
+    let big = h.submit(&[
+        "submit", "--cpu", "full", "--mem", "max", "--", "sleep", "3",
+    ]);
     let status = h.status_json(&big);
     assert_eq!(status["cpu"], 4);
     assert_eq!(status["mem"], 2u64 * 1024 * 1024 * 1024);
@@ -853,12 +905,16 @@ fn a_dead_supervisor_does_not_leave_the_job_alive() {
         libc::kill(supervisor_pid, libc::SIGKILL);
     }
 
-    h.until("the job reaches a final state", Duration::from_secs(30), || {
-        h.status_json(&id)["state"]
-            .as_str()
-            .map(|s| s != "running" && s != "starting")
-            .unwrap_or(false)
-    });
+    h.until(
+        "the job reaches a final state",
+        Duration::from_secs(30),
+        || {
+            h.status_json(&id)["state"]
+                .as_str()
+                .map(|s| s != "running" && s != "starting")
+                .unwrap_or(false)
+        },
+    );
 
     // The job process must stop. A record that says the job stopped, with the
     // job still alive, is the worst result: the memory is in use and no command
@@ -956,7 +1012,10 @@ fn a_spawn_failure_uses_the_error_field() {
 
     let s = h.status_json(&id);
     assert!(
-        s["error"].as_str().unwrap_or("").contains("this-program-does-not-exist"),
+        s["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("this-program-does-not-exist"),
         "the error field must name the program: {s}"
     );
     assert!(
@@ -985,8 +1044,12 @@ fn every_queued_job_gives_a_reason() {
 
     // Give the scheduler one cycle to write the reasons.
     h.until("both jobs give a reason", Duration::from_secs(45), || {
-        let ra = h.status_json(&a)["blocked_reason"].as_str().map(String::from);
-        let rb = h.status_json(&b)["blocked_reason"].as_str().map(String::from);
+        let ra = h.status_json(&a)["blocked_reason"]
+            .as_str()
+            .map(String::from);
+        let rb = h.status_json(&b)["blocked_reason"]
+            .as_str()
+            .map(String::from);
         ra.is_some() && rb.is_some()
     });
 
@@ -1039,9 +1102,15 @@ fn info_can_test_for_a_coordinator_without_starting_one() {
 fn a_claim_of_zero_cores_is_refused() {
     let h = Harness::with_default_config("zeroclaim");
     let out = h.qex(&["submit", "--cpu", "0", "--", "true"]);
-    assert!(!out.status.success(), "qex must refuse a claim of zero cores");
+    assert!(
+        !out.status.success(),
+        "qex must refuse a claim of zero cores"
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("1 core"), "the error must give the correction: {err}");
+    assert!(
+        err.contains("1 core"),
+        "the error must give the correction: {err}"
+    );
 }
 
 /// The same fault must give the same exit code, whatever the form of the name.
@@ -1127,7 +1196,15 @@ fn a_pipeline_that_succeeds_runs_each_stage_in_order() {
         "submit", "--name", "test", "--needs", &build, "--", "sh", "-c", "echo two",
     ]);
     let ship = h.submit(&[
-        "submit", "--name", "ship", "--needs", &test, "--", "sh", "-c", "echo three",
+        "submit",
+        "--name",
+        "ship",
+        "--needs",
+        &test,
+        "--",
+        "sh",
+        "-c",
+        "echo three",
     ]);
 
     let out = h.qex(&["wait", &ship, "--timeout", "60s"]);
@@ -1162,7 +1239,15 @@ fn an_after_job_runs_when_the_job_before_it_fails() {
 
     let build = h.submit(&["submit", "--name", "build", "--", "sh", "-c", "exit 3"]);
     let cleanup = h.submit(&[
-        "submit", "--name", "cleanup", "--after", &build, "--", "sh", "-c", "echo cleaned",
+        "submit",
+        "--name",
+        "cleanup",
+        "--after",
+        &build,
+        "--",
+        "sh",
+        "-c",
+        "echo cleaned",
     ]);
 
     let out = h.qex(&["wait", &cleanup, "--timeout", "60s"]);
@@ -1185,7 +1270,9 @@ fn a_job_that_waits_for_another_job_does_not_hold_capacity() {
     );
 
     // A long job, and a job that waits for it.
-    let slow = h.submit(&["submit", "--name", "slow", "--cpu", "1", "--mem", "64MB", "--", "sleep", "4"]);
+    let slow = h.submit(&[
+        "submit", "--name", "slow", "--cpu", "1", "--mem", "64MB", "--", "sleep", "4",
+    ]);
     let waiter = h.submit(&[
         "submit", "--cpu", "1", "--mem", "64MB", "--needs", &slow, "--", "true",
     ]);
@@ -1213,7 +1300,10 @@ fn a_dependency_that_does_not_exist_is_refused() {
     let out = h.qex(&["submit", "--needs", "no-such-job", "--", "true"]);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("no-such-job"), "the error must name the value: {err}");
+    assert!(
+        err.contains("no-such-job"),
+        "the error must name the value: {err}"
+    );
 }
 
 /// `qex clean` must keep a job that a job in the queue needs. Without that
@@ -1222,7 +1312,15 @@ fn a_dependency_that_does_not_exist_is_refused() {
 fn clean_keeps_a_job_that_another_job_needs() {
     let h = Harness::with_default_config("cleandep");
 
-    let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "sleep 2; exit 1"]);
+    let first = h.submit(&[
+        "submit",
+        "--name",
+        "first",
+        "--",
+        "sh",
+        "-c",
+        "sleep 2; exit 1",
+    ]);
     let second = h.submit(&["submit", "--needs", &first, "--", "true"]);
 
     let out = h.qex(&["clean", &first]);
@@ -1264,7 +1362,7 @@ fn a_job_file_accepts_dependencies() {
     let file = h.root.join("second.toml");
     std::fs::write(
         &file,
-        &format!("command = [\"true\"]\nname = \"second\"\nneeds = [\"{first}\"]\n"),
+        format!("command = [\"true\"]\nname = \"second\"\nneeds = [\"{first}\"]\n"),
     )
     .unwrap();
 
@@ -1272,7 +1370,10 @@ fn a_job_file_accepts_dependencies() {
     let out = h.qex(&["wait", &second, "--timeout", "60s"]);
     assert_eq!(out.status.code(), Some(126));
     assert_eq!(h.state_of(&second), "skipped");
-    assert_eq!(h.status_json(&second)["caused_by"].as_str(), Some(first.as_str()));
+    assert_eq!(
+        h.status_json(&second)["caused_by"].as_str(),
+        Some(first.as_str())
+    );
 }
 
 /// A dependency that names no job must be refused.
@@ -1290,7 +1391,10 @@ fn a_dependency_with_an_unknown_uuid_is_refused() {
         "--",
         "true",
     ]);
-    assert!(!out.status.success(), "qex must refuse an unknown dependency");
+    assert!(
+        !out.status.success(),
+        "qex must refuse an unknown dependency"
+    );
     assert!(h.list_json().is_empty(), "qex must not accept the job");
 }
 
@@ -1355,7 +1459,10 @@ fn a_dependency_that_failed_is_accepted_and_makes_the_job_skipped() {
     let out = h.qex(&["wait", &second, "--timeout", "45s"]);
     assert_eq!(out.status.code(), Some(126));
     assert_eq!(h.state_of(&second), "skipped");
-    assert_eq!(h.status_json(&second)["caused_by"].as_str(), Some(first.as_str()));
+    assert_eq!(
+        h.status_json(&second)["caused_by"].as_str(),
+        Some(first.as_str())
+    );
 }
 
 /// A job whose dependency fails must be marked at once, and not wait for the
@@ -1376,7 +1483,16 @@ fn a_failed_dependency_is_seen_behind_a_blocked_queue() {
 
     // This job operates now, and it fails soon.
     let failer = h.submit(&[
-        "submit", "--cpu", "1", "--mem", "64MB", "--name", "failer", "--", "sh", "-c",
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--name",
+        "failer",
+        "--",
+        "sh",
+        "-c",
         "sleep 2; exit 1",
     ]);
     // This job holds the rest of the budget.
@@ -1388,7 +1504,9 @@ fn a_failed_dependency_is_seen_behind_a_blocked_queue() {
     });
 
     // This job needs two cores, so it waits for capacity at the front.
-    h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--name", "mid", "--", "true"]);
+    h.submit(&[
+        "submit", "--cpu", "2", "--mem", "64MB", "--name", "mid", "--", "true",
+    ]);
     // This job is behind the one above, and its dependency is about to fail.
     let skipped = h.submit(&[
         "submit", "--cpu", "1", "--mem", "64MB", "--needs", &failer, "--", "true",
@@ -1429,8 +1547,18 @@ fn every_command_gives_one_code_for_a_job_that_does_not_exist() {
 fn clean_keeps_the_cause_readable_for_the_jobs_that_it_leaves() {
     let h = Harness::with_default_config("cleancause");
 
-    let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "sleep 1; exit 1"]);
-    let second = h.submit(&["submit", "--name", "second", "--needs", &first, "--", "true"]);
+    let first = h.submit(&[
+        "submit",
+        "--name",
+        "first",
+        "--",
+        "sh",
+        "-c",
+        "sleep 1; exit 1",
+    ]);
+    let second = h.submit(&[
+        "submit", "--name", "second", "--needs", &first, "--", "true",
+    ]);
 
     h.until("the second job is skipped", Duration::from_secs(45), || {
         h.state_of(&second) == "skipped"
@@ -1497,7 +1625,11 @@ fn logs_shows_the_last_lines_by_default() {
 fn the_status_of_a_job_that_failed_holds_its_error_output() {
     let h = Harness::with_default_config("statuslogs");
     let id = h.submit(&[
-        "submit", "--", "sh", "-c", "echo normal; echo 'BOOM: it broke' >&2; exit 3",
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "echo normal; echo 'BOOM: it broke' >&2; exit 3",
     ]);
     h.qex(&["wait", &id, "--timeout", "45s"]);
 
@@ -1510,7 +1642,10 @@ fn the_status_of_a_job_that_failed_holds_its_error_output() {
 
     // The JSON output holds one field for each stream that has content.
     let v = h.status_json(&id);
-    assert!(v["logs"]["stderr"]["text"].as_str().unwrap().contains("BOOM"));
+    assert!(v["logs"]["stderr"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("BOOM"));
 
     // A job that succeeded gives no output, because the reader did not ask.
     let good = h.submit(&["submit", "--", "sh", "-c", "echo quiet"]);
@@ -1553,13 +1688,22 @@ fn the_status_of_a_failure_gives_both_streams() {
 
     // The JSON output holds one field for each stream.
     let v = h.status_json(&id);
-    assert!(v["logs"]["stderr"]["text"].as_str().unwrap().contains("FAIL"));
-    assert!(v["logs"]["stdout"]["text"].as_str().unwrap().contains("27793"));
+    assert!(v["logs"]["stderr"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("FAIL"));
+    assert!(v["logs"]["stdout"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("27793"));
 
     // A reader that names one stream gets that stream only.
     let only = h.ok(&["status", &id, "--stderr"]);
     assert!(only.contains("FAIL"));
-    assert!(!only.contains("27793"), "--stderr must give one stream only");
+    assert!(
+        !only.contains("27793"),
+        "--stderr must give one stream only"
+    );
 }
 
 /// The options that select lines must operate on both commands.
@@ -1587,7 +1731,15 @@ fn the_log_options_select_the_lines() {
 
     // A search reports the number of matches, so a wide pattern is visible.
     // The report goes to stderr, and the lines go to stdout.
-    let out = h.qex(&["logs", &id, "--stdout", "--grep", "line-1[0-9]$", "--max-matches", "3"]);
+    let out = h.qex(&[
+        "logs",
+        &id,
+        "--stdout",
+        "--grep",
+        "line-1[0-9]$",
+        "--max-matches",
+        "3",
+    ]);
     let found = String::from_utf8_lossy(&out.stdout);
     let notice = String::from_utf8_lossy(&out.stderr);
     assert!(notice.contains("10 line(s) match"), "got: {notice}");
@@ -1596,7 +1748,10 @@ fn the_log_options_select_the_lines() {
     // The standard output holds the log lines only, so a file or a parser gets
     // clean data.
     for line in found.lines() {
-        assert!(line.starts_with("line-"), "stdout must hold log lines only: {line}");
+        assert!(
+            line.starts_with("line-"),
+            "stdout must hold log lines only: {line}"
+        );
     }
 
     // The same options operate on `status`.
@@ -1617,14 +1772,32 @@ fn follow_leads_with_the_last_lines_only() {
         "-c",
         "i=1; while [ $i -le 200 ]; do echo old-$i; i=$((i+1)); done; sleep 2; echo NEW-A",
     ]);
-    h.until("the job writes its first lines", Duration::from_secs(45), || {
-        h.job_dir(&id).join("stdout.log").metadata().map(|m| m.len() > 100).unwrap_or(false)
-    });
+    h.until(
+        "the job writes its first lines",
+        Duration::from_secs(45),
+        || {
+            h.job_dir(&id)
+                .join("stdout.log")
+                .metadata()
+                .map(|m| m.len() > 100)
+                .unwrap_or(false)
+        },
+    );
 
     let out = h.ok(&["logs", &id, "--stdout", "--tail", "3", "--follow"]);
-    assert!(out.contains("NEW-A"), "follow must give the new lines: {out}");
-    assert!(!out.contains("old-1\n"), "follow must not write the whole file");
-    assert!(out.lines().count() <= 6, "got {} lines", out.lines().count());
+    assert!(
+        out.contains("NEW-A"),
+        "follow must give the new lines: {out}"
+    );
+    assert!(
+        !out.contains("old-1\n"),
+        "follow must not write the whole file"
+    );
+    assert!(
+        out.lines().count() <= 6,
+        "got {} lines",
+        out.lines().count()
+    );
 }
 
 /// qex must use the measurement of an earlier job of the same command as the
@@ -1637,7 +1810,11 @@ fn a_second_job_of_one_command_uses_the_measurement_of_the_first() {
     let h = Harness::with_default_config("learn");
 
     // A command that uses a measurable quantity of memory.
-    let program = ["sh", "-c", "head -c 40000000 /dev/zero | tail -c 1 > /dev/null"];
+    let program = [
+        "sh",
+        "-c",
+        "head -c 40000000 /dev/zero | tail -c 1 > /dev/null",
+    ];
 
     let first = h.submit(&[&["submit", "--name", "one", "--"], &program[..]].concat());
     h.ok(&["wait", &first, "--timeout", "60s"]);
@@ -1701,7 +1878,8 @@ fn a_job_that_did_not_complete_is_not_a_measurement() {
 
     let second = h.submit(&[&["submit", "--"], &program[..]].concat());
     assert_eq!(
-        h.status_json(&second)["claim_source"], "default",
+        h.status_json(&second)["claim_source"],
+        "default",
         "a job that failed must not become a measurement"
     );
     h.qex(&["wait", &second, "--timeout", "45s"]);
@@ -1786,10 +1964,7 @@ fn a_closed_pipe_does_not_give_a_panic() {
 
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!(
-            "{} list | head -2",
-            env!("CARGO_BIN_EXE_qex")
-        ))
+        .arg(format!("{} list | head -2", env!("CARGO_BIN_EXE_qex")))
         .env("XDG_CONFIG_HOME", h.root.join("cfg"))
         .env("XDG_STATE_HOME", h.root.join("state"))
         .env("QEX_IDLE_EXIT_SECS", "120")
@@ -1811,18 +1986,67 @@ fn the_id_file_holds_the_id() {
     let h = Harness::with_default_config("idfile");
     let file = h.root.join("job.id");
 
-    let id = h.submit(&[
-        "submit",
-        "--id-file",
-        file.to_str().unwrap(),
-        "--",
-        "true",
-    ]);
+    let id = h.submit(&["submit", "--id-file", file.to_str().unwrap(), "--", "true"]);
     let written = std::fs::read_to_string(&file).unwrap();
     assert_eq!(written.trim(), id, "the file must hold the id");
 
     // The id in the file must work in a later command.
     h.ok(&["wait", written.trim(), "--timeout", "45s"]);
+}
+
+/// An id file in a directory that does not last must give a warning.
+///
+/// The id is the handle to a job, and the job continues when the session of an
+/// agent stops. An agent that writes the id into the scratch directory of its
+/// harness thus loses the handle at the moment that it needs the handle: the
+/// harness deletes that directory with the session, and the job continues with
+/// no name. The file operates correctly, so this warning is the one opportunity
+/// to prevent the fault.
+#[test]
+fn an_id_file_in_a_temporary_directory_gives_a_warning() {
+    let h = Harness::with_default_config("idtmp");
+
+    // The root of this harness is under the temporary directory of the machine.
+    let out = h.qex(&[
+        "submit",
+        "--id-file",
+        h.root.join("job.id").to_str().unwrap(),
+        "--",
+        "true",
+    ]);
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("does not last"),
+        "an id file in a temporary directory must give a warning; got: {err}"
+    );
+
+    // The warning must not reach stdout. `ID=$(qex submit ...)` must still give
+    // the id and nothing else.
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        id.parse::<uuid::Uuid>().is_ok(),
+        "stdout must hold the id only, and it held: {id}"
+    );
+
+    // A directory that lasts must give no warning. A warning that appears each
+    // time teaches a reader to ignore it.
+    let lasting = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("qex-id-file-test");
+    std::fs::create_dir_all(&lasting).unwrap();
+    let out = h.qex(&[
+        "submit",
+        "--id-file",
+        lasting.join("job.id").to_str().unwrap(),
+        "--",
+        "true",
+    ]);
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("does not last"),
+        "an id file in a directory that lasts must give no warning; got: {err}"
+    );
+    std::fs::remove_dir_all(&lasting).ok();
 }
 
 /// The id file of a pipeline must hold every stage, in a form that a shell
@@ -1849,7 +2073,10 @@ fn the_id_file_of_a_pipeline_holds_every_stage() {
     ]);
     let text = std::fs::read_to_string(&env_file).unwrap();
     assert!(text.contains(&format!("group={group}")), "got: {text}");
-    assert!(text.contains("build="), "the build stage is missing: {text}");
+    assert!(
+        text.contains("build="),
+        "the build stage is missing: {text}"
+    );
     assert!(text.contains("test="), "the test stage is missing: {text}");
 
     // Every value must be a job that exists.
@@ -1913,8 +2140,7 @@ fn the_directory_filters_select_the_right_jobs() {
             .current_dir(dir)
             .output()
             .unwrap();
-        let jobs: Vec<serde_json::Value> =
-            serde_json::from_slice(&out.stdout).unwrap_or_default();
+        let jobs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
         jobs.iter()
             .map(|j| j["name"].as_str().unwrap().to_string())
             .collect()
