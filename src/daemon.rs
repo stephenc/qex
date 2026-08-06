@@ -49,7 +49,30 @@ pub struct State {
     pub next_sequence: u64,
     /// The time when this coordinator started.
     pub started_at: u64,
+    /// The time when a job last started, in seconds after the Unix epoch.
+    pub last_start_at: Option<u64>,
+    /// What the last scheduler pass found at the front of the queue.
+    pub head: Option<HeadInfo>,
+    /// The claims of the other users, from the last scheduler pass.
+    ///
+    /// `qex info` reads this copy and does not read the files of the other
+    /// users again. The answer then names the same numbers that the scheduler
+    /// used for its decision.
+    pub peer_claims: crate::peers::Claims,
     pub stop: bool,
+}
+
+/// The job at the front of the queue that cannot start, for `qex info`.
+#[derive(Debug, Clone)]
+pub struct HeadInfo {
+    pub id: uuid::Uuid,
+    pub name: String,
+    /// The word for the class of the cause. See `sched::Blocker`.
+    pub blocker: String,
+    /// True when qex keeps the capacity for this job and starts nothing else.
+    pub reserved: bool,
+    /// The number of jobs that started after this job reached the front.
+    pub passed_by: u32,
 }
 
 /// Gives the position of a state in the life of a job.
@@ -158,6 +181,9 @@ impl Coordinator {
                 idle_since: Some(Instant::now()),
                 next_sequence: 1,
                 started_at: crate::sys::now_secs(),
+                last_start_at: None,
+                head: None,
+                peer_claims: crate::peers::Claims::default(),
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -486,6 +512,14 @@ fn no_such_job(id: uuid::Uuid) -> Response {
 fn handle_info(coord: &Arc<Coordinator>) -> Response {
     let state = coord.state.lock().unwrap();
     let (cpu_claimed, mem_claimed) = state.claimed();
+    // `held` says that qex keeps the capacity for the job at the front and
+    // starts nothing. Each other word names the holder of the capacity, so a
+    // reader learns at once whether the cause is inside this queue or outside.
+    let queue_state = match &state.head {
+        None => "running".to_string(),
+        Some(h) if h.reserved => "held".to_string(),
+        Some(h) => h.blocker.clone(),
+    };
     Response::Info {
         pid: std::process::id() as i32,
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -497,6 +531,17 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         mem_budget: state.cfg.budget_mem().unwrap_or(0),
         cpu_claimed,
         mem_claimed,
+        queue_state: Some(queue_state),
+        last_start_at: state.last_start_at,
+        peer_count: Some(state.peer_claims.count),
+        peer_cpu: Some(state.peer_claims.cpu),
+        peer_mem: Some(state.peer_claims.mem),
+        head_job: state
+            .head
+            .as_ref()
+            .map(|h| format!("{} ({})", &h.id.to_string()[..8], h.name)),
+        head_blocker: state.head.as_ref().map(|h| h.blocker.clone()),
+        head_passed_by: state.head.as_ref().map(|h| h.passed_by),
     }
 }
 

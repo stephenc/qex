@@ -2572,3 +2572,456 @@ fn the_status_gives_the_measured_use_of_a_job() {
 }
 
 fn _unused(_: &Path) {}
+
+// ---------------------------------------------------------------------------
+// The order of the queue, and the job at the front that cannot start.
+//
+// The fault that these tests prevent is issue #10: one job that could not be
+// admitted, because another user held part of the budget, kept two small jobs
+// in the queue for ever, and the reason named no cause.
+// ---------------------------------------------------------------------------
+
+/// Makes a directory that two coordinators share for their peer records.
+///
+/// The directory needs the sticky bit, or qex refuses it and each coordinator
+/// then operates for one user only — and the test measures nothing.
+fn shared_peer_dir(tag: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("qxpeers-{}-{tag}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    dir
+}
+
+/// The config of two coordinators that share one machine and one peer
+/// directory. Each one counts the claims of the other.
+fn peer_config(dir: &Path, cpu: &str, max_bypass: u32) -> String {
+    format!(
+        "[budget]\ncpu = \"{cpu}\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = true\ndir = \"{}\"\nstale_after = \"1h\"\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\nmax_bypass = {max_bypass}\n",
+        dir.display()
+    )
+}
+
+fn blocked_reason(h: &Harness, id: &str) -> String {
+    h.status_json(id)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// THE MEASURED FAULT of issue #10.
+///
+/// A job that cannot start because another user holds part of the budget must
+/// not keep the jobs behind it in the queue. qex does not control that user, so
+/// an empty machine gives the job at the front nothing and stops every other
+/// job. The earlier code parked the whole queue and told each job behind it
+/// "waits for the job at the front of the queue", which names no cause.
+#[test]
+fn a_job_that_another_user_holds_back_does_not_park_the_jobs_behind_it() {
+    let dir = shared_peer_dir("hol-a");
+    let config = peer_config(&dir, "4", 2);
+    let other = Harness::new("holpeerb", &config);
+    let mine = Harness::new("holpeera", &config);
+
+    // The other user takes 3 of the 4 cores of the budget.
+    let held = other.submit(&[
+        "submit", "--cpu", "3", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    other.until(
+        "the other user's job starts",
+        Duration::from_secs(45),
+        || other.state_of(&held) == "running",
+    );
+
+    // This job needs the whole budget, so the other user's claim stops it.
+    let big = mine.submit(&["submit", "--cpu", "4", "--mem", "64MB", "--", "true"]);
+    mine.until(
+        "the job at the front names the other user",
+        Duration::from_secs(45),
+        || blocked_reason(&mine, &big).contains("another user holds capacity"),
+    );
+
+    // These two jobs are behind it, and they fit the free capacity.
+    let a = mine.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let b = mine.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    mine.until(
+        "the two small jobs behind the front of the queue run",
+        Duration::from_secs(60),
+        || mine.state_of(&a) == "completed" && mine.state_of(&b) == "completed",
+    );
+
+    // The job at the front still waits, and its reason gives the cause and a
+    // remedy. It must never read as a queue position.
+    assert_eq!(mine.state_of(&big), "queued");
+    let reason = blocked_reason(&mine, &big);
+    assert!(
+        reason.contains("another user holds capacity") && reason.contains("no known end"),
+        "the reason must name the other user: {reason}"
+    );
+    assert!(
+        !reason.contains("front of the queue"),
+        "the job at the front must not read a position sentence: {reason}"
+    );
+
+    // `qex info` must say the same thing in one line.
+    let info: serde_json::Value = serde_json::from_str(&mine.ok(&["info", "--json"])).unwrap();
+    assert_eq!(info["queue_state"], "waits-for-peer", "info: {info}");
+    assert!(
+        info["peer_cpu"].as_u64().unwrap_or(0) >= 3,
+        "qex info must report the cores of the other user: {info}"
+    );
+
+    other.ok(&["kill", &held, "--grace", "1s"]);
+    mine.qex(&["cancel", &big]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A job behind a job that keeps NO capacity gets a reason of its own.
+///
+/// The earlier code stopped at the first job that could not start, so a job
+/// behind it was never tested. Each one read "waits for the job X at the front
+/// of the queue", which names no cause — and a job that the other user also
+/// held back was told the wrong thing.
+#[test]
+fn a_job_behind_a_job_that_keeps_no_capacity_gets_its_own_reason() {
+    let dir = shared_peer_dir("hol-own");
+    let config = peer_config(&dir, "4", 2);
+    let other = Harness::new("holownb", &config);
+    let mine = Harness::new("holowna", &config);
+
+    // The other user takes 3 of the 4 cores.
+    let held = other.submit(&[
+        "submit", "--cpu", "3", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    other.until(
+        "the other user's job starts",
+        Duration::from_secs(45),
+        || other.state_of(&held) == "running",
+    );
+
+    // The job at the front needs the whole budget. The other user stops it, so
+    // qex keeps no capacity for it.
+    let big = mine.submit(&[
+        "submit", "--cpu", "4", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    mine.until(
+        "the job at the front names the other user",
+        Duration::from_secs(45),
+        || blocked_reason(&mine, &big).contains("another user holds capacity"),
+    );
+
+    // The first job behind it fits and starts. The second one does not fit,
+    // because the other user holds the rest of the budget.
+    let a = mine.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    let b = mine.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    mine.until(
+        "the first job behind starts",
+        Duration::from_secs(45),
+        || mine.state_of(&a) == "running",
+    );
+
+    mine.until(
+        "the second job behind gives a reason of its own",
+        Duration::from_secs(45),
+        || !blocked_reason(&mine, &b).is_empty(),
+    );
+    let reason = blocked_reason(&mine, &b);
+    assert!(
+        reason.contains("another user holds capacity"),
+        "the job behind must learn the true cause: {reason}"
+    );
+    assert!(
+        !reason.contains("front of the queue"),
+        "a job behind a job that keeps no capacity must not read a position: {reason}"
+    );
+
+    other.ok(&["kill", &held, "--grace", "1s"]);
+    for id in [&big, &a, &b] {
+        mine.qex(&["kill", id, "--grace", "1s"]);
+        mine.qex(&["cancel", id]);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A job that another user held back becomes unpassable in the same cycle in
+/// which the holder becomes a job of this queue.
+///
+/// This is the subtle half of the rule, and a reviewer must look for it. The
+/// count of the jobs that passed the job at the front is NOT reset when the
+/// holder changes, and it is not reset when the other user releases the
+/// capacity. Without the carry over, the count starts again at zero at each
+/// change of the holder, and a stream of small jobs passes the job at the front
+/// for ever — the starvation that the strict order existed to prevent.
+#[test]
+fn a_job_blocked_by_a_peer_becomes_unpassable_when_the_holder_changes() {
+    let dir = shared_peer_dir("hol-b");
+    let config = peer_config(&dir, "4", 2);
+    let other = Harness::new("holcarryb", &config);
+    let mine = Harness::new("holcarrya", &config);
+
+    // The other user takes 2 of the 4 cores.
+    let held = other.submit(&[
+        "submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    other.until(
+        "the other user's job starts",
+        Duration::from_secs(45),
+        || other.state_of(&held) == "running",
+    );
+
+    // This job needs 3 cores. The other user holds 2, so it cannot start, and
+    // qex must keep no capacity for it.
+    let big = mine.submit(&[
+        "submit", "--cpu", "3", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    mine.until(
+        "the job at the front names the other user",
+        Duration::from_secs(45),
+        || blocked_reason(&mine, &big).contains("another user holds capacity"),
+    );
+    assert_eq!(
+        mine.status_json(&big)["passed_by"].as_u64(),
+        Some(0),
+        "no job passed it yet"
+    );
+
+    // Three small jobs. Two of them pass the job at the front while the other
+    // user holds the capacity. The count then reaches the limit.
+    let small: Vec<String> = (0..3)
+        .map(|_| {
+            mine.submit(&[
+                "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+            ])
+        })
+        .collect();
+
+    mine.until(
+        "two small jobs pass the job at the front",
+        Duration::from_secs(60),
+        || mine.state_of(&small[0]) == "running" && mine.state_of(&small[1]) == "running",
+    );
+
+    // The holder is now a job of THIS queue, and the count carried across that
+    // change. The job at the front is therefore unpassable at once.
+    mine.until(
+        "the queue keeps the capacity",
+        Duration::from_secs(45),
+        || {
+            let info: serde_json::Value =
+                serde_json::from_str(&mine.ok(&["info", "--json"])).unwrap_or_default();
+            info["queue_state"] == "held"
+        },
+    );
+    assert_eq!(
+        mine.status_json(&big)["passed_by"].as_u64(),
+        Some(2),
+        "the count must carry across the change of the holder, and not start again"
+    );
+
+    // The other user releases the capacity. That release must not give the
+    // queue a new licence to pass the job at the front.
+    other.ok(&["kill", &held, "--grace", "1s"]);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        assert_eq!(
+            mine.state_of(&small[2]),
+            "queued",
+            "a small job passed the job at the front after the other user released"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        mine.status_json(&big)["passed_by"].as_u64(),
+        Some(2),
+        "the release of the other user must not reset the count"
+    );
+    let reason = blocked_reason(&mine, &small[2]);
+    assert!(
+        reason.contains("qex keeps the capacity for that job"),
+        "the job behind must read WHY qex holds it: {reason}"
+    );
+    assert!(
+        blocked_reason(&mine, &big).contains("qex starts no other job before this one"),
+        "the job at the front must say that it keeps the capacity"
+    );
+
+    // The job at the front collects the capacity as the jobs of this queue
+    // stop. One core is sufficient.
+    mine.ok(&["kill", &small[0], "--grace", "1s"]);
+    mine.until(
+        "the job at the front starts",
+        Duration::from_secs(45),
+        || mine.has_started(&big),
+    );
+
+    for id in &small {
+        mine.qex(&["kill", id, "--grace", "1s"]);
+        mine.qex(&["cancel", id]);
+    }
+    mine.qex(&["kill", &big, "--grace", "1s"]);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A stream of small jobs must not pass a large job for ever.
+///
+/// This is the reason that the strict order existed. The bypass is bounded, so
+/// the rule that removes the head-of-line fault must not bring starvation back.
+#[test]
+fn a_stream_of_small_jobs_does_not_pass_a_large_job_for_ever() {
+    let h = Harness::new(
+        "holstarve",
+        "[budget]\ncpu = \"4\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\nmax_bypass = 2\n",
+    );
+
+    // This job holds 2 of the 4 cores for the length of the test.
+    let holder = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    // This job needs the whole budget, so the job above stops it. The jobs of
+    // this queue hold the capacity, and qex schedules their release.
+    let big = h.submit(&["submit", "--cpu", "4", "--mem", "64MB", "--", "true"]);
+
+    // Six small jobs, each of which stops immediately. Without a bound, all six
+    // pass the large job.
+    let small: Vec<String> = (0..6)
+        .map(|_| h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]))
+        .collect();
+
+    let done = |h: &Harness| -> usize { small.iter().filter(|id| h.has_started(id)).count() };
+
+    h.until(
+        "two small jobs pass the large job",
+        Duration::from_secs(60),
+        || done(&h) >= 2,
+    );
+
+    // Measure many times. No third job may pass, although a core is free.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        assert!(
+            done(&h) <= 2,
+            "more than 2 small jobs passed the large job, so the bypass has no bound"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(h.state_of(&big), "queued");
+
+    // The large job starts when the holder stops, and the rest follow.
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.until("the large job runs", Duration::from_secs(45), || {
+        h.state_of(&big) == "completed"
+    });
+    h.until("each small job runs", Duration::from_secs(60), || {
+        done(&h) == 6
+    });
+}
+
+/// `max_bypass = 0` gives the strict order of the earlier releases.
+///
+/// A site that needs the exact behaviour of version 0.7.1 sets this value, so
+/// the value must start NO job before the job at the front.
+#[test]
+fn max_bypass_zero_lets_no_job_pass_the_front_of_the_queue() {
+    let h = Harness::new(
+        "holstrict",
+        "[budget]\ncpu = \"4\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\nmax_bypass = 0\n",
+    );
+
+    let holder = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    let big = h.submit(&["submit", "--cpu", "4", "--mem", "64MB", "--", "true"]);
+    let small: Vec<String> = (0..3)
+        .map(|_| h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]))
+        .collect();
+
+    h.until("the queue is held", Duration::from_secs(45), || {
+        let info: serde_json::Value =
+            serde_json::from_str(&h.ok(&["info", "--json"])).unwrap_or_default();
+        info["queue_state"] == "held"
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        for id in &small {
+            assert_eq!(
+                h.state_of(id),
+                "queued",
+                "with max_bypass = 0 no job may pass the job at the front"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        h.status_json(&big)["passed_by"].as_u64(),
+        Some(0),
+        "no job passed the job at the front"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.until("each job runs", Duration::from_secs(60), || {
+        h.state_of(&big) == "completed" && small.iter().all(|id| h.has_started(id))
+    });
+}
+
+/// A job that is larger than the budget, and that the config keeps in the
+/// queue, must not park the jobs behind it.
+///
+/// Such a job never starts, so capacity that qex keeps for it gives it nothing.
+/// This was the second head-of-line path: with `oversized = "queue"` the job
+/// stopped every job behind it FOR EVER.
+#[test]
+fn a_job_that_the_config_parks_does_not_park_the_jobs_behind_it() {
+    let h = Harness::new(
+        "holparked",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    let big = h.submit(&["submit", "--cpu", "64", "--mem", "64MB", "--", "true"]);
+    let a = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let b = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    h.until(
+        "the jobs behind the large job run",
+        Duration::from_secs(60),
+        || h.state_of(&a) == "completed" && h.state_of(&b) == "completed",
+    );
+
+    assert_eq!(h.state_of(&big), "queued");
+    let reason = blocked_reason(&h, &big);
+    assert!(
+        reason.contains("keeps this job in the queue"),
+        "the reason must name the config file: {reason}"
+    );
+    assert!(
+        reason.contains("starts the jobs behind it"),
+        "the reason must say that the queue continues: {reason}"
+    );
+}

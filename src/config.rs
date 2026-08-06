@@ -180,6 +180,14 @@ pub struct QueueConfig {
     ///
     /// This delay prevents a start while the last jobs stop.
     pub settle: String,
+    /// How many jobs may start before the job at the front of the queue.
+    ///
+    /// A small job that passes a large job again and again keeps the large job
+    /// in the queue for ever. After this number of jobs, qex keeps the capacity
+    /// for the job at the front and starts nothing else.
+    ///
+    /// The value `0` gives a strict order: no job passes the job at the front.
+    pub max_bypass: u32,
 }
 
 impl Default for QueueConfig {
@@ -187,6 +195,13 @@ impl Default for QueueConfig {
         Self {
             oversized: OversizedPolicy::RunWhenIdle,
             settle: "3s".into(),
+            // Two jobs, because the count must be small.
+            //
+            // Each bypass makes the job at the front wait for one more job.
+            // A large value thus turns the rule into no rule. A value of two
+            // lets the queue continue while a short job stops, and it stops a
+            // stream of small jobs after two of them.
+            max_bypass: 2,
         }
     }
 }

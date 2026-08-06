@@ -237,7 +237,15 @@ pub const STATUS: &str = r##"{
     },
     "blocked_reason": {
       "type": ["string", "null"],
-      "description": "The reason that the job waits in the queue. The value is null for a job that started."
+      "description": "The reason that the job waits in the queue. The value is null for a job that started. The text names the holder of the capacity: the jobs of this queue, another user, the machine, or the size of the job."
+    },
+    "blocked_since": {
+      "type": ["integer", "null"],
+      "description": "The time when this job first failed the capacity test at the front of the queue, in seconds after the Unix epoch. Read it to see how long the front of the queue has not moved."
+    },
+    "passed_by": {
+      "type": "integer",
+      "description": "The number of jobs that qex started after this job reached the front of the queue. At the value of `[queue] max_bypass`, qex keeps the capacity for this job and starts nothing else. The count is not reset when the cause of the wait changes, so a job that another user held becomes unpassable as soon as that user releases the capacity."
     },
     "error": {
       "type": ["string", "null"],

@@ -627,6 +627,7 @@ that qex uses now.
     [queue]
     oversized = \"run-when-idle\"   # run-when-idle, reject or queue
     settle = \"3s\"
+    max_bypass = 2        # jobs that may start before the job at the front
 
     [submit]
     env_capture = \"all\"           # all, minimal or none
@@ -654,6 +655,21 @@ A submission without `--cpu` or `--mem` uses the `[defaults]` section. If that
 section gives no value, qex uses 1 core and an equal part of the machine
 memory. On a machine with 16 cores and 32GB, the default job is 1 core and 2GB.
 The default job size thus scales with the machine.
+
+The order of the queue
+----------------------
+
+`max_bypass` gives the number of jobs that may start before the job at the front
+of the queue. The default is 2.
+
+With `max_bypass = 0`, no job passes the job at the front. The order is then
+strict, and one large job stops the queue while it waits.
+
+qex counts a bypass only while the jobs of THIS queue hold the capacity, or
+while a large job waits for a quiet machine. qex schedules those releases. If
+another user or a program outside qex holds the capacity, qex starts the jobs
+behind the job at the front and keeps no capacity: an empty machine gives that
+job nothing, because qex does not control the holder.
 
 Enforcement
 -----------
@@ -714,6 +730,39 @@ qex starts a job when all these conditions are true:
      `max_pressure`.
 
 If a job waits, `qex status` gives the reason in the `blocked_reason` field.
+
+Why a job waits, and what holds the queue
+-----------------------------------------
+
+`blocked_reason` names the holder of the capacity. There are four holders, and
+they do not have the same effect on the jobs behind:
+
+  1. The jobs of this queue. qex knows that they stop, so it keeps the capacity
+     for the job at the front after `[queue] max_bypass` jobs passed it.
+  2. Another user. qex does not control that user, so the wait has no known end.
+     qex starts the jobs behind, and it keeps no capacity.
+  3. A program outside qex, or memory pressure. The same rule as 2.
+  4. The size of the job. A job that is larger than the budget waits for a quiet
+     machine, or the config file keeps it in the queue.
+
+Each job that waits gives a reason of ITS OWN. A job behind a job that qex keeps
+capacity for gives that fact and the id of the job at the front.
+
+qex counts the jobs that pass the job at the front in the field `passed_by`, and
+`blocked_since` gives the time when that job reached the front. The count is not
+reset when the holder changes. A job that another user held for an hour keeps its
+count, and it is unpassable in the same cycle in which a job of this queue
+becomes the holder.
+
+Is the queue healthy
+--------------------
+
+    qex info
+
+The last line answers the question. The queue is healthy when a job started
+recently, OR when the line names a cause outside this queue: another user or the
+machine. The queue is stuck when no job started and the cause is a job of this
+queue. `qex top` gives the same line in its header.
 
 A job that is larger than the budget
 ------------------------------------

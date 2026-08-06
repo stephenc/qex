@@ -1376,6 +1376,101 @@ fn find_id_on_disk(raw: &str) -> Result<Option<uuid::Uuid>> {
     Ok(found)
 }
 
+/// Gives the one line that says if the queue is healthy.
+///
+/// A reader answers one question with this line: does the queue move, and if it
+/// does not, what holds it? Without the line, a reader must open the reason of
+/// each job and calculate the answer.
+///
+/// The queue is healthy when a job started recently, OR when the line names a
+/// cause outside this queue: another user or the machine. The queue is stuck
+/// when no job started and the cause is a job of this queue.
+///
+/// `qex info` and `qex top` both use this function. Two texts for one fact
+/// would say two different things after the first change to one of them.
+pub fn queue_line(info: &Response) -> String {
+    let Response::Info {
+        jobs_running,
+        jobs_queued,
+        queue_state,
+        last_start_at,
+        peer_count,
+        peer_cpu,
+        peer_mem,
+        head_job,
+        head_passed_by,
+        ..
+    } = info
+    else {
+        return String::new();
+    };
+
+    // `queue_state` is the mark of a coordinator that reports the health. An
+    // older coordinator sends nothing, and `unknown` is the true answer. A
+    // defaulted value would say "the queue is running", which is a statement
+    // that qex did not measure.
+    let Some(state) = queue_state else {
+        return "queue: unknown · this coordinator is too old to report the health of the queue"
+            .to_string();
+    };
+
+    let now = crate::sys::now_secs();
+    let age = last_start_at.map(|t| format_duration(Duration::from_secs(now.saturating_sub(t))));
+    let started = match (&age, state.as_str()) {
+        (Some(a), "running") => format!("last start {a} ago"),
+        (Some(a), _) => format!("no job started for {a}"),
+        (None, _) => "no job started yet".to_string(),
+    };
+    let front = match head_job {
+        Some(j) => format!(" · the job at the front is {j}"),
+        None => String::new(),
+    };
+    let counts = format!("{jobs_running} running, {jobs_queued} queued");
+
+    match state.as_str() {
+        "running" => format!("queue: running · {started} · {counts}"),
+        "held" => format!(
+            "queue: held for the job {} · {} job(s) started before it · {started} · {counts}",
+            head_job.clone().unwrap_or_else(|| "unknown".into()),
+            head_passed_by
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        "waits-for-peer" => format!(
+            "queue: waits for another user · {started} · {} {} cores and {}{front}",
+            peer_count
+                .map(|n| if n == 1 {
+                    "1 other user holds".to_string()
+                } else {
+                    format!("{n} other users hold")
+                })
+                .unwrap_or_else(|| "an unknown number of other users hold".into()),
+            peer_cpu
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            peer_mem
+                .map(format_size)
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        "waits-for-machine" => format!(
+            "queue: waits for the machine · {started}{front} · the memory belongs to a program \
+             outside this queue"
+        ),
+        "waits-for-capacity" => {
+            format!("queue: waits for the capacity of this queue · {started} · {counts}{front}")
+        }
+        "waits-for-idle" => format!(
+            "queue: waits for a quiet machine · {started}{front} · that job is larger than the \
+             budget"
+        ),
+        "parked" => format!(
+            "queue: the job at the front is larger than the budget and the config keeps it in the \
+             queue · {started}{front} · qex starts the jobs behind it"
+        ),
+        other => format!("queue: {other} · {started} · {counts}{front}"),
+    }
+}
+
 /// Writes the state of the coordinator.
 ///
 /// The process id here comes from the coordinator itself. Use this command to
@@ -1397,7 +1492,9 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
     } else {
         Client::connect()?
     };
-    match client.call(&Request::Info)? {
+    let response = client.call(&Request::Info)?;
+    let line = queue_line(&response);
+    match response {
         Response::Info {
             pid,
             version,
@@ -1409,6 +1506,14 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             mem_budget,
             cpu_claimed,
             mem_claimed,
+            ref queue_state,
+            last_start_at,
+            peer_count,
+            peer_cpu,
+            peer_mem,
+            ref head_job,
+            ref head_blocker,
+            head_passed_by,
         } => {
             if args.json {
                 println!(
@@ -1425,6 +1530,18 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "mem_budget": mem_budget,
                         "cpu_claimed": cpu_claimed,
                         "mem_claimed": mem_claimed,
+                        // Each value below is null when the coordinator is too
+                        // old to measure it. A null says "unknown". It does not
+                        // say "zero", and a reader must not read it as zero.
+                        "queue_state": queue_state,
+                        "queue_line": line,
+                        "last_start_at": last_start_at,
+                        "peer_count": peer_count,
+                        "peer_cpu": peer_cpu,
+                        "peer_mem": peer_mem,
+                        "head_job": head_job,
+                        "head_blocker": head_blocker,
+                        "head_passed_by": head_passed_by,
                     }))?
                 );
                 return Ok(0);
@@ -1451,6 +1568,16 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 format_size(mem_claimed),
                 format_size(mem_budget)
             );
+            match peer_cpu.zip(peer_mem) {
+                Some((cpu, mem)) if cpu > 0 || mem > 0 => println!(
+                    "other users:     {} coordinator(s) with {cpu} cores and {}",
+                    peer_count.unwrap_or(0),
+                    format_size(mem)
+                ),
+                Some(_) => println!("other users:     none"),
+                None => println!("other users:     unknown"),
+            }
+            println!("{line}");
             Ok(0)
         }
         other => report(other),
@@ -2398,6 +2525,8 @@ mod tests {
             forced_reason: None,
             sequence: 0,
             blocked_reason: None,
+            blocked_since: None,
+            passed_by: 0,
             error: None,
             needs: vec![],
             after: vec![],
