@@ -407,6 +407,86 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
     ));
 }
 
+/// Removes a job that waited more time than its `--max-queue-time` value.
+///
+/// The reason names what the job waited for and how long it waited. A reader
+/// that gets `expired` and no other text cannot act: the machine was busy, the
+/// claim was too large, or a lock was held, and each of those needs a different
+/// correction.
+fn expire(state: &mut crate::daemon::State, id: uuid::Uuid, waited: u64, last_reason: &str) {
+    let Some(job) = state.jobs.get_mut(&id) else {
+        return;
+    };
+
+    // A job that is not in the queue must never get this state.
+    //
+    // This is the race that the record must not show. The scheduler chooses a
+    // job, releases the lock, and `start_job` takes the lock again and writes
+    // `starting`. A test that trusted the queue list alone could then write
+    // `expired` over a job that already operates, and `qex wait` would report a
+    // failure for a job that succeeded.
+    if job.status.state != JobState::Queued {
+        return;
+    }
+
+    let limit = job.spec.max_queue_time.unwrap_or(0);
+    job.status.state = JobState::Expired;
+    job.status.finished_at = Some(sys::now_secs());
+    // The queue reason goes into the text below, so this field becomes empty: a
+    // job that stopped waits for nothing.
+    job.status.blocked_reason = None;
+    job.status.error = Some(format!(
+        "the job did not start. It waited {} in the queue, and its --max-queue-time is {}. \
+         The last reason was: {last_reason}. Give the job a smaller claim, wait until the \
+         machine is quiet, or give a longer --max-queue-time, then submit the job again.",
+        crate::units::format_duration(Duration::from_secs(waited)),
+        crate::units::format_duration(Duration::from_secs(limit)),
+    ));
+    let status = job.status.clone();
+    state.queue.retain(|q| *q != id);
+
+    if let Ok(dir) = paths::job_dir(&id) {
+        job::write_status(&dir, &status).ok();
+    }
+    log(&format!(
+        "job {id} did not start; it waited {waited}s and its queue limit is {limit}s"
+    ));
+}
+
+/// Gives the jobs that waited more time than their limit.
+///
+/// The clock starts at the submission, and not at the last scheduling pass. A
+/// coordinator that starts again thus continues the same count. Without that
+/// rule, a restart would give each queued job a new full wait, and the limit
+/// would give no promise at all.
+///
+/// The time of a job that waits for a different job COUNTS. `--max-queue-time`
+/// answers one question for the reader: "does this id give me an answer inside
+/// this time?" A clock that stops while a job waits for a dependency cannot
+/// answer it, because a chain of slow stages would hold the clock for hours. A
+/// stage that must wait for the stages before it therefore takes a limit that
+/// covers the whole pipeline, or no limit.
+fn overdue(state: &crate::daemon::State, chosen: Option<uuid::Uuid>) -> Vec<(uuid::Uuid, u64)> {
+    let now = sys::now_secs();
+    state
+        .queue
+        .iter()
+        .copied()
+        // The job that this pass chose starts now. A job that can start must
+        // start, and it must not expire in the same moment.
+        .filter(|id| Some(*id) != chosen)
+        .filter_map(|id| {
+            let job = state.jobs.get(&id)?;
+            if job.status.state != JobState::Queued {
+                return None;
+            }
+            let limit = job.spec.max_queue_time?;
+            let waited = now.saturating_sub(job.status.submitted_at);
+            (waited >= limit).then_some((id, waited))
+        })
+        .collect()
+}
+
 /// Chooses the next job to start.
 fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     let (cpu_used, mem_used) = state.claimed();
@@ -547,6 +627,17 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
                 }
             }
         }
+    }
+
+    // Remove each job that waited more time than its limit. This step is last,
+    // so the text of the job holds the newest queue reason.
+    for (id, waited) in overdue(state, chosen) {
+        let reason = state
+            .jobs
+            .get(&id)
+            .and_then(|j| j.status.blocked_reason.clone())
+            .unwrap_or_else(|| "the job waited for free capacity".to_string());
+        expire(state, id, waited, &reason);
     }
 
     chosen
@@ -712,6 +803,7 @@ mod tests {
             cpu,
             mem,
             timeout: None,
+            max_queue_time: None,
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
@@ -828,6 +920,132 @@ mod tests {
             panic!("the reserve must stop this job");
         };
         assert!(reason.contains("reserve"), "got: {reason}");
+    }
+
+    /// Makes a state with one job in the queue, for the tests of the limit.
+    fn state_with(
+        job_state: JobState,
+        max_queue_time: Option<u64>,
+        waited: u64,
+    ) -> crate::daemon::State {
+        let mut spec = spec_with(1, 1 << 20);
+        spec.max_queue_time = max_queue_time;
+        let id = spec.id;
+
+        let mut status = crate::job::JobStatus::new(&spec);
+        status.state = job_state;
+        status.submitted_at = sys::now_secs().saturating_sub(waited);
+        status.blocked_reason = Some("waits for cores: 4 of 4 are in use".into());
+
+        let mut jobs = std::collections::BTreeMap::new();
+        jobs.insert(
+            id,
+            crate::daemon::Job {
+                spec,
+                status,
+                supervisor_pid: None,
+            },
+        );
+
+        crate::daemon::State {
+            cfg: cfg_with("4", "8GB"),
+            jobs,
+            queue: vec![id],
+            last_contact: Instant::now(),
+            idle_since: None,
+            next_sequence: 1,
+            started_at: sys::now_secs(),
+            stop: false,
+        }
+    }
+
+    /// A job that waits more time than its limit must give up and say so.
+    ///
+    /// Without this rule, an agent that waits for a job which the budget can
+    /// never admit waits for ever, and it learns nothing.
+    #[test]
+    fn a_job_that_waits_more_than_its_limit_expires() {
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        let id = state.queue[0];
+
+        let overdue = overdue(&state, None);
+        assert_eq!(overdue.len(), 1, "the job passed its limit");
+
+        expire(
+            &mut state,
+            id,
+            overdue[0].1,
+            "waits for cores: 4 of 4 are in use",
+        );
+
+        let job = &state.jobs[&id];
+        assert_eq!(job.status.state, JobState::Expired);
+        assert!(job.status.finished_at.is_some());
+        assert!(state.queue.is_empty(), "an expired job leaves the queue");
+
+        // The text must name the wait and the time. A reader that gets the state
+        // alone cannot act.
+        let reason = job.status.error.clone().unwrap();
+        assert!(reason.contains("cores"), "got: {reason}");
+        assert!(reason.contains("--max-queue-time"), "got: {reason}");
+        assert!(
+            reason.contains("did not start"),
+            "the text must say that the job never ran: {reason}"
+        );
+    }
+
+    /// A job below its limit, and a job with no limit, must stay in the queue.
+    #[test]
+    fn a_job_inside_its_limit_stays_in_the_queue() {
+        let state = state_with(JobState::Queued, Some(600), 10);
+        assert!(overdue(&state, None).is_empty());
+
+        let state = state_with(JobState::Queued, None, 100_000);
+        assert!(
+            overdue(&state, None).is_empty(),
+            "a job with no limit must wait"
+        );
+    }
+
+    /// A JOB THAT STARTED MUST NEVER GET THE STATE `expired`.
+    ///
+    /// The scheduler chooses a job, releases the lock, and `start_job` writes
+    /// `starting`. A pass that expired a job in that moment would give a record
+    /// that says `expired` for a job that ran, and `qex wait` would report a
+    /// failure for a job that succeeded. Two guards stop it: the chosen job is
+    /// never in the list, and `expire` refuses a job that is not queued.
+    #[test]
+    fn a_job_that_started_never_expires() {
+        // The job that this pass chose is not in the list, although it passed
+        // its limit.
+        let state = state_with(JobState::Queued, Some(1), 3600);
+        let chosen = state.queue[0];
+        assert!(
+            overdue(&state, Some(chosen)).is_empty(),
+            "the job that starts now must not expire"
+        );
+
+        // A job that already left the queue keeps its state.
+        for started in [
+            JobState::Starting,
+            JobState::Running,
+            JobState::Completed,
+            JobState::Failed,
+        ] {
+            let mut state = state_with(started, Some(1), 3600);
+            let id = state.queue[0];
+            assert!(
+                overdue(&state, None).is_empty(),
+                "a job in the state {started} must not be in the list"
+            );
+
+            // The second guard, for the moment between the two locks.
+            expire(&mut state, id, 3600, "waits for cores");
+            assert_eq!(
+                state.jobs[&id].status.state, started,
+                "a job in the state {started} must keep it"
+            );
+        }
     }
 
     /// The pressure limit stops a job while the machine reclaims memory.

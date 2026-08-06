@@ -82,6 +82,8 @@ pub fn state(name: &str, text: &str) -> String {
         "killed" => MAGENTA,
         "cancelled" => DIM,
         "skipped" => BLUE,
+        // The same colour as `skipped`: this job also never ran.
+        "expired" => BLUE,
         _ => return text.to_string(),
     };
     wrap(codes, text)

@@ -10,8 +10,8 @@ description: Every command, option, claim word and configuration field.
 ## Commands
 
 ```
-qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
-           [--after ID,ID] [--name NAME] [--job FILE] [--json]
+qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--max-queue-time TIME]
+           [--needs ID,ID] [--after ID,ID] [--name NAME] [--job FILE] [--json]
            [--dedupe-key KEY] [--dedupe-window TIME] -- COMMAND...
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
@@ -38,6 +38,7 @@ Every command that reads data accepts `--json`.
 | ---- | ------- |
 | 0    | The job succeeded. |
 | 1    | The job failed. |
+| 123  | The job never started. It reached its `--max-queue-time`. |
 | 124  | Your wait reached its time limit. The job continues. |
 | 125  | Something stopped the job: kill, cancel, timeout or out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
@@ -46,6 +47,9 @@ Every command that reads data accepts `--json`.
 The code 124 has the same meaning as the code of the `timeout` command. A
 timeout on `qex wait` stops your wait only. It does not stop the job.
 
+The code 123 is not 125. A job with the code 125 ran and wrote output. A job with
+the code 123 never got the machine, so it wrote nothing.
+
 Add `--passthrough` to exit with the exit code of the job.
 
 ### Exit codes of `qex run`
@@ -53,6 +57,7 @@ Add `--passthrough` to exit with the exit code of the job.
 | Code | Meaning |
 | ---- | ------- |
 | the exit code of the job | The job ran. `qex run -- sh -c 'exit 7'` gives 7. |
+| 123  | The job never started. It reached its `--max-queue-time`. |
 | 124  | Your wait stopped, and the job continues. See the dedupe key. |
 | 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
@@ -83,6 +88,37 @@ wait again, or `qex kill $ID` to stop the job.
 `qex run` gives 124 for no other reason. It waits with no limit of its own, and
 a job that reaches the time limit of `--timeout` gives 125, because something
 stopped that job.
+
+## A job that never starts
+
+A job waits until the machine has capacity for it. Use `--max-queue-time` to
+limit that wait:
+
+```sh
+ID=$(qex submit --max-queue-time 30m -- make test)
+qex wait $ID              # this gives an answer inside 30 minutes
+```
+
+The job does not start after that time. Its state becomes `expired`, `qex wait`
+gives the code 123, and the `error` field says what the job waited for and how
+long it waited.
+
+`--timeout` limits the time that the job **runs**. `--max-queue-time` limits the
+time that the job **waits**. A job that reaches the first has output to read; a
+job that reaches the second has none.
+
+The clock starts at the submission. A coordinator that stops and starts again
+continues the same count, so a restart does not give a queued job a new full
+wait.
+
+The wait for a job in `--needs` counts also, because the option answers one
+question: does this id give an answer inside this time? A clock that stopped for
+a dependency could not answer it. Give a stage of a pipeline a value that covers
+the whole pipeline, or give it no value.
+
+There is no value by default, and the config file has none until you write one. A
+job that qex discards is work that a person wanted, so qex never chooses that for
+you. Write `[defaults] max_queue_time` to get the rule for every job.
 
 ## Resource claims
 
@@ -364,7 +400,8 @@ qex submit --job train.toml
 ```toml
 name = "train-model"
 command = ["uv", "run", "train.py", "--epochs", "50"]
-timeout = "4h"
+timeout = "4h"          # the limit on the run
+max_queue_time = "30m"  # the limit on the wait
 tags = ["ml"]
 
 [resources]
@@ -446,6 +483,7 @@ max_bytes = "32MB"    # the output that qex keeps for each stream of each job
 cpu = 1               # the default is 1 core
 mem = "2GB"           # the default is the machine memory / the core count
 timeout = "0"         # the default is no limit
+max_queue_time = "0"  # the default is no limit on the wait
 ```
 
 With no `[defaults]` section, a job gets 1 core and an equal part of the machine

@@ -25,6 +25,14 @@ pub enum JobState {
     Killed,
     /// The job used more time than the `--timeout` value.
     Timeout,
+    /// The job waited more time than the `--max-queue-time` value.
+    ///
+    /// This state is different from `timeout`. The job NEVER STARTED, so there
+    /// is no output to read and no exit code. The correction is also different:
+    /// `timeout` says that the work is too slow, and `expired` says that the
+    /// machine had no capacity for the work. A reader that cannot separate the
+    /// two reads a log file that is empty and learns nothing.
+    Expired,
     /// The out-of-memory killer or the cgroup limit stopped the job.
     ///
     /// This state is different from `failed`. The correction is also different:
@@ -60,6 +68,7 @@ impl JobState {
             Self::Failed => "failed",
             Self::Killed => "killed",
             Self::Timeout => "timeout",
+            Self::Expired => "expired",
             Self::Oom => "oom",
             Self::Cancelled => "cancelled",
             Self::Skipped => "skipped",
@@ -84,12 +93,13 @@ impl std::str::FromStr for JobState {
             "failed" => Ok(Self::Failed),
             "killed" => Ok(Self::Killed),
             "timeout" => Ok(Self::Timeout),
+            "expired" => Ok(Self::Expired),
             "oom" => Ok(Self::Oom),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             "skipped" => Ok(Self::Skipped),
             other => Err(format!(
                 "unknown job state `{other}`. Use one of these states: queued, starting, \
-                 running, completed, failed, killed, timeout, oom, cancelled"
+                 running, completed, failed, killed, timeout, expired, oom, cancelled"
             )),
         }
     }
@@ -555,6 +565,7 @@ mod tests {
             JobState::Failed,
             JobState::Killed,
             JobState::Timeout,
+            JobState::Expired,
             JobState::Oom,
             JobState::Cancelled,
         ] {
@@ -576,6 +587,7 @@ mod tests {
             JobState::Running,
             JobState::Completed,
             JobState::Oom,
+            JobState::Expired,
             JobState::Cancelled,
         ] {
             assert_eq!(JobState::from_str(s.as_str()).unwrap(), s);

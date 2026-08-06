@@ -105,6 +105,8 @@ does not, and no third condition exists. `qex wait` thus always gives an answer:
 
     the job succeeded            -> 0
     the job failed               -> 1
+    the job never started, and it
+    had a `--max-queue-time`     -> 123
     somebody stopped the job     -> 125
     a job before it failed       -> 126
 
@@ -320,6 +322,7 @@ reads as a complete failure.
 
     0    the job succeeded
     1    the job failed
+    123  the job never started; it reached its `--max-queue-time`
     124  your wait timed out; the job still operates
     125  something stopped the job
     126  the job did not run, because a job that it needed failed
@@ -327,6 +330,29 @@ reads as a complete failure.
 
 Add `--timeout` to limit your wait. Example: `qex wait $ID --timeout 30m`.
 A timeout stops your wait only. It does not stop the job.
+
+Give up on a job that never starts
+----------------------------------
+
+A job waits until the machine has capacity for it. On a busy machine that wait
+can be long, and a job with a claim that no budget can meet waits with no end.
+
+    ID=$(qex submit --max-queue-time 30m -- make test)
+    qex wait $ID                 # this gives an answer inside 30 minutes
+
+The job does not start after that time. Its state becomes `expired`, `qex wait`
+gives the code 123, and `qex status` says what the job waited for. Nothing ran,
+so there is no output to read.
+
+The clock starts at the submission. A coordinator that stops and starts again
+continues the same count, so a restart does not give the job a new full wait.
+
+The wait for a job in `--needs` counts also. Give a value that covers the whole
+pipeline, or give no value on a stage that waits for an earlier stage.
+
+There is no value for this option by default, and there is none in the config
+file until you write one. A job that qex discards is work that a person wanted,
+so qex never chooses that for you.
 
 What qex captures
 -----------------
@@ -644,6 +670,7 @@ A full file
     cwd  = \"/home/me/project\"     # the default is your current directory
     command = [\"uv\", \"run\", \"train.py\", \"--epochs\", \"50\"]
     timeout = \"4h\"                # the default is no limit
+    max_queue_time = \"30m\"        # give up if the job waits this long
     tags = [\"ml\"]                 # for `qex list --tag ml`
     priority = 0                  # a larger number starts earlier
     needs = [\"build\"]             # stop if these jobs do not succeed
@@ -673,6 +700,11 @@ a shell feature such as a pipe, name the shell:
 `mem` accepts `8GB`, `8G`, `512MB` or a number of bytes. One unit step is 1024.
 
 `timeout` accepts `30s`, `5m`, `4h`, `2d`, or `0` for no limit.
+
+`max_queue_time` accepts the same values. It limits the time that the job WAITS,
+and `timeout` limits the time that the job RUNS. A job that reaches this limit
+does not start, and its state becomes `expired`. The time counts from the
+submission, and the wait for a job in `needs` counts also.
 
 `env_capture` selects the environment that the job receives:
 
@@ -773,6 +805,7 @@ that qex uses now.
     cpu = 1               # the default is 1 core
     mem = \"2GB\"           # the default is the machine memory / the core count
     timeout = \"0\"         # the default is no limit
+    max_queue_time = \"0\"  # the default is no limit on the wait
 
 Quotation marks around a number
 -------------------------------
@@ -1023,6 +1056,8 @@ qex job states
     failed      the job stopped with an exit code that is not 0.
     killed      the command `qex kill` stopped the job.
     timeout     the job used more time than its `--timeout` value.
+    expired     the job waited more time than its `--max-queue-time` value,
+                so it never started. There is no output and no exit code.
     oom         the out-of-memory killer stopped the job.
     cancelled   qex removed the job from the queue before it started.
     skipped     a job that this job needed did not succeed, so this job
@@ -1034,6 +1069,11 @@ final and does not change.
 
 The state `oom` is different from `failed`. For `oom`, correct your memory claim
 or use a larger machine.
+
+The state `expired` is different from `timeout`. For `timeout`, the work is too
+slow, and the log file holds the output of the part that ran. For `expired`, the
+machine never gave the job a place, so the log file is empty. Read the `error`
+field: it says what the job waited for and how long it waited.
 
 Use `qex list --state running` to select the jobs in one state.
 ";
@@ -1256,8 +1296,12 @@ so `GROUP=$(qex pipeline ci.toml)` operates.
     command = [\"./clean.sh\"]
     after = [\"ship\"]
 
-Each job in the file takes every field of a job file: `cwd`, `env`, `timeout`, `tags`,
-`priority`, `env_capture`, `nice` and `[resources]`.
+Each job in the file takes every field of a job file: `cwd`, `env`, `timeout`,
+`max_queue_time`, `tags`, `priority`, `env_capture`, `nice` and `[resources]`.
+
+A stage that waits for an earlier stage also uses its `max_queue_time`, because
+that clock counts every wait. Give a value that covers the whole pipeline, or
+give no value on such a stage.
 
 Why a pipeline file, and not several submissions
 ------------------------------------------------
@@ -1317,12 +1361,18 @@ qex exit codes
 
     0    the job succeeded (exit code 0)
     1    the job failed (a different exit code, or a signal)
+    123  the job never started. It waited more time than its
+         `--max-queue-time` value, and its state is `expired`.
     124  your wait timed out. The job still operates.
     125  something stopped the job: kill, cancel, timeout or out-of-memory
     126  the job did not run, because a job that it needed did not succeed
     127  there is no job with that id
 
 The code 124 has the same meaning as the code of the `timeout` command.
+
+The code 123 is not 125. A job with the code 125 ran and wrote output. A job with
+the code 123 never got the machine, so it has no output. Read the `error` field
+of `qex status` for the wait that stopped it.
 
 A timeout on `qex wait` stops your wait only. It does not stop the job. Use
 `qex kill` to stop the job.
@@ -1338,6 +1388,7 @@ result of the job to a script.
 ---------
 
     the exit code of the job    the job ran (0, 7, 1, whatever it gave)
+    123  the job never started; it reached its `--max-queue-time`
     124  your wait stopped, and the job continues. See the dedupe key below.
     125  something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory
     126  the job did not run, because a job that it needed did not succeed

@@ -47,6 +47,8 @@ pub struct Stage {
     pub cwd: Option<String>,
     pub command: Vec<String>,
     pub timeout: Option<String>,
+    /// The time that this stage may wait in the queue before it starts.
+    pub max_queue_time: Option<String>,
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<crate::config::EnvCapture>,
@@ -239,6 +241,7 @@ pub fn stage_spec(
         cwd: stage.cwd.clone(),
         command: stage.command.clone(),
         timeout: stage.timeout.clone(),
+        max_queue_time: stage.max_queue_time.clone(),
         tags: stage.tags.clone(),
         priority: stage.priority,
         env_capture: stage.env_capture,

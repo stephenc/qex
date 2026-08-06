@@ -665,6 +665,14 @@ pub struct DefaultsConfig {
     /// The time limit for a job. The default is `0`, which sets no limit.
     #[serde(default, deserialize_with = "text_or_number_opt")]
     pub timeout: Option<String>,
+    /// The time that a job may wait in the queue. The default is no limit.
+    ///
+    /// qex has NO built-in value here, and that is deliberate. A job that
+    /// reaches this limit never runs. A built-in value would thus discard the
+    /// work of a user who did not ask for the rule, on the day that the machine
+    /// is busy. A user who wants the rule for every job writes it here one time.
+    #[serde(default, deserialize_with = "text_or_number_opt")]
+    pub max_queue_time: Option<String>,
 }
 
 /// Controls the command that collects the old records.
@@ -1198,6 +1206,18 @@ impl Config {
         Ok(())
     }
 
+    /// Gives the default queue limit for a job.
+    ///
+    /// If the config file gives no value, the result is `None`. A job then waits
+    /// for capacity with no end, which is the behaviour of every earlier qex.
+    pub fn default_max_queue_time(&self) -> Result<Option<std::time::Duration>> {
+        match &self.defaults.max_queue_time {
+            Some(s) => units::parse_duration(s)
+                .map_err(|e| anyhow::anyhow!("config [defaults] max_queue_time: {e}")),
+            None => Ok(None),
+        }
+    }
+
     /// Reads each field that the config parser does not read immediately.
     ///
     /// Call this function at start. qex then reports an incorrect config file
@@ -1212,6 +1232,7 @@ impl Config {
         self.gc_keep()?;
         self.default_mem()?;
         self.default_timeout()?;
+        self.default_max_queue_time()?;
         self.log_max_bytes()?;
         if self.learn.margin < 1.0 {
             anyhow::bail!(
@@ -1276,7 +1297,7 @@ mod tests {
              [peers]\nstale_after = 45\n\
              [gc]\nkeep = 3600.0\n\
              [history]\nkeep = 7200\n\
-             [defaults]\nmem = 536870912\ntimeout = 90\n",
+             [defaults]\nmem = 536870912\ntimeout = 90\nmax_queue_time = 120\n",
         )
         .unwrap();
         c.validate().unwrap();
@@ -1294,6 +1315,10 @@ mod tests {
         assert_eq!(
             c.default_timeout().unwrap(),
             Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            c.default_max_queue_time().unwrap(),
+            Some(std::time::Duration::from_secs(120))
         );
     }
 
