@@ -69,8 +69,11 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     };
 
     let mut client = Client::connect()?;
-    let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
-        return report(client.call(&Request::List)?);
+    // Report the answer that arrived. A second request would hide the first
+    // fault and could give a different answer.
+    let response = client.call(&Request::List)?;
+    let Response::Jobs { mut jobs } = response else {
+        return report(response);
     };
 
     if let Some(f) = &filter {
@@ -126,7 +129,16 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
 
 pub fn status(args: cli::StatusArgs) -> Result<i32> {
     let mut client = Client::connect()?;
-    let id = resolve_id(&mut client, &args.id)?;
+    // Use one exit code for every "no such job" result. Without this test, a
+    // name that is not a UUID gives the code 1 and a UUID gives the code 127,
+    // for the same fault. A script cannot use two codes for one condition.
+    let id = match resolve_id(&mut client, &args.id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("qex: {e}");
+            return Ok(EXIT_NO_SUCH_JOB);
+        }
+    };
 
     match client.call(&Request::Status { id })? {
         Response::Status { status } => {
@@ -247,7 +259,9 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
         for s in &results {
-            println!("{} {} {}", short_id(&s.id), s.state, describe_result(s));
+            // Use punctuation. Without it, the line reads as one sentence:
+            // "a1b2c3d4 completed the job succeeded".
+            println!("{}: {} — {}", short_id(&s.id), s.state, describe_result(s));
         }
     }
 
@@ -281,22 +295,52 @@ fn wait_one(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
         client.set_read_timeout(remaining)?;
 
         client.send(&Request::Wait { id })?;
-        return match client.recv() {
-            Ok(Response::Status { status }) => Ok(WaitOutcome::Finished(*status)),
+        match client.recv() {
+            Ok(Response::Status { status }) => return Ok(WaitOutcome::Finished(*status)),
             Ok(Response::Error {
                 kind: ErrorKind::NoSuchJob,
                 ..
-            }) => Ok(WaitOutcome::NoSuchJob),
+            }) => return Ok(WaitOutcome::NoSuchJob),
             Ok(other) => {
                 report(other)?;
                 bail!("the coordinator gave an answer that qex did not expect")
             }
-            Err(_) => Ok(WaitOutcome::TimedOut),
-        };
+            Err(e) => {
+                // Separate the two causes. A read that reaches its limit is the
+                // time limit of the user. Every other fault means that the
+                // coordinator stopped.
+                //
+                // Without this test, `qex wait` reports the code 124 when the
+                // coordinator fails, and the user reads "your wait reached its
+                // time limit" for a wait that had no time limit.
+                if is_read_timeout(&e) {
+                    return Ok(WaitOutcome::TimedOut);
+                }
+                // The coordinator stopped. The supervisor of the job continues
+                // and writes the result, so read that file instead.
+            }
+        }
     }
 
     // There is no coordinator. Read the file of the job.
     wait_on_file(raw_id, deadline)
+}
+
+/// Tests if a socket fault is the time limit of the read.
+///
+/// The system gives `WouldBlock` or `TimedOut` for a read that reaches its
+/// limit. Every other fault has a different cause, such as a coordinator that
+/// stopped.
+fn is_read_timeout(e: &anyhow::Error) -> bool {
+    for cause in e.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            );
+        }
+    }
+    false
 }
 
 /// Waits by reading the status file of the job.
@@ -358,8 +402,35 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
         return follow(&dir, &files);
     }
 
+    if args.json {
+        let read = |name: &str| -> String {
+            std::fs::read(dir.join(name))
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        let mut out = serde_json::Map::new();
+        out.insert("id".into(), serde_json::Value::String(id.to_string()));
+        if !args.stderr {
+            out.insert("stdout".into(), serde_json::Value::String(read("stdout.log")));
+        }
+        if !args.stdout {
+            out.insert("stderr".into(), serde_json::Value::String(read("stderr.log")));
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+
     for (label, path) in &files {
-        let text = std::fs::read_to_string(path).unwrap_or_default();
+        // Read the bytes, then convert them. A job writes any byte, and one
+        // byte that is not UTF-8 must not hide the whole file.
+        //
+        // A strict read gives an error for such a file, and an empty result
+        // looks the same as a job that wrote nothing. A reader then believes
+        // that the build printed nothing.
+        let text = match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => String::new(),
+        };
         let text = match args.tail {
             Some(n) => {
                 let lines: Vec<&str> = text.lines().collect();
@@ -404,9 +475,18 @@ fn follow(dir: &std::path::Path, files: &[(&str, std::path::PathBuf)]) -> Result
         }
 
         // Stop when the job stops and the files hold no more data.
-        if let Ok(status) = crate::job::read_status(dir) {
-            if status.state.is_terminal() && !moved {
-                return Ok(0);
+        match crate::job::read_status(dir) {
+            Ok(status) => {
+                if status.state.is_terminal() && !moved {
+                    return Ok(0);
+                }
+            }
+            Err(_) => {
+                // The record is gone, so `qex clean` deleted the job. Stop, and
+                // do not wait for a file that will never change again.
+                if !moved {
+                    return Ok(0);
+                }
             }
         }
 
@@ -641,7 +721,21 @@ fn find_id_on_disk(raw: &str) -> Result<Option<uuid::Uuid>> {
 /// find the coordinator. Do not search the process list with `pgrep -f qex`,
 /// because that pattern also matches the command that contains it.
 pub fn info(args: cli::InfoArgs) -> Result<i32> {
-    let mut client = Client::connect()?;
+    let mut client = if args.no_start {
+        match Client::connect_existing() {
+            Some(c) => c,
+            None => {
+                if args.json {
+                    println!("{}", serde_json::json!({ "running": false }));
+                } else {
+                    println!("no coordinator operates");
+                }
+                return Ok(1);
+            }
+        }
+    } else {
+        Client::connect()?
+    };
     match client.call(&Request::Info)? {
         Response::Info {
             pid,
@@ -696,8 +790,11 @@ mod tests {
         JobStatus {
             id: uuid::Uuid::new_v4(),
             name: "t".into(),
+            command: vec!["true".into()],
+            cwd: "/".into(),
             state,
             pid: Some(1),
+            supervisor_pid: None,
             exit_code: code,
             signal: None,
             submitted_at: 0,
@@ -709,6 +806,7 @@ mod tests {
             forced: false,
             forced_reason: None,
             blocked_reason: None,
+            error: None,
             tags: vec![],
         }
     }

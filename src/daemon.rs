@@ -48,6 +48,20 @@ pub struct State {
     pub stop: bool,
 }
 
+/// Gives the position of a state in the life of a job.
+///
+/// A job moves forward only. This function lets the code refuse a record that
+/// moves a job back to an earlier state.
+fn rank(state: JobState) -> u8 {
+    match state {
+        JobState::Queued => 0,
+        JobState::Starting => 1,
+        JobState::Running => 2,
+        // Each final state has the same position.
+        _ => 3,
+    }
+}
+
 impl State {
     /// Reads the status file of each job that operates.
     ///
@@ -82,6 +96,16 @@ impl State {
             // The queue owns the reason that a job waits. The supervisor does
             // not write that field, so keep the value from this process.
             if job.status.state == JobState::Queued && disk.state == JobState::Queued {
+                continue;
+            }
+
+            // Never move a job back to an earlier state.
+            //
+            // The scheduler changes the memory copy to `starting` and then
+            // writes the file. A request that arrives between those two steps
+            // reads the older file. Without this test, the job returns to the
+            // state `queued` while the supervisor already starts it.
+            if rank(disk.state) < rank(job.status.state) {
                 continue;
             }
 
@@ -146,6 +170,16 @@ pub fn run() -> Result<()> {
     let cfg = Config::load()?;
     cfg.validate()?;
 
+    // If the config asks for a memory limit, this process can need a cgroup
+    // that it owns, and systemd gives one.
+    //
+    // Do this step before the socket exists. The new process opens the socket,
+    // and two processes must never try to open it together.
+    if crate::enforce::restart_with_systemd(&cfg) {
+        log("the coordinator starts again in a systemd unit, to get a cgroup that it owns");
+        return Ok(());
+    }
+
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
@@ -161,8 +195,19 @@ pub fn run() -> Result<()> {
         std::fs::remove_file(&socket_path).ok();
     }
 
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("opening the socket {}", socket_path.display()))?;
+    // Set the umask before the socket exists.
+    //
+    // `bind` makes the socket with the mode of the umask. A change of the mode
+    // after `bind` leaves a short time in which a different user can connect
+    // and send commands, and a command starts a program as this user.
+    let listener = {
+        let previous = unsafe { libc::umask(0o177) };
+        let result = UnixListener::bind(&socket_path);
+        unsafe {
+            libc::umask(previous);
+        }
+        result.with_context(|| format!("opening the socket {}", socket_path.display()))?
+    };
     restrict_socket(&socket_path)?;
 
     // Warn now if the config asks for a limit that this system cannot apply. A
@@ -264,16 +309,39 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         };
 
         // A job that says "running" can be dead. Its supervisor stopped with
-        // the coordinator, or the machine restarted. Test the process.
+        // the coordinator, or the machine restarted.
+        //
+        // Test the job process and the supervisor process. A job in the state
+        // `starting` has no job process yet, and a test of the job process
+        // alone would mark a live job as failed. That job then completes on the
+        // disk while the coordinator reports a failure for ever.
         if status.state.is_active() {
-            let alive = status.pid.map(sys::pid_alive).unwrap_or(false);
-            if !alive {
+            let job_alive = status.pid.map(sys::pid_alive).unwrap_or(false);
+            let supervisor_alive = status.supervisor_pid.map(sys::pid_alive).unwrap_or(false);
+
+            if job_alive || supervisor_alive {
+                // The job continues. Keep its state, and let the supervisor
+                // write the result.
+                if supervisor_alive {
+                    if let Some(pid) = status.supervisor_pid {
+                        // Watch the supervisor again, so the coordinator learns
+                        // when the job stops.
+                        let coord2 = Arc::clone(coord);
+                        let id = status.id;
+                        std::thread::spawn(move || crate::supervisor::reap(coord2, id, pid));
+                    }
+                }
+            } else {
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
                 status.blocked_reason = None;
+                status.error = Some(
+                    "the coordinator stopped, and neither the job nor its supervisor continued"
+                        .to_string(),
+                );
                 job::write_status(&path, &status).ok();
                 log(&format!(
-                    "job {} was active but its process is gone; the state is now failed",
+                    "job {} was active but its processes are gone; the state is now failed",
                     status.id
                 ));
             }
@@ -557,15 +625,24 @@ fn idle_watch(coord: Arc<Coordinator>, socket: std::path::PathBuf) {
     loop {
         std::thread::sleep(Duration::from_secs(1).min(idle_limit));
 
+        // Decide and set the flag with one lock only.
+        //
+        // With two lock operations, a `Submit` request can arrive between them.
+        // qex would accept that job, write its record, give the id to the user,
+        // and then stop. The job would never start, and `qex wait` would block
+        // with no end.
         let should_stop = {
-            let state = coord.state.lock().unwrap();
+            let mut state = coord.state.lock().unwrap();
             let active = state.count_state(|s| !s.is_terminal());
-            active == 0 && state.last_contact.elapsed() >= idle_limit
+            let idle = active == 0 && state.last_contact.elapsed() >= idle_limit;
+            if idle {
+                state.stop = true;
+            }
+            idle
         };
 
         if should_stop {
             log("the coordinator is idle and stops");
-            coord.state.lock().unwrap().stop = true;
             // Open one connection, so the accept loop wakes and reads the flag.
             UnixStream::connect(&socket).ok();
             return;

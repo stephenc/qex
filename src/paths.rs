@@ -43,17 +43,23 @@ pub fn jobs_dir() -> Result<PathBuf> {
 
 /// Gives the location of the runtime directory.
 ///
-/// This directory holds the socket, the spawn lock and the daemon pidfile.
-/// These files must not stay available after a restart of the machine.
+/// This directory holds the socket, the spawn lock and the log of the
+/// coordinator.
 ///
-/// qex uses `$XDG_RUNTIME_DIR` if the system sets it. That directory is a tmpfs
-/// with mode `0700`, and the system deletes it at logout. macOS does not have
-/// this directory, so qex uses the state directory there.
+/// The directory is always inside the state directory. It is not inside
+/// `$XDG_RUNTIME_DIR`.
+///
+/// The reason is important. The jobs of a user are in the state directory, and
+/// there must be one coordinator for those jobs. A desktop terminal sets
+/// `$XDG_RUNTIME_DIR`, but an ssh session, a cron job and a container
+/// frequently do not set it. Two sessions with one home directory would then
+/// use two sockets and start two coordinators. Each coordinator would hold the
+/// full budget, and together they would start twice the permitted work. That
+/// result is the fault that qex prevents.
+///
+/// The socket and the lock file are thus beside the jobs that they control.
 pub fn runtime_dir() -> Result<PathBuf> {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(v) if !v.is_empty() => Ok(PathBuf::from(v).join("qex")),
-        _ => Ok(state_dir()?.join("run")),
-    }
+    Ok(state_dir()?.join("run"))
 }
 
 /// The maximum length of a socket path.
@@ -210,19 +216,46 @@ mod tests {
     #[test]
     fn socket_path_stays_within_sun_path_limits() {
         let _guard = env_lock();
-        let _r = EnvVar::set("XDG_RUNTIME_DIR", "/run/user/1000");
+        let _s = EnvVar::set("XDG_STATE_HOME", "/tmp/qex-sock-test");
         let p = socket_path().unwrap();
-        assert_eq!(p, PathBuf::from("/run/user/1000/qex/s"));
+        assert_eq!(p, PathBuf::from("/tmp/qex-sock-test/qex/run/s"));
         assert!(p.as_os_str().len() <= MAX_SOCKET_PATH);
+    }
+
+    /// The socket must depend on the state directory only.
+    ///
+    /// A desktop terminal sets `$XDG_RUNTIME_DIR`, and an ssh session, a cron
+    /// job and a container frequently do not. If the socket depended on that
+    /// variable, two sessions with one home directory would start two
+    /// coordinators. Each would hold the full budget, and together they would
+    /// start twice the permitted work.
+    #[test]
+    fn the_socket_does_not_depend_on_the_runtime_variable() {
+        let _guard = env_lock();
+        let _s = EnvVar::set("XDG_STATE_HOME", "/tmp/qex-one-state");
+
+        let with_variable = {
+            let _r = EnvVar::set("XDG_RUNTIME_DIR", "/run/user/1000");
+            socket_path().unwrap()
+        };
+        let without_variable = {
+            let _r = EnvVar::unset("XDG_RUNTIME_DIR");
+            socket_path().unwrap()
+        };
+
+        assert_eq!(
+            with_variable, without_variable,
+            "one state directory must give one socket, and thus one coordinator"
+        );
     }
 
     /// A deep directory must not stop qex. A test harness and a long `$HOME`
     /// both give a path that does not fit in `sun_path`.
     #[test]
-    fn a_long_runtime_directory_gives_a_short_socket_path() {
+    fn a_long_state_directory_gives_a_short_socket_path() {
         let _guard = env_lock();
         let long = format!("/tmp/{}", "very-long-directory-name/".repeat(8));
-        let _r = EnvVar::set("XDG_RUNTIME_DIR", &long);
+        let _s = EnvVar::set("XDG_STATE_HOME", &long);
 
         let p = socket_path().unwrap();
         assert!(
@@ -235,8 +268,8 @@ mod tests {
         // cannot find each other.
         assert_eq!(p, socket_path().unwrap());
 
-        // A different runtime directory must give a different socket.
-        let _r2 = EnvVar::set("XDG_RUNTIME_DIR", &format!("{long}other/"));
+        // A different state directory must give a different socket.
+        let _s2 = EnvVar::set("XDG_STATE_HOME", &format!("{long}other/"));
         assert_ne!(p, socket_path().unwrap());
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();

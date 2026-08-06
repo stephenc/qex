@@ -189,6 +189,10 @@ pub struct LogsArgs {
     /// Show the last N lines only.
     #[arg(long, value_name = "N")]
     pub tail: Option<usize>,
+
+    /// Write the output as JSON, with one field for each stream.
+    #[arg(long, conflicts_with = "follow")]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -237,12 +241,24 @@ pub struct InfoArgs {
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Do not start a coordinator. Use this option to test for one.
+    ///
+    /// Without this option, the command starts a coordinator if none operates.
+    /// A script that stops a coordinator thus needs this option, or it starts
+    /// the process that it wants to stop.
+    #[arg(long)]
+    pub no_start: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct ConfigArgs {
     #[command(subcommand)]
     pub action: Option<ConfigAction>,
+
+    /// Write the output as JSON. Same as `qex config show --json`.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]

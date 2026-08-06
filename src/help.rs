@@ -150,9 +150,24 @@ Other commands
     qex kill <id>              stop a job that operates
     qex cancel <id>            remove a job from the queue
     qex clean --state done     delete the records of the jobs that stopped
+    qex info                   the coordinator and the free capacity
 
 Every command that reads data accepts `--json`. Use `qex schema status` and
 `qex schema job` to get the JSON Schema for these two formats.
+
+Short forms of a job id
+-----------------------
+
+Each command accepts the first characters of an id, and it also accepts the
+name of a job:
+
+    qex submit --name build -- make
+    qex status build
+
+Give a name with `--name` when you start a job. You can then use that name in
+place of the id, and you do not keep the UUID.
+
+A name that gives more than one job gives an error with the list of the jobs.
 
 Start with a job file for a complex task
 ----------------------------------------

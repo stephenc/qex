@@ -102,9 +102,26 @@ pub struct Usage {
 pub struct JobStatus {
     pub id: uuid::Uuid,
     pub name: String,
+    /// The program and its arguments.
+    ///
+    /// A reader of the status can then see what the job ran. Without this
+    /// field, a status shows the program name only, and a reader must open
+    /// `spec.json` to learn the arguments.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// The directory of the job.
+    #[serde(default)]
+    pub cwd: String,
     pub state: JobState,
     /// The pid of the job process. The value is `None` before the job starts.
     pub pid: Option<i32>,
+    /// The pid of the supervisor of the job.
+    ///
+    /// A new coordinator reads this value to learn if a job continues. Without
+    /// it, a coordinator that starts again cannot separate a live job from a
+    /// job that stopped.
+    #[serde(default)]
+    pub supervisor_pid: Option<i32>,
     /// The exit code, if the job stopped without a signal.
     pub exit_code: Option<i32>,
     /// The signal that stopped the job, if a signal stopped it.
@@ -127,9 +144,16 @@ pub struct JobStatus {
     /// The reason that the job stays in the queue.
     ///
     /// This text tells the reader what the job waits for. The reader does not
-    /// calculate the budget.
+    /// calculate the budget. The value is `None` for a job that started.
     #[serde(default)]
     pub blocked_reason: Option<String>,
+    /// The reason that a job failed, when qex itself gives the reason.
+    ///
+    /// A command that does not exist is the usual cause. This field is separate
+    /// from `blocked_reason`, because a job that failed does not wait for
+    /// anything, and a reader of `blocked_reason` expects a queue reason.
+    #[serde(default)]
+    pub error: Option<String>,
     pub tags: Vec<String>,
 }
 
@@ -138,8 +162,11 @@ impl JobStatus {
         Self {
             id: spec.id,
             name: spec.name.clone(),
+            command: spec.command.clone(),
+            cwd: spec.cwd.to_string_lossy().into_owned(),
             state: JobState::Queued,
             pid: None,
+            supervisor_pid: None,
             exit_code: None,
             signal: None,
             submitted_at: spec.submitted_at,
@@ -151,6 +178,7 @@ impl JobStatus {
             forced: false,
             forced_reason: None,
             blocked_reason: None,
+            error: None,
             tags: spec.tags.clone(),
         }
     }

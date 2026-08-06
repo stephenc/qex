@@ -59,12 +59,25 @@ fn peer_dir(cfg: &Config) -> Option<PathBuf> {
                 return None;
             }
             let mode = meta.mode();
-            // 0o1000 is the sticky bit.
+            // 0o1000 is the sticky bit. It stops a different user from the
+            // deletion of the files of this user.
             if mode & 0o1000 == 0 {
                 return None;
             }
+
+            // Accept a directory that every user can write, whatever its owner.
+            //
+            // qex makes this directory, so the first user of the machine owns
+            // it. A test for the owner would thus refuse the directory for
+            // every other user, and each of those users would lose the shared
+            // accounting with no message.
+            //
+            // The owner of the directory does not give safety here. The safety
+            // comes from the sticky bit and from the test of the owner of each
+            // file. See `read_peer`.
+            let world_writable = mode & 0o002 != 0;
             let owner = meta.uid();
-            if owner != 0 && owner != current_uid() {
+            if !world_writable && owner != 0 && owner != current_uid() {
                 return None;
             }
             Some(dir)
@@ -79,6 +92,34 @@ fn peer_dir(cfg: &Config) -> Option<PathBuf> {
     }
 }
 
+/// Writes the true state of the shared accounting, for `qex config show`.
+///
+/// This function tests the directory. A message that says "on" while the
+/// directory fails a test would tell the user that a feature operates when it
+/// does not.
+pub fn describe(cfg: &Config) -> String {
+    if !cfg.peers.enabled {
+        return "off; the config file sets [peers] enabled = false".to_string();
+    }
+    match peer_dir(cfg) {
+        Some(dir) => {
+            let c = claims(cfg);
+            format!(
+                "on, in {} ({} other coordinator(s), {} cores and {} claimed)",
+                dir.display(),
+                c.count,
+                c.cpu,
+                crate::units::format_size(c.mem)
+            )
+        }
+        None => format!(
+            "NOT ACTIVE; qex cannot use the directory {}. It must be a directory with the \
+             sticky bit. qex uses the budget of this user only.",
+            cfg.peers.dir
+        ),
+    }
+}
+
 pub fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
@@ -86,6 +127,16 @@ pub fn current_uid() -> u32 {
 /// Gives the file name of the directory of one user.
 fn user_dir_name(uid: u32) -> String {
     format!("u{uid}")
+}
+
+/// Gives the file name for one coordinator.
+///
+/// The name holds the process id, so each coordinator has its own file. One
+/// user can have more than one coordinator, with one for each state directory.
+/// With one file for each user, the last coordinator to write would hide the
+/// claims of the others, and a busy coordinator would report no load.
+fn peer_file_name(pid: i32) -> String {
+    format!("peer-{pid}.json")
 }
 
 /// Writes the claims of this coordinator.
@@ -116,7 +167,7 @@ pub fn publish(cfg: &Config, cpu: u64, mem: u64) {
     };
 
     if let Ok(bytes) = serde_json::to_vec(&peer) {
-        crate::job::write_atomic(&mine.join("peer.json"), &bytes, 0o644).ok();
+        crate::job::write_atomic(&mine.join(peer_file_name(peer.pid)), &bytes, 0o644).ok();
     }
 }
 
@@ -127,7 +178,7 @@ pub fn publish(cfg: &Config, cpu: u64, mem: u64) {
 pub fn withdraw(cfg: &Config) {
     if let Some(dir) = peer_dir(cfg) {
         let mine = dir.join(user_dir_name(current_uid()));
-        std::fs::remove_file(mine.join("peer.json")).ok();
+        std::fs::remove_file(mine.join(peer_file_name(std::process::id() as i32))).ok();
     }
 }
 
@@ -168,33 +219,57 @@ pub fn claims(cfg: &Config) -> Claims {
         let Some(claimed_uid) = name.strip_prefix('u').and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        if claimed_uid == me {
-            continue;
-        }
 
-        let file = entry.path().join("peer.json");
-        let Some(peer) = read_peer(&file, claimed_uid) else {
+        // One user can have more than one coordinator, with one for each state
+        // directory. Read every file in the directory, and skip the file of
+        // this coordinator only.
+        //
+        // A test that skips the whole directory of this user would hide a
+        // second coordinator of the same user. Two coordinators would then each
+        // use the full budget, and together they would start twice the
+        // permitted work.
+        let Ok(files) = std::fs::read_dir(entry.path()) else {
             continue;
         };
+        let my_pid = std::process::id() as i32;
 
-        // A record from a different start of the machine is old. The system
-        // uses each process id again after a restart.
-        if peer.boot_id != boot {
-            continue;
-        }
-        // A coordinator writes its record frequently. An old record shows a
-        // coordinator that stopped without a clean end.
-        if now.saturating_sub(peer.updated_at) > stale {
-            continue;
-        }
-        // The process must be alive.
-        if !sys::pid_alive(peer.pid) {
-            continue;
-        }
+        for file in files.flatten() {
+            let fname = file.file_name();
+            let Some(fname) = fname.to_str() else { continue };
+            if !fname.starts_with("peer-") || !fname.ends_with(".json") {
+                continue;
+            }
 
-        total.cpu += peer.cpu;
-        total.mem += peer.mem;
-        total.count += 1;
+            let Some(peer) = read_peer(&file.path(), claimed_uid) else {
+                continue;
+            };
+
+            // Skip this coordinator. Its own claims are already in its total.
+            if claimed_uid == me && peer.pid == my_pid {
+                continue;
+            }
+            // A record from a different start of the machine is old. The system
+            // uses each process id again after a restart.
+            if peer.boot_id != boot {
+                std::fs::remove_file(file.path()).ok();
+                continue;
+            }
+            // A coordinator writes its record frequently. An old record shows a
+            // coordinator that stopped without a clean end.
+            if now.saturating_sub(peer.updated_at) > stale {
+                std::fs::remove_file(file.path()).ok();
+                continue;
+            }
+            // The process must be alive.
+            if !sys::pid_alive(peer.pid) {
+                std::fs::remove_file(file.path()).ok();
+                continue;
+            }
+
+            total.cpu += peer.cpu;
+            total.mem += peer.mem;
+            total.count += 1;
+        }
     }
 
     total

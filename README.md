@@ -227,7 +227,9 @@ fail or restart, and the job must continue and must still record its result. A
     stderr.log
 ```
 
-`status.json` is the primary record. The supervisor writes it in one operation,
+`status.json` is the primary record. It records the command, the directory, the
+state, the exit code, the times and the measured use. The supervisor writes it
+in one operation,
 so a reader sees the old contents or the new contents, and never a part of them.
 `qex wait` reads this file directly when no coordinator operates.
 

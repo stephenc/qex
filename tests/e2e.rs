@@ -652,7 +652,9 @@ fn a_command_that_does_not_exist_gives_a_clear_message() {
             .unwrap_or(false)
     });
 
-    let reason = h.status_json(&id)["blocked_reason"]
+    // The reason is in the `error` field. A job that failed waits for nothing,
+    // so `blocked_reason` is not the correct place for this text.
+    let reason = h.status_json(&id)["error"]
         .as_str()
         .unwrap_or("")
         .to_string();
@@ -815,6 +817,237 @@ fn a_job_file_accepts_the_claim_words() {
     assert_eq!(status["cpu"], 4);
     assert_eq!(status["mem"], 2u64 * 1024 * 1024 * 1024);
     h.ok(&["wait", &id, "--timeout", "30s"]);
+}
+
+/// A supervisor that stops must not leave the job process alive.
+///
+/// Without this rule, a job continues and uses memory and cores, the budget
+/// shows that memory as free, and no qex command can stop the job, because its
+/// record says that the job stopped.
+#[test]
+fn a_dead_supervisor_does_not_leave_the_job_alive() {
+    let h = Harness::with_default_config("orphan");
+    let id = h.submit(&["submit", "--", "sleep", "120"]);
+
+    h.until("the job starts", Duration::from_secs(15), || {
+        h.state_of(&id) == "running"
+    });
+
+    let job_pid = h.status_json(&id)["pid"].as_i64().unwrap() as i32;
+    let supervisor_pid = h.status_json(&id)["supervisor_pid"]
+        .as_i64()
+        .expect("the status must record the supervisor") as i32;
+
+    // Stop the supervisor only. The job continues at this moment.
+    unsafe {
+        libc::kill(supervisor_pid, libc::SIGKILL);
+    }
+
+    h.until("the job reaches a final state", Duration::from_secs(30), || {
+        h.status_json(&id)["state"]
+            .as_str()
+            .map(|s| s != "running" && s != "starting")
+            .unwrap_or(false)
+    });
+
+    // The job process must stop. A record that says the job stopped, with the
+    // job still alive, is the worst result: the memory is in use and no command
+    // can free it.
+    h.until("the job process stops", Duration::from_secs(30), || {
+        let rc = unsafe { libc::kill(job_pid, 0) };
+        rc != 0
+    });
+
+    // The budget must show the capacity as free again.
+    let info = h.ok(&["info", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(v["cpu_claimed"].as_u64(), Some(0));
+}
+
+/// A job that stops at the same moment as its time limit must keep its true
+/// result. A job that succeeded must never get the state `timeout`.
+#[test]
+fn a_job_that_stops_at_its_time_limit_keeps_its_result() {
+    let h = Harness::with_default_config("timerrace");
+
+    // Start many jobs whose length is near the limit, to meet the moment in
+    // which the timer and the job both finish.
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        let sleep = format!("0.{:03}", 995 + i);
+        ids.push(h.submit(&["submit", "--timeout", "1s", "--", "sleep", &sleep]));
+    }
+
+    for id in &ids {
+        h.ok(&["wait", id, "--timeout", "60s"]);
+        let s = h.status_json(id);
+        let state = s["state"].as_str().unwrap();
+        let code = s["exit_code"].as_i64();
+
+        // A record that says `timeout` with the exit code 0 is self
+        // contradictory. A reader cannot tell what happened.
+        if state == "timeout" {
+            assert_ne!(
+                code,
+                Some(0),
+                "the job stopped with the code 0, so its state must not be `timeout`: {s}"
+            );
+        }
+        if code == Some(0) {
+            assert_eq!(
+                state, "completed",
+                "a job that stopped with the code 0 must be `completed`: {s}"
+            );
+        }
+    }
+}
+
+/// `qex logs` must show the output of a job that writes bytes which are not
+/// UTF-8. A build in a different language, or a program that writes a byte from
+/// a binary file, gives such output.
+///
+/// Without this rule, the command writes nothing and gives the code 0, and a
+/// reader believes that the job wrote nothing.
+#[test]
+fn logs_shows_output_that_is_not_utf8() {
+    let h = Harness::with_default_config("badbytes");
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        r#"printf 'FIRST-LINE\n'; printf 'BAD\377\376\n'; printf 'LAST-LINE\n'"#,
+    ]);
+    h.ok(&["wait", &id, "--timeout", "30s"]);
+
+    let logs = h.ok(&["logs", &id]);
+    assert!(
+        logs.contains("FIRST-LINE") && logs.contains("LAST-LINE"),
+        "one byte that is not UTF-8 hid the whole output: {logs:?}"
+    );
+
+    // The JSON output must show the same text.
+    let json = h.ok(&["logs", &id, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(v["stdout"].as_str().unwrap().contains("LAST-LINE"));
+}
+
+/// A command that does not exist must give its reason in the `error` field.
+/// The field `blocked_reason` says why a job waits, and a job that failed waits
+/// for nothing.
+#[test]
+fn a_spawn_failure_uses_the_error_field() {
+    let h = Harness::with_default_config("spawnfail");
+    let id = h.submit(&["submit", "--", "this-program-does-not-exist"]);
+
+    h.until("the job stops", Duration::from_secs(15), || {
+        h.state_of(&id) == "failed"
+    });
+
+    let s = h.status_json(&id);
+    assert!(
+        s["error"].as_str().unwrap_or("").contains("this-program-does-not-exist"),
+        "the error field must name the program: {s}"
+    );
+    assert!(
+        s["blocked_reason"].is_null(),
+        "a job that failed waits for nothing: {s}"
+    );
+}
+
+/// Every queued job must say why it waits, and not the first job only.
+#[test]
+fn every_queued_job_gives_a_reason() {
+    let h = Harness::new(
+        "reasons",
+        "[budget]\ncpu = \"2\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let running = h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "5"]);
+    h.until("the first job starts", Duration::from_secs(15), || {
+        h.state_of(&running) == "running"
+    });
+
+    let a = h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--", "true"]);
+    let b = h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--", "true"]);
+
+    // Give the scheduler one cycle to write the reasons.
+    h.until("both jobs give a reason", Duration::from_secs(15), || {
+        let ra = h.status_json(&a)["blocked_reason"].as_str().map(String::from);
+        let rb = h.status_json(&b)["blocked_reason"].as_str().map(String::from);
+        ra.is_some() && rb.is_some()
+    });
+
+    h.ok(&["kill", &running, "--grace", "1s"]);
+}
+
+/// The status must record what the job ran. Without these fields, a reader must
+/// open a file in the state directory to learn the command.
+#[test]
+fn the_status_records_the_command_and_the_directory() {
+    let h = Harness::with_default_config("cmdfield");
+    let id = h.submit(&["submit", "--", "echo", "hello", "world"]);
+    h.ok(&["wait", &id, "--timeout", "30s"]);
+
+    let s = h.status_json(&id);
+    let command: Vec<String> = serde_json::from_value(s["command"].clone()).unwrap();
+    assert_eq!(command, vec!["echo", "hello", "world"]);
+    assert!(!s["cwd"].as_str().unwrap().is_empty());
+}
+
+/// `qex info --no-start` must not start a coordinator.
+///
+/// A script that stops the coordinator needs this option. Without it, the
+/// command starts the process that the script wants to stop.
+#[test]
+fn info_can_test_for_a_coordinator_without_starting_one() {
+    let h = Harness::with_default_config("nostart");
+
+    let out = h.qex(&["info", "--no-start", "--json"]);
+    assert!(!out.status.success(), "there is no coordinator yet");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["running"], false);
+
+    // No coordinator may exist after that command.
+    assert!(
+        !h.root.join("state/qex/run/s").exists(),
+        "the command started a coordinator"
+    );
+
+    // With a coordinator, the same command reports it.
+    let id = h.submit(&["submit", "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "30s"]);
+    let out = h.qex(&["info", "--no-start", "--json"]);
+    assert!(out.status.success());
+}
+
+/// A claim of zero cores must give an error. qex must not change the number in
+/// silence, and a claim of zero would let qex start jobs with no limit.
+#[test]
+fn a_claim_of_zero_cores_is_refused() {
+    let h = Harness::with_default_config("zeroclaim");
+    let out = h.qex(&["submit", "--cpu", "0", "--", "true"]);
+    assert!(!out.status.success(), "qex must refuse a claim of zero cores");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("1 core"), "the error must give the correction: {err}");
+}
+
+/// The same fault must give the same exit code, whatever the form of the name.
+#[test]
+fn an_unknown_job_gives_the_same_code_for_each_form_of_the_name() {
+    let h = Harness::with_default_config("codes");
+    for name in ["3f5a1c2e-0000-4000-8000-000000000000", "not-a-uuid"] {
+        for command in ["status", "wait"] {
+            let out = h.qex(&[command, name]);
+            assert_eq!(
+                out.status.code(),
+                Some(127),
+                "`qex {command} {name}` must give the code 127"
+            );
+        }
+    }
 }
 
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,

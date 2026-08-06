@@ -96,7 +96,13 @@ pub const STATUS: &str = r##"{
   "required": ["id", "name", "state", "submitted_at", "cpu", "mem", "usage", "tags"],
   "properties": {
     "id": { "type": "string", "format": "uuid", "description": "The job id." },
-    "name": { "type": "string", "description": "The job name." },
+    "name": { "type": "string", "description": "The job name. Use it in place of the id in each command." },
+    "command": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The program and its arguments, as qex ran them."
+    },
+    "cwd": { "type": "string", "description": "The directory of the job." },
     "state": {
       "type": "string",
       "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled"],

@@ -86,12 +86,23 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
     let sent = unsafe { libc::killpg(pid, signal) };
     if sent != 0 {
         let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::ESRCH) {
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            // There is no process in that group. The job stopped in the moment
+            // before this command. Report that result. A message that says
+            // "the job received the signal" would be false.
+            log(&format!("job {id} has no process; it stopped already"));
             return Response::error(
-                ErrorKind::Internal,
-                format!("qex could not signal the job {id}: {e}"),
+                ErrorKind::WrongState,
+                format!(
+                    "the job {id} has no process. It stopped in the moment before this \
+                     command. Read `qex status {id}` for the result."
+                ),
             );
         }
+        return Response::error(
+            ErrorKind::Internal,
+            format!("qex could not signal the job {id}: {e}"),
+        );
     }
 
     log(&format!("job {id} received the signal {signal}"));

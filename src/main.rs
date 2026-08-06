@@ -155,7 +155,13 @@ fn cmd_schema(which: Option<&str>) -> Result<i32> {
 fn cmd_config(args: cli::ConfigArgs) -> Result<i32> {
     use cli::ConfigAction;
 
-    match args.action.unwrap_or(ConfigAction::Show { json: false }) {
+    // Accept `qex config --json` as well as `qex config show --json`. A user
+    // who writes the shorter form must not get a usage error.
+    let json_flag = args.json;
+    match args
+        .action
+        .unwrap_or(ConfigAction::Show { json: json_flag })
+    {
         ConfigAction::Path => {
             let path = paths::config_file()?;
             let exists = path.exists();
@@ -168,7 +174,7 @@ fn cmd_config(args: cli::ConfigArgs) -> Result<i32> {
         ConfigAction::Show { json } => {
             let cfg = config::Config::load()?;
             cfg.validate()?;
-            if json {
+            if json || json_flag {
                 println!("{}", serde_json::to_string_pretty(&cfg)?);
             } else {
                 print_config_summary(&cfg)?;
@@ -219,14 +225,10 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
         }
         None => println!("enforcement:  off; the claims control the queue only"),
     }
-    println!(
-        "peers:        {}",
-        if cfg.peers.enabled {
-            format!("on, in {}", cfg.peers.dir)
-        } else {
-            "off".to_string()
-        }
-    );
+    // Report the true state of the shared accounting. A message that says "on"
+    // for a directory that qex cannot use is the fault that this program must
+    // not have.
+    println!("peers:        {}", peers::describe(cfg));
     println!("oversized:    {:?}", cfg.queue.oversized);
     println!("environment:  capture {:?}", cfg.submit.env_capture);
     Ok(())

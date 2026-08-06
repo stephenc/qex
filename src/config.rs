@@ -284,8 +284,12 @@ impl Config {
     /// Gives the budget in bytes for this machine.
     pub fn budget_mem(&self) -> Result<u64> {
         let total = sys::total_memory();
-        units::parse_budget(&self.budget.mem, total, true)
-            .map_err(|e| anyhow::anyhow!("config [budget] mem: {e}"))
+        let n = units::parse_budget(&self.budget.mem, total, true)
+            .map_err(|e| anyhow::anyhow!("config [budget] mem: {e}"))?;
+        // A budget of zero makes every job too large for the budget. Each job
+        // then runs alone with a warning. A memory probe that gives zero, in an
+        // unusual container, would cause that result.
+        Ok(n.max(64 << 20))
     }
 
     pub fn reserve_mem(&self) -> Result<u64> {

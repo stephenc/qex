@@ -223,14 +223,39 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
 
         match size_check(&cfg, &job.spec) {
             Size::Fits => match admit(&cfg, &job.spec, cpu_used, mem_used) {
-                Admit::Yes => {
+                Admit::Yes if chosen.is_none() => {
                     chosen = Some(id);
                     break;
                 }
+                Admit::Yes => break,
                 Admit::No(reason) => {
                     reasons.push((id, Some(reason)));
                     // Keep the capacity for this job. A smaller job must not
                     // pass it again and again, or the large job never starts.
+                    //
+                    // Give a reason to each job behind this one. A user who
+                    // asks "why does my job wait" must get an answer for every
+                    // job, and not for the first job only.
+                    for later in state.queue.iter().copied() {
+                        if later == id {
+                            continue;
+                        }
+                        let Some(other) = state.jobs.get(&later) else {
+                            continue;
+                        };
+                        if other.status.state != JobState::Queued {
+                            continue;
+                        }
+                        if !reasons.iter().any(|(r, _)| *r == later) {
+                            reasons.push((
+                                later,
+                                Some(format!(
+                                    "waits for the job {} at the front of the queue",
+                                    &id.to_string()[..8]
+                                )),
+                            ));
+                        }
+                    }
                     break;
                 }
             },
@@ -278,34 +303,64 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
 
 /// Starts the supervisor of one job.
 fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
-    let (forced_reason, name) = {
-        let state = coord.state.lock().unwrap();
-        let job = state.jobs.get(&id).expect("the job left the map");
+    // Take the job and test it again, with one lock only.
+    //
+    // The scheduler chose this job and then released the lock. In that moment,
+    // `qex cancel` can change the job, and `qex clean` can delete it. This code
+    // must thus test the job again. Without the test, qex starts a job that the
+    // user cancelled, and the user receives an answer that says the opposite.
+    //
+    // This code uses no `expect` on the map. A panic here occurs while this
+    // thread holds the lock, which poisons the lock and stops the coordinator.
+    let (forced_reason, name, status) = {
+        let mut state = coord.state.lock().unwrap();
+
+        let Some(job) = state.jobs.get(&id) else {
+            // `qex clean` deleted the job. There is nothing to start.
+            return Ok(());
+        };
+        if job.status.state != JobState::Queued {
+            // `qex cancel` or a different thread changed the job.
+            return Ok(());
+        }
+
         let forced = match size_check(&state.cfg, &job.spec) {
             Size::TooBig(reason) => Some(format!(
                 "{reason}. qex started this job alone because no other job operated."
             )),
             Size::Fits => None,
         };
-        (forced, job.spec.name.clone())
-    };
 
-    // Write the state before the fork. If this process stops now, the record
-    // shows `starting`, and the next coordinator corrects it.
-    {
-        let mut state = coord.state.lock().unwrap();
-        let job = state.jobs.get_mut(&id).expect("the job left the map");
+        let Some(job) = state.jobs.get_mut(&id) else {
+            return Ok(());
+        };
         job.status.state = JobState::Starting;
         job.status.started_at = Some(sys::now_secs());
         job.status.blocked_reason = None;
-        job.status.forced = forced_reason.is_some();
-        job.status.forced_reason = forced_reason.clone();
+        job.status.forced = forced.is_some();
+        job.status.forced_reason = forced.clone();
         let status = job.status.clone();
+        let name = job.spec.name.clone();
         state.queue.retain(|q| *q != id);
-        drop(state);
+        (forced, name, status)
+    };
 
-        let dir = paths::job_dir(&id)?;
-        job::write_status(&dir, &status)?;
+    // Write the record after the change in memory, and before the fork.
+    //
+    // A fault here must not leave the job in the state `starting` for ever.
+    // Such a job holds its claim in the budget, stops the idle exit, and makes
+    // `qex wait` block with no end.
+    if let Err(e) = write_started(&id, &status) {
+        let mut state = coord.state.lock().unwrap();
+        if let Some(job) = state.jobs.get_mut(&id) {
+            job.status.state = JobState::Failed;
+            job.status.finished_at = Some(sys::now_secs());
+            job.status.error = Some(format!("qex could not write the job record: {e:#}"));
+        }
+        drop(state);
+        coord.notify();
+        log(&format!("job {id} could not start: {e:#}"));
+        return Ok(());
     }
 
     if let Some(reason) = &forced_reason {
@@ -314,11 +369,22 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
 
     match crate::supervisor::spawn(id) {
         Ok(pid) => {
-            let mut state = coord.state.lock().unwrap();
-            if let Some(job) = state.jobs.get_mut(&id) {
-                job.supervisor_pid = Some(pid);
+            let status = {
+                let mut state = coord.state.lock().unwrap();
+                match state.jobs.get_mut(&id) {
+                    Some(job) => {
+                        job.supervisor_pid = Some(pid);
+                        // Record the supervisor in the file. A coordinator that
+                        // starts again then knows that this job continues.
+                        job.status.supervisor_pid = Some(pid);
+                        Some(job.status.clone())
+                    }
+                    None => None,
+                }
+            };
+            if let Some(status) = status {
+                write_started(&id, &status).ok();
             }
-            drop(state);
 
             log(&format!("job {id} ({name}) started; the supervisor pid is {pid}"));
 
@@ -333,7 +399,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             if let Some(job) = state.jobs.get_mut(&id) {
                 job.status.state = JobState::Failed;
                 job.status.finished_at = Some(sys::now_secs());
-                job.status.blocked_reason = Some(format!("qex could not start the job: {e:#}"));
+                job.status.error = Some(format!("qex could not start the job: {e:#}"));
                 let status = job.status.clone();
                 drop(state);
                 if let Ok(dir) = paths::job_dir(&id) {
@@ -345,6 +411,12 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Writes the record of a job that starts.
+fn write_started(id: &uuid::Uuid, status: &crate::job::JobStatus) -> anyhow::Result<()> {
+    let dir = paths::job_dir(id)?;
+    job::write_status(&dir, status)
 }
 
 #[cfg(test)]

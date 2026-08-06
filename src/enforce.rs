@@ -91,47 +91,122 @@ pub fn availability() -> Availability {
 
 /// Makes a cgroup for one job and sets the memory limits.
 ///
-/// Gives the path of the new cgroup, or `None` if qex did not make one.
+/// Every step reports its fault. A limit that qex could not apply must never
+/// look like a limit that operates.
 #[cfg(target_os = "linux")]
-pub fn create_job_cgroup(cfg: &Config, id: &uuid::Uuid, mem_claim: u64) -> Option<PathBuf> {
+pub fn create_job_cgroup(
+    cfg: &Config,
+    id: &uuid::Uuid,
+    mem_claim: u64,
+) -> Result<PathBuf, String> {
     if !cfg.enforce.mode.is_on() {
-        return None;
+        return Err("the config file sets [enforce] mode = \"off\"".into());
     }
-    let Availability::Available(base) = availability() else {
-        return None;
+    let base = match availability() {
+        Availability::Available(b) => b,
+        Availability::Unavailable(reason) => return Err(reason),
     };
 
     // Give the memory controller to the child directories.
-    std::fs::write(base.join("cgroup.subtree_control"), b"+memory").ok();
+    //
+    // This write fails with EBUSY while a process is in this directory, because
+    // cgroup v2 refuses a directory that holds both processes and children.
+    // Move this process to a child directory first, then the write succeeds.
+    let leaf = base.join("qex-main");
+    if std::fs::read_to_string(base.join("cgroup.procs"))
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+    {
+        std::fs::create_dir_all(&leaf)
+            .map_err(|e| format!("qex could not make {}: {e}", leaf.display()))?;
+        move_processes(&base, &leaf)?;
+    }
+
+    std::fs::write(base.join("cgroup.subtree_control"), b"+memory").map_err(|e| {
+        format!(
+            "qex could not give the memory controller to {}: {e}",
+            base.display()
+        )
+    })?;
 
     let dir = base.join(format!("qex-{id}"));
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("qex could not make {}: {e}", dir.display()))?;
+
+    // Test that the controller arrived. Without this test, qex writes to a file
+    // that does not exist and reports a limit that it did not apply.
+    if !dir.join("memory.max").exists() {
+        std::fs::remove_dir(&dir).ok();
+        return Err(format!(
+            "the cgroup {} has no memory.max file, so this system cannot limit the memory",
+            dir.display()
+        ));
+    }
 
     match cfg.enforce.mode {
         EnforceMode::Soft => {
             // `memory.high` slows the job and reclaims its memory. The job
             // continues. `memory.max` stops the job, and it is the second limit.
             let max = (mem_claim as f64 * cfg.enforce.mem_overcommit) as u64;
-            std::fs::write(dir.join("memory.high"), mem_claim.to_string()).ok();
-            std::fs::write(dir.join("memory.max"), max.to_string()).ok();
+            write_limit(&dir, "memory.high", mem_claim)?;
+            write_limit(&dir, "memory.max", max)?;
         }
         EnforceMode::Hard => {
-            std::fs::write(dir.join("memory.max"), mem_claim.to_string()).ok();
+            write_limit(&dir, "memory.max", mem_claim)?;
         }
-        EnforceMode::Off => return None,
+        EnforceMode::Off => unreachable!("this function tests the mode above"),
     }
 
-    Some(dir)
+    Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn write_limit(dir: &Path, file: &str, value: u64) -> Result<(), String> {
+    std::fs::write(dir.join(file), value.to_string())
+        .map_err(|e| format!("qex could not write {}/{file}: {e}", dir.display()))
+}
+
+/// Moves every process of one cgroup to a different cgroup.
+#[cfg(target_os = "linux")]
+fn move_processes(from: &Path, to: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(from.join("cgroup.procs"))
+        .map_err(|e| format!("qex could not read {}/cgroup.procs: {e}", from.display()))?;
+    for line in text.lines() {
+        let pid = line.trim();
+        if pid.is_empty() {
+            continue;
+        }
+        // A process that stops between the read and the write gives an error.
+        // That error is not a fault of qex, so this code continues.
+        std::fs::write(to.join("cgroup.procs"), pid).ok();
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn create_job_cgroup(_cfg: &Config, _id: &uuid::Uuid, _mem: u64) -> Option<PathBuf> {
-    None
+pub fn create_job_cgroup(
+    _cfg: &Config,
+    _id: &uuid::Uuid,
+    _mem: u64,
+) -> Result<PathBuf, String> {
+    Err("this system cannot limit the memory of a job".into())
 }
 
 /// Puts a process in a cgroup.
-pub fn add_process(cgroup: &Path, pid: i32) -> bool {
-    std::fs::write(cgroup.join("cgroup.procs"), pid.to_string()).is_ok()
+pub fn add_process(cgroup: &Path, pid: i32) -> Result<(), String> {
+    std::fs::write(cgroup.join("cgroup.procs"), pid.to_string())
+        .map_err(|e| format!("qex could not put the process {pid} in the cgroup: {e}"))
+}
+
+/// Moves this process out of a cgroup, back to the parent cgroup.
+///
+/// A cgroup directory holds processes or child directories, and a directory
+/// with a process in it cannot be deleted.
+pub fn leave_cgroup(cgroup: &Path) {
+    if let Some(parent) = cgroup.parent() {
+        let pid = std::process::id().to_string();
+        std::fs::write(parent.join("cgroup.procs"), &pid).ok();
+    }
 }
 
 /// Tests if the kernel stopped a job because it reached its memory limit.
@@ -204,6 +279,90 @@ pub fn was_oom_killed(job_dir: &Path) -> bool {
 /// Records an out-of-memory event for a job.
 pub fn mark_oom(job_dir: &Path) {
     std::fs::write(job_dir.join("oom"), b"1").ok();
+}
+
+/// The name of the variable that stops a second start with systemd.
+const REEXEC_VAR: &str = "QEX_SYSTEMD_STARTED";
+
+/// Starts the coordinator again in a temporary systemd unit, if that step gives
+/// it a cgroup that it owns.
+///
+/// A coordinator that starts from a login shell is in a cgroup of the root
+/// user, and it cannot make a cgroup for a job. `systemd-run --user` with
+/// `Delegate=yes` gives the coordinator a cgroup that it owns.
+///
+/// systemd holds a temporary unit in memory. It writes no file to the disk, so
+/// this step leaves nothing in `/etc` and nothing in the home directory.
+///
+/// Gives `true` if this process must stop, because the new process continues
+/// the work.
+#[cfg(target_os = "linux")]
+pub fn restart_with_systemd(cfg: &Config) -> bool {
+    if !cfg.enforce.mode.is_on() || !cfg.enforce.use_systemd {
+        return false;
+    }
+    // A limit is possible already, so this step is not necessary.
+    if matches!(availability(), Availability::Available(_)) {
+        return false;
+    }
+    // This process is the second start. A third start would repeat for ever.
+    if std::env::var_os(REEXEC_VAR).is_some() {
+        return false;
+    }
+    if !systemd_is_available() {
+        return false;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+
+    let result = std::process::Command::new("systemd-run")
+        .args([
+            "--user",
+            "--quiet",
+            "--collect",
+            "--property=Delegate=yes",
+            "--property=Description=qex coordinator",
+            "--unit",
+        ])
+        .arg(format!("qex-{}", std::process::id()))
+        .arg(&exe)
+        .arg("daemon")
+        .env(REEXEC_VAR, "1")
+        .status();
+
+    match result {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!(
+                "qex: systemd-run gave the code {:?}, so qex continues without a memory limit",
+                status.code()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("qex: qex could not run systemd-run ({e}), so it continues without a memory limit");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn restart_with_systemd(_cfg: &Config) -> bool {
+    false
+}
+
+/// Tests that a systemd user manager operates.
+#[cfg(target_os = "linux")]
+fn systemd_is_available() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-system-running"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Tests the configuration and gives a warning if enforcement cannot operate.

@@ -41,13 +41,24 @@ impl Claim {
             "half" | "guess" | "auto" => Ok(Self::Half),
             "full" | "max" | "all" => Ok(Self::Full),
             _ if is_size => crate::units::parse_size(&t).map(Self::Exact),
-            _ => t.parse::<u64>().map(Self::Exact).map_err(|_| {
-                format!(
-                    "incorrect core count `{s}`. Give an integer, or one of these words: \
-                     `half` and `guess` for one half of the budget, `full` and `max` for \
-                     the full budget."
-                )
-            }),
+            _ => {
+                let n = t.parse::<u64>().map_err(|_| {
+                    format!(
+                        "incorrect core count `{s}`. Give an integer, or one of these words: \
+                         `half` and `guess` for one half of the budget, `full` and `max` for \
+                         the full budget."
+                    )
+                })?;
+                // Refuse zero. A claim of zero would let qex start an unlimited
+                // number of jobs together, which is the fault that qex prevents.
+                // qex must not change the number without a message either.
+                if n == 0 {
+                    return Err(
+                        "a job needs 1 core or more. Give 1, or the word `guess`.".to_string()
+                    );
+                }
+                Ok(Self::Exact(n))
+            }
         }
     }
 

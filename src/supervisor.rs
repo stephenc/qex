@@ -26,9 +26,11 @@ pub fn spawn(id: uuid::Uuid) -> Result<i32> {
     let dir = paths::job_dir(&id)?;
     let log_path = dir.join("supervisor.log");
 
+    use std::os::unix::fs::OpenOptionsExt;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
     let log_err = log_file.try_clone().context("copying the log file handle")?;
@@ -66,10 +68,19 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
     let rc = unsafe { libc::waitpid(pid, &mut wait_status, 0) };
 
     if rc < 0 {
-        log(&format!(
-            "qex could not wait for the supervisor {pid} of the job {id}: {}",
-            std::io::Error::last_os_error()
-        ));
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::ECHILD) {
+            // This supervisor is not a child of this process. A coordinator
+            // that starts again finds the supervisors of the previous
+            // coordinator, and the system gave them to the init process.
+            //
+            // `waitpid` cannot wait for such a process, so watch it instead.
+            watch_until_gone(pid);
+        } else {
+            log(&format!(
+                "qex could not wait for the supervisor {pid} of the job {id}: {e}"
+            ));
+        }
     }
 
     // The supervisor wrote the result. Read that file, because it holds the
@@ -87,14 +98,32 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
             Ok(status) if status.state.is_terminal() => {
                 job.status = status;
             }
-            _ => {
-                // The supervisor stopped without a record. The job result is
-                // lost, so mark the job failed. This is better than a job that
-                // stays in the state `running` for ever.
+            other => {
+                // The supervisor stopped before it wrote a result. Something
+                // stopped it: a signal, or the out-of-memory killer.
+                //
+                // The job process can still operate. The system gives it to the
+                // init process, and it continues to use memory and cores. qex
+                // must stop it here. Without this step, the job continues, the
+                // budget shows the memory as free, and no qex command can stop
+                // the job, because its record says that it stopped.
+                let job_pid = other.ok().and_then(|s| s.pid).or(job.status.pid);
+                let mut note = "the supervisor stopped without a result".to_string();
+
+                if let Some(pid) = job_pid {
+                    if sys::pid_alive(pid) {
+                        log(&format!(
+                            "the supervisor of the job {id} stopped, and the job {pid} \
+                             continues; qex stops the job now"
+                        ));
+                        stop_process_group(pid);
+                        note.push_str("; qex stopped the job process");
+                    }
+                }
+
                 job.status.state = JobState::Failed;
                 job.status.finished_at = Some(sys::now_secs());
-                job.status.blocked_reason =
-                    Some("the supervisor stopped without a result".to_string());
+                job.status.blocked_reason = Some(note);
                 let status = job.status.clone();
                 job::write_status(&dir, &status).ok();
                 log(&format!("the supervisor of the job {id} left no result"));
@@ -106,6 +135,36 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
     coord.notify();
 }
 
+/// Waits until a process stops, for a process that is not a child.
+///
+/// A parent uses `waitpid`. This function is for the other case: a coordinator
+/// that starts again inherits no supervisor, so it tests the process instead.
+fn watch_until_gone(pid: i32) {
+    while sys::pid_alive(pid) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Stops each process of one process group.
+///
+/// This function sends `SIGTERM`, waits a short time, then sends `SIGKILL`.
+/// A process cannot avoid the second signal.
+fn stop_process_group(pid: i32) {
+    unsafe {
+        libc::killpg(pid, libc::SIGTERM);
+    }
+    // Give the job a short time to write its files and stop.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if !sys::pid_alive(pid) {
+            return;
+        }
+    }
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+}
+
 /// Runs one job. This function is the body of the `qex supervise` command.
 ///
 /// The supervisor does not stop when the coordinator stops. It does not use
@@ -115,9 +174,11 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let spec = job::read_spec(&dir).context("reading the job specification")?;
     let mut status = job::read_status(&dir).context("reading the job status")?;
 
-    let stdout = std::fs::File::create(dir.join("stdout.log"))
+    // The output of a job holds secrets as frequently as its environment, so
+    // these files use the same mode as the job specification.
+    let stdout = create_private(&dir.join("stdout.log"))
         .context("opening the standard output file of the job")?;
-    let stderr = std::fs::File::create(dir.join("stderr.log"))
+    let stderr = create_private(&dir.join("stderr.log"))
         .context("opening the standard error file of the job")?;
 
     let mut cmd = std::process::Command::new(&spec.command[0]);
@@ -142,6 +203,35 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         });
     }
 
+    // Apply the memory limit before the job starts.
+    //
+    // This code puts the supervisor itself in the cgroup, and the job then
+    // inherits it. A job that starts first could allocate memory and fork
+    // children before qex moved it, and those children would never meet the
+    // limit.
+    let cfg = crate::config::Config::load().unwrap_or_default();
+    let mut cgroup_dir: Option<std::path::PathBuf> = None;
+    if cfg.enforce.mode.is_on() {
+        match crate::enforce::create_job_cgroup(&cfg, &id, spec.mem) {
+            Ok(cgroup) => match crate::enforce::add_process(&cgroup, std::process::id() as i32) {
+                Ok(()) => {
+                    crate::enforce::record_cgroup_path(&dir, &cgroup);
+                    cgroup_dir = Some(cgroup);
+                }
+                Err(e) => {
+                    // Report the fault. A limit that qex did not apply must
+                    // never look like a limit that operates.
+                    eprintln!("qex: the memory limit is not active for this job: {e}");
+                    crate::enforce::remove_cgroup(&cgroup);
+                }
+            },
+            Err(e) => {
+                eprintln!("qex: the memory limit is not active for this job: {e}");
+            }
+        }
+    }
+    let _ = &cgroup_dir;
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -154,58 +244,85 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             eprintln!("{message}");
             status.state = JobState::Failed;
             status.finished_at = Some(sys::now_secs());
-            status.blocked_reason = Some(message);
+            // Use the error field. A job that failed waits for nothing, so this
+            // text does not belong in `blocked_reason`.
+            status.error = Some(message);
+            status.blocked_reason = None;
             job::write_status(&dir, &status)?;
             return Ok(1);
         }
     };
 
     let pid = child.id() as i32;
-
-    // Apply the memory limit, if the config asks for one and the system can do
-    // it. Put the job in its cgroup now, so each child of the job is also in
-    // the cgroup and the limit covers the whole job.
-    let cfg = crate::config::Config::load().unwrap_or_default();
-    if let Some(cgroup) = crate::enforce::create_job_cgroup(&cfg, &id, spec.mem) {
-        if crate::enforce::add_process(&cgroup, pid) {
-            crate::enforce::record_cgroup_path(&dir, &cgroup);
-        }
-    }
-
     status.state = JobState::Running;
     status.pid = Some(pid);
+    // Record this process as the supervisor.
+    //
+    // The coordinator also writes this value, but this process writes the file
+    // after that, from a copy that it read before. This process knows its own
+    // process id, so it writes the correct value and no race is possible.
+    status.supervisor_pid = Some(std::process::id() as i32);
     status.started_at = Some(sys::now_secs());
     job::write_status(&dir, &status)?;
 
-    // Start the timer, if the job has a time limit.
-    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The job and the timer race each other. This value records the winner.
+    //
+    // A simple flag is not sufficient here. The timer can fire in the moment
+    // between the exit of the job and the test of the flag. A job that
+    // succeeded then gets the state `timeout`, and `qex wait` reports a failure
+    // for a job that succeeded.
+    //
+    // Each side thus changes the value from RACE_OPEN with one atomic
+    // operation. One side only can win.
+    let outcome = Arc::new(std::sync::atomic::AtomicU8::new(RACE_OPEN));
+
     if let Some(limit) = spec.timeout {
-        let flag = Arc::clone(&timed_out);
+        let outcome = Arc::clone(&outcome);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(limit));
-            // Test the flag. The job can stop before the limit.
-            if !flag.load(std::sync::atomic::Ordering::SeqCst) {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                // Signal the process group, so each child of the job stops.
-                unsafe {
-                    libc::killpg(pid, libc::SIGTERM);
-                }
-                std::thread::sleep(Duration::from_secs(10));
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+
+            // Take the race. If the job already stopped, this operation fails
+            // and the timer does nothing.
+            if outcome
+                .compare_exchange(
+                    RACE_OPEN,
+                    RACE_TIMER,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_err()
+            {
+                return;
+            }
+
+            // Signal the process group, so each child of the job stops.
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+            std::thread::sleep(Duration::from_secs(10));
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
             }
         });
     }
 
-    let exit = child.wait().context("waiting for the job")?;
+    // Wait for the job, but do not release its process id yet.
+    //
+    // `waitid` with `WNOWAIT` reports the result and keeps the process in the
+    // table. The process id thus stays reserved, and the process group is still
+    // the group of this job. The signals below cannot reach a different process.
+    wait_without_reaping(pid);
 
-    // Read the resources that the job used. The values include each child of
-    // the job, so a job that forks gives a correct measurement.
-    let usage = read_usage();
+    // Take the race before the last signals. The timer can no longer start.
+    let _ = outcome.compare_exchange(
+        RACE_OPEN,
+        RACE_JOB,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    );
 
-    // The job stopped. Stop each process that the job left, so no process stays
-    // and holds the memory that qex counted.
+    // Stop each process that the job left. The job process is a zombie now, so
+    // its process id is still reserved and this signal is safe.
     unsafe {
         libc::killpg(pid, libc::SIGKILL);
     }
@@ -217,13 +334,25 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             crate::enforce::mark_oom(&dir);
         }
         crate::enforce::kill_cgroup(&cgroup);
+    }
+
+    // Release the process id. Each signal above is complete.
+    let exit = child.wait().context("waiting for the job")?;
+
+    // Read the resources that the job used. The values include each child of
+    // the job, so a job that forks gives a correct measurement.
+    let usage = read_usage();
+
+    if let Some(cgroup) = crate::enforce::job_cgroup_path(&dir) {
+        crate::enforce::leave_cgroup(&cgroup);
         crate::enforce::remove_cgroup(&cgroup);
     }
 
     let signal = exit_signal(&exit);
     let code = exit.code();
+    let timed_out = outcome.load(std::sync::atomic::Ordering::SeqCst) == RACE_TIMER;
 
-    status.state = classify(&spec, code, signal, timed_out.load(std::sync::atomic::Ordering::SeqCst), &dir);
+    status.state = classify(&spec, code, signal, timed_out, &dir);
     status.exit_code = code;
     status.signal = signal;
     status.finished_at = Some(sys::now_secs());
@@ -232,6 +361,49 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     job::write_status(&dir, &status)?;
 
     Ok(code.unwrap_or(0))
+}
+
+/// Makes a file that the other users of the machine cannot read.
+///
+/// The output of a job frequently holds a token or a password, in the same way
+/// as its environment.
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// No side won the race between the job and the timer.
+const RACE_OPEN: u8 = 0;
+/// The job stopped first.
+const RACE_JOB: u8 = 1;
+/// The timer fired first, so the job reached its time limit.
+const RACE_TIMER: u8 = 2;
+
+/// Waits for a process, but keeps its process id reserved.
+///
+/// The `WNOWAIT` option tells the kernel to report the result and keep the
+/// process in the process table. The caller can then signal the process group
+/// of that process without a risk: the system cannot give the process id to a
+/// different process while the first process stays in the table.
+///
+/// The caller must call `wait` after this function, or the process stays in the
+/// table as a zombie.
+fn wait_without_reaping(pid: i32) {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // This call blocks until the process stops.
+    unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT,
+        );
+    }
 }
 
 /// Chooses the final state of a job.
