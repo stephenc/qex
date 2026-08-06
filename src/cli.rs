@@ -171,6 +171,17 @@ pub struct StatusArgs {
     #[arg(long)]
     pub no_logs: bool,
 
+    /// Wait until the job stops, then show the status.
+    ///
+    /// The exit code is the code of `qex wait`. This option gives the result
+    /// and the cause of a failure with one command.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Stop the wait after this time. The job continues. Example: 30m.
+    #[arg(long, value_name = "TIME", requires = "wait")]
+    pub timeout: Option<String>,
+
     #[command(flatten)]
     pub select: crate::logsel::LogSelect,
 }
@@ -501,7 +512,14 @@ mod tests {
     /// the banner.
     #[test]
     fn the_banner_points_to_the_agents_topic() {
-        assert!(crate::help::BANNER.contains("qex help agents"));
+        assert!(crate::help::banner().contains("qex help agents"));
+        // The banner must give the length of the page, so a reader opens it one
+        // time only.
+        assert!(
+            crate::help::banner().contains(&crate::help::AGENTS.lines().count().to_string()),
+            "the banner must give the number of lines: {}",
+            crate::help::banner()
+        );
     }
 
     /// The agents topic must warn about the monitor script fault. That warning
@@ -511,6 +529,23 @@ mod tests {
         let text = crate::help::AGENTS;
         assert!(text.contains("pgrep"), "the topic must name the pgrep fault");
         assert!(text.contains("qex wait"), "the topic must give the solution");
+    }
+
+    /// The topic must show the pattern that operates inside a harness.
+    ///
+    /// `qex wait` blocks, and the harness of an agent reports the end of a
+    /// background command. The two together need no timer.
+    #[test]
+    fn the_agents_topic_gives_the_pattern_for_a_harness() {
+        let text = crate::help::AGENTS;
+        assert!(
+            text.contains("--wait"),
+            "the topic must name `qex status --wait`"
+        );
+        assert!(
+            text.contains("background"),
+            "the topic must say to run it in the background of the harness"
+        );
     }
 
     /// The help text must steer an agent away from a test job.

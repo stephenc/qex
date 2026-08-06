@@ -147,6 +147,12 @@ pub struct JobStatus {
     pub finished_at: Option<u64>,
     pub cpu: u64,
     pub mem: u64,
+    /// Where the claim came from: `explicit`, `learned` or `default`.
+    ///
+    /// A reader can then see that a claim came from a measurement, and it does
+    /// not look like a value that the agent chose.
+    #[serde(default)]
+    pub claim_source: String,
     pub usage: Usage,
     /// Shows that qex started the job although it is larger than the budget.
     ///
@@ -206,6 +212,7 @@ impl JobStatus {
             finished_at: None,
             cpu: spec.cpu,
             mem: spec.mem,
+            claim_source: spec.claim_source.clone(),
             usage: Usage::default(),
             forced: false,
             forced_reason: None,

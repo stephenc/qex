@@ -85,6 +85,20 @@ timeout on `qex wait` stops your wait only. It does not stop the job.
 
 Add `--passthrough` to exit with the exit code of the job.
 
+## If you drive qex from an agent harness
+
+`qex wait` blocks, and your harness — not qex — reports when a background
+command ends. Compose the two:
+
+```sh
+ID=$(qex submit -- make test)   # returns at once
+qex status $ID --wait           # run THIS in the background of your harness
+```
+
+qex watches the process correctly, the harness reports the end. No timer, no
+polling, no second command: the output of `qex status --wait` holds the state,
+the exit code and the last lines of the error output.
+
 ## Resource claims
 
 Give `--cpu` and `--mem`. qex uses these claims to decide how many jobs operate
@@ -99,6 +113,25 @@ If you do not know the size of a task, use a word in place of a number:
 
 qex calculates these words against the budget, and not against the free memory
 of the moment. The same command thus always gives the same claim.
+
+### qex learns the size of a task
+
+qex records what each job really used and uses those numbers as the claim for
+the next job of the same command:
+
+```sh
+qex submit -- cargo test    # run 1: the default claim
+qex submit -- cargo test    # run 2: the claim comes from run 1
+```
+
+`qex status` says where a claim came from. The record is for the command, not
+the name, because `cargo build` and `cargo test` need different sizes. qex uses
+the **largest** measurement it holds plus a margin, because a claim that is too
+small stops the job while a claim that is a little large costs only capacity.
+A job that did not complete is never recorded: it shows the memory it reached,
+not the memory it needs.
+
+Turn it off with `[learn] enabled = false`.
 
 Do not run a small test job to measure a task. Give `guess` and start the real
 task. qex measures each job, and you can read the true use later:

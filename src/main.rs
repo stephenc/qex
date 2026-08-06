@@ -36,6 +36,7 @@ mod sys;
 #[cfg(test)]
 mod testutil;
 mod units;
+mod usage;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -100,7 +101,7 @@ fn run() -> Result<i32> {
 /// The banner comes first. An agent that reads a few lines only must still see
 /// the pointer to `qex help agents`.
 fn print_root_help() {
-    print!("{}", help::BANNER);
+    print!("{}", help::banner());
     println!();
     let mut cmd = Cli::command();
     cmd.print_help().ok();

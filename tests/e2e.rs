@@ -1588,6 +1588,86 @@ fn follow_leads_with_the_last_lines_only() {
     assert!(out.lines().count() <= 6, "got {} lines", out.lines().count());
 }
 
+/// qex must use the measurement of an earlier job of the same command as the
+/// claim for the next one.
+///
+/// This behaviour is the reason that qex measures each job. `guess` is safe and
+/// frequently far too large, and an agent should not have to tune a claim.
+#[test]
+fn a_second_job_of_one_command_uses_the_measurement_of_the_first() {
+    let h = Harness::with_default_config("learn");
+
+    // A command that uses a measurable quantity of memory.
+    let program = ["sh", "-c", "head -c 40000000 /dev/zero | tail -c 1 > /dev/null"];
+
+    let first = h.submit(&[&["submit", "--name", "one", "--"], &program[..]].concat());
+    h.ok(&["wait", &first, "--timeout", "60s"]);
+
+    let s1 = h.status_json(&first);
+    assert_eq!(
+        s1["claim_source"], "default",
+        "the first job has no measurement to use"
+    );
+    let used = s1["usage"]["max_rss"].as_u64().unwrap();
+    assert!(used > 0);
+
+    // The same command, with no claim from the user.
+    let second = h.submit(&[&["submit", "--name", "two", "--"], &program[..]].concat());
+    let s2 = h.status_json(&second);
+    assert_eq!(
+        s2["claim_source"], "learned",
+        "the second job must use the measurement: {s2}"
+    );
+
+    let claimed = s2["mem"].as_u64().unwrap();
+    assert!(
+        claimed >= used,
+        "the claim {claimed} must not be below the measurement {used}"
+    );
+    assert!(
+        claimed < s1["mem"].as_u64().unwrap(),
+        "the claim must be below the default, or the measurement gave nothing"
+    );
+    h.ok(&["wait", &second, "--timeout", "60s"]);
+}
+
+/// A claim from the user must always win over a measurement.
+#[test]
+fn a_claim_from_the_user_wins_over_a_measurement() {
+    let h = Harness::with_default_config("learnwins");
+    let first = h.submit(&["submit", "--", "true"]);
+    h.ok(&["wait", &first, "--timeout", "45s"]);
+
+    let second = h.submit(&["submit", "--cpu", "2", "--mem", "1GB", "--", "true"]);
+    let s = h.status_json(&second);
+    assert_eq!(s["claim_source"], "explicit");
+    assert_eq!(s["cpu"], 2);
+    assert_eq!(s["mem"], 1024u64 * 1024 * 1024);
+    h.ok(&["wait", &second, "--timeout", "45s"]);
+}
+
+/// A job that did not complete must not become a measurement.
+///
+/// Such a job shows the memory that it reached before something stopped it, and
+/// not the memory that it needs. A record from it would make the next claim too
+/// small, and the next job would stop in the same way.
+#[test]
+fn a_job_that_did_not_complete_is_not_a_measurement() {
+    let h = Harness::with_default_config("learnfail");
+    let program = ["sh", "-c", "exit 1"];
+
+    let first = h.submit(&[&["submit", "--"], &program[..]].concat());
+    h.qex(&["wait", &first, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&first), "failed");
+
+    let second = h.submit(&[&["submit", "--"], &program[..]].concat());
+    assert_eq!(
+        h.status_json(&second)["claim_source"], "default",
+        "a job that failed must not become a measurement"
+    );
+    h.qex(&["wait", &second, "--timeout", "45s"]);
+}
+
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,
 /// and a test harness gives a long path.
 #[test]

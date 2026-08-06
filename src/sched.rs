@@ -591,6 +591,7 @@ mod tests {
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
             needs: vec![],
             after: vec![],
             submitted_at: 0,

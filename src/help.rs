@@ -7,11 +7,19 @@
 ///
 /// The banner points to the `agents` topic. An agent then reads one page and
 /// does not read each command help.
-pub const BANNER: &str = "\
-  ==> AGENTS: run `qex help agents` first. It is one page.
-      It shows how to start a job, wait for the job, and read the output.
-      Do not write a monitor script. The command `qex wait` does that work.
-";
+/// The banner that `qex` writes before the usage text when it has no arguments.
+///
+/// The banner gives the length of the agents topic. A reader that knows the
+/// length reads the page one time, and does not open it again to see if there
+/// is more.
+pub fn banner() -> String {
+    format!(
+        "  ==> AGENTS: run `qex help agents` first. It is {} lines, and it is complete.\n\
+     \x20     It shows how to start a job, wait for the job, and read the output.\n\
+     \x20     Do not write a monitor script. The command `qex wait` does that work.\n",
+        AGENTS.lines().count()
+    )
+}
 
 /// The list of topic names, for the error message and for the `--help` text.
 pub const TOPICS: &[&str] = &[
@@ -71,6 +79,22 @@ The three commands you need
     ID=$(qex submit --cpu 2 --mem 4GB -- uv run train.py)
     qex wait $ID
     qex logs $ID
+
+If you operate inside a harness
+-------------------------------
+
+`qex wait` blocks. Your harness, and not qex, tells you when a background
+command ends. Put the two together:
+
+    ID=$(qex submit -- make test)      # gives the id at once
+    qex status $ID --wait              # run THIS in the background of your harness
+
+qex watches the process correctly, and your harness reports the end of the
+command. You thus need no timer and no second command.
+
+Use `qex status --wait` and not `qex wait` for this. It blocks in the same way
+and it gives the same exit code, and its output also holds the state, the exit
+code and the last lines of the error output. One command gives everything.
 
 `qex submit` writes the job UUID to stdout and writes nothing else. You can
 thus put the UUID in a shell variable.
@@ -150,8 +174,29 @@ other job operates. The job can then swap or stop with an out-of-memory error.
 The status field `forced` is `true` for such a job. That result is data: your
 claim or the machine is too small.
 
+qex learns the size of a task
+-----------------------------
+
+qex records what each job really used, and it uses those numbers as the claim
+for the next job of the same command. You thus give no claim at all after the
+first run:
+
+    qex submit -- cargo test        # run 1: the default claim
+    qex submit -- cargo test        # run 2: the claim comes from run 1
+
+`qex status` says where a claim came from. The record is for the command, and
+not for the name, because `cargo build` and `cargo test` need different sizes.
+
+qex uses the LARGEST measurement that it holds, and it adds a margin. A claim
+that is too small stops the job, and a claim that is a little too large costs
+some capacity only.
+
+qex records a job that completed only. A job that the out-of-memory killer
+stopped shows the memory that it reached, and not the memory that it needs.
+
 In short: give `guess`, start the task, and read the result. Add an exact claim
-later, and only if you repeat the task.
+later, and only if you repeat the task. After the first run of a command, qex
+gives the claim for you.
 
 A pipeline of stages
 --------------------
@@ -358,6 +403,10 @@ that qex uses now.
     [submit]
     env_capture = \"all\"           # all, minimal or none
     minimal_env = [\"PATH\", \"HOME\", \"USER\", \"LOGNAME\", \"SHELL\", \"LANG\", \"TZ\"]
+
+    [learn]
+    enabled = true        # use the earlier jobs of a command as the claim
+    margin = 1.5          # the multiplier for a measurement
 
     [defaults]
     cpu = 1               # the default is 1 core

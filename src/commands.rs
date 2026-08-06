@@ -158,6 +158,35 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         }
     };
 
+    // Wait for the job first, if the user asked for that.
+    //
+    // An agent runs this command in the background of its harness. The harness
+    // then reports the end of the command, and this output holds the state, the
+    // exit code and the cause of a failure. One command gives everything.
+    let mut wait_code = 0;
+    if args.wait {
+        let deadline = match &args.timeout {
+            Some(t) => parse_duration(t)
+                .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
+                .map(|d| Instant::now() + d),
+            None => None,
+        };
+        match wait_one(&args.id, deadline)? {
+            WaitOutcome::Finished(s) => wait_code = exit_code_for(&s, false),
+            WaitOutcome::TimedOut => {
+                eprintln!(
+                    "qex: the wait for {} reached its time limit. The job continues.",
+                    args.id
+                );
+                wait_code = EXIT_TIMEOUT;
+            }
+            WaitOutcome::NoSuchJob => {
+                eprintln!("qex: there is no job with the id {}", args.id);
+                return Ok(EXIT_NO_SUCH_JOB);
+            }
+        }
+    }
+
     match client.call(&Request::Status { id })? {
         Response::Status { status } => {
             // Read the output of the job in the same call.
@@ -206,7 +235,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                     }
                 }
             }
-            Ok(0)
+            Ok(wait_code)
         }
         other => report(other),
     }
@@ -273,7 +302,18 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     if let Some(sig) = s.signal {
         println!("signal:    {sig}");
     }
-    println!("claim:     {} core(s), {}", s.cpu, format_size(s.mem));
+    println!(
+        "claim:     {} core(s), {}{}",
+        s.cpu,
+        format_size(s.mem),
+        match s.claim_source.as_str() {
+            // Say where the claim came from. A reader then knows that qex
+            // calculated it from the earlier jobs, and that no agent chose it.
+            "learned" => "  (from the earlier jobs of this command)",
+            "default" => "  (the default; give --cpu and --mem to change it)",
+            _ => "",
+        }
+    );
 
     if s.usage.max_rss > 0 || s.usage.cpu_secs > 0.0 {
         println!(
@@ -1141,6 +1181,7 @@ mod tests {
             finished_at: Some(1),
             cpu: 1,
             mem: 1 << 30,
+            claim_source: "explicit".into(),
             usage: Usage::default(),
             forced: false,
             forced_reason: None,

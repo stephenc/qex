@@ -148,6 +148,9 @@ pub struct JobSpec {
     /// `qex status` shows this value. The reader can then see why the job has
     /// this environment, and does not calculate the sequence of the sources.
     pub env_capture: EnvCapture,
+    /// Where the claim came from: `explicit`, `learned` or `default`.
+    #[serde(default)]
+    pub claim_source: String,
     /// The jobs that must succeed before this job starts.
     #[serde(default)]
     pub needs: Vec<uuid::Uuid>,
@@ -253,15 +256,51 @@ impl JobSpec {
         // A claim can be a number, or a word such as `half` or `full`. qex
         // calculates the word against the budget here, so the coordinator
         // receives an exact value and the record shows what the job asked for.
-        let cpu = match opts.cpu.as_ref().or(file.resources.cpu.as_ref()) {
-            Some(c) => c.cores(cfg),
-            None => cfg.default_cpu(),
+        let asked_cpu = opts.cpu.as_ref().or(file.resources.cpu.as_ref());
+        let asked_mem = opts.mem.as_ref().or(file.resources.mem.as_ref());
+
+        // With no claim from the user, use the measurements of the earlier jobs
+        // of this command.
+        //
+        // This step is the reason that qex measures each job. `guess` is safe
+        // and frequently far too large: a test suite that uses 165MB would hold
+        // one half of the budget and stop other work for the length of the run.
+        let learned = if cfg.learn.enabled && (asked_cpu.is_none() || asked_mem.is_none()) {
+            crate::usage::suggest(&crate::usage::load(), &command, cfg.learn.margin)
+        } else {
+            None
+        };
+
+        let mut source = "default";
+        let cpu = match asked_cpu {
+            Some(c) => {
+                source = "explicit";
+                c.cores(cfg)
+            }
+            None => match &learned {
+                Some(s) => {
+                    source = "learned";
+                    s.cpu
+                }
+                None => cfg.default_cpu(),
+            },
         }
         .max(1);
 
-        let mem = match opts.mem.as_ref().or(file.resources.mem.as_ref()) {
-            Some(c) => c.bytes(cfg),
-            None => cfg.default_mem()?,
+        let mem = match asked_mem {
+            Some(c) => {
+                if source != "learned" {
+                    source = "explicit";
+                }
+                c.bytes(cfg)
+            }
+            None => match &learned {
+                Some(s) => {
+                    source = "learned";
+                    s.mem
+                }
+                None => cfg.default_mem()?,
+            },
         };
 
         let timeout = match opts.timeout.as_ref().or(file.timeout.as_ref()) {
@@ -318,6 +357,7 @@ impl JobSpec {
             tags,
             priority: opts.priority.or(file.priority).unwrap_or(0),
             env_capture: capture,
+            claim_source: source.to_string(),
             // The CLI changes each name into an id after this function, because
             // that step needs the coordinator.
             needs: Vec::new(),

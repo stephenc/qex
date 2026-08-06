@@ -245,6 +245,28 @@ pub struct DefaultsConfig {
     pub timeout: Option<String>,
 }
 
+/// Controls the claim that qex calculates from the earlier jobs.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LearnConfig {
+    /// Permits qex to use the measurements of the earlier jobs as the claim.
+    pub enabled: bool,
+    /// The multiplier for a measurement.
+    ///
+    /// A measurement is the peak that qex saw. A job can use more with a larger
+    /// input, so the claim is larger than the measurement.
+    pub margin: f64,
+}
+
+impl Default for LearnConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            margin: 1.5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -255,6 +277,7 @@ pub struct Config {
     pub queue: QueueConfig,
     pub submit: SubmitConfig,
     pub defaults: DefaultsConfig,
+    pub learn: LearnConfig,
 }
 
 impl Config {
@@ -360,6 +383,13 @@ impl Config {
         self.peer_stale_after()?;
         self.default_mem()?;
         self.default_timeout()?;
+        if self.learn.margin < 1.0 {
+            anyhow::bail!(
+                "config [learn] margin is {}. Use a value of 1.0 or more. A smaller value \
+                 gives a claim below the measurement, and the job would then stop.",
+                self.learn.margin
+            );
+        }
         if self.enforce.mem_overcommit < 1.0 {
             anyhow::bail!(
                 "config [enforce] mem_overcommit is {}. Use a value of 1.0 or more. \

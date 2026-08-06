@@ -396,6 +396,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.pid = Some(pid);
     job::write_status(&dir, &status)?;
 
+    // Keep the measurement, so the next job of this command gets an accurate
+    // claim with no effort from the agent.
+    crate::usage::record(&spec, &status);
+
     Ok(code.unwrap_or(0))
 }
 
@@ -526,6 +530,7 @@ mod tests {
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
             needs: vec![],
             after: vec![],
             submitted_at: 0,
