@@ -258,6 +258,17 @@ pub const STATUS: &str = r##"{
       "format": "uuid",
       "description": "For a job in the state skipped, the first job that failed. This value is the root cause, and not the job before this one, so one read gives the true cause of a pipeline failure."
     },
+    "logs_dropped": {
+      "type": ["object", "null"],
+      "description": "What qex removed from the output files, because the job wrote more than [logs] max_bytes. The value is null when qex kept everything. qex keeps the first part and the last part of each file, and it writes a line between them that says how much went. The removed lines are NOT on the disk, so no option of `qex logs` gives them back.",
+      "properties": {
+        "stdout_bytes": { "type": "integer", "description": "The bytes that qex did not keep from stdout.log." },
+        "stdout_lines": { "type": "integer", "description": "The lines that qex did not keep from stdout.log." },
+        "stderr_bytes": { "type": "integer", "description": "The bytes that qex did not keep from stderr.log." },
+        "stderr_lines": { "type": "integer", "description": "The lines that qex did not keep from stderr.log." },
+        "limit": { "type": "integer", "description": "The limit in bytes that operated, from [logs] max_bytes." }
+      }
+    },
     "sequence": {
       "type": "integer",
       "description": "The position of the job in the order of submission. Sort by submitted_at and then by this value to see a pipeline in order."

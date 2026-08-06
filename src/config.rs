@@ -496,6 +496,34 @@ impl Default for HistoryConfig {
     }
 }
 
+/// Controls the limit on the output that qex keeps for each job.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogsConfig {
+    /// The bytes that qex keeps for each stream of each job.
+    ///
+    /// qex keeps the first part and the last part of the output, and it writes
+    /// a line between them that says how much went. Use `"0"` for no limit.
+    pub max_bytes: String,
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        // A job wrote 386MB of standard output in a review, and nothing stopped
+        // it. qex is made to be started and left, so nobody sees a disk fill,
+        // and the same disk holds the record of each job. No limit is thus not
+        // an acceptable default.
+        //
+        // 32MB for each stream is far above the output of a real build or a
+        // real test run, which is a few megabytes. It is also small enough that
+        // a day of runaway jobs costs some gigabytes and not some hundreds of
+        // gigabytes. A user who needs more writes one line in the config file.
+        Self {
+            max_bytes: "32MB".into(),
+        }
+    }
+}
+
 /// Controls the claim that qex calculates from the earlier jobs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -532,6 +560,7 @@ pub struct Config {
     pub learn: LearnConfig,
     pub history: HistoryConfig,
     pub gc: GcConfig,
+    pub logs: LogsConfig,
 }
 
 /// How much of the message about the config file the reader needs.
@@ -868,6 +897,35 @@ impl Config {
         }
     }
 
+    /// Gives the bytes that qex keeps for each stream of each job.
+    ///
+    /// `None` means that no limit operates. The values `0`, `none` and
+    /// `unlimited` give that result.
+    pub fn log_max_bytes(&self) -> Result<Option<u64>> {
+        let text = self.logs.max_bytes.trim().to_ascii_lowercase();
+        if matches!(text.as_str(), "0" | "none" | "never" | "unlimited") {
+            return Ok(None);
+        }
+        let bytes = units::parse_size(&text)
+            .map_err(|e| anyhow::anyhow!("config [logs] max_bytes: {e}"))?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        // A limit must hold a head, a tail and the line that says what went. A
+        // smaller value gives a file that answers no question, and a user who
+        // writes one has an intention that the file cannot satisfy.
+        if bytes < crate::logcap::MIN_LIMIT {
+            anyhow::bail!(
+                "config [logs] max_bytes is {}. Use {} or more, or use \"0\" for no limit. \
+                 A smaller limit does not hold the start of the output, the end of the \
+                 output and the line that says how much went.",
+                units::format_size(bytes),
+                units::format_size(crate::logcap::MIN_LIMIT)
+            );
+        }
+        Ok(Some(bytes))
+    }
+
     /// Reads each field that the config parser does not read immediately.
     ///
     /// Call this function at start. qex then reports an incorrect config file
@@ -882,6 +940,7 @@ impl Config {
         self.gc_keep()?;
         self.default_mem()?;
         self.default_timeout()?;
+        self.log_max_bytes()?;
         if self.learn.margin < 1.0 {
             anyhow::bail!(
                 "config [learn] margin is {}. Use a value of 1.0 or more. A smaller value \
@@ -1309,6 +1368,9 @@ settle = "3s"
 env_capture = "minimal"
 minimal_env = ["PATH", "HOME"]
 
+[logs]
+max_bytes = "64MB"
+
 [defaults]
 cpu = 1
 mem = "1GB"
@@ -1320,6 +1382,47 @@ timeout = "0"
         assert_eq!(c.submit.env_capture, EnvCapture::Minimal);
         assert_eq!(c.budget_mem().unwrap(), 20 << 30);
         assert_eq!(c.default_timeout().unwrap(), None);
+        assert_eq!(c.log_max_bytes().unwrap(), Some(64 << 20));
+    }
+
+    /// The output of a job must have a limit with no configuration file.
+    ///
+    /// A job wrote 386MB in a review and nothing stopped it. The same disk
+    /// holds the record of each job, so no limit is not an acceptable default.
+    #[test]
+    fn the_output_of_a_job_has_a_limit_with_no_configuration() {
+        let c = Config::default();
+        let limit = c.log_max_bytes().unwrap().expect("there is no limit");
+        assert!(
+            (crate::logcap::MIN_LIMIT..=1 << 30).contains(&limit),
+            "the default limit {} is not plausible",
+            units::format_size(limit)
+        );
+    }
+
+    /// A user can remove the limit, and a user can give it in the size syntax
+    /// of the other fields.
+    #[test]
+    fn the_limit_on_the_output_reads_sizes_and_the_word_for_no_limit() {
+        let c: Config = toml::from_str("[logs]\nmax_bytes = \"64MB\"\n").unwrap();
+        assert_eq!(c.log_max_bytes().unwrap(), Some(64 << 20));
+
+        for text in ["\"0\"", "\"none\"", "\"unlimited\""] {
+            let c: Config = toml::from_str(&format!("[logs]\nmax_bytes = {text}\n")).unwrap();
+            assert_eq!(c.log_max_bytes().unwrap(), None, "for {text}");
+            c.validate().unwrap();
+        }
+    }
+
+    /// A limit that is too small to hold a head, a tail and the note must give
+    /// an error. In silence, the user believes that a small file is the whole
+    /// output.
+    #[test]
+    fn a_limit_on_the_output_that_is_too_small_is_refused() {
+        let c: Config = toml::from_str("[logs]\nmax_bytes = \"100\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[logs] max_bytes"), "got: {err}");
+        assert!(err.contains("0"), "the message must give the remedy: {err}");
     }
 
     #[test]

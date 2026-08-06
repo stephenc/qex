@@ -169,6 +169,44 @@ pub fn safe_name(name: &str) -> String {
     out
 }
 
+/// What qex removed from the output files of a job.
+///
+/// The output of a job has a limit, so `qex status` and `qex logs` must be able
+/// to say that a file is not the whole output. A reader who believes that a
+/// truncated file is complete reads a wrong conclusion from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogsDropped {
+    /// The bytes that qex did not keep from `stdout.log`.
+    #[serde(default)]
+    pub stdout_bytes: u64,
+    /// The lines that qex did not keep from `stdout.log`.
+    #[serde(default)]
+    pub stdout_lines: u64,
+    /// The bytes that qex did not keep from `stderr.log`.
+    #[serde(default)]
+    pub stderr_bytes: u64,
+    /// The lines that qex did not keep from `stderr.log`.
+    #[serde(default)]
+    pub stderr_lines: u64,
+    /// The limit that operated, from `[logs] max_bytes`.
+    #[serde(default)]
+    pub limit: u64,
+}
+
+impl LogsDropped {
+    /// Gives the bytes and the lines of one stream.
+    ///
+    /// The name is `stdout` or `stderr`, as the commands use it.
+    pub fn of(&self, stream: &str) -> Option<(u64, u64)> {
+        let (bytes, lines) = match stream {
+            "stdout" => (self.stdout_bytes, self.stdout_lines),
+            "stderr" => (self.stderr_bytes, self.stderr_lines),
+            _ => return None,
+        };
+        (bytes > 0).then_some((bytes, lines))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: uuid::Uuid,
@@ -289,6 +327,10 @@ pub struct JobStatus {
     /// command, and does not follow the chain.
     #[serde(default)]
     pub caused_by: Option<uuid::Uuid>,
+    /// What qex removed from the output files, when the job wrote more than
+    /// `[logs] max_bytes`. The value is `None` when qex kept everything.
+    #[serde(default)]
+    pub logs_dropped: Option<LogsDropped>,
     pub tags: Vec<String>,
 }
 
@@ -333,6 +375,7 @@ impl JobStatus {
             attempts: 0,
             retries_left: spec.retries,
             caused_by: None,
+            logs_dropped: None,
             tags: spec.tags.clone(),
         }
     }

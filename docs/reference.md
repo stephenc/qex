@@ -266,6 +266,9 @@ max_pressure = 20     # maximum PSI memory pressure (Linux only)
 [queue]
 oversized = "run-when-idle"   # run-when-idle, reject or queue
 
+[logs]
+max_bytes = "32MB"    # the output that qex keeps for each stream of each job
+
 [defaults]
 cpu = 1               # the default is 1 core
 mem = "2GB"           # the default is the machine memory / the core count
@@ -509,6 +512,48 @@ home directory and `$x` as a variable, so give the name inside a single quote:
 
 This command is for a person. An agent writes the full command and needs no
 completion.
+## The limit on the output of a job
+
+`[logs] max_bytes` is the space that one stream of one job can use. The default
+is 32MB for `stdout.log` and 32MB for `stderr.log`.
+
+qex applies the limit **while the job writes**. The supervisor reads the output
+through a pipe, so a job that writes 400MB never puts 400MB on the disk. That
+disk also holds the record of each job, and qex is made to be started and left,
+so a job with no limit can fill it while nobody looks.
+
+qex keeps **both ends** of the output:
+
+```
+line 1                        <- the head: the start-up and the configuration
+...
+[qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+[qex] The limit is `[logs] max_bytes` = 32MB. qex kept the first 8MB and the
+      last 24MB. To keep more, make max_bytes larger.
+...
+Error: the build failed         <- the tail: the failure
+```
+
+The head holds the reason that the job started. The tail holds the reason that
+it stopped. A reader needs both.
+
+A job never fails because of this limit. Reaching the limit is normal.
+
+`qex status` and `qex logs` say how much went, so a reader never takes a part of
+the output for the whole output:
+
+```sh
+qex status $ID --json    # the field logs_dropped gives the bytes and the lines
+```
+
+Those lines are not on the disk, so `qex logs --all` does not give them back.
+
+While the job operates, qex holds the last part of the output in a file beside
+the log file (`stdout.log.tail`). It writes that part into the log file and
+deletes it when the job stops. `qex logs --follow` shows the head, then a line
+that says that the limit is reached, and then the last part when the job stops.
+
+Use `max_bytes = "0"` for no limit. A job can then fill the disk.
 
 ## More help inside the tool
 

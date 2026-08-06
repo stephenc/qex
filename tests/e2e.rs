@@ -2797,6 +2797,92 @@ fn a_config_fault_in_the_record_of_a_job_stays_short() {
     );
 }
 
+/// A job that writes far more than the limit must leave a file that is not
+/// larger than the limit, with the first lines, the last lines, and a line that
+/// says how much went.
+///
+/// A job wrote 386MB of standard output in a review, and nothing stopped it.
+/// qex is made to be started and left, so nobody sees a disk fill, and the same
+/// disk holds the record of each job. This test holds that fault.
+#[test]
+fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
+    let h = Harness::new(
+        "logcap",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // About 3.4MB of output, which is 50 times the limit.
+    let id = h.submit(&["submit", "--", "sh", "-c", "seq 1 500000"]);
+    let wait = h.qex(&["wait", &id, "--timeout", "60s"]);
+
+    // The limit must never fail a job. Reaching it is normal.
+    assert_eq!(
+        wait.status.code(),
+        Some(0),
+        "the limit on the output must not fail the job"
+    );
+    assert_eq!(h.state_of(&id), "completed");
+
+    let path = h.job_dir(&id).join("stdout.log");
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        size <= 64 * 1024,
+        "the file holds {size} bytes, and the limit is 65536"
+    );
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.lines().any(|l| l == "1"),
+        "the first line went, and it holds the start of the job"
+    );
+    assert!(
+        text.lines().any(|l| l == "500000"),
+        "the last line went, and it holds the end of the job"
+    );
+    assert!(
+        !text.lines().any(|l| l == "250000"),
+        "the middle must go, and it stayed"
+    );
+    assert!(
+        text.contains("are not in this file"),
+        "the file must say what went: {:.400}",
+        text
+    );
+
+    // The file beside the log file must go with the job.
+    assert!(
+        !h.job_dir(&id).join("stdout.log.tail").exists(),
+        "the file that held the last output stayed"
+    );
+
+    // The record must say what went. A reader that gives `--tail 20` never sees
+    // the line in the file, so the count must also be in the status.
+    let status = h.status_json(&id);
+    let dropped = &status["logs_dropped"];
+    assert!(
+        dropped["stdout_bytes"].as_u64().unwrap() > 0,
+        "the record must say how many bytes went: {status}"
+    );
+    assert!(
+        dropped["stdout_lines"].as_u64().unwrap() > 1000,
+        "the record must say how many lines went: {status}"
+    );
+    assert_eq!(dropped["limit"].as_u64().unwrap(), 64 * 1024);
+
+    // The commands must not present a part of the output as the whole output.
+    let logs = h.qex(&["logs", &id, "--stdout", "--tail", "5"]);
+    let notice = String::from_utf8_lossy(&logs.stderr);
+    assert!(
+        notice.contains("qex removed"),
+        "`qex logs` must say what went: {notice}"
+    );
+
+    let json = h.ok(&["logs", &id, "--stdout", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(value["stdout_dropped_lines"].as_u64().unwrap() > 1000);
+}
+
 fn _unused(_: &Path) {}
 
 /// Waits until a `qex run` that a test started stops, and gives its output.

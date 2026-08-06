@@ -229,53 +229,13 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.supervisor_pid = Some(std::process::id() as i32);
     job::write_status(&dir, &status).context("writing the job status")?;
 
-    // The output of a job holds secrets as frequently as its environment, so
-    // these files use the same mode as the job specification.
+    // Keep what an earlier attempt of this job removed from the output. The
+    // limit belongs to the stream and not to one attempt, so the count of the
+    // job is the sum of the attempts.
+    let earlier_drops = status.logs_dropped.unwrap_or_default();
+
+    // Read the configuration before anything else uses it.
     //
-    // A second attempt adds to the file and does not replace it. The output of
-    // the attempt that failed is the reason for the retry, and a reader needs
-    // it. A mark separates the attempts.
-    let again = status.attempts > 0;
-    let stdout = create_private(&dir.join("stdout.log"), again)
-        .context("opening the standard output file of the job")?;
-    let stderr = create_private(&dir.join("stderr.log"), again)
-        .context("opening the standard error file of the job")?;
-
-    if again {
-        use std::io::Write;
-        let mark = format!("\n--- attempt {} ---\n", status.attempts + 1);
-        (&stdout).write_all(mark.as_bytes()).ok();
-        (&stderr).write_all(mark.as_bytes()).ok();
-    }
-
-    let mut cmd = std::process::Command::new(&spec.command[0]);
-    cmd.args(&spec.command[1..])
-        .current_dir(&spec.cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(stdout))
-        .stderr(std::process::Stdio::from(stderr))
-        // Give the job the environment that the CLI captured. Remove the
-        // environment of this process, which came from the coordinator.
-        .env_clear()
-        .envs(&spec.env);
-
-    unsafe {
-        cmd.pre_exec(|| {
-            // A new process group. `qex kill` then signals every process of the
-            // job with one call to `killpg`.
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    // Apply the memory limit before the job starts.
-    //
-    // This code puts the supervisor itself in the cgroup, and the job then
-    // inherits it. A job that starts first could allocate memory and fork
-    // children before qex moved it, and those children would never meet the
-    // limit.
     // A configuration that qex cannot read must never become the default
     // configuration in silence. The default has no enforcement, so a fault in
     // the file would turn `must enforce` into `no limit`, and the job would run
@@ -305,6 +265,80 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             crate::config::Config::default()
         }
     };
+
+    // The limit on the output of the job. A fault in this field must not stop
+    // the job, so an incorrect value gives the default limit and a warning.
+    let log_limit = match cfg.log_max_bytes() {
+        Ok(limit) => limit,
+        Err(e) => {
+            let message = format!("{e}. This job uses the default limit.");
+            log(&message);
+            eprintln!("qex: {message}");
+            crate::config::Config::default()
+                .log_max_bytes()
+                .ok()
+                .flatten()
+        }
+    };
+
+    // The output of a job holds secrets as frequently as its environment, so
+    // these files use the same mode as the job specification.
+    //
+    // A second attempt adds to the file and does not replace it. The output of
+    // the attempt that failed is the reason for the retry, and a reader needs
+    // it. A mark separates the attempts.
+    let again = status.attempts > 0;
+    let out_path = dir.join("stdout.log");
+    let err_path = dir.join("stderr.log");
+    let stdout =
+        create_private(&out_path, again).context("opening the standard output file of the job")?;
+    let stderr =
+        create_private(&err_path, again).context("opening the standard error file of the job")?;
+
+    if again {
+        use std::io::Write;
+        let mark = format!("\n--- attempt {} ---\n", status.attempts + 1);
+        (&stdout).write_all(mark.as_bytes()).ok();
+        (&stderr).write_all(mark.as_bytes()).ok();
+    }
+
+    let out_len = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    let err_len = std::fs::metadata(&err_path).map(|m| m.len()).unwrap_or(0);
+    let out_cap = crate::logcap::CapWriter::new(&out_path, stdout, out_len, log_limit);
+    let err_cap = crate::logcap::CapWriter::new(&err_path, stderr, err_len, log_limit);
+
+    let mut cmd = std::process::Command::new(&spec.command[0]);
+    cmd.args(&spec.command[1..])
+        .current_dir(&spec.cwd)
+        .stdin(std::process::Stdio::null())
+        // The job writes into a pipe, and this process writes the file. The
+        // limit on the output thus operates while the job writes. A job that
+        // writes into the file itself can fill the disk before anybody looks,
+        // and the same disk holds the record of each job.
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Give the job the environment that the CLI captured. Remove the
+        // environment of this process, which came from the coordinator.
+        .env_clear()
+        .envs(&spec.env);
+
+    unsafe {
+        cmd.pre_exec(|| {
+            // A new process group. `qex kill` then signals every process of the
+            // job with one call to `killpg`.
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    // Apply the memory limit before the job starts.
+    //
+    // This code puts the supervisor itself in the cgroup, and the job then
+    // inherits it. A job that starts first could allocate memory and fork
+    // children before qex moved it, and those children would never meet the
+    // limit.
     let mut cgroup_dir: Option<std::path::PathBuf> = None;
     let mut enforce_warning: Option<String> = None;
     if cfg.enforce.mode.is_on() {
@@ -368,6 +402,27 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             return Ok(1);
         }
     };
+
+    // Copy each stream of the job through the limit, in a thread of its own.
+    //
+    // The threads report through a channel and not through `join`. A process
+    // that left the process group can hold the pipe open, and a `join` would
+    // then wait for ever. The supervisor must write the result of a job that
+    // stopped, whatever a process of that job still holds.
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, crate::logcap::Dropped)>();
+    if let Some(pipe) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            tx.send((false, crate::logcap::pump(pipe, out_cap))).ok();
+        });
+    }
+    if let Some(pipe) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            tx.send((true, crate::logcap::pump(pipe, err_cap))).ok();
+        });
+    }
+    drop(tx);
 
     // Read the out-of-memory count before the job starts. An increase after
     // the job stops shows that the kernel stopped a process for memory.
@@ -489,6 +544,35 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // Release the process id. Each signal above is complete.
     let exit = child.wait().context("waiting for the job")?;
 
+    // Complete the two copies. Each process of the job stopped, so the pipes
+    // are closed and each thread writes the last part of its file.
+    let mut drops = crate::job::LogsDropped {
+        limit: log_limit.unwrap_or(0),
+        ..earlier_drops
+    };
+    for _ in 0..2 {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok((false, d)) => {
+                drops.stdout_bytes += d.bytes;
+                drops.stdout_lines += d.lines;
+            }
+            Ok((true, d)) => {
+                drops.stderr_bytes += d.bytes;
+                drops.stderr_lines += d.lines;
+            }
+            Err(_) => {
+                // Something still holds a pipe of this job. Say so, and write
+                // the result. A record that arrives is worth more than a wait
+                // that has no end.
+                log(&format!(
+                    "the output of the job {id} did not close; qex writes the result now, \
+                     and the last part of one log file can be missing"
+                ));
+                break;
+            }
+        }
+    }
+
     // Read the resources that the job used. The values include each child of
     // the job, so a job that forks gives a correct measurement.
     let usage = read_usage();
@@ -507,6 +591,9 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.signal = signal;
     status.finished_at = Some(sys::now_secs());
     status.usage = usage;
+    // Say what qex removed from the output. `qex status` and `qex logs` read
+    // this value, so a reader never takes a part of the output for the whole.
+    status.logs_dropped = (drops.stdout_bytes > 0 || drops.stderr_bytes > 0).then_some(drops);
     // The job stopped, so the pid stops being an identity: the machine can
     // give that number to another process at any moment. Keep it as history
     // only, where no code can act on it.
@@ -569,6 +656,10 @@ fn create_private(path: &std::path::Path, append: bool) -> std::io::Result<std::
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
+        // The limit on the output reads this file to count the lines that it
+        // removes. Without this permission, the count of a second attempt is
+        // zero, and the file then says that no line went.
+        .read(true)
         .create(true)
         .truncate(!append)
         .append(append)

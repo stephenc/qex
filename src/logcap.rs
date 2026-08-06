@@ -1,0 +1,683 @@
+//! This module holds the limit on the output of one stream of one job.
+//!
+//! A job wrote 386MB of standard output in a review, and nothing stopped it.
+//! qex is made to be started and left, and that is the moment when nobody sees
+//! a disk fill. The same disk holds `status.json`, so output with no limit can
+//! destroy the record of every job on the machine.
+//!
+//! # The limit operates while the job writes
+//!
+//! The supervisor reads the output of the job through a pipe and writes it
+//! here. It does not give the file to the job and correct the file afterwards.
+//! A correction afterwards lets the disk fill first, and a full disk is the
+//! fault that this module removes.
+//!
+//! # The reader keeps both ends
+//!
+//! The head of the output holds the start: the version, the configuration and
+//! the arguments. The tail holds the failure. A reader who loses either end
+//! loses the reason that the reader opened the file, so qex keeps both ends and
+//! writes a line between them that says how much went.
+//!
+//! # The tail stays on the disk, and not in the memory
+//!
+//! The supervisor puts itself in the cgroup of the job, so memory that the
+//! supervisor holds counts against the memory claim of the job. A tail of 24MB
+//! in the memory of the supervisor would thus stop a job that operates at its
+//! claim, and `qex status` would show an out-of-memory event that the job did
+//! not cause. qex keeps the tail in a circular file: the file has a fixed size,
+//! the writer returns to the start of it when it reaches the end, and this
+//! module holds one buffer of 64KB in the memory.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+/// The number of bytes that this module moves in one operation.
+const CHUNK: usize = 64 * 1024;
+
+/// The space that qex keeps in the limit for the two notes that it writes.
+const NOTE_ROOM: u64 = 2048;
+
+/// The smallest limit that qex accepts.
+///
+/// The limit must hold a head, a tail and the two notes. A limit of a few
+/// hundred bytes holds nothing, and a user who writes one has an intention that
+/// the file cannot satisfy. The configuration refuses such a value and says so.
+pub const MIN_LIMIT: u64 = 16 * 1024;
+
+/// The mark at the start of each line that qex itself writes into a log file.
+///
+/// A reader searches for this text, and `qex logs --grep` finds it.
+pub const MARK: &str = "[qex]";
+
+/// What qex removed from one stream of one job.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub bytes: u64,
+    pub lines: u64,
+}
+
+/// The three parts of the limit.
+#[derive(Debug, Clone, Copy)]
+struct Parts {
+    /// The bytes that the file keeps from the start of the output.
+    head: u64,
+    /// The bytes that the circular file keeps from the end of the output.
+    tail: u64,
+    /// The limit itself, for the notes that qex writes.
+    max: u64,
+}
+
+/// Divides the limit between the head, the tail and the notes.
+///
+/// The head, the tail and the notes together are the limit. The head file and
+/// the circular file are the only files, so the disk that one stream uses stays
+/// below the limit at each moment, and not at the end only.
+///
+/// The tail is three times the head. The head needs the start of the output
+/// only: a banner, the configuration and the first commands. The failure is at
+/// the end, and the reader usually needs more of it.
+fn parts(max: u64) -> Parts {
+    let room = NOTE_ROOM.min(max / 8);
+    let head = max / 4;
+    Parts {
+        head,
+        tail: max.saturating_sub(head + room).max(1),
+        max,
+    }
+}
+
+/// Writes one stream of one job, with a limit on the bytes that reach the disk.
+pub struct CapWriter {
+    file: File,
+    /// `None` means that no limit operates.
+    parts: Option<Parts>,
+    /// The bytes in the file that a reader opens.
+    head_len: u64,
+    /// The bytes that went to the circular file.
+    overflow_bytes: u64,
+    /// The lines that went to the circular file.
+    overflow_lines: u64,
+    dropped: Dropped,
+    tail: Option<Ring>,
+    tail_path: PathBuf,
+    /// The first write fault, for the log of the supervisor.
+    ///
+    /// A job must never fail because of this module. A disk that refuses a
+    /// write is a fault of the machine, and the job continues.
+    fault: Option<String>,
+}
+
+impl CapWriter {
+    /// Makes a writer for one open log file.
+    ///
+    /// `existing` is the size of that file now. A second attempt of a job adds
+    /// to the file, and those bytes belong to the same limit.
+    pub fn new(path: &Path, file: File, existing: u64, max_bytes: Option<u64>) -> Self {
+        Self {
+            file,
+            parts: max_bytes.map(parts),
+            head_len: existing,
+            overflow_bytes: 0,
+            overflow_lines: 0,
+            dropped: Dropped::default(),
+            tail: None,
+            // A name beside the log file. `qex clean` deletes the directory of
+            // the job, so a supervisor that a signal stops leaves no file that
+            // nothing removes.
+            tail_path: path.with_extension("log.tail"),
+            fault: None,
+        }
+    }
+
+    /// Writes one part of the output.
+    pub fn write(&mut self, buf: &[u8]) {
+        let Some(parts) = self.parts else {
+            self.push_head(buf);
+            return;
+        };
+
+        let mut rest = buf;
+        if self.head_len < parts.head {
+            let room = (parts.head - self.head_len) as usize;
+            let take = room.min(rest.len());
+            self.push_head(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if rest.is_empty() {
+            return;
+        }
+        self.push_overflow(rest);
+    }
+
+    /// Writes the head, and counts the bytes that reached the file.
+    fn push_head(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        match self.file.write_all(data) {
+            Ok(()) => self.head_len += data.len() as u64,
+            Err(e) => self.record_fault(&format!("writing the output of the job: {e}")),
+        }
+    }
+
+    /// Puts the bytes above the head in the circular file.
+    fn push_overflow(&mut self, data: &[u8]) {
+        if self.tail.is_none() {
+            self.start_overflow();
+        }
+        self.overflow_bytes += data.len() as u64;
+        self.overflow_lines += count_lines(data);
+
+        let result = match &mut self.tail {
+            Some(ring) => ring.write(data),
+            None => Ok(()),
+        };
+        if let Err(e) = result {
+            self.record_fault(&format!("writing the last part of the output: {e}"));
+        }
+    }
+
+    /// Prepares the file for a stream that is above the limit.
+    ///
+    /// This function writes a note into the file at that moment. A reader who
+    /// opens the file while the job operates must not believe that the job
+    /// wrote no more, and `qex logs --follow` gives this line as it arrives.
+    fn start_overflow(&mut self) {
+        let Some(parts) = self.parts else { return };
+
+        // An earlier attempt of this job can have left more than the head in
+        // the file. The limit belongs to the stream and not to the attempt, so
+        // those bytes go now. The line count is exact, because this function
+        // reads the part that it removes.
+        if self.head_len > parts.head {
+            let extra = self.head_len - parts.head;
+            let lines = count_lines_in(&mut self.file, parts.head, extra).unwrap_or(0);
+            match self.file.set_len(parts.head) {
+                Ok(()) => {
+                    self.dropped.bytes += extra;
+                    self.dropped.lines += lines;
+                    self.head_len = parts.head;
+                }
+                Err(e) => self.record_fault(&format!("cutting the earlier output: {e}")),
+            }
+            if let Err(e) = self.file.seek(SeekFrom::End(0)) {
+                self.record_fault(&format!("moving to the end of the output: {e}"));
+            }
+        }
+
+        let note = format!(
+            "\n{MARK} The output of this job reached the limit `[logs] max_bytes` = {}. \
+             qex keeps the last part of the output beside this file. It writes that part \
+             here when the job stops.\n",
+            crate::units::format_size(parts.max)
+        );
+        if let Err(e) = self.file.write_all(note.as_bytes()) {
+            self.record_fault(&format!("writing the note about the limit: {e}"));
+        }
+
+        match Ring::create(&self.tail_path, parts.tail) {
+            Ok(ring) => self.tail = Some(ring),
+            Err(e) => self.record_fault(&format!("making the file for the last output: {e}")),
+        }
+    }
+
+    /// Completes the file, and gives what qex removed.
+    ///
+    /// This function writes the line that says how much went, and then the
+    /// tail. A reader thus finds the start of the output, one line that names
+    /// the loss, and the end of the output, in that order.
+    pub fn finish(mut self) -> Dropped {
+        let Some(ring) = self.tail.take() else {
+            self.file.flush().ok();
+            return self.dropped;
+        };
+        let Some(parts) = self.parts else {
+            return self.dropped;
+        };
+        let mut ring = ring;
+
+        // The first pass measures. The line that says how much went must be
+        // before the tail, so qex needs the numbers before it writes anything.
+        // Neither pass holds the tail in the memory.
+        let (kept_bytes, kept_lines) = ring.walk(None).unwrap_or((0, 0));
+        self.dropped.bytes += self.overflow_bytes.saturating_sub(kept_bytes);
+        self.dropped.lines += self.overflow_lines.saturating_sub(kept_lines);
+
+        let note = format!(
+            "{MARK} ---- {} and {} line(s) of the output are not in this file ----\n\
+             {MARK} The limit is `[logs] max_bytes` = {}. qex kept the first {} and the last {}. \
+             To keep more, make max_bytes larger in the configuration file.\n",
+            crate::units::format_size(self.dropped.bytes),
+            self.dropped.lines,
+            crate::units::format_size(parts.max),
+            crate::units::format_size(parts.head),
+            crate::units::format_size(kept_bytes),
+        );
+        if let Err(e) = self.file.write_all(note.as_bytes()) {
+            self.record_fault(&format!("writing the line about the removed output: {e}"));
+        }
+
+        if let Err(e) = ring.walk(Some(&mut self.file)) {
+            self.record_fault(&format!("writing the last part of the output: {e}"));
+        }
+        self.file.flush().ok();
+        ring.remove();
+        self.dropped
+    }
+
+    /// Keeps the first fault, and writes it to the log of the supervisor.
+    fn record_fault(&mut self, message: &str) {
+        if self.fault.is_some() {
+            return;
+        }
+        self.fault = Some(message.to_string());
+        eprintln!("qex: {message}. The job continues, and its output is not complete.");
+    }
+}
+
+/// A file of a fixed size that holds the last bytes of a stream.
+///
+/// The writer returns to the start of the file when it reaches the end. The
+/// file thus holds the last `size` bytes at each moment, and it never grows.
+struct Ring {
+    path: PathBuf,
+    file: File,
+    size: u64,
+    /// The position for the next byte.
+    pos: u64,
+    /// True after the writer returned to the start one time.
+    wrapped: bool,
+}
+
+impl Ring {
+    fn create(path: &Path, size: u64) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            // The output of a job holds a token as frequently as its
+            // environment, so this file uses the mode of the log file.
+            .mode(0o600)
+            .open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            size,
+            pos: 0,
+            wrapped: false,
+        })
+    }
+
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        // Bytes that a later byte of the same call would cover need no write.
+        let mut buf = if buf.len() as u64 > self.size {
+            self.wrapped = true;
+            &buf[buf.len() - self.size as usize..]
+        } else {
+            buf
+        };
+
+        while !buf.is_empty() {
+            let room = (self.size - self.pos) as usize;
+            let take = room.min(buf.len());
+            self.file.seek(SeekFrom::Start(self.pos))?;
+            self.file.write_all(&buf[..take])?;
+            self.pos += take as u64;
+            if self.pos == self.size {
+                self.pos = 0;
+                self.wrapped = true;
+            }
+            buf = &buf[take..];
+        }
+        Ok(())
+    }
+
+    /// Reads the contents in the order that the job wrote them.
+    ///
+    /// With `out`, this function also writes the contents there. It gives the
+    /// number of bytes and the number of lines that it read. The caller calls
+    /// it two times: one time to measure, and one time to write.
+    ///
+    /// The first line is incomplete when the writer returned to the start, so
+    /// this function removes the bytes before the first line end. A reader must
+    /// not meet one half of a line as if it were a whole line.
+    fn walk(&mut self, mut out: Option<&mut File>) -> std::io::Result<(u64, u64)> {
+        let segments: [(u64, u64); 2] = if self.wrapped {
+            [(self.pos, self.size - self.pos), (0, self.pos)]
+        } else {
+            [(0, self.pos), (0, 0)]
+        };
+
+        let mut trim = self.wrapped;
+        let mut bytes = 0u64;
+        let mut lines = 0u64;
+        let mut buf = vec![0u8; CHUNK];
+
+        for (start, len) in segments {
+            if len == 0 {
+                continue;
+            }
+            self.file.seek(SeekFrom::Start(start))?;
+            let mut left = len;
+            while left > 0 {
+                let want = (left as usize).min(buf.len());
+                let n = self.file.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                left -= n as u64;
+                let mut data = &buf[..n];
+                if trim {
+                    match data.iter().position(|b| *b == b'\n') {
+                        Some(i) => {
+                            data = &data[i + 1..];
+                            trim = false;
+                        }
+                        None => data = &[],
+                    }
+                }
+                bytes += data.len() as u64;
+                lines += count_lines(data);
+                if let Some(file) = out.as_deref_mut() {
+                    file.write_all(data)?;
+                }
+            }
+        }
+        Ok((bytes, lines))
+    }
+
+    fn remove(&self) {
+        std::fs::remove_file(&self.path).ok();
+    }
+}
+
+fn count_lines(data: &[u8]) -> u64 {
+    data.iter().filter(|b| **b == b'\n').count() as u64
+}
+
+/// Counts the lines in one part of a file, with no large read.
+fn count_lines_in(file: &mut File, start: u64, len: u64) -> std::io::Result<u64> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut left = len;
+    let mut lines = 0u64;
+    while left > 0 {
+        let want = (left as usize).min(buf.len());
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        left -= n as u64;
+        lines += count_lines(&buf[..n]);
+    }
+    Ok(lines)
+}
+
+/// Reads one stream of the job and writes it through the limit.
+///
+/// This function operates in a thread of its own, one thread for each stream.
+/// It reads until the job closes the stream. A read fault stops the copy, and
+/// it does not stop the job.
+pub fn pump(mut source: impl Read, mut writer: CapWriter) -> Dropped {
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        match source.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => writer.write(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    writer.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "qex-logcap-{}-{}-{name}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn log(&self) -> PathBuf {
+            self.0.join("stdout.log")
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn open(path: &Path) -> File {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Writes numbered lines through a writer, one line in each call.
+    fn write_lines(writer: &mut CapWriter, from: usize, to: usize) {
+        for i in from..=to {
+            writer.write(format!("line-{i}\n").as_bytes());
+        }
+    }
+
+    /// The head and the tail must both stay, and the file must say what went.
+    ///
+    /// A job wrote 386MB in a review. A limit that keeps the tail only loses
+    /// the start-up and the configuration, and a limit that keeps the head only
+    /// loses the failure. The reader needs both ends.
+    #[test]
+    fn the_first_lines_and_the_last_lines_stay_and_the_file_says_what_went() {
+        let dir = Dir::new("both-ends");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(64 * 1024));
+        write_lines(&mut w, 1, 20000);
+        let dropped = w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("line-1\n"), "the first line went");
+        assert!(text.contains("line-20000\n"), "the last line went");
+        assert!(
+            !text.contains("line-10000\n"),
+            "the middle must go, and it stayed"
+        );
+        assert!(dropped.bytes > 0 && dropped.lines > 0, "{dropped:?}");
+        assert!(
+            text.contains("are not in this file"),
+            "the file must say what went: {text:.400}"
+        );
+        assert!(
+            text.contains(&dropped.lines.to_string()),
+            "the file must give the number of lines"
+        );
+
+        // The file must never be larger than the limit. That promise is the
+        // reason for this module.
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size <= 64 * 1024, "the file is {size} bytes");
+    }
+
+    /// The disk must stay below the limit WHILE THE JOB WRITES.
+    ///
+    /// A limit that qex applies after the job stops lets the disk fill first,
+    /// and a full disk is the fault that this module removes. The test measures
+    /// the log file and the file beside it together, at each step.
+    #[test]
+    fn the_disk_stays_below_the_limit_while_the_job_writes() {
+        let dir = Dir::new("during");
+        let path = dir.log();
+        let limit = 32 * 1024;
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(limit));
+
+        for i in 1..=5000 {
+            w.write(format!("line-{i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n").as_bytes());
+            if i % 100 == 0 {
+                let mut total = 0;
+                for entry in std::fs::read_dir(&dir.0).unwrap() {
+                    total += entry.unwrap().metadata().unwrap().len();
+                }
+                assert!(total <= limit, "the disk holds {total} bytes at line {i}");
+            }
+        }
+        w.finish();
+        let mut total = 0;
+        for entry in std::fs::read_dir(&dir.0).unwrap() {
+            total += entry.unwrap().metadata().unwrap().len();
+        }
+        assert!(total <= limit, "the disk holds {total} bytes at the end");
+    }
+
+    /// The file beside the log file must go. A file that stays holds disk space
+    /// that `qex du` cannot explain.
+    #[test]
+    fn the_file_that_holds_the_tail_goes_at_the_end() {
+        let dir = Dir::new("cleanup");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(32 * 1024));
+        write_lines(&mut w, 1, 5000);
+        w.finish();
+
+        let left: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["stdout.log".to_string()], "a file stayed");
+    }
+
+    /// Output that is below the limit must arrive complete, with no note.
+    #[test]
+    fn output_below_the_limit_arrives_complete() {
+        let dir = Dir::new("small");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+        write_lines(&mut w, 1, 20);
+        let dropped = w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(dropped, Dropped::default());
+        assert!(!text.contains(MARK), "qex wrote a note with no reason");
+        assert_eq!(text.lines().count(), 20);
+    }
+
+    /// A limit of `None` keeps every byte. A user who turns the limit off must
+    /// get the behaviour of the earlier versions.
+    #[test]
+    fn no_limit_keeps_every_byte() {
+        let dir = Dir::new("none");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, None);
+        write_lines(&mut w, 1, 5000);
+        let dropped = w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(dropped, Dropped::default());
+        assert_eq!(text.lines().count(), 5000);
+    }
+
+    /// A reader that opens the file WHILE the job writes must see that the job
+    /// wrote more. Without this note, a file that stops at the head reads as a
+    /// complete file, and the reader believes that the job stopped there.
+    #[test]
+    fn a_reader_sees_the_limit_before_the_job_stops() {
+        let dir = Dir::new("live");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(32 * 1024));
+        write_lines(&mut w, 1, 5000);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("reached the limit"),
+            "the file must say that the output continues: {text:.300}"
+        );
+    }
+
+    /// The limit belongs to the stream of the job, and not to one attempt.
+    ///
+    /// A job with `--retries` adds to the same file. Without this rule, a job
+    /// with three attempts holds three times the limit on the disk.
+    #[test]
+    fn a_second_attempt_shares_the_limit_of_the_first() {
+        let dir = Dir::new("retry");
+        let path = dir.log();
+        let limit = 32 * 1024;
+
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(limit));
+        write_lines(&mut w, 1, 5000);
+        w.finish();
+
+        let existing = std::fs::metadata(&path).unwrap().len();
+        let again = std::fs::OpenOptions::new()
+            .append(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        let mut w = CapWriter::new(&path, again, existing, Some(limit));
+        write_lines(&mut w, 5001, 10000);
+        let dropped = w.finish();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size <= limit, "two attempts hold {size} bytes");
+        assert!(dropped.bytes > 0, "the second attempt removed nothing");
+        assert!(
+            dropped.lines > 0,
+            "the count of the lines must hold the lines of the first attempt"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("line-1\n"), "the start of the job went");
+        assert!(text.contains("line-10000\n"), "the last line went");
+    }
+
+    /// One write that is larger than the whole tail must not lose the end of
+    /// that write. A program that writes one very long line meets this path.
+    #[test]
+    fn one_write_that_is_larger_than_the_tail_keeps_its_end() {
+        let dir = Dir::new("big-write");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+        w.write(b"first\n");
+        let mut big = vec![b'x'; 200 * 1024];
+        big.extend_from_slice(b"\nTHE-END\n");
+        w.write(&big);
+        w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("first"), "the head went");
+        assert!(text.contains("THE-END"), "the end of the write went");
+        assert!(std::fs::metadata(&path).unwrap().len() <= MIN_LIMIT);
+    }
+
+    /// The parts of the limit must never be larger than the limit itself. The
+    /// two files exist together while the job operates.
+    #[test]
+    fn the_parts_of_the_limit_fit_the_limit() {
+        for max in [MIN_LIMIT, 1 << 20, 32 << 20, 1 << 30] {
+            let p = parts(max);
+            assert!(
+                p.head + p.tail <= max,
+                "the parts of {max} are larger than the limit"
+            );
+            assert!(p.tail > p.head, "the tail must hold more than the head");
+        }
+    }
+}
