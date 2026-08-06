@@ -422,7 +422,7 @@ that qex uses now.
     margin = 1.5          # the multiplier for a measurement
 
     [history]
-    keep = "1d"           # how long to keep the id of a job after its removal
+    keep = \"1d\"           # how long to keep the id of a job after its removal
 
     [defaults]
     cpu = 1               # the default is 1 core

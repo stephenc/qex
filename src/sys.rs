@@ -333,3 +333,24 @@ fn parse_ps_time(text: &str) -> f64 {
     }
     seconds
 }
+
+/// Gives the time of day as `HH:MM:SS`, in the time zone of the machine.
+pub fn clock_text(epoch_secs: u64) -> String {
+    let t = epoch_secs as libc::time_t;
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&t, &mut parts);
+    }
+    format!(
+        "{:02}:{:02}:{:02}",
+        parts.tm_hour, parts.tm_min, parts.tm_sec
+    )
+}
+
+/// Tests if the standard input is a terminal.
+///
+/// A command that reads a key needs a terminal. In a pipe or a script there is
+/// no key to read.
+pub fn stdin_is_terminal() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}

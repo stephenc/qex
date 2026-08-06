@@ -29,7 +29,20 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
     let interval = Duration::from_secs_f64(args.interval.max(0.2));
     let mut previous: HashMap<uuid::Uuid, Previous> = HashMap::new();
 
+    // Read the keys, so `q` stops the command. This step also puts the terminal
+    // back when a signal stops the process.
+    let keys = if args.once {
+        false
+    } else {
+        crate::keys::watch_for_quit()
+    };
+
     loop {
+        if keys && crate::keys::quit_requested() {
+            crate::keys::restore();
+            return Ok(0);
+        }
+
         // Read the queue from the coordinator when one operates, and from the
         // state directory when none does.
         //
@@ -64,7 +77,17 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
         print!("{CLEAR}{page}");
         use std::io::Write;
         std::io::stdout().flush().ok();
-        std::thread::sleep(interval);
+
+        // Sleep in short steps, so the `q` key stops the command at once and
+        // not after the whole time between two refreshes.
+        let until = Instant::now() + interval;
+        while Instant::now() < until {
+            if keys && crate::keys::quit_requested() {
+                crate::keys::restore();
+                return Ok(0);
+            }
+            std::thread::sleep(Duration::from_millis(50).min(interval));
+        }
     }
 }
 
@@ -134,23 +157,29 @@ fn render(
     }
 
     out.push_str(&format!(
-        "machine  {} cores, {} free of {}\n\n",
+        "machine  {} cores, {} free of {}     {}\n\n",
         sys::cpu_count(),
         format_size(sys::available_memory()),
         format_size(sys::total_memory()),
+        // The time of the page. A reader of a screen that stopped refreshing
+        // must be able to see that it is old.
+        sys::clock_text(sys::now_secs()),
     ));
+
+    let (ordered, hidden) = arrange(jobs);
 
     out.push_str(&format!(
-        "{:<8}  {:<9}  {:<14}  {:>9}  {:>9}  {:>17}  {:>6}  {}\n",
-        "ID", "STATE", "NAME", "CPU CLAIM", "CPU NOW", "MEMORY CLAIM/NOW", "TIME", "NOTE"
+        "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}\n",
+        "ID", "STATE", "NAME", "CPU CLAIM", "CPU NOW", "MEMORY CLAIM/NOW", "RUNTIME", "SINCE",
+        "NOTE"
     ));
 
-    if jobs.is_empty() {
+    if ordered.is_empty() {
         out.push_str("\nno jobs\n");
         return out;
     }
 
-    for job in jobs {
+    for job in &ordered {
         // Measure the job now, for a job that operates.
         let (cpu_now, mem_now) = match (job.state.is_active(), job.pid) {
             (true, Some(pid)) => {
@@ -205,7 +234,7 @@ fn render(
         let note = note_for(job);
 
         out.push_str(&format!(
-            "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>9}  {:>17}  {:>6}  {:.40}\n",
+            "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}\n",
             &job.id.to_string()[..8],
             job.state.as_str(),
             job.name,
@@ -213,12 +242,86 @@ fn render(
             cpu_text,
             mem_text,
             elapsed,
+            since_text(job),
             note
         ));
     }
 
-    out.push_str("\nThe CPU column gives cores in use. Press Ctrl-C to stop.\n");
+    if hidden > 0 {
+        out.push_str(&format!(
+            "\n{hidden} more job(s) that stopped are not shown. Use `qex list`.\n"
+        ));
+    }
+
+    out.push_str(
+        "\nCPU NOW gives cores in use. SINCE gives the time since the job was queued, \
+         started or stopped.\n",
+    );
+    if sys::stdin_is_terminal() {
+        out.push_str("Press q to stop.\n");
+    }
     out
+}
+
+/// The number of jobs that stopped to show on the page.
+///
+/// A page must fit a screen. The jobs that operate and the jobs in the queue
+/// always appear, because they are the state of the machine now.
+const RECENT_DONE: usize = 12;
+
+/// Puts the jobs in the order for the page, and gives the number that it hides.
+///
+/// The jobs that operate come first, then the jobs in the queue, then the jobs
+/// that stopped, with the most recent first. A reader looks at the top of the
+/// page for the state of the machine now.
+fn arrange(jobs: &[JobStatus]) -> (Vec<JobStatus>, usize) {
+    let mut active: Vec<JobStatus> = jobs
+        .iter()
+        .filter(|j| j.state.is_active())
+        .cloned()
+        .collect();
+    active.sort_by_key(|j| j.started_at.unwrap_or(j.submitted_at));
+
+    let mut queued: Vec<JobStatus> = jobs
+        .iter()
+        .filter(|j| j.state == JobState::Queued)
+        .cloned()
+        .collect();
+    queued.sort_by_key(|j| (j.submitted_at, j.sequence));
+
+    let mut done: Vec<JobStatus> = jobs
+        .iter()
+        .filter(|j| j.state.is_terminal())
+        .cloned()
+        .collect();
+    // The most recent first.
+    done.sort_by_key(|j| std::cmp::Reverse(j.finished_at.unwrap_or(j.submitted_at)));
+
+    let hidden = done.len().saturating_sub(RECENT_DONE);
+    done.truncate(RECENT_DONE);
+
+    let mut out = active;
+    out.extend(queued);
+    out.extend(done);
+    (out, hidden)
+}
+
+/// Gives the time since the last change of a job.
+///
+/// The meaning follows the state: a job in the queue gives the time since its
+/// submission, a job that operates gives the time since its start, and a job
+/// that stopped gives the time since it stopped. A reader thus sees how old
+/// each line is.
+fn since_text(job: &JobStatus) -> String {
+    let now = crate::sys::now_secs();
+    let at = if job.state.is_terminal() {
+        job.finished_at.unwrap_or(job.submitted_at)
+    } else if job.state.is_active() {
+        job.started_at.unwrap_or(job.submitted_at)
+    } else {
+        job.submitted_at
+    };
+    format_duration(Duration::from_secs(now.saturating_sub(at)))
 }
 
 /// Gives the short note for one job.
@@ -360,6 +463,77 @@ mod tests {
         );
         // The budget still comes from the config file.
         assert!(page.contains("cores"), "the budget is missing: {page}");
+    }
+
+    /// The page must give the jobs that operate first, then the queue, then the
+    /// jobs that stopped. A reader looks at the top for the state now.
+    #[test]
+    fn the_page_gives_the_running_jobs_first() {
+        let mut running = job(JobState::Running, 1, 1 << 30);
+        running.name = "runs-now".into();
+
+        let mut queued = job(JobState::Queued, 1, 1 << 30);
+        queued.name = "in-queue".into();
+        queued.started_at = None;
+
+        let mut done = job(JobState::Completed, 1, 1 << 30);
+        done.name = "finished".into();
+        done.finished_at = Some(5);
+
+        // Give them in the wrong order for the page.
+        let (ordered, hidden) = arrange(&[done, queued, running]);
+        let names: Vec<&str> = ordered.iter().map(|j| j.name.as_str()).collect();
+        assert_eq!(names, vec!["runs-now", "in-queue", "finished"]);
+        assert_eq!(hidden, 0);
+    }
+
+    /// The page shows the most recent jobs that stopped, and it says how many
+    /// it did not show.
+    #[test]
+    fn the_page_limits_the_jobs_that_stopped() {
+        let mut jobs = Vec::new();
+        for i in 0..(RECENT_DONE + 5) {
+            let mut j = job(JobState::Completed, 1, 1 << 20);
+            j.name = format!("job-{i}");
+            j.finished_at = Some(i as u64);
+            jobs.push(j);
+        }
+
+        let (ordered, hidden) = arrange(&jobs);
+        assert_eq!(ordered.len(), RECENT_DONE);
+        assert_eq!(hidden, 5);
+        // The most recent comes first.
+        assert_eq!(ordered[0].name, format!("job-{}", RECENT_DONE + 4));
+    }
+
+    /// The SINCE column follows the state of the job.
+    #[test]
+    fn the_since_column_follows_the_state() {
+        let now = crate::sys::now_secs();
+
+        let mut queued = job(JobState::Queued, 1, 1 << 20);
+        queued.submitted_at = now - 120;
+        queued.started_at = None;
+        assert_eq!(since_text(&queued), "2m", "a job in the queue: since it arrived");
+
+        let mut running = job(JobState::Running, 1, 1 << 20);
+        running.submitted_at = now - 600;
+        running.started_at = Some(now - 60);
+        assert_eq!(since_text(&running), "1m", "a job that operates: since it started");
+
+        let mut done = job(JobState::Completed, 1, 1 << 20);
+        done.started_at = Some(now - 600);
+        done.finished_at = Some(now - 30);
+        assert_eq!(since_text(&done), "30s", "a job that stopped: since it stopped");
+    }
+
+    /// The page must give the time, so a reader sees that a screen is old.
+    #[test]
+    fn the_page_gives_the_time() {
+        let mut previous = HashMap::new();
+        let page = render(&[], Some(&info()), &mut previous);
+        let clock = crate::sys::clock_text(crate::sys::now_secs());
+        assert!(page.contains(&clock[..5]), "the time is missing: {page}");
     }
 
     #[test]

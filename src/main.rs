@@ -24,6 +24,7 @@ mod enforce;
 mod help;
 mod history;
 mod job;
+mod keys;
 mod lifecycle;
 mod logsel;
 mod paths;
