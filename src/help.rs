@@ -675,6 +675,10 @@ that qex uses now.
     env_capture = \"all\"           # all, minimal or none
     minimal_env = [\"PATH\", \"HOME\", \"USER\", \"LOGNAME\", \"SHELL\", \"LANG\", \"TZ\"]
 
+    [claims]
+    export_env = true     # tell the job how large its claim is
+    also = []             # add \"java\" or \"make\"; see below
+
     [learn]
     enabled = true        # use the earlier jobs of a command as the claim
     margin = 1.5          # the multiplier for a measurement

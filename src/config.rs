@@ -546,6 +546,42 @@ impl Default for PolitenessConfig {
     }
 }
 
+/// Tells the job how large its claim is.
+///
+/// A claim controls the QUEUE. It does not control the job, and a job that
+/// asks the machine how large it is gets the size of the MACHINE. A build with
+/// a claim of 2 cores on a machine of 16 then starts 16 threads, and the claim
+/// that qex made becomes a promise that the job breaks.
+///
+/// Most runtimes read a variable in place of the machine, so qex writes those
+/// variables from the claim. This is the nearest thing to a limit that operates
+/// on macOS as well as on Linux, and it needs no cgroup and no privilege.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaimsConfig {
+    /// Write the size of the claim into the environment of the job.
+    pub export_env: bool,
+    /// The variables that qex does not write without a request.
+    ///
+    /// `java` writes `JAVA_TOOL_OPTIONS`, and each JVM then writes a line to
+    /// ITS STANDARD ERROR: `Picked up JAVA_TOOL_OPTIONS: ...`. That line goes
+    /// into the log of the job, and a test that compares the error output
+    /// fails because of it.
+    ///
+    /// `make` writes `MAKEFLAGS`, which replaces the `-j` of a Makefile that
+    /// gives one.
+    pub also: Vec<String>,
+}
+
+impl Default for ClaimsConfig {
+    fn default() -> Self {
+        Self {
+            export_env: true,
+            also: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubmitConfig {
@@ -693,6 +729,7 @@ pub struct Config {
     pub queue: QueueConfig,
     pub submit: SubmitConfig,
     pub politeness: PolitenessConfig,
+    pub claims: ClaimsConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
     pub history: HistoryConfig,

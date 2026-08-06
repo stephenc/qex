@@ -736,6 +736,61 @@ process an output of its own:
 qex submit -- sh -c 'setsid my-daemon > daemon.log 2>&1 &'
 ```
 
+## The claim reaches the job
+
+A claim controls the queue. It does not control the job: a job that asks the
+machine how many cores it has receives the number of the **machine**, so a job
+with a claim of 2 cores on a machine of 16 starts 16 threads and takes the
+capacity that qex gave to the other jobs.
+
+qex therefore writes the claim into the environment of the job, and most
+runtimes read those variables in place of the machine:
+
+```console
+$ qex submit --cpu 2 --mem 2GB -- go run main.go
+$ qex logs <id> --stdout
+go: NumCPU=16 GOMAXPROCS=2
+```
+
+| Variable | For |
+| --- | --- |
+| `QEX_CPU`, `QEX_MEM`, `QEX_MEM_MB` | your own script: `make -j"$QEX_CPU"` |
+| `GOMAXPROCS`, `GOMEMLIMIT` | Go |
+| `OMP_NUM_THREADS` | OpenMP: C, C++, Fortran |
+| `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` | numpy, pandas and the libraries below them |
+| `RAYON_NUM_THREADS`, `CARGO_BUILD_JOBS` | Rust |
+| `JULIA_NUM_THREADS`, `DOTNET_PROCESSOR_COUNT`, `POLARS_MAX_THREADS` | Julia, .NET, Polars |
+| `NODE_OPTIONS=--max-old-space-size` | node, at three quarters of the claim |
+
+**qex never replaces a value that is already there.** A value from your shell,
+from the job file or from `--env` is a decision that somebody made, and qex
+fills the values that nobody chose.
+
+This is the nearest thing to a limit that operates on macOS as well as on Linux,
+and it needs no cgroup and no privilege. It stays a promise: a program that asks
+the operating system directly still sees the whole machine.
+
+Two variables need a request, because each has a cost:
+
+```toml
+[claims]
+also = ["java", "make"]
+```
+
+`java` writes `JAVA_TOOL_OPTIONS`, and every JVM then writes `Picked up
+JAVA_TOOL_OPTIONS: ...` to its standard error, which lands in the log of the
+job. `make` writes `MAKEFLAGS=-jN`, which replaces the `-j` of a Makefile that
+gives one.
+
+Turn it all off with `[claims] export_env = false`.
+
+`qex submit --no-limit-env-hints` turns it off for one job, for a job that must
+see the machine as it is.
+
+`--env-capture none` also turns it off for that job. That mode says the job
+starts with an empty environment and receives `[env]` and `--env` only, and
+`none` means none.
+
 ## More help inside the tool
 
 Each topic below is also in the binary, so an agent needs no network:

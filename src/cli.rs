@@ -214,6 +214,14 @@ pub struct SubmitArgs {
     /// coordinator, and it still runs.
     #[arg(long, allow_negative_numbers = true)]
     pub nice: Option<i32>,
+    /// Do not tell the job how large its claim is.
+    ///
+    /// qex writes the claim into the environment of the job (GOMAXPROCS,
+    /// OMP_NUM_THREADS, GOMEMLIMIT and more), so a runtime sizes its thread
+    /// pool to the claim and not to the machine. Use this option for a job that
+    /// must see the machine as it is.
+    #[arg(long)]
+    pub no_limit_env_hints: bool,
 
     /// Write the job id to this file as well as to stdout.
     ///

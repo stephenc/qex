@@ -5312,3 +5312,69 @@ fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
         "the record of the job must name the fault: {status}"
     );
 }
+
+/// A job must be told how large its claim is.
+///
+/// A claim controls the queue and not the job. A job that asks the machine how
+/// many cores it has receives the number of the MACHINE, so a job with a claim
+/// of two cores on a machine of sixteen starts sixteen threads and takes the
+/// capacity that qex gave to the other jobs.
+#[test]
+fn a_job_is_told_the_size_of_its_claim() {
+    let h = Harness::with_default_config("claimenv");
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--",
+        "sh",
+        "-c",
+        "echo \"$QEX_CPU $QEX_MEM_MB $GOMAXPROCS $OMP_NUM_THREADS\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "2 2048 2 2",
+        "the job must see its own claim: {out}"
+    );
+
+    // A value that somebody chose must stay. `--env` is a decision.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--env",
+        "GOMAXPROCS=9",
+        "--",
+        "sh",
+        "-c",
+        "echo \"$GOMAXPROCS $OMP_NUM_THREADS\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "9 2",
+        "`--env` must win, and the rest must still arrive: {out}"
+    );
+
+    // `--no-limit-env-hints` is the answer for a job that must see the machine
+    // as it is.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--no-limit-env-hints",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(out.trim(), "[][]", "the option must write nothing: {out}");
+}
