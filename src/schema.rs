@@ -266,7 +266,8 @@ pub const STATUS: &str = r##"{
         "stdout_lines": { "type": "integer", "description": "The lines that qex did not keep from stdout.log." },
         "stderr_bytes": { "type": "integer", "description": "The bytes that qex did not keep from stderr.log." },
         "stderr_lines": { "type": "integer", "description": "The lines that qex did not keep from stderr.log." },
-        "limit": { "type": "integer", "description": "The limit in bytes that operated, from [logs] max_bytes." }
+        "limit": { "type": "integer", "description": "The limit in bytes that operated, from [logs] max_bytes." },
+        "incomplete": { "type": "boolean", "description": "True when qex could not complete a log file, and could not count what went. A process of the job held the output open after the job stopped. The counts above are then the counts that arrived, and not the full quantity." }
       }
     },
     "sequence": {

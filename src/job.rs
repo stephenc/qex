@@ -191,6 +191,16 @@ pub struct LogsDropped {
     /// The limit that operated, from `[logs] max_bytes`.
     #[serde(default)]
     pub limit: u64,
+    /// True when qex could not complete a log file, and could not count what
+    /// went.
+    ///
+    /// A process of the job can hold the output open after the job stops. qex
+    /// then writes the record and leaves the copy. The counts above are the
+    /// counts that arrived, and they are not the full quantity. Without this
+    /// field, the record of that job says that the files are complete, and a
+    /// reader that reads only the record believes it.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 impl LogsDropped {
@@ -204,6 +214,11 @@ impl LogsDropped {
             _ => return None,
         };
         (bytes > 0).then_some((bytes, lines))
+    }
+
+    /// Tests if qex removed output, or could not complete a file.
+    pub fn any(&self) -> bool {
+        self.stdout_bytes > 0 || self.stderr_bytes > 0 || self.incomplete
     }
 }
 

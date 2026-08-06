@@ -2971,6 +2971,58 @@ fn a_retry_that_fits_the_limit_keeps_the_output_of_both_attempts() {
     );
 }
 
+/// `qex logs --follow` must not lose the output after the limit.
+///
+/// The log file of a job becomes SHORTER at the moment that the output passes
+/// `[logs] max_bytes`, because the supervisor keeps the head and removes the
+/// middle. That never happened before this limit existed. The position of the
+/// follower was then after the end of the file, it read nothing more, and the
+/// command gave the code 0 and no word: the reader saw the output stop in the
+/// middle and had no reason to doubt it. This is the command that an agent uses
+/// to watch a job.
+#[test]
+fn follow_does_not_lose_the_output_of_a_job_that_passes_the_limit() {
+    let h = Harness::new(
+        "logcap-follow",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // The job writes in three steps, and it waits between them:
+    //
+    // 1. About 61KB, which is below the limit. The follower reads it, and its
+    //    position is then near 61KB.
+    // 2. 6KB more. The output passes the limit, and the file becomes about
+    //    17KB. The position of the follower is now far after the end.
+    // 3. The last line, which arrives in the file when the job stops.
+    //
+    // The file at the end is smaller than the position of the follower, so a
+    // follower that does not watch the length gives nothing after step 1.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "seq 1 12000; sleep 2; seq 12001 13000; sleep 2; echo THE-FINAL-LINE",
+    ]);
+
+    let out = h.qex(&["logs", &id, "--stdout", "--follow"]);
+    assert_eq!(out.status.code(), Some(0));
+    let lines = String::from_utf8_lossy(&out.stdout).into_owned();
+    let notice = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(
+        lines.contains("THE-FINAL-LINE"),
+        "the follower lost each line after the limit. It gave:\n{:.600}\n--- stderr ---\n{}",
+        lines,
+        notice
+    );
+    assert!(
+        notice.contains("removed"),
+        "the follower must say that qex removed output. It said: {notice}"
+    );
+}
+
 fn _unused(_: &Path) {}
 
 /// Waits until a `qex run` that a test started stops, and gives its output.

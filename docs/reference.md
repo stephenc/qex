@@ -538,8 +538,14 @@ The head holds the reason that the job started. The tail holds the reason that
 it stopped. A reader needs both.
 
 qex removes nothing until the output passes the limit. A job that writes less
-than `max_bytes` thus keeps every byte in one piece, with no note, and a second
-attempt of a job that failed keeps the output of the first attempt.
+than `max_bytes`, less the room that qex keeps for the notes (2KB), thus keeps
+every byte in one piece and gets no note. A second attempt of a job that failed
+keeps the output of the first attempt in the same way.
+
+Above that point, qex keeps the first quarter of the limit and the last part.
+A job that passes the point by one byte therefore gets the same file as a job
+that passes it by a gigabyte. The reason is that qex writes the file while the
+job runs: at that moment, nobody knows how much output comes after it.
 
 A job never fails because of this limit. Reaching the limit is normal.
 
@@ -554,12 +560,18 @@ Those lines are not on the disk, so `qex logs --all` does not give them back.
 
 While the job operates, qex holds the last part of the output in a file beside
 the log file (`stdout.log.tail`). It writes that part into the log file and
-deletes it when the job stops. `qex logs --follow` shows the head, then a line
-that says that the limit is reached, and then the last part when the job stops.
+deletes it when the job stops. **The log file thus becomes shorter at the moment
+that the output passes the limit.** `qex logs --follow` watches for that, says
+that qex removed the middle, and continues at the new end of the file. It shows
+the head, then the line that says that the limit is reached, and then the last
+part when the job stops.
 
-If the last part holds no line end, qex keeps it and says that the text starts
-in the middle of a line. One JSON document, one base64 block and a progress
-display that uses `\r` all give output of that form.
+The last part starts in the middle of a line, because qex removed the bytes
+before it. qex removes that fragment when it is a small part of the last part,
+and keeps it in each other case with a line that says that the text starts in
+the middle of a line. One JSON document, one base64 block and a progress display
+that uses `\r` all give output with no line end, or with one line end far into
+the file.
 
 Use `max_bytes = "0"` for no limit. A job can then fill the disk.
 

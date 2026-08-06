@@ -622,6 +622,13 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             Some(first) => format!("{first}; {note}"),
             None => note.to_string(),
         });
+        // Say it in the record as well, and not in the text only.
+        //
+        // The counts here are the counts that arrived. A copy that did not
+        // report can have removed much more, and a field that says `null` tells
+        // a program that the file is complete. That is not true, and a program
+        // reads this field and not the text.
+        drops.incomplete = true;
     }
 
     // Read the resources that the job used. The values include each child of
@@ -644,7 +651,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.usage = usage;
     // Say what qex removed from the output. `qex status` and `qex logs` read
     // this value, so a reader never takes a part of the output for the whole.
-    status.logs_dropped = (drops.stdout_bytes > 0 || drops.stderr_bytes > 0).then_some(drops);
+    status.logs_dropped = drops.any().then_some(drops);
     // The job stopped, so the pid stops being an identity: the machine can
     // give that number to another process at any moment. Keep it as history
     // only, where no code can act on it.

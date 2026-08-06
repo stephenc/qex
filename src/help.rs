@@ -969,8 +969,14 @@ nothing holds them. `qex status` and `qex logs` say how much went, and
 `qex status --json` gives the numbers in the field `logs_dropped`.
 
 qex removes nothing until the output passes the limit. A job that writes less
-than the limit keeps every byte in one piece, and a second attempt of a job
-that failed keeps the output of the first attempt.
+than the limit, less the room that qex keeps for the notes (2KB), keeps every
+byte in one piece, and a second attempt of a job that failed keeps the output of
+the first attempt. Above that point, a job that passes the limit by one byte
+gets the same file as a job that passes it by a gigabyte: qex writes the file
+while the job runs, and at that moment nobody knows how much output follows.
+
+The log file becomes shorter at the moment that the output passes the limit.
+`qex logs --follow` says so, and it continues at the new end of the file.
 
 Make `[logs] max_bytes` larger for a job that must keep everything, or write
 the output of the job to a file of your own.

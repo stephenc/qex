@@ -380,7 +380,6 @@ fn job_excerpt(
 /// look the same to a reader.
 fn dropped_notice(status: &JobStatus, stream: &str) -> Option<String> {
     let dropped = status.logs_dropped?;
-    let (bytes, lines) = dropped.of(stream)?;
     let limit = if dropped.limit > 0 {
         format!(
             " The limit is `[logs] max_bytes` = {}.",
@@ -389,12 +388,31 @@ fn dropped_notice(status: &JobStatus, stream: &str) -> Option<String> {
     } else {
         String::new()
     };
-    Some(format!(
-        "... qex removed {} and {lines} line(s) from the middle of this stream.{limit} \
-         The first part and the last part are here. To keep more, make max_bytes larger \
-         in the configuration file.",
-        format_size(bytes)
-    ))
+
+    let mut text = match dropped.of(stream) {
+        Some((bytes, lines)) => format!(
+            "... qex removed {} and {lines} line(s) from the middle of this stream.{limit} \
+             The first part and the last part are here. To keep more, make max_bytes larger \
+             in the configuration file.",
+            format_size(bytes)
+        ),
+        // A stream with no count can still be incomplete, so the test of the
+        // count comes second.
+        None if dropped.incomplete => String::new(),
+        None => return None,
+    };
+
+    if dropped.incomplete {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(
+            "... The output of this job did not close, so this file can be missing more \
+             than the count above. A process of the job kept the output open after the job \
+             stopped.",
+        );
+    }
+    Some(text)
 }
 
 /// Reads one log file, and accepts a byte that is not UTF-8.
@@ -494,6 +512,13 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
                 } else {
                     String::new()
                 }
+            );
+        }
+        if d.incomplete {
+            println!("output:    a log file of this job is not complete.");
+            println!(
+                "           The output did not close after the job stopped, so qex could \
+                 not count what went. Start the job again if you need the full output."
             );
         }
     }
@@ -1030,10 +1055,12 @@ fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i3
     // whole output. While the job operates, the supervisor writes the same
     // information into the file itself, and this command gives it as it
     // arrives.
+    let mut said: Vec<String> = Vec::new();
     if let Ok(status) = crate::job::read_status(dir) {
         for (name, _) in &streams {
             if let Some(notice) = dropped_notice(&status, name) {
                 eprintln!("{notice}");
+                said.push((*name).to_string());
             }
         }
     }
@@ -1080,36 +1107,90 @@ fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i3
             Some(end) => text[end + 1..].to_string(),
             None => text,
         };
-        f.seek(SeekFrom::End(0))?;
-        handles.push((name.to_string(), f, partial));
+        let end = f.seek(SeekFrom::End(0))?;
+        handles.push(Followed {
+            name: name.to_string(),
+            file: f,
+            partial,
+            high_water: end,
+            said: said.iter().any(|s| s == name),
+        });
     }
 
     loop {
         let mut moved = false;
-        for (name, file, partial) in handles.iter_mut() {
-            let mut buf = Vec::new();
-            if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                moved = true;
-                partial.push_str(&String::from_utf8_lossy(&buf));
+        for h in handles.iter_mut() {
+            // THE LOG FILE OF A JOB CAN BECOME SHORTER. When the output passes
+            // `[logs] max_bytes`, the supervisor keeps the head and removes the
+            // middle. The position of this command is then after the end of the
+            // file, and every later line goes to nobody: the reader sees the
+            // output stop, with no word, and this command exits with the code 0.
+            //
+            // qex therefore watches the length. A file that became shorter gets
+            // a notice and a new position at its end.
+            let len = h.file.metadata().map(|m| m.len()).unwrap_or(h.high_water);
+            if len < h.high_water {
+                if !h.said {
+                    eprintln!(
+                        "... qex reached the limit `[logs] max_bytes` and removed the middle \
+                         of this file. This command continues at the new end of the file. \
+                         Read the file again when the job stops."
+                    );
+                    h.said = true;
+                }
+                h.file.seek(SeekFrom::Start(len))?;
+                h.partial.clear();
+                // The new length is the new reference. Without this line, the
+                // test above would find the file short at each turn, and the
+                // last part of the output would never reach the reader.
+                h.high_water = len;
+            }
 
-                while let Some(end) = partial.find('\n') {
-                    let line: String = partial.drain(..=end).collect();
+            let mut buf = Vec::new();
+            if h.file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                moved = true;
+                h.partial.push_str(&String::from_utf8_lossy(&buf));
+
+                while let Some(end) = h.partial.find('\n') {
+                    let line: String = h.partial.drain(..=end).collect();
                     let line = line.trim_end_matches('\n');
                     if keep_line(select, line) {
                         let mut out = stdout.lock();
                         if streams.len() > 1 {
-                            write!(out, "[{name}] ")?;
+                            write!(out, "[{}] ", h.name)?;
                         }
                         writeln!(out, "{line}")?;
                         out.flush()?;
                     }
                 }
             }
+            h.high_water = h
+                .file
+                .stream_position()
+                .unwrap_or(h.high_water)
+                .max(h.high_water);
         }
 
         match crate::job::read_status(dir) {
             Ok(status) => {
                 if status.state.is_terminal() && !moved {
+                    // The last word about the output.
+                    //
+                    // A job that reaches the limit and stops between two reads
+                    // of this loop leaves no shorter file for the test above to
+                    // find. The record holds the truth, and the supervisor
+                    // writes it when the job stops, so this command reads it
+                    // here. A reader must never take a part of the output for
+                    // the whole output.
+                    for h in handles.iter_mut() {
+                        if h.said {
+                            continue;
+                        }
+                        if let Some(notice) = dropped_notice(&status, &h.name) {
+                            eprintln!("{notice}");
+                            h.said = true;
+                        }
+                    }
                     return Ok(0);
                 }
             }
@@ -1123,6 +1204,21 @@ fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i3
 
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// One stream that `qex logs --follow` reads.
+struct Followed {
+    name: String,
+    file: std::fs::File,
+    /// The text after the last line end. A filter must never test half a line.
+    partial: String,
+    /// The largest length that this command saw.
+    ///
+    /// The log file of a job becomes shorter when the output passes the limit,
+    /// so a position alone does not show that qex removed something.
+    high_water: u64,
+    /// True after this command said that the output is not complete.
+    said: bool,
 }
 
 /// Tests one line against the filter of a stream.
@@ -2853,6 +2949,41 @@ mod tests {
             logs_dropped: None,
             tags: vec![],
         }
+    }
+
+    /// A log file that qex could not complete must give a notice.
+    ///
+    /// A process of a job can hold the output open after the job stops. qex
+    /// then writes the record and leaves the copy, and it cannot count what
+    /// went. An earlier version wrote no count and no flag, so the record said
+    /// that the file was complete. A program reads that field and not the text
+    /// beside it.
+    #[test]
+    fn a_log_file_that_qex_could_not_complete_gives_a_notice() {
+        use crate::job::LogsDropped;
+        let mut s = status_with(JobState::Completed, Some(0));
+
+        s.logs_dropped = Some(LogsDropped {
+            incomplete: true,
+            ..Default::default()
+        });
+        let notice = dropped_notice(&s, "stdout").expect("a file that is not complete says so");
+        assert!(notice.contains("did not close"), "got: {notice}");
+
+        // With a count as well, the reader gets both facts.
+        s.logs_dropped = Some(LogsDropped {
+            stdout_bytes: 4096,
+            stdout_lines: 20,
+            incomplete: true,
+            ..Default::default()
+        });
+        let notice = dropped_notice(&s, "stdout").unwrap();
+        assert!(notice.contains("qex removed"), "got: {notice}");
+        assert!(notice.contains("did not close"), "got: {notice}");
+
+        // A file that is complete, with nothing removed, gives no notice.
+        s.logs_dropped = None;
+        assert_eq!(dropped_notice(&s, "stdout"), None);
     }
 
     /// These codes are a contract with the agents. The help text gives them.

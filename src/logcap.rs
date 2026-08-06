@@ -270,17 +270,25 @@ impl CapWriter {
         };
         let mut ring = ring;
 
-        // The tail starts in the middle of a line, and a reader must not read
-        // that fragment as a whole line. qex therefore removes the bytes before
-        // the first line end — BUT ONLY IF THERE IS ONE.
+        // The tail starts in the middle of a line when qex removed bytes
+        // between the head and the tail. A reader must not read that fragment
+        // as a whole line, so qex removes the bytes before the first line end.
         //
-        // A stream can hold no line end at all in the tail: one JSON document
-        // of 30MB, a base64 block, or a progress display that uses `\r` (dd,
-        // curl, docker, apt). An earlier version removed the whole tail in that
-        // case, and the file then held the head only. That defeats the reason
-        // for this module, so qex keeps the fragment and says that it is one.
-        let cut_line = ring.wrapped && !ring.has_line_end().unwrap_or(false);
-        let trim = ring.wrapped && !cut_line;
+        // THAT RULE HAS A LIMIT. The first line end can be far into the tail,
+        // or there can be no line end at all: one JSON document of 30MB, a
+        // base64 block, or a progress display that uses `\r` (dd, curl, docker,
+        // apt) all give output of that form. To remove the fragment then is to
+        // remove almost all of the space that the reader paid for: a measure
+        // with a 64KB limit kept 13 bytes of a tail of 46KB, and the words
+        // before the failure went with it.
+        //
+        // qex therefore removes the fragment only when it is a small part of
+        // the tail. In each other case it keeps the fragment and writes a line
+        // that says that the text starts in the middle of a line.
+        let gap = ring.wrapped || self.dropped.bytes > 0;
+        let first_end = ring.first_line_end().unwrap_or(None);
+        let trim = gap && matches!(first_end, Some(n) if n <= parts.tail / 4);
+        let cut_line = gap && !trim;
 
         // The first pass measures. The line that says how much went must be
         // before the tail, so qex needs the numbers before it writes anything.
@@ -301,8 +309,7 @@ impl CapWriter {
         );
         if cut_line {
             note.push_str(&format!(
-                "{MARK} The last part has no line end in it. The text that follows starts in \
-                 the middle of a line.\n"
+                "{MARK} The text that follows starts in the middle of a line.\n"
             ));
         }
         if let Err(e) = self.file.write_all(note.as_bytes()) {
@@ -395,13 +402,15 @@ impl Ring {
         }
     }
 
-    /// Tests if the contents hold a line end.
+    /// Gives the position of the first line end, in the order of the output.
     ///
-    /// The caller removes the incomplete first line, and it must not do that
-    /// when the whole tail is one incomplete line. This function stops at the
-    /// first line end, so the usual stream costs one read.
-    fn has_line_end(&mut self) -> std::io::Result<bool> {
+    /// The result is `None` when the contents hold no line end. The caller
+    /// removes the incomplete first line, and it uses this position to decide
+    /// if that operation costs too much. The function stops at the first line
+    /// end, so the usual stream costs one read.
+    fn first_line_end(&mut self) -> std::io::Result<Option<u64>> {
         let mut buf = vec![0u8; CHUNK];
+        let mut seen = 0u64;
         for (start, len) in self.segments() {
             if len == 0 {
                 continue;
@@ -415,12 +424,13 @@ impl Ring {
                     break;
                 }
                 left -= n as u64;
-                if buf[..n].contains(&b'\n') {
-                    return Ok(true);
+                if let Some(i) = buf[..n].iter().position(|b| *b == b'\n') {
+                    return Ok(Some(seen + i as u64));
                 }
+                seen += n as u64;
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Reads the contents in the order that the job wrote them.
@@ -867,6 +877,75 @@ mod tests {
             "the mark between the attempts went"
         );
         assert!(text.contains("the second attempt"));
+    }
+
+    /// A line end that is far into the tail must not cost the whole tail.
+    ///
+    /// qex removes the incomplete first line of the tail. With one line end
+    /// far into the tail, that rule removed almost everything: a measure with
+    /// a 64KB limit kept 13 bytes of a tail of 46KB, and the words before the
+    /// failure went with them. A progress display that uses `\r` and then one
+    /// line at the end gives output of that form.
+    #[test]
+    fn a_line_end_that_is_far_into_the_tail_does_not_cost_the_tail() {
+        let dir = Dir::new("late-line-end");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+
+        w.write(b"the start\n");
+        // A progress display: many parts, and no line end at all.
+        for i in 0..4000 {
+            w.write(format!("\rstep {i} of 4000").as_bytes());
+        }
+        w.write(b"\nBUILD FAILED: the compiler stopped\n");
+        w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("BUILD FAILED"), "the last line went");
+        // The tail must hold the work before the failure as well, and not the
+        // last line alone.
+        let tail = text.rsplit(MARK).next().unwrap_or("");
+        assert!(
+            tail.len() > 1000,
+            "the tail holds {} bytes only, so the trim removed the output",
+            tail.len()
+        );
+        assert!(
+            text.contains("middle of a line"),
+            "the file must say that the last part is not a whole line"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= MIN_LIMIT);
+    }
+
+    /// A tail that starts in the middle of a line always says so.
+    ///
+    /// qex removes the bytes between the head and the tail, so the first bytes
+    /// of the tail are the middle of a line. That is true whether the circular
+    /// file returned to its start or not, and an earlier version wrote the
+    /// warning in the first case only: a reader then met `AAAAAAAAAAAAAAA-994`
+    /// and had no reason to doubt it.
+    #[test]
+    fn a_tail_that_starts_in_the_middle_of_a_line_says_so() {
+        let dir = Dir::new("mid-line");
+        let path = dir.log();
+        // Long lines, and an output that passes the limit by a small quantity.
+        // The circular file does not return to its start in this case.
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+        for i in 0..400 {
+            w.write(format!("{}-{i}\n", "A".repeat(59)).as_bytes());
+        }
+        w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let after = text.rsplit(MARK).next().unwrap_or("");
+        let first = after.lines().nth(1).unwrap_or("");
+        if !first.is_empty() && !first.starts_with(&"A".repeat(59)) {
+            assert!(
+                text.contains("middle of a line"),
+                "the first line of the tail is `{first}`, and the file does not say that it \
+                 is not a whole line"
+            );
+        }
     }
 
     /// A machine that refuses the file for the tail must still stop the output,
