@@ -127,7 +127,9 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         // A group takes its id or its name. A name is easier to type, and the
         // names of a pipeline belong to one submission.
         jobs.retain(|j| {
-            j.group.map(|g| g.to_string().starts_with(group)).unwrap_or(false)
+            j.group
+                .map(|g| g.to_string().starts_with(group))
+                .unwrap_or(false)
                 || j.group_name.as_deref() == Some(group.as_str())
         });
     }
@@ -146,8 +148,8 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     }
 
     println!(
-        "{:<8}  {:<10}  {:<16}  {:>5}  {:>8}  {:>8}  {}",
-        "ID", "STATE", "NAME", "CPU", "MEM", "TIME", "NOTE"
+        "{:<8}  {:<10}  {:<16}  {:>5}  {:>8}  {:>8}  NOTE",
+        "ID", "STATE", "NAME", "CPU", "MEM", "TIME"
     );
     for j in &jobs {
         let elapsed = j
@@ -246,7 +248,10 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                     let mut logs = serde_json::Map::new();
                     for (name, selected) in &excerpt {
                         let mut one = serde_json::Map::new();
-                        one.insert("text".into(), serde_json::Value::from(selected.text.clone()));
+                        one.insert(
+                            "text".into(),
+                            serde_json::Value::from(selected.text.clone()),
+                        );
                         if let Some(found) = selected.matches {
                             one.insert("matches".into(), serde_json::Value::from(found));
                         }
@@ -357,8 +362,13 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     println!("id:        {}", s.id);
     println!("name:      {}", s.name);
     println!("state:     {}", s.state);
+    // A pid that a reader can act on, and a pid that a reader must not act on,
+    // get different words. After the job stops, the machine can give that
+    // number to another process, so the line says `was`.
     if let Some(pid) = s.pid {
         println!("pid:       {pid}");
+    } else if let Some(pid) = s.last_pid {
+        println!("pid:       {pid} (was; the job stopped, and this pid is history)");
     }
     if let Some(code) = s.exit_code {
         println!("exit code: {code}");
@@ -476,7 +486,9 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
             WaitOutcome::Finished(s) => s,
             WaitOutcome::TimedOut => {
                 if !args.json {
-                    eprintln!("qex: the wait for {raw_id} reached its time limit. The job continues.");
+                    eprintln!(
+                        "qex: the wait for {raw_id} reached its time limit. The job continues."
+                    );
                 }
                 return Ok(EXIT_TIMEOUT);
             }
@@ -492,7 +504,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         if code != 0 && worst == 0 {
             worst = code;
         }
-        results.push(status);
+        results.push(*status);
     }
 
     if args.json {
@@ -566,7 +578,10 @@ fn wait_for_any(args: &cli::WaitArgs, deadline: Option<Instant>) -> Result<i32> 
 }
 
 enum WaitOutcome {
-    Finished(JobStatus),
+    // `JobStatus` is large, and the other two answers hold nothing. A box keeps
+    // this type small, because each value of it would otherwise take the space
+    // of the largest one.
+    Finished(Box<JobStatus>),
     TimedOut,
     NoSuchJob,
 }
@@ -593,7 +608,7 @@ fn wait_one(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
 
         client.send(&Request::Wait { id })?;
         match client.recv() {
-            Ok(Response::Status { status }) => return Ok(WaitOutcome::Finished(*status)),
+            Ok(Response::Status { status }) => return Ok(WaitOutcome::Finished(status)),
             Ok(Response::Error {
                 kind: ErrorKind::NoSuchJob,
                 ..
@@ -749,7 +764,7 @@ fn wait_on_file(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> 
     loop {
         if let Ok(status) = crate::job::read_status(&dir) {
             if status.state.is_terminal() {
-                return Ok(WaitOutcome::Finished(status));
+                return Ok(WaitOutcome::Finished(Box::new(status)));
             }
         }
 
@@ -806,10 +821,7 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
             let selected = select_log(&dir, file, &args.select, crate::logsel::DEFAULT_LINES)?;
             out.insert((*name).into(), serde_json::Value::String(selected.text));
             if let Some(found) = selected.matches {
-                out.insert(
-                    format!("{name}_matches"),
-                    serde_json::Value::from(found),
-                );
+                out.insert(format!("{name}_matches"), serde_json::Value::from(found));
             }
             if selected.truncated {
                 out.insert(
@@ -896,6 +908,9 @@ fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i3
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .create(true)
+            // Keep what the file holds. This command reads the output of the
+            // job, and it must never remove it.
+            .truncate(false)
             .write(true)
             .open(&path)?;
 
@@ -988,8 +1003,8 @@ fn keep_line(select: &crate::logsel::LogSelect, line: &str) -> bool {
 }
 
 pub fn kill(args: cli::KillArgs) -> Result<i32> {
-    let signal =
-        crate::lifecycle::parse_signal(&args.signal).map_err(|e| anyhow::anyhow!("--signal: {e}"))?;
+    let signal = crate::lifecycle::parse_signal(&args.signal)
+        .map_err(|e| anyhow::anyhow!("--signal: {e}"))?;
     let grace = parse_duration(&args.grace)
         .map_err(|e| anyhow::anyhow!("--grace: {e}"))?
         .map(|d| d.as_secs())
@@ -1145,8 +1160,7 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
 
         // A directory is a filter and not a selector. A job outside the
         // directory is never deleted, whatever the other options say.
-        if by_directory
-            && !matches_directory(&j.cwd, clean_cwd.as_deref(), clean_under.as_deref())
+        if by_directory && !matches_directory(&j.cwd, clean_cwd.as_deref(), clean_under.as_deref())
         {
             continue;
         }
@@ -1409,7 +1423,10 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 return Ok(0);
             }
             println!("coordinator pid: {pid}");
-            println!("version:         {version} (this command: {})", env!("CARGO_PKG_VERSION"));
+            println!(
+                "version:         {version} (this command: {})",
+                env!("CARGO_PKG_VERSION")
+            );
             if program_replaced {
                 // Say this clearly. A user that replaces the program during
                 // development would otherwise meet a message with no cause.
@@ -1421,9 +1438,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             }
             println!("jobs running:    {jobs_running}");
             println!("jobs queued:     {jobs_queued}");
-            println!(
-                "cores:           {cpu_claimed} of {cpu_budget} in use",
-            );
+            println!("cores:           {cpu_claimed} of {cpu_budget} in use",);
             println!(
                 "memory:          {} of {} in use",
                 format_size(mem_claimed),
@@ -1432,97 +1447,6 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             Ok(0)
         }
         other => report(other),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::job::Usage;
-
-    fn status_with(state: JobState, code: Option<i32>) -> JobStatus {
-        JobStatus {
-            id: uuid::Uuid::new_v4(),
-            name: "t".into(),
-            command: vec!["true".into()],
-            cwd: "/".into(),
-            state,
-            pid: Some(1),
-            supervisor_pid: None,
-            exit_code: code,
-            signal: None,
-            submitted_at: 0,
-            started_at: Some(0),
-            finished_at: Some(1),
-            cpu: 1,
-            mem: 1 << 30,
-            claim_source: "explicit".into(),
-            group: None,
-            group_name: None,
-            usage: Usage::default(),
-            forced: false,
-            forced_reason: None,
-            sequence: 0,
-            blocked_reason: None,
-            error: None,
-            needs: vec![],
-            after: vec![],
-            locks: vec![],
-            attempts: 1,
-            retries_left: 0,
-            caused_by: None,
-            tags: vec![],
-        }
-    }
-
-    /// These codes are a contract with the agents. The help text gives them.
-    #[test]
-    fn the_exit_codes_follow_the_documentation() {
-        assert_eq!(exit_code_for(&status_with(JobState::Completed, Some(0)), false), 0);
-        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(1)), false), 1);
-        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(42)), false), 1);
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Killed, None), false),
-            EXIT_KILLED
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Timeout, None), false),
-            EXIT_KILLED
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Oom, None), false),
-            EXIT_KILLED
-        );
-    }
-
-    /// The option `--passthrough` gives the exit code of the job.
-    #[test]
-    fn the_passthrough_option_gives_the_exit_code_of_the_job() {
-        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(42)), true), 42);
-        assert_eq!(exit_code_for(&status_with(JobState::Completed, Some(0)), true), 0);
-        // A signal gives no exit code. The result must still show a failure.
-        assert_eq!(exit_code_for(&status_with(JobState::Killed, None), true), 1);
-    }
-
-    #[test]
-    fn the_result_text_names_the_cause() {
-        let s = status_with(JobState::Failed, Some(3));
-        assert!(describe_result(&s).contains('3'));
-
-        let mut s = status_with(JobState::Oom, None);
-        s.usage.max_rss = 2 << 30;
-        let text = describe_result(&s);
-        assert!(text.contains("memory"), "got: {text}");
-        // The text must give the claim and the true use. An agent then corrects
-        // its claim from this line.
-        assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
-    }
-
-    #[test]
-    fn a_short_id_has_eight_characters() {
-        let id = uuid::Uuid::new_v4();
-        assert_eq!(short_id(&id).len(), 8);
-        assert!(id.to_string().starts_with(&short_id(&id)));
     }
 }
 
@@ -1580,13 +1504,19 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
         for name in &stage.needs {
             match ids.get(name) {
                 Some(id) => spec.needs.push(*id),
-                None => bail!("the stage `{}` waits for `{name}`, which qex did not submit", stage.name),
+                None => bail!(
+                    "the stage `{}` waits for `{name}`, which qex did not submit",
+                    stage.name
+                ),
             }
         }
         for name in &stage.after {
             match ids.get(name) {
                 Some(id) => spec.after.push(*id),
-                None => bail!("the stage `{}` waits for `{name}`, which qex did not submit", stage.name),
+                None => bail!(
+                    "the stage `{}` waits for `{name}`, which qex did not submit",
+                    stage.name
+                ),
             }
         }
 
@@ -1652,16 +1582,14 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
 
     // Do not start a coordinator. A question about a version must not change
     // the machine.
-    let coordinator = Client::connect_existing().and_then(|mut c| {
-        match c.call(&Request::Info) {
-            Ok(Response::Info {
-                version,
-                pid,
-                program_replaced,
-                ..
-            }) => Some((version, pid, program_replaced)),
-            _ => None,
-        }
+    let coordinator = Client::connect_existing().and_then(|mut c| match c.call(&Request::Info) {
+        Ok(Response::Info {
+            version,
+            pid,
+            program_replaced,
+            ..
+        }) => Some((version, pid, program_replaced)),
+        _ => None,
     });
 
     if args.json {
@@ -1728,9 +1656,60 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
 /// A shell variable does not last between the commands of an agent, and an
 /// agent that loses an id must search for it. A file holds the id.
 fn write_id_file(path: &std::path::Path, text: &str) -> Result<()> {
+    warn_if_temporary(path);
     // A job id gives no access to anything, so this file uses the usual mode.
     crate::job::write_atomic(path, text.as_bytes(), 0o644)
         .with_context(|| format!("writing the id file {}", path.display()))
+}
+
+/// Gives a warning for an id file in a directory that does not last.
+///
+/// # The trap
+///
+/// The id is the handle to the job. The job continues when the session of the
+/// agent stops, WHICH IS THE PROPERTY THAT MAKES THE ID FILE VALUABLE. An agent
+/// that writes the id into its scratch directory therefore loses the handle at
+/// the exact moment that it needs the handle: the harness deletes that
+/// directory with the session, and the job continues with no name.
+///
+/// The file operates correctly, and the fault appears in a later session only.
+/// A warning at this moment is thus the one opportunity to prevent it.
+fn warn_if_temporary(path: &std::path::Path) {
+    let full = std::fs::canonicalize(path.parent().unwrap_or(std::path::Path::new(".")))
+        .unwrap_or_else(|_| path.to_path_buf());
+    let text = full.to_string_lossy().to_string();
+
+    // The directories that a machine or a harness empties. `TMPDIR` covers
+    // macOS, where the value is a directory of the user under `/var/folders`.
+    let mut roots: Vec<String> = vec!["/tmp".into(), "/var/tmp".into()];
+    for name in ["TMPDIR", "CLAUDE_JOB_DIR", "XDG_RUNTIME_DIR"] {
+        if let Ok(value) = std::env::var(name) {
+            if !value.is_empty() {
+                roots.push(value.trim_end_matches('/').to_string());
+            }
+        }
+    }
+
+    let inside = roots
+        .iter()
+        .any(|r| text == *r || text.starts_with(&format!("{r}/")));
+    // A directory with this name belongs to a harness, whatever its position.
+    let scratch = full
+        .components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some("scratchpad") | Some("scratch")));
+
+    if !(inside || scratch) {
+        return;
+    }
+
+    eprintln!(
+        "qex: WARNING: the id file {} is in a directory that does not last.\n\
+         qex:   The job continues when your session stops, but this file goes with the\n\
+         qex:   session, and you then have no handle for a job that still operates.\n\
+         qex:   Put the id file in your project or in your home directory instead.\n\
+         qex:   `qex list` finds a job again when the id is lost.",
+        path.display()
+    );
 }
 
 /// Makes the contents of the id file of a pipeline.
@@ -1776,8 +1755,7 @@ fn pipeline_id_file(
 }
 
 /// True when the user pressed Ctrl-C during `qex run`.
-static RUN_INTERRUPTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static RUN_INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn on_interrupt(_signal: libc::c_int) {
     // A signal handler may use an atomic store and very little else.
@@ -1863,11 +1841,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
 }
 
 /// Writes the output of a job as it arrives, until the job stops.
-fn stream_until_done(
-    client: &mut Client,
-    id: uuid::Uuid,
-    dir: &std::path::Path,
-) -> Result<i32> {
+fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let mut handles: Vec<(bool, Option<std::fs::File>)> = vec![(false, None), (true, None)];
@@ -1981,11 +1955,17 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
-        Response::Submitted { id: new_id, warning } => {
+        Response::Submitted {
+            id: new_id,
+            warning,
+        } => {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
-            eprintln!("qex: the job {} runs again as {new_id}", &id.to_string()[..8]);
+            eprintln!(
+                "qex: the job {} runs again as {new_id}",
+                &id.to_string()[..8]
+            );
             if let Some(path) = &args.id_file {
                 write_id_file(path, &format!("{new_id}\n"))?;
             }
@@ -2008,18 +1988,13 @@ fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
         _ => return (Vec::new(), String::from("unknown"), 0),
     };
 
-    if crate::capabilities::parse(&version) >= crate::capabilities::ASK_FROM_VERSION {
-        if let Ok(Response::Capabilities { names }) = client.call(&Request::Capabilities) {
-            return (names, version, pid);
-        }
+    // Every version that qex supports answers this request. A coordinator that
+    // does not answer it is below the support floor, and it gets an empty list;
+    // the floor test then refuses it with the correct words.
+    match client.call(&Request::Capabilities) {
+        Ok(Response::Capabilities { names }) => (names, version, pid),
+        _ => (Vec::new(), version, pid),
     }
-
-    // An earlier coordinator. Its version says what it can do.
-    let names = crate::capabilities::implied_by_version(&version)
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    (names, version, pid)
 }
 
 /// Refuses a job that the coordinator cannot obey.
@@ -2028,10 +2003,15 @@ fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
 /// ignored in silence. A user would then receive a job id for a job that runs
 /// without the rule that the user asked for.
 fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
+    let (have, version, pid) = coordinator_capabilities(client);
+
+    // The floor first. A coordinator below it comes from a build that no
+    // release holds, so no promise covers it, whatever the job asks for.
+    crate::capabilities::check_floor(&version, pid).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     if crate::capabilities::required_by(spec).is_empty() {
         return Ok(());
     }
-    let (have, version, pid) = coordinator_capabilities(client);
     crate::capabilities::check(&have, &version, pid, spec).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
@@ -2040,7 +2020,11 @@ fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
 /// `exact` gives the jobs of one directory. `under` gives the jobs of that
 /// directory and of every directory below it, so a user at the top of a project
 /// reaches every job of that project.
-fn matches_directory(job_cwd: &str, exact: Option<&std::path::Path>, under: Option<&std::path::Path>) -> bool {
+fn matches_directory(
+    job_cwd: &str,
+    exact: Option<&std::path::Path>,
+    under: Option<&std::path::Path>,
+) -> bool {
     if let Some(dir) = exact {
         if std::path::Path::new(job_cwd) != dir {
             return false;
@@ -2065,7 +2049,6 @@ fn resolve_directory(path: &std::path::Path, option: &str) -> Result<std::path::
     path.canonicalize()
         .with_context(|| format!("{option}: the directory {} does not exist", path.display()))
 }
-
 
 /// Collects the old records of every directory.
 ///
@@ -2111,7 +2094,11 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
         let stopped = j.finished_at.unwrap_or(j.submitted_at);
         let age = now.saturating_sub(stopped);
         if age >= keep {
-            targets.push((j.id, j.name.clone(), directory_size(&paths::job_dir(&j.id)?)));
+            targets.push((
+                j.id,
+                j.name.clone(),
+                directory_size(&paths::job_dir(&j.id)?),
+            ));
         }
     }
 
@@ -2318,7 +2305,11 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
     }
 
     println!("qex holds {} in {}", format_size(total), state.display());
-    println!("  {} in {} job record(s)", format_size(total_jobs), per_job.len());
+    println!(
+        "  {} in {} job record(s)",
+        format_size(total_jobs),
+        per_job.len()
+    );
     if orphan_count > 0 {
         println!(
             "  {} in {orphan_count} directory(s) with no record",
@@ -2345,9 +2336,120 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
                 &id.to_string()[..8],
                 state,
                 name,
-                if *old { "  (qex gc would free this)" } else { "" }
+                if *old {
+                    "  (qex gc would free this)"
+                } else {
+                    ""
+                }
             );
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::Usage;
+
+    fn status_with(state: JobState, code: Option<i32>) -> JobStatus {
+        JobStatus {
+            id: uuid::Uuid::new_v4(),
+            name: "t".into(),
+            command: vec!["true".into()],
+            cwd: "/".into(),
+            state,
+            pid: Some(1),
+            last_pid: None,
+            supervisor_pid: None,
+            exit_code: code,
+            signal: None,
+            submitted_at: 0,
+            started_at: Some(0),
+            finished_at: Some(1),
+            cpu: 1,
+            mem: 1 << 30,
+            claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
+            usage: Usage::default(),
+            forced: false,
+            forced_reason: None,
+            sequence: 0,
+            blocked_reason: None,
+            error: None,
+            needs: vec![],
+            after: vec![],
+            locks: vec![],
+            attempts: 1,
+            retries_left: 0,
+            caused_by: None,
+            tags: vec![],
+        }
+    }
+
+    /// These codes are a contract with the agents. The help text gives them.
+    #[test]
+    fn the_exit_codes_follow_the_documentation() {
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Completed, Some(0)), false),
+            0
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(1)), false),
+            1
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(42)), false),
+            1
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Killed, None), false),
+            EXIT_KILLED
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Timeout, None), false),
+            EXIT_KILLED
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Oom, None), false),
+            EXIT_KILLED
+        );
+    }
+
+    /// The option `--passthrough` gives the exit code of the job.
+    #[test]
+    fn the_passthrough_option_gives_the_exit_code_of_the_job() {
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(42)), true),
+            42
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Completed, Some(0)), true),
+            0
+        );
+        // A signal gives no exit code. The result must still show a failure.
+        assert_eq!(exit_code_for(&status_with(JobState::Killed, None), true), 1);
+    }
+
+    #[test]
+    fn the_result_text_names_the_cause() {
+        let s = status_with(JobState::Failed, Some(3));
+        assert!(describe_result(&s).contains('3'));
+
+        let mut s = status_with(JobState::Oom, None);
+        s.usage.max_rss = 2 << 30;
+        let text = describe_result(&s);
+        assert!(text.contains("memory"), "got: {text}");
+        // The text must give the claim and the true use. An agent then corrects
+        // its claim from this line.
+        assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
+    }
+
+    #[test]
+    fn a_short_id_has_eight_characters() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(short_id(&id).len(), 8);
+        assert!(id.to_string().starts_with(&short_id(&id)));
+    }
 }

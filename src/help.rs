@@ -153,6 +153,53 @@ the id in a file:
     qex submit --id-file build.id -- make
     qex status \"$(cat build.id)\" --wait
 
+PUT THE ID FILE WHERE IT LASTS LONGER THAN YOUR SESSION. Your project directory
+or your home directory is correct. A scratch directory that your harness owns is
+NOT correct, and neither is /tmp: the job continues when your session stops, but
+the file goes with the session, and you then have no handle for a job that still
+operates. qex gives a warning when the file goes to such a directory.
+
+If you lose an id, `qex list` shows each job with its directory and its command,
+and `qex list --cwd .` shows the jobs of this directory only.
+
+Your session can stop, and the work continues
+---------------------------------------------
+
+THIS IS THE PROPERTY THAT MAKES qex SAFE FOR AN AGENT THAT A PERSON CAN STOP.
+
+The job is not a child of your shell, and it is not a child of your agent. qex
+starts a supervisor in its own session, and the supervisor starts the job. Three
+things follow, and all three matter:
+
+    Somebody stops your agent           the job continues.
+    Your terminal closes                the job continues.
+    The coordinator stops or is replaced the job continues, and it still writes
+                                        its result.
+
+Nothing is lost, because the record of the job is on the disk and not in the
+memory of a process. Your wait is the only thing that stops.
+
+You can therefore attach the wait again, in a later session, in a new shell,
+from a different agent, at any time:
+
+    qex status $ID --wait
+
+The id is the handle. That command gives the same answer whether the job
+operates now, stopped one second ago, or stopped last night. A job that stopped
+while nobody watched loses nothing at all.
+
+This is what a monitor script cannot do. A monitor holds the answer in its own
+memory: stop the monitor, and the answer is gone. Keep the id in a file with
+`--id-file`, and the answer waits for you instead.
+
+    qex submit --id-file build.id -- make    # session 1
+    # the person stops the agent here. `make` continues.
+    qex status \"$(cat build.id)\" --wait      # session 2, and the result is there
+
+A person can thus stop you at any moment with no cost. Do not start the work
+again in a new session before you ask: `qex list` shows what already operates,
+and `qex status <id>` gives the result of what stopped.
+
 One command gives the result and the cause
 ------------------------------------------
 

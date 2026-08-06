@@ -122,8 +122,26 @@ pub struct JobStatus {
     #[serde(default)]
     pub cwd: String,
     pub state: JobState,
-    /// The pid of the job process. The value is `None` before the job starts.
+    /// The pid of the job process WHILE THE JOB OPERATES.
+    ///
+    /// The value is `None` before the job starts, and `None` again after the job
+    /// stops. See `last_pid` for the historical value.
+    ///
+    /// A pid is not a name. The machine gives the same number to a new process
+    /// soon after the earlier process stops. A pid in the record of a job that
+    /// stopped would thus point at a process that has no connection with the
+    /// job, and a reader that sends a signal to that number stops the work of
+    /// somebody else. `pid` therefore answers one question only: which process
+    /// is this job, now. A reader can act on it, because a value that exists
+    /// means that the job operates.
     pub pid: Option<i32>,
+    /// The pid that the job HAD, kept after the job stops.
+    ///
+    /// This value is for a person who reads a log of the machine. NEVER SEND A
+    /// SIGNAL TO IT, and never look for it in the process list: the machine
+    /// gives that number to another process later.
+    #[serde(default)]
+    pub last_pid: Option<i32>,
     /// The pid of the supervisor of the job.
     ///
     /// A new coordinator reads this value to learn if a job continues. Without
@@ -221,6 +239,7 @@ impl JobStatus {
             cwd: spec.cwd.to_string_lossy().into_owned(),
             state: JobState::Queued,
             pid: None,
+            last_pid: None,
             supervisor_pid: None,
             exit_code: None,
             signal: None,
@@ -264,41 +283,79 @@ impl JobStatus {
 ///
 /// This behaviour is necessary because `qex wait` reads `status.json` directly
 /// when the coordinator does not operate.
+///
+/// # The three steps that make the record durable
+///
+/// qex says that a job keeps its result when the coordinator stops and when the
+/// machine loses power. Three steps together give that, and two of the three are
+/// easy to forget:
+///
+/// 1. `sync_all` on the file, so that the contents reach the disk.
+/// 2. `rename`, which is one operation. A reader sees the old file or the new
+///    file, and never a part of either.
+/// 3. `sync_all` on the DIRECTORY, so that the name reaches the disk as well.
+///    Without this step the contents can be durable while the name is not, and
+///    a machine that loses power can start with the earlier file, or with no
+///    file at all.
+///
+/// An error in any of these steps is an error of this function. A record that
+/// qex could not write is not a record, and a caller must hear that.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
+
+    // The name of the temporary file must belong to this writer alone. The pid
+    // separates the processes, and the counter separates the threads of one
+    // process. `create_new` then proves it: an open that finds an existing file
+    // gives an error, and no two writers can share one temporary file.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(
-        ".{}.tmp.{}",
+        ".{}.tmp.{}.{}",
         path.file_name().and_then(|f| f.to_str()).unwrap_or("f"),
-        std::process::id()
+        std::process::id(),
+        unique
     ));
 
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(mode)
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
         f.write_all(bytes)
             .with_context(|| format!("writing {}", tmp.display()))?;
-        // Write the data to the disk now. If the machine loses power during a
-        // job, the status file must not be incomplete after the restart.
-        f.sync_all().ok();
+        // Step 1. Write the data to the disk now. If the machine loses power
+        // during a job, the status file must not be incomplete after the
+        // restart.
+        f.sync_all()
+            .with_context(|| format!("writing {} to the disk", tmp.display()))?;
     }
 
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} into place", tmp.display()))?;
+    // Step 2.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // The temporary file must not stay behind. A directory that fills with
+        // these files holds space that `qex du` cannot explain.
+        std::fs::remove_file(&tmp).ok();
+        return Err(e).with_context(|| format!("renaming {} into place", tmp.display()));
+    }
+
+    // Step 3. Some systems give an error for a sync of a directory. That is not
+    // a failure of the write, and the file is in place, so this step gives no
+    // error to the caller.
+    if let Ok(handle) = std::fs::File::open(dir) {
+        handle.sync_all().ok();
+    }
     Ok(())
 }
 
 pub fn read_status(dir: &Path) -> Result<JobStatus> {
     let path = dir.join("status.json");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -332,8 +389,8 @@ pub fn read_all_from_disk() -> Vec<JobStatus> {
 
 pub fn read_spec(dir: &Path) -> Result<JobSpec> {
     let path = dir.join("spec.json");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -394,7 +451,10 @@ mod tests {
         write_atomic(&path, b"{}", 0o600).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "other users must not read a captured environment");
+        assert_eq!(
+            mode, 0o600,
+            "other users must not read a captured environment"
+        );
 
         // A second write must keep the same mode. It must not open the file.
         write_atomic(&path, b"{\"a\":1}", 0o600).unwrap();

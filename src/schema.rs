@@ -200,7 +200,11 @@ pub const STATUS: &str = r##"{
     },
     "pid": {
       "type": ["integer", "null"],
-      "description": "The process id of the job. The value is null before the job starts."
+      "description": "The process id of the job WHILE THE JOB OPERATES. The value is null before the job starts and null again after the job stops, because the machine gives that number to a different process soon after. A value that is not null thus means that the job operates now, and a reader can act on it. To stop a job, use `qex kill <id>`, which is correct at each moment."
+    },
+    "last_pid": {
+      "type": ["integer", "null"],
+      "description": "The process id that the job HAD. This value stays after the job stops, for a reader of a machine log. Never send a signal to it, and never look for it in the process list: the machine gives that number to another process later."
     },
     "exit_code": {
       "type": ["integer", "null"],
@@ -281,12 +285,28 @@ mod tests {
             .as_object()
             .unwrap();
         for field in [
-            "name", "command", "needs", "after", "cwd", "timeout", "tags", "priority",
-            "env_capture", "resources", "env",
+            "name",
+            "command",
+            "needs",
+            "after",
+            "cwd",
+            "timeout",
+            "tags",
+            "priority",
+            "env_capture",
+            "resources",
+            "env",
         ] {
-            assert!(props.contains_key(field), "the schema has no field `{field}`");
+            assert!(
+                props.contains_key(field),
+                "the schema has no field `{field}`"
+            );
         }
-        assert_eq!(props.len(), 11, "the schema has a field that a stage does not accept");
+        assert_eq!(
+            props.len(),
+            11,
+            "the schema has a field that a stage does not accept"
+        );
     }
 
     /// The example in the schema must parse as a pipeline file.
@@ -338,7 +358,11 @@ mod tests {
                 "the schema does not list the state `{state}`"
             );
         }
-        assert_eq!(listed.len(), 10, "the schema lists a state that qex does not use");
+        assert_eq!(
+            listed.len(),
+            10,
+            "the schema lists a state that qex does not use"
+        );
     }
 
     /// The job schema must list each field of the job file. A missing field
@@ -360,9 +384,16 @@ mod tests {
             "needs",
             "after",
         ] {
-            assert!(props.contains_key(field), "the schema has no field `{field}`");
+            assert!(
+                props.contains_key(field),
+                "the schema has no field `{field}`"
+            );
         }
-        assert_eq!(props.len(), 11, "the schema has a field that the job file does not accept");
+        assert_eq!(
+            props.len(),
+            11,
+            "the schema has a field that the job file does not accept"
+        );
     }
 
     /// The example in the job schema must parse as a job file.

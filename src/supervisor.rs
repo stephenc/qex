@@ -33,7 +33,9 @@ pub fn spawn(id: uuid::Uuid) -> Result<i32> {
         .mode(0o600)
         .open(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
-    let log_err = log_file.try_clone().context("copying the log file handle")?;
+    let log_err = log_file
+        .try_clone()
+        .context("copying the log file handle")?;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("supervise")
@@ -224,7 +226,29 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // inherits it. A job that starts first could allocate memory and fork
     // children before qex moved it, and those children would never meet the
     // limit.
-    let cfg = crate::config::Config::load().unwrap_or_default();
+    // A configuration that qex cannot read must never become the default
+    // configuration in silence. The default has no enforcement, so a fault in
+    // the file would turn `must enforce` into `no limit`, and the job would run
+    // with no limit and no word to anybody.
+    //
+    // The job continues, because the work of the user is more important than the
+    // file. The fault goes into the record of the job, where `qex status` shows
+    // it, and into the log of the supervisor.
+    let mut config_fault: Option<String> = None;
+    let cfg = match crate::config::Config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let message = format!(
+                "qex could not read the configuration ({e}). This job uses the default values, \
+                 SO NO LIMIT OPERATES. Correct the file, and start the job again with \
+                 `qex rerun {id}`."
+            );
+            log(&message);
+            eprintln!("{message}");
+            config_fault = Some(message);
+            crate::config::Config::default()
+        }
+    };
     let mut cgroup_dir: Option<std::path::PathBuf> = None;
     let mut enforce_warning: Option<String> = None;
     if cfg.enforce.mode.is_on() {
@@ -258,6 +282,13 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         status.error = Some(format!(
             "the memory limit is not active for this job: {warning}"
         ));
+    }
+
+    // A configuration that qex could not read is at least as important, and it
+    // keeps its own words. It goes after the block above, because a fault in
+    // the configuration is the cause of any limit fault that follows it.
+    if let Some(fault) = &config_fault {
+        status.error = Some(fault.clone());
     }
     let _ = &cgroup_dir;
 
@@ -352,7 +383,19 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // `waitid` with `WNOWAIT` reports the result and keeps the process in the
     // table. The process id thus stays reserved, and the process group is still
     // the group of this job. The signals below cannot reach a different process.
-    wait_without_reaping(pid);
+    //
+    // An error means that the process id is NOT reserved. The signals below
+    // must then not go to that process group; see the note on the function.
+    let reserved = match wait_without_reaping(pid) {
+        Ok(()) => true,
+        Err(e) => {
+            log(&format!(
+                "the wait for the job {id} (pid {pid}) failed: {e}. qex sends no signal to that \
+                 process group, because the machine can give that pid to another process."
+            ));
+            false
+        }
+    };
 
     // Take the race before the last signals. The timer can no longer start.
     let _ = outcome.compare_exchange(
@@ -364,8 +407,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 
     // Stop each process that the job left. The job process is a zombie now, so
     // its process id is still reserved and this signal is safe.
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
+    if reserved {
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
     }
 
     // If qex made a cgroup, stop each process in it. A process cannot leave a
@@ -406,7 +451,11 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.signal = signal;
     status.finished_at = Some(sys::now_secs());
     status.usage = usage;
-    status.pid = Some(pid);
+    // The job stopped, so the pid stops being an identity: the machine can
+    // give that number to another process at any moment. Keep it as history
+    // only, where no code can act on it.
+    status.pid = None;
+    status.last_pid = Some(pid);
     job::write_status(&dir, &status)?;
 
     // Run the job again when it failed and a retry is left.
@@ -474,16 +523,37 @@ const RACE_TIMER: u8 = 2;
 ///
 /// The caller must call `wait` after this function, or the process stays in the
 /// table as a zombie.
-fn wait_without_reaping(pid: i32) {
+///
+/// # Why an error here needs an answer
+///
+/// The caller signals a process group after this function. That is safe ONLY
+/// while the process stays in the process table. A call that failed leaves no
+/// such promise, and a caller that continues sends a signal to a process id
+/// that the machine can have given to somebody else.
+///
+/// A signal that arrives interrupts this call and gives `EINTR`. That is common
+/// in code that controls processes, and it is not an error: the process has not
+/// stopped, so the call starts again.
+fn wait_without_reaping(pid: i32) -> std::io::Result<()> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // This call blocks until the process stops.
-    unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOWAIT,
-        );
+    loop {
+        // This call blocks until the process stops.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(e);
     }
 }
 
@@ -585,9 +655,18 @@ mod tests {
     #[test]
     fn the_exit_code_gives_the_final_state() {
         let dir = std::path::Path::new("/nonexistent");
-        assert_eq!(classify(&spec(), Some(0), None, false, dir), JobState::Completed);
-        assert_eq!(classify(&spec(), Some(1), None, false, dir), JobState::Failed);
-        assert_eq!(classify(&spec(), Some(127), None, false, dir), JobState::Failed);
+        assert_eq!(
+            classify(&spec(), Some(0), None, false, dir),
+            JobState::Completed
+        );
+        assert_eq!(
+            classify(&spec(), Some(1), None, false, dir),
+            JobState::Failed
+        );
+        assert_eq!(
+            classify(&spec(), Some(127), None, false, dir),
+            JobState::Failed
+        );
     }
 
     #[test]
