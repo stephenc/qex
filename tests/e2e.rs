@@ -1508,10 +1508,9 @@ fn the_status_of_a_job_that_failed_holds_its_error_output() {
         "the status must hold the error output: {text}"
     );
 
-    // The JSON output must hold the same text in a field.
+    // The JSON output holds one field for each stream that has content.
     let v = h.status_json(&id);
-    assert_eq!(v["logs"]["stream"], "stderr");
-    assert!(v["logs"]["text"].as_str().unwrap().contains("BOOM"));
+    assert!(v["logs"]["stderr"]["text"].as_str().unwrap().contains("BOOM"));
 
     // A job that succeeded gives no output, because the reader did not ask.
     let good = h.submit(&["submit", "--", "sh", "-c", "echo quiet"]);
@@ -1521,6 +1520,46 @@ fn the_status_of_a_job_that_failed_holds_its_error_output() {
     // The option --no-logs removes the output.
     let text = h.ok(&["status", &id, "--no-logs"]);
     assert!(!text.contains("BOOM"), "--no-logs must remove the output");
+}
+
+/// The status of a job that failed must give BOTH streams.
+///
+/// A test program writes its failure summary to the standard error and its
+/// result to the standard output. The standard error alone reads as a complete
+/// failure, and the reader then needs a second command to learn what really
+/// happened.
+#[test]
+fn the_status_of_a_failure_gives_both_streams() {
+    let h = Harness::with_default_config("bothstreams");
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "echo 'exact 27793/27793 OK'; echo 'FAIL: 64087 mismatched' >&2; exit 1",
+    ]);
+    h.qex(&["wait", &id, "--timeout", "45s"]);
+
+    let text = h.ok(&["status", &id]);
+    assert!(
+        text.contains("FAIL: 64087"),
+        "the status must hold the error output: {text}"
+    );
+    assert!(
+        text.contains("27793/27793"),
+        "the status must also hold the standard output, or the reader sees a \
+         failure with no result: {text}"
+    );
+
+    // The JSON output holds one field for each stream.
+    let v = h.status_json(&id);
+    assert!(v["logs"]["stderr"]["text"].as_str().unwrap().contains("FAIL"));
+    assert!(v["logs"]["stdout"]["text"].as_str().unwrap().contains("27793"));
+
+    // A reader that names one stream gets that stream only.
+    let only = h.ok(&["status", &id, "--stderr"]);
+    assert!(only.contains("FAIL"));
+    assert!(!only.contains("27793"), "--stderr must give one stream only");
 }
 
 /// The options that select lines must operate on both commands.

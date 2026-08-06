@@ -206,33 +206,37 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                         value["env"] = serde_json::to_value(&spec.env)?;
                     }
                 }
-                if let Some((name, selected)) = &excerpt {
+                if !excerpt.is_empty() {
+                    // One field for each stream. A reader that wants the result
+                    // of a test program needs the standard output, and a reader
+                    // that wants the cause needs the standard error.
                     let mut logs = serde_json::Map::new();
-                    logs.insert("stream".into(), serde_json::Value::from(name.as_str()));
-                    logs.insert("text".into(), serde_json::Value::from(selected.text.clone()));
-                    if let Some(found) = selected.matches {
-                        logs.insert("matches".into(), serde_json::Value::from(found));
-                    }
-                    if selected.truncated {
-                        logs.insert(
-                            "hidden_lines".into(),
-                            serde_json::Value::from(selected.hidden),
-                        );
+                    for (name, selected) in &excerpt {
+                        let mut one = serde_json::Map::new();
+                        one.insert("text".into(), serde_json::Value::from(selected.text.clone()));
+                        if let Some(found) = selected.matches {
+                            one.insert("matches".into(), serde_json::Value::from(found));
+                        }
+                        if selected.truncated {
+                            one.insert(
+                                "hidden_lines".into(),
+                                serde_json::Value::from(selected.hidden),
+                            );
+                        }
+                        logs.insert(name.clone(), serde_json::Value::Object(one));
                     }
                     value["logs"] = serde_json::Value::Object(logs);
                 }
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 print_status(&status, args.show_env)?;
-                if let Some((name, selected)) = &excerpt {
-                    if !selected.text.is_empty() {
-                        println!();
-                        println!("--- {name} ---");
-                        if let Some(notice) = selected.notice() {
-                            println!("{notice}");
-                        }
-                        print!("{}", selected.text);
+                for (name, selected) in &excerpt {
+                    println!();
+                    println!("--- {name} ---");
+                    if let Some(notice) = selected.notice() {
+                        println!("{notice}");
                     }
+                    print!("{}", selected.text);
                 }
             }
             Ok(wait_code)
@@ -241,52 +245,79 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     }
 }
 
-/// Chooses the part of the output of a job to show with its status.
+/// Chooses the parts of the output of a job to show with its status.
 ///
-/// With no option, a job that did not succeed gives the last lines of its
-/// standard error, or of its standard output when the standard error is empty.
-/// A job that succeeded gives nothing, because the reader did not ask for it.
+/// With no option, a job that did not succeed gives the last lines of BOTH
+/// streams. A job that succeeded gives nothing, because the reader did not ask.
 ///
-/// With any option of the log selection, the reader asked for output, so this
-/// function gives it whatever the state of the job.
+/// Both streams matter. A test program writes its failure summary to the
+/// standard error and its result to the standard output. The standard error
+/// alone then reads as a complete failure, and the reader needs a second
+/// command to learn what really happened.
+///
+/// With `--stdout` or `--stderr`, the reader chose one stream, so this function
+/// gives that stream only.
 fn job_excerpt(
     status: &JobStatus,
     args: &cli::StatusArgs,
-) -> Result<Option<(String, crate::logsel::Selected)>> {
+) -> Result<Vec<(String, crate::logsel::Selected)>> {
     if args.no_logs {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
-    let explicit = args.select.is_explicit() || args.select.stdout || args.select.stderr;
+    let one_stream = args.select.stdout || args.select.stderr;
+    let explicit = args.select.is_explicit() || one_stream;
     let failed = status.state.is_terminal() && status.state != JobState::Completed;
     if !explicit && !failed {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let dir = paths::job_dir(&status.id)?;
-    let limit = if explicit {
-        crate::logsel::DEFAULT_LINES
-    } else {
-        crate::logsel::STATUS_LINES
-    };
-
-    // Choose the stream. The standard error holds the cause of a failure, and a
-    // program that writes its fault to the standard output is also frequent.
-    let order: Vec<(&str, &str)> = if args.select.stdout {
+    let wanted: Vec<(&str, &str)> = if args.select.stdout {
         vec![("stdout", "stdout.log")]
     } else if args.select.stderr {
         vec![("stderr", "stderr.log")]
     } else {
+        // The standard error comes first, because it usually holds the cause.
         vec![("stderr", "stderr.log"), ("stdout", "stdout.log")]
     };
 
-    for (name, file) in order {
-        let selected = select_log(&dir, file, &args.select, limit)?;
-        if !selected.text.trim().is_empty() {
-            return Ok(Some((name.to_string(), selected)));
+    // Read each stream with a generous limit first, to learn which streams hold
+    // anything. The limit for the output then depends on that count.
+    let mut found = Vec::new();
+    for (name, file) in &wanted {
+        let text = read_log(&dir, file);
+        if !text.trim().is_empty() {
+            found.push((*name, *file));
         }
     }
-    Ok(None)
+
+    let limit = if explicit {
+        crate::logsel::DEFAULT_LINES
+    } else if found.len() > 1 {
+        // Two streams. Give fewer lines of each, so the total stays small for
+        // a reader with a limited context.
+        crate::logsel::STATUS_LINES / 2
+    } else {
+        crate::logsel::STATUS_LINES
+    };
+
+    let mut out = Vec::new();
+    for (name, file) in found {
+        let selected = select_log(&dir, file, &args.select, limit)?;
+        if !selected.text.trim().is_empty() {
+            out.push((name.to_string(), selected));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads one log file, and accepts a byte that is not UTF-8.
+fn read_log(dir: &std::path::Path, file: &str) -> String {
+    match std::fs::read(dir.join(file)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {

@@ -106,9 +106,16 @@ One command gives the result and the cause
 standard error. You thus need no second command for the usual question.
 
     qex status $ID                  the state, the exit code and the last lines
+                                    of BOTH streams
+    qex status $ID --wait           the same, but wait for the job first
     qex status $ID --tail 50        more lines
+    qex status $ID --stderr         one stream only
     qex status $ID --grep ERROR     the lines that match
     qex status $ID --no-logs        the state only
+
+qex gives both streams, because a program frequently writes its result to the
+standard output and its failure summary to the standard error. The error alone
+reads as a complete failure.
 
 `qex wait` stops until the job stops. Its exit code tells you the result:
 
