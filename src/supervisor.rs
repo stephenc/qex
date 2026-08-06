@@ -175,6 +175,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 log(&format!("the supervisor of the job {id} left no result"));
             }
         }
+        state.publish_changes();
     }
     drop(state);
 

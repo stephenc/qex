@@ -71,13 +71,19 @@ pub enum Command {
     /// Watch the queue. Shows the claim and the true use of each job.
     Top(TopArgs),
 
+    /// Write one line for each change of state, as it happens.
+    ///
+    /// Use this command in place of a loop that asks about each job. One
+    /// reader learns of every job of this user.
+    Events(EventsArgs),
+
     /// Show the coordinator: its process id, its budget and its load.
     Info(InfoArgs),
 
     /// Show the configuration or its location.
     Config(ConfigArgs),
 
-    /// Write the JSON Schema for a job file or for the status output.
+    /// Write the JSON Schema of a qex format: job, status, pipeline or event.
     Schema(SchemaArgs),
 
     /// Explain a topic. Agents: run `qex help agents` first.
@@ -447,6 +453,31 @@ pub struct TopArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct EventsArgs {
+    /// Write one JSON object for each line.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Where to start: `start`, `now`, or a sequence number.
+    ///
+    /// The default is `start`: every event that the coordinator still holds,
+    /// and then the new events. Give the last number that you read to continue
+    /// with no loss after a restart of your program.
+    #[arg(long, value_name = "SEQ|start|now", default_value = "start")]
+    pub since: String,
+
+    /// Stop after this number of events.
+    #[arg(long, value_name = "N")]
+    pub count: Option<u64>,
+
+    /// Stop the stream after this time. Example: 30m.
+    ///
+    /// The exit code is then 124, as for `qex wait`.
+    #[arg(long, value_name = "TIME")]
+    pub timeout: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct InfoArgs {
     /// Write the output as JSON.
     #[arg(long)]
@@ -485,7 +516,7 @@ pub enum ConfigAction {
 
 #[derive(Debug, Args)]
 pub struct SchemaArgs {
-    /// The schema to write: job or status.
+    /// The schema to write: job, status, pipeline or event.
     #[arg(value_name = "WHICH")]
     pub which: Option<String>,
 }

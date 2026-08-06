@@ -45,6 +45,8 @@ mod daemon;
 #[cfg(unix)]
 mod enforce;
 #[cfg(unix)]
+mod events;
+#[cfg(unix)]
 mod help;
 #[cfg(unix)]
 mod history;
@@ -149,6 +151,7 @@ fn run() -> Result<i32> {
         Command::Status(args) => commands::status(args),
         Command::Wait(args) => commands::wait(args),
         Command::Logs(args) => commands::logs(args),
+        Command::Events(args) => commands::events(args),
         Command::Kill(args) => commands::kill(args),
         Command::Cancel(args) => commands::cancel(args),
         Command::Rerun(args) => commands::rerun(args),

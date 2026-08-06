@@ -78,15 +78,28 @@ impl Client {
 
     /// Reads one response. This function blocks until the coordinator answers.
     pub fn recv(&mut self) -> Result<Response> {
+        match self.recv_opt()? {
+            Some(response) => Ok(response),
+            None => bail!("the coordinator closed the connection without an answer"),
+        }
+    }
+
+    /// Reads one response, and gives `None` at the end of the connection.
+    ///
+    /// A command that reads MANY answers needs this form. The end of the
+    /// connection is a normal condition for such a command, and it is not the
+    /// same fault as a connection that gives no answer at all.
+    pub fn recv_opt(&mut self) -> Result<Option<Response>> {
         let mut line = String::new();
         let n = self
             .reader
             .read_line(&mut line)
             .context("reading the answer of the coordinator")?;
         if n == 0 {
-            bail!("the coordinator closed the connection without an answer");
+            return Ok(None);
         }
         serde_json::from_str(&line)
+            .map(Some)
             .with_context(|| format!("reading this answer of the coordinator: {}", line.trim()))
     }
 
