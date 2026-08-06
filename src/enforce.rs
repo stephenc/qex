@@ -327,6 +327,50 @@ pub fn mark_oom(job_dir: &Path) {
     std::fs::write(job_dir.join("oom"), b"1").ok();
 }
 
+/// Deletes the out-of-memory record of a job.
+///
+/// The record belongs to ONE attempt. qex starts the job again with a larger
+/// claim after such a kill, and a record that stays would make the next attempt
+/// an out-of-memory kill as well, whatever stopped it.
+pub fn clear_oom(job_dir: &Path) {
+    std::fs::remove_file(job_dir.join("oom")).ok();
+}
+
+/// Records that a command stopped this job.
+///
+/// `qex kill` writes this mark BEFORE it sends the signal.
+///
+/// The kernel and `qex kill` both use `SIGKILL`, and the cgroup counter is not
+/// exact when qex applies no limit: qex then reads the counter of the session,
+/// which also counts a kill in a different program of the same user. A job that
+/// a person stopped must NEVER look like an out-of-memory kill, because qex
+/// answers an out-of-memory kill with a larger claim and a new attempt. It must
+/// not repeat work that somebody stopped on purpose.
+///
+/// This mark is thus the first evidence, and it wins against the counter.
+pub fn mark_user_kill(job_dir: &Path) {
+    std::fs::write(job_dir.join("killed-by-user"), b"1").ok();
+}
+
+/// Tests if a command stopped this job.
+pub fn was_user_killed(job_dir: &Path) -> bool {
+    job_dir.join("killed-by-user").exists()
+}
+
+/// Tests if this machine can tell an out-of-memory kill from another kill.
+///
+/// Linux counts the kills of the out-of-memory killer in `memory.events`, and
+/// every process is in a cgroup, so the evidence is there whether qex applies a
+/// limit or not. macOS has no cgroup and no equivalent counter.
+///
+/// qex uses this test to say what it does not know. A kill with no evidence
+/// gives the state `killed`, which is the safe answer: qex starts no new
+/// attempt for it. A reader must learn that qex could not tell, and not believe
+/// that qex knew.
+pub fn oom_evidence_is_available() -> bool {
+    own_cgroup().is_some()
+}
+
 /// The name of the variable that stops a second start with systemd.
 ///
 /// systemd is on Linux only, and macOS thus never reads this name.
