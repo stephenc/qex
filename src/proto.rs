@@ -57,6 +57,17 @@ pub enum Response {
         /// The CLI writes this text to stderr. The job id stays alone on
         /// stdout, so `ID=$(qex submit ...)` continues to operate.
         warning: Option<String>,
+        /// True when a dedupe key gave a job that already existed.
+        ///
+        /// The id above is then the id of that job, and this submission
+        /// started nothing. A caller that must know if IT started the work
+        /// reads this field with `qex submit --json`.
+        ///
+        /// An earlier coordinator does not write this field. `default` gives
+        /// `false` there, which is the truth for a coordinator that has no
+        /// dedupe keys.
+        #[serde(default)]
+        deduplicated: bool,
     },
     /// The state of many jobs.
     Jobs { jobs: Vec<JobStatus> },

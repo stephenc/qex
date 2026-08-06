@@ -199,6 +199,21 @@ impl Harness {
         !matches!(self.state_of(id).as_str(), "queued" | "starting")
     }
 
+    /// Stops a job that a test started, and leaves no process behind.
+    ///
+    /// `qex kill` refuses a job that is between the queue and its first
+    /// process, so this function waits for the job to start. Without it, a test
+    /// leaves a `sleep` process on the machine, and the next test then measures
+    /// a machine that is busy.
+    fn stop(&self, id: &str) {
+        self.until("the job starts", Duration::from_secs(45), || {
+            self.has_started(id)
+        });
+        if self.state_of(id) == "running" {
+            self.ok(&["kill", id, "--grace", "1s"]);
+        }
+    }
+
     /// Gives the process id of the coordinator.
     ///
     /// The value comes from the coordinator itself. A search of the process
@@ -395,6 +410,219 @@ fn many_submissions_at_once_start_one_coordinator_only() {
         .unwrap()
         .count();
     assert_eq!(dirs, 20);
+}
+
+/// A second submission with one key must give the first job and start nothing.
+///
+/// This is the fault that `--dedupe-key` removes. An agent that loses its
+/// context runs its script again. Without the key, qex starts a second copy of
+/// a four-hour run beside the first copy, and both copies hold the machine.
+#[test]
+fn a_second_submission_with_one_key_gives_the_first_job_and_starts_no_job() {
+    let h = Harness::with_default_config("dedupe");
+    let first = h.submit(&["submit", "--dedupe-key", "build:/x", "--", "sleep", "30"]);
+
+    let out = h.qex(&["submit", "--dedupe-key", "build:/x", "--", "sleep", "30"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the second submission must exit with the code 0, so that \
+         `ID=$(qex submit ...)` operates"
+    );
+    let second = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(
+        second, first,
+        "the second submission must give the first id"
+    );
+
+    // The reason goes to stderr, so the id stays alone on stdout.
+    let message = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        message.contains("started no job"),
+        "the message must say what happened: {message}"
+    );
+    assert!(
+        message.contains("build:/x"),
+        "the message must name the key: {message}"
+    );
+
+    // The count of jobs must not go up.
+    assert_eq!(h.list_json().len(), 1, "qex started a second job");
+    assert_eq!(
+        std::fs::read_dir(h.root.join("state/qex/jobs"))
+            .unwrap()
+            .count(),
+        1,
+        "qex wrote a second job record"
+    );
+
+    // The key is in the record, so a reader can see which key gave the id.
+    assert_eq!(h.status_json(&first)["dedupe_key"], "build:/x");
+
+    h.stop(&first);
+}
+
+/// Several submissions with one key in the same moment must make ONE job.
+///
+/// Two agents run the same script together. The test of the key and the
+/// reservation of the key are one step in the coordinator, so no submission can
+/// arrive between them. Without that rule, both agents start a job.
+#[test]
+fn many_submissions_with_one_key_at_once_make_one_job() {
+    let h = Harness::with_default_config("dedupe-race");
+    let exe = env!("CARGO_BIN_EXE_qex");
+
+    let mut children = Vec::new();
+    for _ in 0..20 {
+        children.push(
+            Command::new(exe)
+                .args(["submit", "--dedupe-key", "one", "--", "sleep", "30"])
+                .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+                .env("XDG_STATE_HOME", h.root.join("state"))
+                .env("XDG_RUNTIME_DIR", h.root.join("run"))
+                .env("QEX_IDLE_EXIT_SECS", "120")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("qex did not start"),
+        );
+    }
+
+    let mut ids = Vec::new();
+    for c in children {
+        let out = c.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "one submission failed during the race: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        ids.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+
+    let first = ids[0].clone();
+    assert!(
+        ids.iter().all(|id| *id == first),
+        "the submissions gave more than one id: {ids:?}"
+    );
+    assert_eq!(h.list_json().len(), 1, "the race made more than one job");
+    assert_eq!(
+        std::fs::read_dir(h.root.join("state/qex/jobs"))
+            .unwrap()
+            .count(),
+        1,
+        "the race wrote more than one job record"
+    );
+
+    h.stop(&first);
+}
+
+/// A job that stopped must free its key, and a window must keep it.
+///
+/// A key that held a job for ever would give an agent the id of a job of
+/// yesterday. That answer looks like a success, and the work never runs again.
+#[test]
+fn a_job_that_stopped_frees_its_key_and_a_window_keeps_it() {
+    let h = Harness::with_default_config("dedupe-free");
+
+    let first = h.submit(&["submit", "--dedupe-key", "k", "--", "true"]);
+    h.ok(&["wait", &first]);
+
+    let second = h.submit(&["submit", "--dedupe-key", "k", "--", "true"]);
+    assert_ne!(
+        second, first,
+        "a job that stopped must not hold its key, or the work never runs again"
+    );
+    h.ok(&["wait", &second]);
+
+    // A window keeps the key of a job that SUCCEEDED.
+    let third = h.submit(&[
+        "submit",
+        "--dedupe-key",
+        "k",
+        "--dedupe-window",
+        "1h",
+        "--",
+        "true",
+    ]);
+    assert_eq!(
+        third, second,
+        "the window must keep the key of the job that succeeded"
+    );
+
+    // A job that did NOT succeed frees its key inside the window also. The one
+    // remedy for a failure is another run, so the key must never stop it.
+    let failed = h.submit(&["submit", "--dedupe-key", "bad", "--", "false"]);
+    h.qex(&["wait", &failed]);
+    let again = h.submit(&[
+        "submit",
+        "--dedupe-key",
+        "bad",
+        "--dedupe-window",
+        "1h",
+        "--",
+        "false",
+    ]);
+    assert_ne!(
+        again, failed,
+        "a job that failed must not hold its key, or a second run is not possible"
+    );
+    h.qex(&["wait", &again]);
+}
+
+/// `qex submit --json` must say if THIS command started the work.
+///
+/// The plain command writes the id alone, so a caller that needs this answer
+/// must have a way to ask for it.
+#[test]
+fn submit_json_says_if_this_command_started_the_work() {
+    let h = Harness::with_default_config("dedupe-json");
+
+    let text = h.ok(&["submit", "--json", "--dedupe-key", "j", "--", "sleep", "30"]);
+    let first: serde_json::Value = serde_json::from_str(&text).expect("the output is not JSON");
+    assert_eq!(first["deduplicated"], false);
+    let id = first["id"].as_str().unwrap().to_string();
+
+    let text = h.ok(&["submit", "--json", "--dedupe-key", "j", "--", "sleep", "30"]);
+    let second: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(second["deduplicated"], true);
+    assert_eq!(second["id"], first["id"]);
+
+    h.stop(&id);
+}
+
+/// A coordinator that starts again must give each key back to its job.
+///
+/// The key is in the record of the job. Without that, a restart would free
+/// every key, and the next submission would start a second copy of work that
+/// still operates, with no message.
+#[test]
+fn a_key_stays_with_its_job_after_the_coordinator_stops() {
+    let h = Harness::with_default_config("dedupe-restart");
+    let first = h.submit(&["submit", "--dedupe-key", "r", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&first)
+    });
+
+    // Take the pid from the coordinator itself. A search of the process list
+    // finds the command that holds those letters also.
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator stops", Duration::from_secs(30), || {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        !alive
+    });
+
+    // The next command starts a new coordinator, and it reads the records.
+    let second = h.submit(&["submit", "--dedupe-key", "r", "--", "sleep", "30"]);
+    assert_eq!(
+        second, first,
+        "a new coordinator lost the key, and it started a second copy of the work"
+    );
+    assert_eq!(h.list_json().len(), 1);
+
+    h.stop(&first);
 }
 
 /// The budget must limit the number of jobs that operate together. This rule is

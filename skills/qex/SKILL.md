@@ -118,9 +118,25 @@ session stops, but the file goes with the session, and you then hold no handle
 for work that still operates. qex gives a warning when the file goes to such a
 place.
 
-**Before you start work again in a new session, ask first.** `qex list` shows
-what already operates and `qex status <id>` gives the result of what stopped.
-Starting the same build twice is the cost of not asking.
+**Give each submission a key, and a second run of your script starts nothing:**
+
+```sh
+ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+qex wait "$ID"
+```
+
+While a job with that key waits or operates, a second submission with the same
+key starts **no** job: qex writes the id of that job and exits with the code 0.
+Your script does not change, and it cannot start the same four-hour run twice.
+
+Do not read `qex list` and decide for yourself. That test is a proxy, and a
+different agent can submit between your read and your decision. The coordinator
+makes the test and the submission one step.
+
+The key is free when the job stops. Add `--dedupe-window 1h` to keep the key of
+a job that **succeeded** for an hour also; a job that did not succeed never
+keeps its key. Add `--json` when your script must know if **it** started the
+work.
 
 ## Claims
 

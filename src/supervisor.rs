@@ -1410,6 +1410,8 @@ mod tests {
             needs: vec![],
             after: vec![],
             submitted_at: 0,
+            dedupe_key: None,
+            dedupe_window: 0,
         }
     }
 

@@ -64,6 +64,17 @@ pub struct JobFile {
     /// A larger number gives way to everything else. The default comes from
     /// `[politeness] nice` in the configuration.
     pub nice: Option<i32>,
+    /// The key that makes this submission idempotent.
+    ///
+    /// A second submission with the same key starts no second job. It gives
+    /// the id of the job that the first submission started.
+    ///
+    /// This field is in the job file, because an agent that comes back to a
+    /// session runs the same command again, and `qex submit --job train.toml`
+    /// is one of those commands. A key in the file protects each run of it.
+    pub dedupe_key: Option<String>,
+    /// The time for which a job that SUCCEEDED keeps its key.
+    pub dedupe_window: Option<String>,
     pub resources: Resources,
     pub env: BTreeMap<String, String>,
 }
@@ -149,6 +160,10 @@ pub struct SubmitOptions {
     pub nice: Option<i32>,
     /// Do not write the claim into the environment of the job.
     pub no_limit_env_hints: bool,
+    /// The key that makes this submission idempotent.
+    pub dedupe_key: Option<String>,
+    /// The time for which a job that succeeded keeps its key.
+    pub dedupe_window: Option<String>,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -209,6 +224,38 @@ pub struct JobSpec {
     /// How politely this job uses the processor. See `[politeness] nice`.
     #[serde(default)]
     pub nice: Option<i32>,
+    /// The key that makes this submission idempotent.
+    ///
+    /// The coordinator holds one job for each key. A second submission with
+    /// the same key starts no job, and it gives the id of that job.
+    ///
+    /// # Which job a key holds
+    ///
+    /// A key holds a job that is in the queue or operates. When that job
+    /// stops, the key is free again, and the next submission starts a new job.
+    ///
+    /// A key that holds a job for ever is not correct: an agent that
+    /// legitimately wants the work again would receive the id of a job of
+    /// yesterday, and the answer would look like a success. A key that stops
+    /// at the end of the job is the rule that a reader can state in one
+    /// sentence: **the key stops a second copy of the work, and it does
+    /// nothing else.**
+    ///
+    /// `dedupe_window` extends the rule for a caller that wants more.
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    /// The seconds for which a job that SUCCEEDED keeps its key.
+    ///
+    /// The value 0 is the default, and it means that the key is free when the
+    /// job stops.
+    ///
+    /// A job that did NOT succeed never keeps its key, whatever this value is.
+    /// A job that failed, that somebody stopped, or that used too much time or
+    /// memory, is work that a caller must be able to start again immediately.
+    /// A window that blocked that would make the option dangerous: the one
+    /// remedy for a failure is another run.
+    #[serde(default)]
+    pub dedupe_window: u64,
     pub submitted_at: u64,
 }
 
@@ -489,6 +536,38 @@ impl JobSpec {
         tags.sort();
         tags.dedup();
 
+        // The dedupe key: the command line replaces the job file.
+        let dedupe_key = match opts.dedupe_key.clone().or(file.dedupe_key) {
+            Some(k) if k.trim().is_empty() => bail!(
+                "--dedupe-key is empty.\n\n\
+                 An empty key holds no job, so it makes no submission idempotent.\n\n\
+                 Give a key that names the work and the place, such as \
+                 `--dedupe-key build:$(pwd)`."
+            ),
+            Some(k) => Some(k.trim().to_string()),
+            None => None,
+        };
+
+        let dedupe_window = match opts.dedupe_window.as_ref().or(file.dedupe_window.as_ref()) {
+            Some(s) => crate::units::parse_duration(s)
+                .map_err(|e| anyhow::anyhow!("--dedupe-window: {e}"))?
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            None => 0,
+        };
+
+        // A window with no key does nothing. Refuse it, and do not accept it in
+        // silence: the user asked for a rule, and qex must apply the rule or
+        // say that it cannot.
+        if dedupe_window > 0 && dedupe_key.is_none() {
+            bail!(
+                "--dedupe-window needs --dedupe-key.\n\n\
+                 The window says how long a job that succeeded keeps its key. \
+                 With no key, qex has nothing to keep, and the option does nothing.\n\n\
+                 Add a key: `--dedupe-key build:$(pwd)`."
+            );
+        }
+
         let mut deps = DependencyNames {
             needs: file.needs,
             after: file.after,
@@ -521,6 +600,8 @@ impl JobSpec {
                 },
                 retries: opts.retries.or(file.retries).unwrap_or(0),
                 nice,
+                dedupe_key,
+                dedupe_window,
                 // The CLI changes each name into an id after this function, because
                 // that step needs the coordinator.
                 needs: Vec::new(),
@@ -1392,6 +1473,66 @@ mod tests {
         // A name that a person can read is accepted.
         o.name = Some("build".into());
         assert!(JobSpec::resolve(&o, &Config::default()).is_ok());
+    }
+
+    /// The key must reach the coordinator, from the command line and from the
+    /// job file. A key that the CLI loses would let a second copy of the work
+    /// start, and the user would see no message.
+    #[test]
+    fn a_dedupe_key_comes_from_the_command_line_or_the_job_file() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.dedupe_key = Some("build:/x".into());
+        let spec = JobSpec::resolve(&o, &Config::default()).unwrap();
+        assert_eq!(spec.dedupe_key.as_deref(), Some("build:/x"));
+        assert_eq!(spec.dedupe_window, 0, "the default window is zero");
+
+        let dir = tmpdir("dedupe");
+        let p = job_file(
+            &dir,
+            "j.toml",
+            "command = [\"true\"]\ndedupe_key = \"from-file\"\ndedupe_window = \"1h\"\n",
+        );
+        let mut o = SubmitOptions {
+            job_file: Some(p),
+            ..Default::default()
+        };
+        let spec = JobSpec::resolve(&o, &Config::default()).unwrap();
+        assert_eq!(spec.dedupe_key.as_deref(), Some("from-file"));
+        assert_eq!(spec.dedupe_window, 3600);
+
+        // The command line replaces the job file.
+        o.dedupe_key = Some("from-cli".into());
+        o.dedupe_window = Some("0".into());
+        let spec = JobSpec::resolve(&o, &Config::default()).unwrap();
+        assert_eq!(spec.dedupe_key.as_deref(), Some("from-cli"));
+        assert_eq!(spec.dedupe_window, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An option that does nothing must give an error, and qex must not accept
+    /// it in silence. The user asked for a rule, and a rule that qex cannot
+    /// apply is a rule that the user must hear about.
+    #[test]
+    fn a_dedupe_option_that_holds_no_job_is_refused() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.dedupe_key = Some("   ".into());
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "got: {err}");
+
+        let mut o = opts(&["true"]);
+        o.dedupe_window = Some("1h".into());
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--dedupe-key"),
+            "the message must name the option that is missing: {err}"
+        );
     }
 
     #[test]

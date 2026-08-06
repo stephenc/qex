@@ -238,9 +238,48 @@ memory: stop the monitor, and the answer is gone. Keep the id in a file with
     # the person stops the agent here. `make` continues.
     qex status \"$(cat build.id)\" --wait      # session 2, and the result is there
 
-A person can thus stop you at any moment with no cost. Do not start the work
-again in a new session before you ask: `qex list` shows what already operates,
-and `qex status <id>` gives the result of what stopped.
+A person can thus stop you at any moment with no cost.
+
+Give each submission a key, and a second run starts nothing
+-----------------------------------------------------------
+
+YOU LOSE YOUR CONTEXT AND YOU RUN YOUR SCRIPT AGAIN. Without a key, qex starts a
+SECOND copy of a four-hour training run beside the first copy. Both copies then
+hold the machine, and both write to the same files.
+
+Give the submission a key. The second run of the same script starts nothing:
+
+    ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+    qex wait $ID
+
+The second run gives THE SAME id and exits with the code 0, so your script does
+not change and `ID=$(qex submit ...)` stays correct. qex writes the reason to
+stderr:
+
+    qex: this submission started no job. The dedupe key `train:/home/me/p`
+    gives the job 7f3c8a12-..., and that job is in the state `running`.
+
+DO NOT READ `qex list` AND DECIDE FOR YOURSELF. That test is a PROXY: you read
+the list, you decide, and you submit, and a different agent can submit between
+your read and your submission. The coordinator makes the test and the submission
+ONE step. Two commands in the same moment thus give one job and one id.
+
+    --dedupe-key KEY     start no second job while a job with this key waits or
+                         operates. The key is free when that job stops.
+
+    --dedupe-window 1h   keep the key of a job that SUCCEEDED for this time
+                         also. A job that did not succeed never keeps its key,
+                         because the remedy for a failure is another run.
+
+    --json               write {\"id\": \"...\", \"deduplicated\": true} in place of
+                         the id alone. Use it when your script must know if IT
+                         started the work.
+
+Choose a key that names the work AND the place: `build:$(pwd)`. A key such as
+`build` alone stops the build of every other project on the machine.
+
+`qex status <id>` shows the key of a job. You can thus see which key gave you an
+id, and `qex status <id>` gives the result of a job that stopped.
 
 One command gives the result and the cause
 ------------------------------------------
@@ -438,6 +477,11 @@ Other useful options
                        `qex run --lock target -- cargo test` stops two builds
                        from destroying each other in one directory.
 
+    --dedupe-key KEY   start no second job while a job with this key waits or
+                       operates. qex gives the id of that job and exits with
+                       the code 0. Use it in a script that can run a second
+                       time: `--dedupe-key build:$(pwd)`.
+
     --id-file FILE     write the job id to a file as well as to stdout.
 
     qex wait A B --any   give control back when the FIRST job stops.
@@ -590,6 +634,8 @@ A full file
     env_capture = \"all\"           # all, minimal or none
     nice = 10                     # -20 to 19; a larger number gives way
     no_limit_env_hints = false    # true: do not tell the job its claim size
+    dedupe_key = \"train:p1\"       # start no second job while this one operates
+    dedupe_window = \"0\"           # keep the key after a job that succeeded
 
     [resources]
     cpu = 3
@@ -616,6 +662,19 @@ a shell feature such as a pipe, name the shell:
     all       every variable from your shell (the default)
     minimal   PATH, HOME, USER, LOGNAME, SHELL, LANG, TZ only
     none      no variable from your shell
+
+`dedupe_key` makes the submission idempotent. While a job with that key waits or
+operates, a second submission with the same key starts NO job: qex gives the id
+of the first job and exits with the code 0. Use it for a job file that a script
+submits each time it runs. `--dedupe-key` on the command line replaces the value
+in the file.
+
+`dedupe_window` accepts a time such as `1h`. The key of a job that SUCCEEDED
+stays for that time. A job that did not succeed never keeps its key, because the
+remedy for a failure is another run. The default is `0`.
+
+A pipeline stage has NO dedupe key. A key on one stage would answer for that
+stage alone, and the stages after it would wait for a job of an earlier run.
 
 The sequence of the sources
 ---------------------------

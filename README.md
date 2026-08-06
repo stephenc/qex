@@ -136,6 +136,24 @@ or the home directory, and not a scratch directory that the harness owns or
 `/tmp`. qex gives a warning when the file goes to such a directory, because the
 file would go away at the moment that the handle becomes necessary.
 
+## A script that runs a second time starts no second job
+
+An agent that loses its context runs its script again. Give the submission a
+key, and the second run starts nothing:
+
+```sh
+ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+```
+
+While a job with that key waits or operates, a second submission with the same
+key gives **that job's id** and exits with the code 0. `ID=$(qex submit ...)` is
+thus correct in both cases, and the script needs no test of its own.
+
+The coordinator makes the test and the submission one step, so two agents that
+run the same script in the same moment get one job and one id. A test that a
+script makes itself — read `qex list`, decide, submit — has a gap between the
+read and the submission, and both agents start a job in that gap.
+
 ## What qex does not do
 
 **qex does not limit the CPU of a job.** The `cpu` controller of cgroup v2 is

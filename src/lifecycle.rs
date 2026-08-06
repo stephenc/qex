@@ -237,6 +237,13 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     state.jobs.remove(&id);
     state.queue.retain(|q| *q != id);
 
+    // Free the dedupe key of this job with its record.
+    //
+    // The key must go at the same moment as the record. A key that names a job
+    // with no record would give an id that `qex status` cannot answer, and the
+    // caller could not learn anything about the work.
+    crate::daemon::release_dedupe(&mut state, id);
+
     // Make each job that names this job as its cause self-contained.
     //
     // A skipped job holds `caused_by` and a text that says "Read `qex logs X`

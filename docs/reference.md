@@ -11,7 +11,8 @@ description: Every command, option, claim word and configuration field.
 
 ```
 qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
-           [--after ID,ID] [--name NAME] [--job FILE] -- COMMAND...
+           [--after ID,ID] [--name NAME] [--job FILE] [--json]
+           [--dedupe-key KEY] [--dedupe-window TIME] -- COMMAND...
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
@@ -132,6 +133,75 @@ Each of these results is data for you. A job that waits for ever gives no data.
 The status field `forced` is `true` for such a job, and `qex submit` writes a
 warning at the time of the submission.
 
+## A submission that a script can repeat
+
+A script that runs a second time must not start a second copy of the work. Give
+the submission a key:
+
+```sh
+ID=$(qex submit --dedupe-key build:$(pwd) -- make)
+```
+
+While a job with that key waits or operates, a second submission with the same
+key **starts no job**. qex writes the id of the first job to stdout and exits
+with the code 0, so `ID=$(qex submit ...)` gives a usable id in both cases and
+the script needs no test.
+
+The reason goes to stderr:
+
+```
+qex: this submission started no job. The dedupe key `build:/home/me/p` gives
+the job 7f3c8a12-..., and that job is in the state `running`.
+```
+
+**The coordinator makes the test and the submission one step.** Two agents that
+run the same script in the same moment thus get one job and one id. A test that
+you write yourself (`qex list`, then decide, then submit) has a gap between the
+read and the submission, and both agents start a job in that gap.
+
+### When a key becomes free
+
+| The job with the key | A new submission with that key |
+| -------------------- | ------------------------------ |
+| waits in the queue, or operates | gets that job's id, and starts nothing |
+| stopped, for any reason | starts a new job |
+| succeeded inside `--dedupe-window` | gets that job's id, and starts nothing |
+| its record is deleted | starts a new job |
+
+A key that held a job for ever would give an agent the id of a job of yesterday,
+and that answer would look like a success. A key thus stops a second copy of the
+work, and it does nothing else.
+
+`--dedupe-window 1h` extends the rule for a caller that wants a completed result
+to count. A job that did **not** succeed never keeps its key, whatever the
+window is: the remedy for a failure is another run, and a window that blocked it
+would make the option dangerous.
+
+The key is in the record of the job, so `qex status` and `qex list --json` show
+it, and a coordinator that starts again gives each key back to its job.
+
+### How a script learns which case it got
+
+```sh
+qex submit --json --dedupe-key build:$(pwd) -- make
+{
+  "id": "7f3c8a12-...",
+  "deduplicated": true
+}
+```
+
+`deduplicated` is `false` when this command started the work. Without `--json`,
+`qex submit` writes the id alone, and the message goes to stderr.
+
+`qex rerun <id>` never keeps the key of the first job. That command exists to
+run the work again.
+
+`qex run` accepts `--dedupe-key` and waits for the job that the key gives. It
+does not accept `--json`, because its stdout holds the output of the job.
+
+A pipeline stage has no dedupe key. A key on one stage would answer for that
+stage alone, and the stages after it would wait for a job of an earlier run.
+
 ## A pipeline of stages
 
 Do not put the stages of a pipeline in one script. If stage 3 of that script
@@ -250,6 +320,16 @@ mem = "8GB"
 [env]
 CUDA_VISIBLE_DEVICES = "0"
 ```
+
+A job file also accepts `dedupe_key` and `dedupe_window`:
+
+```toml
+command = ["uv", "run", "train.py"]
+dedupe_key = "train:experiment-7"
+dedupe_window = "1h"
+```
+
+`--dedupe-key` on the command line replaces the value in the file.
 
 A job file also accepts `needs` and `after`:
 

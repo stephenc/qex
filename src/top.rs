@@ -427,6 +427,7 @@ mod tests {
             caused_by: None,
             logs_dropped: None,
             tags: vec![],
+            dedupe_key: None,
         }
     }
 

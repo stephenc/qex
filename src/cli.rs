@@ -222,6 +222,21 @@ pub struct SubmitArgs {
     /// option for a job that must see the machine as it is.
     #[arg(long)]
     pub no_limit_env_hints: bool,
+    /// Start no second job when a job with this key already exists.
+    ///
+    /// qex gives the id of that job and exits with the code 0. Use it in a
+    /// script that can run a second time: `--dedupe-key build:$(pwd)`. A key
+    /// holds a job while that job waits or operates, and the key is free when
+    /// the job stops.
+    #[arg(long, value_name = "KEY")]
+    pub dedupe_key: Option<String>,
+
+    /// Keep the key of a job that SUCCEEDED for this time. Example: 1h.
+    ///
+    /// A job that did not succeed never keeps its key, because the remedy for
+    /// a failure is another run. This option needs --dedupe-key.
+    #[arg(long, value_name = "TIME")]
+    pub dedupe_window: Option<String>,
 
     /// Write the job id to this file as well as to stdout.
     ///
@@ -229,6 +244,14 @@ pub struct SubmitArgs {
     /// a later command. A file holds it.
     #[arg(long, value_name = "FILE")]
     pub id_file: Option<PathBuf>,
+
+    /// Write the id and the result of the dedupe test as JSON.
+    ///
+    /// Use this option when your script must know if IT started the work.
+    /// Without it, `qex submit` writes the id alone, and
+    /// `ID=$(qex submit ...)` stays correct.
+    #[arg(long)]
+    pub json: bool,
 
     /// The command to run. Write it after `--`.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]

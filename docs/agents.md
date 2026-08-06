@@ -90,10 +90,48 @@ A monitor script cannot do this. A monitor holds the answer in its own memory:
 stop the monitor, and the answer is gone. Keep the id in a file, and the answer
 waits for you instead.
 
-**Before you start work again in a new session, ask first.** `qex list` shows
-what already operates, and `qex status <id>` gives the result of what stopped.
-A person who stops you pays nothing, and a person who stops you and then gets
-the same build twice pays for it.
+## Give each submission a key, and a second run starts nothing
+
+A person who stops you pays nothing. A person who stops you and then gets the
+same build twice pays for it.
+
+You lose your context, and you run your script again. Without a key, qex starts
+a **second copy** of a four-hour training run beside the first copy. Both copies
+then hold the machine, and both write to the same files.
+
+Give the submission a key:
+
+```sh
+ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+qex wait $ID
+```
+
+The second run of that script gives **the same id** and exits with the code 0.
+Your script does not change, and `ID=$(qex submit ...)` stays correct. qex says
+what happened on stderr:
+
+```
+qex: this submission started no job. The dedupe key `train:/home/me/p` gives
+the job 7f3c8a12-..., and that job is in the state `running`.
+```
+
+**Do not read `qex list` and decide for yourself.** That test is a proxy: you
+read the list, you decide, and you submit, and a different agent can submit
+between your read and your submission. The coordinator makes the test and the
+submission **one step**, so two commands in the same moment give one job and one
+id.
+
+| Option | Meaning |
+| ------ | ------- |
+| `--dedupe-key KEY` | Start no second job while a job with this key waits or operates. The key is free when that job stops. |
+| `--dedupe-window 1h` | Keep the key of a job that **succeeded** for this time also. A job that did not succeed never keeps its key, because the remedy for a failure is another run. |
+| `--json` | Write `{"id": "...", "deduplicated": true}` in place of the id alone. Use it when your script must know if **it** started the work. |
+
+Choose a key that names the work **and** the place: `build:$(pwd)`. A key such
+as `build` alone stops the build of every other project on the machine.
+
+`qex status <id>` shows the key of a job. You can thus see which key gave you an
+id, and the same command gives the result of a job that stopped.
 
 ## Do not write a monitor script
 

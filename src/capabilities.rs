@@ -181,6 +181,7 @@ pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Floor {
 
 /// Everything that this build can do.
 pub const ALL: &[&str] = &[
+    "dedupe",
     "dependencies",
     "groups",
     "history",
@@ -234,6 +235,12 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
     if spec.nice.is_some() {
         out.push("politeness");
     }
+    // A coordinator that does not know this field ignores it, starts a second
+    // copy of the work, and gives a new id. That is exactly the fault that the
+    // option removes, and the caller would see no message.
+    if spec.dedupe_key.is_some() {
+        out.push("dedupe");
+    }
     out
 }
 
@@ -265,6 +272,7 @@ pub fn check(
             "dependencies" => "--needs and --after",
             "groups" => "qex pipeline",
             "politeness" => "--nice",
+            "dedupe" => "--dedupe-key",
             other => other,
         })
         .collect();
@@ -307,6 +315,8 @@ mod tests {
             nice: None,
             needs: vec![],
             after: vec![],
+            dedupe_key: None,
+            dedupe_window: 0,
             submitted_at: 0,
         }
     }
@@ -540,6 +550,41 @@ mod tests {
         // A coordinator that has locks accepts the job.
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
         assert!(check(&new, "0.6.0", 4321, &s).is_ok());
+    }
+
+    /// A dedupe key must be refused by a coordinator that has no dedupe.
+    ///
+    /// This is the most dangerous option to ignore in silence. The caller asks
+    /// qex to start no second copy of the work. An earlier coordinator would
+    /// start that second copy, give a new id, and say nothing, so the caller
+    /// would get two four-hour runs and no message.
+    #[test]
+    fn a_dedupe_key_is_refused_by_a_coordinator_that_has_no_dedupe() {
+        let mut s = spec();
+        s.dedupe_key = Some("build:/x".into());
+        assert_eq!(required_by(&s), vec!["dedupe"]);
+
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "dedupe")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check(&old, "0.7.1", 4321, &s).unwrap_err();
+        assert!(
+            err.contains("--dedupe-key"),
+            "the message must name the option: {err}"
+        );
+        assert!(
+            err.contains("in silence"),
+            "the message must give the danger: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check(&new, "0.8.0", 4321, &s).is_ok());
     }
 
     #[test]

@@ -58,6 +58,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         retries: args.retries,
         nice: args.nice,
         no_limit_env_hints: args.no_limit_env_hints,
+        dedupe_key: args.dedupe_key,
+        dedupe_window: args.dedupe_window,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -78,16 +80,36 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
-        Response::Submitted { id, warning } => {
+        Response::Submitted {
+            id,
+            warning,
+            deduplicated,
+        } => {
             // The warning goes to stderr. The id stays alone on stdout, so the
             // command `ID=$(qex submit ...)` continues to operate.
+            //
+            // A submission that a dedupe key answered writes its message here
+            // also. The exit code stays 0 and the id stays alone on stdout,
+            // because a script that captures the id must operate in the same
+            // way in both cases. The difference belongs on the other stream.
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
             if let Some(path) = &args.id_file {
                 write_id_file(path, &format!("{id}\n"))?;
             }
-            println!("{id}");
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": id.to_string(),
+                        // False says: this command started the work.
+                        "deduplicated": deduplicated,
+                    }))?
+                );
+            } else {
+                println!("{id}");
+            }
             Ok(0)
         }
         other => report(other),
@@ -589,6 +611,11 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     }
     if !s.locks.is_empty() {
         println!("locks:     {}", s.locks.join(", "));
+    }
+    // Show the key. A caller that received this id from a second submission can
+    // then see which key gave it, and it does not read the job file again.
+    if let Some(key) = &s.dedupe_key {
+        println!("dedupe:    {key}");
     }
     if !s.needs.is_empty() {
         println!(
@@ -2303,7 +2330,9 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
         match client.call(&Request::Submit {
             spec: Box::new(spec),
         })? {
-            Response::Submitted { id: given, warning } => {
+            Response::Submitted {
+                id: given, warning, ..
+            } => {
                 if let Some(text) = warning {
                     eprintln!("qex: {}: {text}", stage.name);
                 }
@@ -2639,6 +2668,19 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
 
+    // `qex run` gives the output of the job on stdout. A JSON object there
+    // would mix with that output, and neither part could be read.
+    if args.submit.json {
+        bail!(
+            "`qex run` does not accept --json.\n\n\
+             This command writes the output of the job to stdout, so a JSON object there \
+             would mix with that output.\n\n\
+             Use two commands:\n\
+             \x20   ID=$(qex submit --json ... | jq -r .id)\n\
+             \x20   qex wait $ID"
+        );
+    }
+
     let env_capture = if args.submit.no_env_capture {
         Some(EnvCapture::None)
     } else {
@@ -2663,6 +2705,8 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         retries: args.submit.retries,
         nice: args.submit.nice,
         no_limit_env_hints: args.submit.no_limit_env_hints,
+        dedupe_key: args.submit.dedupe_key,
+        dedupe_window: args.submit.dedupe_window,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -2675,7 +2719,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     let id = match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
-        Response::Submitted { id, warning } => {
+        Response::Submitted { id, warning, .. } => {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
@@ -2953,12 +2997,21 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     spec.group = None;
     spec.group_name = None;
 
+    // A rerun must not keep the dedupe key of the first job.
+    //
+    // `qex rerun` is the command that says "run this work again". With the key,
+    // qex would give the id of the first job and start nothing, and the command
+    // would do the one thing that it exists to prevent: nothing.
+    spec.dedupe_key = None;
+    spec.dedupe_window = 0;
+
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
         Response::Submitted {
             id: new_id,
             warning,
+            ..
         } => {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
@@ -3397,6 +3450,7 @@ mod tests {
             caused_by: None,
             logs_dropped: None,
             tags: vec![],
+            dedupe_key: None,
         }
     }
 
