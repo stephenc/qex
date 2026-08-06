@@ -125,11 +125,19 @@ impl State {
     }
 
     /// Gives the resources that the jobs which operate now have claimed.
-    pub fn claimed(&self) -> (u64, u64) {
-        self.jobs
-            .values()
-            .filter(|j| j.status.state.is_active())
-            .fold((0, 0), |(c, m), j| (c + j.status.cpu, m + j.status.mem))
+    ///
+    /// The result holds the cores, the memory, the units of each pool and the
+    /// quantity in use on each device. A coordinator that starts again rebuilds
+    /// every one of these values from the records on the disk.
+    pub fn claimed(&self) -> crate::sched::Held {
+        let pools = self.cfg.pools().unwrap_or_default();
+        let mut held = crate::sched::Held::default();
+        for job in self.jobs.values() {
+            if job.status.state.is_active() {
+                held.add(&job.status, &pools);
+            }
+        }
+        held
     }
 
     pub fn count_state(&self, f: impl Fn(JobState) -> bool) -> usize {
@@ -485,8 +493,56 @@ fn no_such_job(id: uuid::Uuid) -> Response {
 
 fn handle_info(coord: &Arc<Coordinator>) -> Response {
     let state = coord.state.lock().unwrap();
-    let (cpu_claimed, mem_claimed) = state.claimed();
+    let held = state.claimed();
+    let (cpu_claimed, mem_claimed) = (held.cpu, held.mem);
+
+    // Report the pools, and report what the other users hold.
+    //
+    // This field is an Option, and it is NOT a defaulted number. An older
+    // coordinator gives no value, and the reader must see `unknown`. A
+    // defaulted `0` would read as "no other user holds anything", which is a
+    // lie in the place where the honest answer matters most.
+    let peers = if state.cfg.peers.enabled {
+        crate::peers::claims(&state.cfg)
+    } else {
+        crate::peers::Claims::default()
+    };
+    let pools: Vec<crate::proto::PoolReport> = state
+        .cfg
+        .pools()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| crate::proto::PoolReport {
+            devices: p
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(i, capacity)| crate::proto::DeviceReport {
+                    index: i as u32,
+                    capacity: *capacity,
+                    used: held
+                        .devices
+                        .get(&p.name)
+                        .and_then(|m| m.get(&(i as u32)))
+                        .copied()
+                        .unwrap_or(0),
+                    peer: peers
+                        .devices
+                        .get(&p.name)
+                        .map(|s| s.contains(&(i as u32)))
+                        .unwrap_or(false),
+                })
+                .collect(),
+            used: held.pools.get(&p.name).copied().unwrap_or(0),
+            peer_used: peers.pools.get(&p.name).copied().unwrap_or(0),
+            total: p.total,
+            size_name: p.size_name,
+            name: p.name,
+        })
+        .collect();
+
     Response::Info {
+        pools: Some(pools),
         pid: std::process::id() as i32,
         version: env!("CARGO_PKG_VERSION").to_string(),
         started_at: state.started_at,
@@ -543,6 +599,14 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         let state = coord.state.lock().unwrap();
         match crate::sched::size_check(&state.cfg, &spec) {
             crate::sched::Size::Fits => None,
+            // A claim above the pool total is ALWAYS a refusal, whatever
+            // `[queue] oversized` says. This is a change in kind from the cores
+            // and the memory: an oversized memory job can run alone and swap,
+            // and that result is data. Running alone does not make a fifth
+            // device.
+            crate::sched::Size::Impossible(reason) => {
+                return Response::error(ErrorKind::WrongState, reason)
+            }
             crate::sched::Size::TooBig(reason) => {
                 use crate::config::OversizedPolicy;
                 match state.cfg.queue.oversized {

@@ -92,6 +92,7 @@ pub const ALL: &[&str] = &[
     "history",
     "learn",
     "locks",
+    "pools",
     "retries",
 ];
 
@@ -123,6 +124,12 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
     }
     if !spec.locks.is_empty() {
         out.push("locks");
+    }
+    // A lock does NOT need `pools`. It travels in its own field, and a
+    // coordinator that has `locks` and not `pools` reads that field and obeys
+    // it. A test here would refuse a job that the coordinator can run.
+    if !spec.claims.is_empty() {
+        out.push("pools");
     }
     if spec.retries > 0 {
         out.push("retries");
@@ -157,6 +164,7 @@ pub fn check(
         .iter()
         .map(|m| match *m {
             "locks" => "--lock",
+            "pools" => "--gpu, --vram and --claim",
             "retries" => "--retries",
             "dependencies" => "--needs and --after",
             "groups" => "qex pipeline",
@@ -198,6 +206,7 @@ mod tests {
             group: None,
             group_name: None,
             locks: vec![],
+            claims: Default::default(),
             retries: 0,
             needs: vec![],
             after: vec![],
@@ -291,6 +300,66 @@ mod tests {
         // A coordinator that has locks accepts the job.
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
         assert!(check(&new, "0.6.0", 4321, &s).is_ok());
+    }
+
+    /// A lock must NOT need `pools`.
+    ///
+    /// `--lock` travels in its own wire field, and a coordinator that has
+    /// `locks` reads that field and obeys it. A test for `pools` here would
+    /// refuse a job that the coordinator can run correctly.
+    #[test]
+    fn a_lock_does_not_need_the_pools_capability() {
+        let mut s = spec();
+        s.locks = vec!["target".into()];
+        assert_eq!(required_by(&s), vec!["locks"]);
+
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "pools")
+            .map(|c| c.to_string())
+            .collect();
+        assert!(
+            check(&old, "0.7.1", 4321, &s).is_ok(),
+            "a coordinator with `locks` and no `pools` must accept a lock"
+        );
+    }
+
+    /// A job with a counted claim must be refused by a coordinator that has no
+    /// pools. Such a coordinator would ignore the claim in silence, and the
+    /// job would then run beside a job that holds the device.
+    #[test]
+    fn a_claim_is_refused_by_a_coordinator_that_has_no_pools() {
+        let mut s = spec();
+        s.claims.insert(
+            "gpu".into(),
+            crate::spec::PoolClaim {
+                count: 1,
+                size: None,
+            },
+        );
+        assert_eq!(required_by(&s), vec!["pools"]);
+
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "pools")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check(&old, "0.7.1", 4321, &s).unwrap_err();
+        assert!(
+            err.contains("--gpu"),
+            "the message must name the option: {err}"
+        );
+        assert!(
+            err.contains("in silence"),
+            "the message must give the danger: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check(&new, "0.8.0", 4321, &s).is_ok());
     }
 
     #[test]

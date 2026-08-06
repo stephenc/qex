@@ -107,6 +107,24 @@ pub struct Usage {
     pub cpu_secs: f64,
 }
 
+/// The units and the devices that qex gave one job from one pool.
+///
+/// This value is a RESULT and not a request, so it lives in `status.json` and
+/// never in `spec.json`. The coordinator writes it inside the same lock hold
+/// that moves the job to `starting`, before the fork. A coordinator that starts
+/// again reads it back and rebuilds the occupancy of each pool.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Assignment {
+    /// The number of units, or of devices for an indexed pool.
+    pub units: u64,
+    /// The device indices, in order. The list is empty for a plain pool.
+    #[serde(default)]
+    pub devices: Vec<u32>,
+    /// The quantity on EACH device, in bytes. `None` means the whole device.
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: uuid::Uuid,
@@ -210,6 +228,12 @@ pub struct JobStatus {
     /// The locks that this job holds while it operates.
     #[serde(default)]
     pub locks: Vec<String>,
+    /// The counted claims of this job. The key is the pool name.
+    #[serde(default)]
+    pub claims: std::collections::BTreeMap<String, crate::spec::PoolClaim>,
+    /// The devices and units that qex gave this job. The key is the pool name.
+    #[serde(default)]
+    pub assigned: std::collections::BTreeMap<String, Assignment>,
     /// The number of times that qex started this job.
     ///
     /// The value is more than 1 when the job failed and `--retries` let qex
@@ -260,6 +284,8 @@ impl JobStatus {
             needs: spec.needs.clone(),
             after: spec.after.clone(),
             locks: spec.locks.clone(),
+            claims: spec.claims.clone(),
+            assigned: Default::default(),
             attempts: 0,
             retries_left: spec.retries,
             caused_by: None,

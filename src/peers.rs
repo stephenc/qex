@@ -26,6 +26,20 @@ pub struct Peer {
     pub boot_id: String,
     pub cpu: u64,
     pub mem: u64,
+    /// The units of each pool that this coordinator holds.
+    ///
+    /// `#[serde(default)]` IS NECESSARY HERE, and on `devices` below. A file
+    /// that an earlier version wrote has no such field. Without the default,
+    /// that file does not parse, `read_peer` gives `None`, and the claims of
+    /// that user disappear WITH NO MESSAGE. Two coordinators would then each
+    /// use the full machine, which is the fault that this module removes.
+    #[serde(default)]
+    pub pools: std::collections::BTreeMap<String, u64>,
+    /// The device indices of each indexed pool that this coordinator holds.
+    ///
+    /// Without this field, two users give the device 0 to two jobs.
+    #[serde(default)]
+    pub devices: std::collections::BTreeMap<String, Vec<u32>>,
     pub updated_at: u64,
 }
 
@@ -34,6 +48,15 @@ pub struct Peer {
 pub struct Claims {
     pub cpu: u64,
     pub mem: u64,
+    /// The units of each pool that the other users hold.
+    pub pools: std::collections::BTreeMap<String, u64>,
+    /// The devices of each indexed pool that the other users hold.
+    ///
+    /// A device in this set is not available to this coordinator. A peer
+    /// publishes the index, and not the quantity, so qex keeps the whole
+    /// device for that user. That is the safe direction: a job of this user
+    /// that shared the device would meet a memory error on the card.
+    pub devices: std::collections::BTreeMap<String, std::collections::BTreeSet<u32>>,
     /// The number of other coordinators that qex counted.
     pub count: usize,
 }
@@ -143,7 +166,13 @@ fn peer_file_name(pid: i32) -> String {
 ///
 /// The function writes the file in one operation, so a reader never sees a part
 /// of the record.
-pub fn publish(cfg: &Config, cpu: u64, mem: u64) {
+pub fn publish(
+    cfg: &Config,
+    cpu: u64,
+    mem: u64,
+    pools: std::collections::BTreeMap<String, u64>,
+    devices: std::collections::BTreeMap<String, Vec<u32>>,
+) {
     if !cfg.peers.enabled {
         return;
     }
@@ -163,6 +192,8 @@ pub fn publish(cfg: &Config, cpu: u64, mem: u64) {
         boot_id: sys::boot_id(),
         cpu,
         mem,
+        pools,
+        devices,
         updated_at: sys::now_secs(),
     };
 
@@ -270,6 +301,16 @@ pub fn claims(cfg: &Config) -> Claims {
 
             total.cpu += peer.cpu;
             total.mem += peer.mem;
+            for (name, units) in &peer.pools {
+                *total.pools.entry(name.clone()).or_insert(0) += units;
+            }
+            for (name, indices) in &peer.devices {
+                total
+                    .devices
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(indices.iter().copied());
+            }
             total.count += 1;
         }
     }
@@ -338,7 +379,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let cfg = cfg_for(&dir);
 
-        publish(&cfg, 4, 8 << 30);
+        publish(&cfg, 4, 8 << 30, Default::default(), Default::default());
         // The claims of this coordinator are already in its own total. A second
         // count would stop the jobs of this user.
         assert_eq!(claims(&cfg), Claims::default());
@@ -382,6 +423,8 @@ mod tests {
             boot_id: sys::boot_id(),
             cpu: 64,
             mem: 64 << 30,
+            pools: Default::default(),
+            devices: Default::default(),
             updated_at: sys::now_secs(),
         };
         std::fs::write(other.join("peer.json"), serde_json::to_vec(&peer).unwrap()).unwrap();
@@ -414,6 +457,8 @@ mod tests {
             boot_id: sys::boot_id(),
             cpu: 64,
             mem: 64 << 30,
+            pools: Default::default(),
+            devices: Default::default(),
             updated_at: sys::now_secs().saturating_sub(3600),
         };
         std::fs::write(other.join("peer.json"), serde_json::to_vec(&old).unwrap()).unwrap();
@@ -449,6 +494,8 @@ mod tests {
             boot_id: sys::boot_id(),
             cpu: 64,
             mem: 64 << 30,
+            pools: Default::default(),
+            devices: Default::default(),
             updated_at: sys::now_secs(),
         };
         std::fs::write(&target, serde_json::to_vec(&peer).unwrap()).unwrap();
@@ -461,6 +508,56 @@ mod tests {
             read_peer(&other.join("peer.json"), 54321).is_none(),
             "the reader must not follow a symbolic link"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A record that an earlier version wrote has no `pools` and no `devices`.
+    ///
+    /// THIS IS THE HIGHEST-RISK LINE OF THE POOL FEATURE. Without the
+    /// `#[serde(default)]` on those two fields, that file does not parse,
+    /// `read_peer` gives `None`, and the cores and the memory of that user
+    /// disappear WITH NO MESSAGE. Two coordinators would then each use the full
+    /// machine.
+    #[test]
+    fn a_peer_file_of_an_earlier_version_still_parses_and_still_counts() {
+        let old = r#"{"uid":4242,"pid":7,"boot_id":"b","cpu":6,"mem":17179869184,
+                      "updated_at":1700000000}"#;
+        let peer: Peer =
+            serde_json::from_str(old).expect("a record of an earlier version must still parse");
+        assert_eq!(peer.cpu, 6, "the cores of that user must still count");
+        assert_eq!(
+            peer.mem,
+            16 << 30,
+            "the memory of that user must still count"
+        );
+        assert!(peer.pools.is_empty());
+        assert!(peer.devices.is_empty());
+    }
+
+    /// A record with pools and devices must give both back. Without the
+    /// devices, two users give the device 0 to two jobs.
+    #[test]
+    fn a_peer_record_carries_the_pools_and_the_devices() {
+        let dir = tmpdir("pools");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let cfg = cfg_for(&dir);
+
+        publish(
+            &cfg,
+            2,
+            1 << 30,
+            [("gpu".to_string(), 2u64)].into_iter().collect(),
+            [("gpu".to_string(), vec![0u32, 2])].into_iter().collect(),
+        );
+
+        // The file of this coordinator does not count for itself, so read it
+        // back directly.
+        let mine = dir.join(user_dir_name(current_uid()));
+        let path = mine.join(peer_file_name(std::process::id() as i32));
+        let peer = read_peer(&path, current_uid()).expect("the record must parse");
+        assert_eq!(peer.pools.get("gpu"), Some(&2));
+        assert_eq!(peer.devices.get("gpu"), Some(&vec![0, 2]));
 
         std::fs::remove_dir_all(&dir).ok();
     }

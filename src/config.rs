@@ -228,6 +228,88 @@ pub struct DefaultsConfig {
     pub mem: Option<String>,
     /// The time limit for a job. The default is `0`, which sets no limit.
     pub timeout: Option<String>,
+    /// The quantity on each device for a job that claims a device.
+    ///
+    /// The value `0`, and no value, mean that the job takes the whole of each
+    /// device that qex gives it. That is the safe value: a job that consumed
+    /// nothing would let qex put four unlimited jobs on one card.
+    pub vram: Option<String>,
+}
+
+/// The name of the pool that `--gpu` and `--vram` claim.
+///
+/// The two options are fixed names in the command line, because clap cannot
+/// grow an option from a config file at run time, and because an agent that
+/// writes `--gpu 1` must be correct on the first try. The scheduler holds no
+/// special case for this name.
+pub const GPU_POOL: &str = "gpu";
+
+/// One pool of a countable resource, as the config file gives it.
+///
+/// A pool has a name and a total. A pool with `devices` also has a capacity for
+/// each device, and qex then says WHICH device each job gets.
+///
+/// qex never probes a driver. The devices come from this file only, so a
+/// machine with no CUDA and no driver library schedules GPU claims correctly.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolConfig {
+    /// The name that a job claims: `--claim NAME=N`, or `--gpu` for `gpu`.
+    pub name: String,
+    /// The name of the quantity that each device holds, such as `vram`.
+    ///
+    /// This value is for the reader of the configuration and of the messages.
+    pub size: Option<String>,
+    /// The capacity of each device. Give one size for each device.
+    pub devices: Vec<String>,
+    /// The number of units, for a pool that has no devices.
+    pub count: Option<u64>,
+    /// The environment variable that receives the device indices.
+    pub env: Option<String>,
+}
+
+/// One pool, with each value calculated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pool {
+    pub name: String,
+    /// The capacity of each device, in bytes. The list is empty for a pool
+    /// that has no devices.
+    pub devices: Vec<u64>,
+    /// The number of units in the pool. For an indexed pool this is the number
+    /// of devices.
+    pub total: u64,
+    /// The name of the quantity that each device holds, such as `vram`.
+    pub size_name: Option<String>,
+    /// The environment variable that receives the device indices.
+    pub env: Option<String>,
+}
+
+impl Pool {
+    /// Tests if qex says WHICH device each job of this pool gets.
+    pub fn is_indexed(&self) -> bool {
+        !self.devices.is_empty()
+    }
+
+    /// Gives the capacity of the largest device.
+    pub fn largest_device(&self) -> u64 {
+        self.devices.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Gives the pool that qex uses for a name that the configuration does not
+    /// declare.
+    ///
+    /// `--lock NAME` needs no configuration, and it must keep that. A name that
+    /// the configuration does not declare is thus a pool of one unit, which is
+    /// exactly a lock.
+    pub fn implicit(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            devices: Vec::new(),
+            total: 1,
+            size_name: None,
+            env: None,
+        }
+    }
 }
 
 /// Controls the command that collects the old records.
@@ -302,6 +384,9 @@ pub struct Config {
     pub learn: LearnConfig,
     pub history: HistoryConfig,
     pub gc: GcConfig,
+    /// The pools of countable resources. The key in the file is `[[pool]]`.
+    #[serde(rename = "pool")]
+    pub pools: Vec<PoolConfig>,
 }
 
 impl Config {
@@ -397,6 +482,105 @@ impl Config {
         }
     }
 
+    /// Gives the quantity on each device for a job that gives no value.
+    ///
+    /// The result `None` means that a job takes the whole of each device.
+    pub fn default_vram(&self) -> Result<Option<u64>> {
+        match &self.defaults.vram {
+            Some(s) => {
+                let n = units::parse_size(s)
+                    .map_err(|e| anyhow::anyhow!("config [defaults] vram: {e}"))?;
+                // `0` says "the whole device". A claim of zero bytes on a
+                // device would let qex put an unlimited number of jobs on one
+                // card, which is the fault that a claim prevents.
+                Ok(if n == 0 { None } else { Some(n) })
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Gives each pool with its values calculated.
+    pub fn pools(&self) -> Result<Vec<Pool>> {
+        let mut out = Vec::with_capacity(self.pools.len());
+        for p in &self.pools {
+            let name = p.name.trim().to_string();
+            let mut devices = Vec::with_capacity(p.devices.len());
+            for (i, d) in p.devices.iter().enumerate() {
+                let bytes = units::parse_size(d)
+                    .map_err(|e| anyhow::anyhow!("config [[pool]] `{name}` device {i}: {e}"))?;
+                devices.push(bytes);
+            }
+            let total = if devices.is_empty() {
+                p.count.unwrap_or(0)
+            } else {
+                devices.len() as u64
+            };
+            out.push(Pool {
+                name,
+                devices,
+                total,
+                size_name: p.size.clone(),
+                env: p.env.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Gives the pool with one name, or `None`.
+    pub fn pool(&self, name: &str) -> Option<Pool> {
+        self.pools()
+            .ok()
+            .and_then(|all| all.into_iter().find(|p| p.name == name))
+    }
+
+    /// Tests each `[[pool]]` entry.
+    fn validate_pools(&self) -> Result<()> {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for p in &self.pools {
+            let name = p.name.trim();
+            if name.is_empty() {
+                anyhow::bail!(
+                    "config [[pool]] has no name. Give a name, such as `gpu`. A job claims \
+                     a pool by its name."
+                );
+            }
+            if name == "cpu" || name == "mem" {
+                anyhow::bail!(
+                    "config [[pool]] cannot use the name `cpu` or `mem`. Those two are in \
+                     [budget]."
+                );
+            }
+            if !p.devices.is_empty() && p.count.is_some() {
+                anyhow::bail!(
+                    "config [[pool]] `{name}` gives `count` and `devices`. Give one only. \
+                     Use `devices` when qex must say WHICH one a job gets. Use `count` when \
+                     the number is sufficient."
+                );
+            }
+            if p.devices.is_empty() && p.count.is_none() {
+                anyhow::bail!(
+                    "config [[pool]] `{name}` gives no `count` and no `devices`, so qex \
+                     does not know its size. Give `count = 4`, or `devices = [\"24GB\", \
+                     \"24GB\"]`."
+                );
+            }
+            if let Some(0) = p.count {
+                anyhow::bail!(
+                    "config [[pool]] `{name}` has `count = 0`, so no job that claims it can \
+                     ever start. Give 1 or more, or delete the pool."
+                );
+            }
+            if !seen.insert(name.to_string()) {
+                anyhow::bail!(
+                    "config [[pool]] `{name}` has two entries with the same name. Give one \
+                     entry for each pool."
+                );
+            }
+        }
+        self.pools()?;
+        Ok(())
+    }
+
     /// Gives the default time limit for a job.
     ///
     /// If the config file gives no value, the result is `None`. A job then has
@@ -423,6 +607,8 @@ impl Config {
         self.gc_keep()?;
         self.default_mem()?;
         self.default_timeout()?;
+        self.default_vram()?;
+        self.validate_pools()?;
         if self.learn.margin < 1.0 {
             anyhow::bail!(
                 "config [learn] margin is {}. Use a value of 1.0 or more. A smaller value \
@@ -527,6 +713,17 @@ minimal_env = ["PATH", "HOME"]
 cpu = 1
 mem = "1GB"
 timeout = "0"
+vram = "0"
+
+[[pool]]
+name    = "gpu"
+size    = "vram"
+devices = ["24GB", "24GB", "24GB", "24GB"]
+env     = "CUDA_VISIBLE_DEVICES"
+
+[[pool]]
+name  = "net"
+count = 4
 "#;
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();
@@ -534,6 +731,63 @@ timeout = "0"
         assert_eq!(c.submit.env_capture, EnvCapture::Minimal);
         assert_eq!(c.budget_mem().unwrap(), 20 << 30);
         assert_eq!(c.default_timeout().unwrap(), None);
+
+        let gpu = c.pool("gpu").expect("the pool `gpu` must parse");
+        assert!(gpu.is_indexed());
+        assert_eq!(gpu.total, 4);
+        assert_eq!(gpu.largest_device(), 24 << 30);
+        assert_eq!(gpu.env.as_deref(), Some("CUDA_VISIBLE_DEVICES"));
+
+        let net = c.pool("net").expect("the pool `net` must parse");
+        assert!(!net.is_indexed());
+        assert_eq!(net.total, 4);
+
+        // `vram = "0"` means "the whole device", and not "no memory at all".
+        assert_eq!(c.default_vram().unwrap(), None);
+    }
+
+    /// A pool that gives `count` and `devices` says two different things, and
+    /// qex must not choose one of them in silence.
+    #[test]
+    fn a_pool_with_a_count_and_devices_is_refused() {
+        let c: Config =
+            toml::from_str("[[pool]]\nname = \"gpu\"\ncount = 2\ndevices = [\"24GB\"]\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("Give one only"), "got: {err}");
+    }
+
+    /// The cores and the memory live in `[budget]`. A pool with one of those
+    /// names would give a second, silent budget.
+    #[test]
+    fn a_pool_cannot_take_the_name_of_the_budget() {
+        for name in ["cpu", "mem"] {
+            let c: Config =
+                toml::from_str(&format!("[[pool]]\nname = \"{name}\"\ncount = 2\n")).unwrap();
+            assert!(
+                c.validate().is_err(),
+                "the name `{name}` must not be a pool"
+            );
+        }
+    }
+
+    /// Two entries with one name give two answers for one question.
+    #[test]
+    fn two_pools_with_one_name_are_refused() {
+        let c: Config = toml::from_str(
+            "[[pool]]\nname = \"gpu\"\ncount = 2\n\n[[pool]]\nname = \"gpu\"\ncount = 4\n",
+        )
+        .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("two entries"), "got: {err}");
+    }
+
+    /// A pool with no size declares nothing. qex must say so, and must not
+    /// give the pool a size that no person chose.
+    #[test]
+    fn a_pool_with_no_count_and_no_devices_is_refused() {
+        let c: Config = toml::from_str("[[pool]]\nname = \"gpu\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("does not know its size"), "got: {err}");
     }
 
     #[test]
