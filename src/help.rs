@@ -421,6 +421,9 @@ that qex uses now.
     enabled = true        # use the earlier jobs of a command as the claim
     margin = 1.5          # the multiplier for a measurement
 
+    [history]
+    keep = "1d"           # how long to keep the id of a job after its removal
+
     [defaults]
     cpu = 1               # the default is 1 core
     mem = \"2GB\"           # the default is the machine memory / the core count
@@ -631,6 +634,19 @@ Use `--follow --grep` in place of a pipe to `grep`. A pipe holds the lines in a
 buffer and shows nothing until the buffer fills, because `grep` needs the option
 `--line-buffered`. qex writes each line as it reads it.
 
+Watch the queue
+---------------
+
+    qex top            the jobs, the claim of each one, and its true use now
+    qex top --once     one page, for a script
+    qex top -i 5       a refresh every 5 seconds
+
+The CPU column gives the cores in use. Compare it with the CPU CLAIM column to
+find a claim that is much larger than the need.
+
+This command never starts a coordinator, and it gives the jobs when no
+coordinator operates.
+
 Delete the records
 ------------------
 
@@ -643,6 +659,14 @@ Delete the records
 
 `qex clean` deletes the directory of the job. It does not stop a job that
 operates.
+
+qex keeps the id of a deleted job for one day, so `qex status` can tell you that
+a job existed and that its work happened. An agent thus does not repeat work
+after a deletion. Change that time with `[history] keep` in the config file.
+
+`qex clean --all` deletes the record of EVERY job of this user, including the
+jobs of a different agent that shares this machine. Use `qex clean <id>` when
+another agent uses qex at the same time.
 ";
 
 pub const EXIT_CODES: &str = "\

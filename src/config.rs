@@ -245,6 +245,28 @@ pub struct DefaultsConfig {
     pub timeout: Option<String>,
 }
 
+/// Controls the short record of the jobs that qex accepted.
+///
+/// The record lets `qex status` tell "the record was deleted" from "this job
+/// never existed". An agent then knows whether to submit the job again.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HistoryConfig {
+    /// The time to keep the id of a job after its record is gone.
+    ///
+    /// An agent asks about a job of the last minutes or hours. An id of last
+    /// month answers no question, so qex does not keep it.
+    pub keep: String,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            keep: "1d".into(),
+        }
+    }
+}
+
 /// Controls the claim that qex calculates from the earlier jobs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -278,6 +300,7 @@ pub struct Config {
     pub submit: SubmitConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
+    pub history: HistoryConfig,
 }
 
 impl Config {
@@ -324,6 +347,13 @@ impl Config {
         units::parse_duration(&self.queue.settle)
             .map_err(|e| anyhow::anyhow!("config [queue] settle: {e}"))
             .map(|d| d.unwrap_or(std::time::Duration::ZERO))
+    }
+
+    /// Gives the time to keep the id of a job after its record is gone.
+    pub fn history_keep(&self) -> Result<std::time::Duration> {
+        units::parse_duration(&self.history.keep)
+            .map_err(|e| anyhow::anyhow!("config [history] keep: {e}"))
+            .map(|d| d.unwrap_or(std::time::Duration::from_secs(86400)))
     }
 
     pub fn peer_stale_after(&self) -> Result<std::time::Duration> {
@@ -381,6 +411,7 @@ impl Config {
         self.reserve_mem()?;
         self.settle()?;
         self.peer_stale_after()?;
+        self.history_keep()?;
         self.default_mem()?;
         self.default_timeout()?;
         if self.learn.margin < 1.0 {

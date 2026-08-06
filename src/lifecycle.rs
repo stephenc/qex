@@ -196,6 +196,17 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
         }
     }
 
+    // Record the removal before the deletion. A reader of `qex status` can then
+    // learn that this job existed and that its work happened.
+    {
+        let state = coord.state.lock().unwrap();
+        if let Some(job) = state.jobs.get(&id) {
+            let status = job.status.clone();
+            drop(state);
+            crate::history::record_removed(&status);
+        }
+    }
+
     let dir = match paths::job_dir(&id) {
         Ok(d) => d,
         Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),

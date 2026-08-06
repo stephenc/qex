@@ -30,40 +30,36 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
     let mut previous: HashMap<uuid::Uuid, Previous> = HashMap::new();
 
     loop {
-        let mut client = match Client::connect_existing() {
-            Some(c) => c,
-            None => {
-                // Do not start a coordinator. A command that watches must not
-                // change the thing that it watches.
-                if args.once {
-                    println!("no coordinator operates");
-                    return Ok(1);
-                }
-                print!("{CLEAR}");
-                println!("no coordinator operates. qex starts one when you submit a job.");
-                std::thread::sleep(interval);
-                continue;
+        // Read the queue from the coordinator when one operates, and from the
+        // state directory when none does.
+        //
+        // This command never starts a coordinator. A command that watches must
+        // not change the thing that it watches. It must also give an answer
+        // when no coordinator operates: the supervisor of each job writes its
+        // own record, so those records hold the truth at every moment, and a
+        // job that operates can still be measured by its process group.
+        let (jobs, info) = match Client::connect_existing() {
+            Some(mut client) => {
+                let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
+                    bail!("the coordinator did not give the job list");
+                };
+                jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+                (jobs, Some(client.call(&Request::Info)?))
             }
+            None => (crate::job::read_all_from_disk(), None),
         };
-
-        let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
-            bail!("the coordinator did not give the job list");
-        };
-        jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
-
-        let info = client.call(&Request::Info)?;
 
         if args.once {
             // The CPU column is the change in the CPU time between two
             // measurements, so one page needs two of them. Take the first
             // measurement, wait a short time, then write the page.
-            render(&jobs, &info, &mut previous);
+            render(&jobs, info.as_ref(), &mut previous);
             std::thread::sleep(Duration::from_millis(400));
-            print!("{}", render(&jobs, &info, &mut previous));
+            print!("{}", render(&jobs, info.as_ref(), &mut previous));
             return Ok(0);
         }
 
-        let page = render(&jobs, &info, &mut previous);
+        let page = render(&jobs, info.as_ref(), &mut previous);
 
         print!("{CLEAR}{page}");
         use std::io::Write;
@@ -74,12 +70,13 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
 
 fn render(
     jobs: &[JobStatus],
-    info: &Response,
+    info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
 ) -> String {
     let mut out = String::new();
 
-    if let Response::Info {
+    if let Some(Response::Info {
+        version,
         program_replaced,
         cpu_budget,
         mem_budget,
@@ -88,7 +85,7 @@ fn render(
         jobs_running,
         jobs_queued,
         ..
-    } = info
+    }) = info
     {
         out.push_str(&format!(
             "qex   budget {cpu_claimed}/{cpu_budget} cores, {}/{} memory   \
@@ -96,11 +93,44 @@ fn render(
             format_size(*mem_claimed),
             format_size(*mem_budget),
         ));
+        // Give both versions. A coordinator can hold the code of an earlier
+        // build, and that difference caused a fault that named no cause.
+        let mine = env!("CARGO_PKG_VERSION");
+        if version != mine {
+            out.push_str(&format!(
+                "      WARNING: the coordinator is version {version} and this command is \
+                 {mine}\n"
+            ));
+        } else {
+            out.push_str(&format!("      version {version}\n"));
+        }
         if *program_replaced {
             out.push_str(
                 "      the qex program changed; this coordinator stops when no job operates\n",
             );
         }
+    }
+
+    if info.is_none() {
+        // No coordinator. Give the budget from the config file, and count the
+        // jobs from their records.
+        let cfg = crate::config::Config::load().unwrap_or_default();
+        let active: Vec<&JobStatus> = jobs.iter().filter(|j| j.state.is_active()).collect();
+        let queued = jobs.iter().filter(|j| j.state == JobState::Queued).count();
+        let cpu: u64 = active.iter().map(|j| j.cpu).sum();
+        let mem: u64 = active.iter().map(|j| j.mem).sum();
+
+        out.push_str(&format!(
+            "qex   budget {cpu}/{} cores, {}/{} memory   {} running, {queued} queued\n",
+            cfg.budget_cpu().unwrap_or(0),
+            format_size(mem),
+            format_size(cfg.budget_mem().unwrap_or(0)),
+            active.len(),
+        ));
+        out.push_str(
+            "      no coordinator operates. These records come from the state directory.\n\
+             \x20     qex starts a coordinator when you submit a job.\n",
+        );
     }
 
     out.push_str(&format!(
@@ -268,7 +298,7 @@ mod tests {
     fn the_page_holds_the_budget_and_the_jobs() {
         let jobs = vec![job(JobState::Running, 2, 4 << 30)];
         let mut previous = HashMap::new();
-        let page = render(&jobs, &info(), &mut previous);
+        let page = render(&jobs, Some(&info()), &mut previous);
 
         assert!(page.contains("2/12 cores"), "the budget is missing: {page}");
         assert!(page.contains("example"), "the job name is missing");
@@ -282,11 +312,11 @@ mod tests {
         let jobs = vec![job(JobState::Running, 1, 1 << 30)];
         let mut previous = HashMap::new();
 
-        let first = render(&jobs, &info(), &mut previous);
+        let first = render(&jobs, Some(&info()), &mut previous);
         assert!(first.contains("..."), "the first page has no earlier value");
 
         std::thread::sleep(Duration::from_millis(50));
-        let second = render(&jobs, &info(), &mut previous);
+        let second = render(&jobs, Some(&info()), &mut previous);
         assert!(
             !second.contains("..."),
             "the second page must give a number: {second}"
@@ -301,15 +331,41 @@ mod tests {
         j.finished_at = Some(10);
 
         let mut previous = HashMap::new();
-        let page = render(&[j], &info(), &mut previous);
+        let page = render(&[j], Some(&info()), &mut previous);
         assert!(page.contains("500MB"), "the measurement is missing: {page}");
         assert!(page.contains("ok"), "the result is missing");
+    }
+
+    /// The command must give the jobs when no coordinator operates.
+    ///
+    /// A command that watches must not depend on the thing that it watches, and
+    /// it must not start it either.
+    #[test]
+    fn the_page_holds_the_jobs_with_no_coordinator() {
+        let mut j = job(JobState::Completed, 2, 1 << 30);
+        j.usage.max_rss = 100 << 20;
+        j.finished_at = Some(5);
+
+        let mut previous = HashMap::new();
+        let page = render(&[j], None, &mut previous);
+
+        assert!(page.contains("example"), "the job is missing: {page}");
+        assert!(
+            page.contains("no coordinator"),
+            "the page must say that no coordinator operates: {page}"
+        );
+        assert!(
+            page.contains("state directory"),
+            "the page must say where the records come from: {page}"
+        );
+        // The budget still comes from the config file.
+        assert!(page.contains("cores"), "the budget is missing: {page}");
     }
 
     #[test]
     fn an_empty_queue_says_so() {
         let mut previous = HashMap::new();
-        let page = render(&[], &info(), &mut previous);
+        let page = render(&[], Some(&info()), &mut previous);
         assert!(page.contains("no jobs"));
     }
 
@@ -321,7 +377,7 @@ mod tests {
         j.started_at = None;
 
         let mut previous = HashMap::new();
-        let page = render(&[j], &info(), &mut previous);
+        let page = render(&[j], Some(&info()), &mut previous);
         assert!(page.contains("waits for cores"), "got: {page}");
     }
 }

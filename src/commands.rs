@@ -53,6 +53,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
 
     let mut client = Client::connect()?;
+    warn_if_version_differs(&mut client);
 
     // Change each dependency name into an id.
     //
@@ -510,6 +511,39 @@ fn wait_one(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
 
     // There is no coordinator. Read the file of the job.
     wait_on_file(raw_id, deadline)
+}
+
+/// Writes a warning when the coordinator holds a different version.
+///
+/// A coordinator can operate for hours, and a new build replaces the program.
+/// The coordinator then holds the earlier code. That difference caused a fault
+/// that named no cause: every job failed with "No such file or directory".
+///
+/// qex now starts the program that is on the disk, so a job runs. The two
+/// versions can still behave differently, so the user must know.
+fn warn_if_version_differs(client: &mut Client) {
+    let mine = env!("CARGO_PKG_VERSION");
+    if let Ok(Response::Info {
+        version,
+        pid,
+        program_replaced,
+        ..
+    }) = client.call(&Request::Info)
+    {
+        if version != mine {
+            eprintln!(
+                "qex: the coordinator (pid {pid}) is version {version}, and this command is \
+                 version {mine}. The coordinator stops when no job operates, and the next \
+                 command starts one with this version. Stop it now with `kill {pid}` if you \
+                 need this version immediately."
+            );
+        } else if program_replaced {
+            eprintln!(
+                "qex: something replaced the qex program after the coordinator (pid {pid}) \
+                 started. The coordinator stops when no job operates."
+            );
+        }
+    }
 }
 
 /// Changes each dependency name into a job id.
@@ -1072,7 +1106,10 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
         return if jobs.iter().any(|j| j.id == id) {
             Ok(id)
         } else {
-            bail!("there is no job with the id {id}")
+            // Say whether qex ever saw this id. An agent must be able to tell
+            // "the record was deleted, and the work happened" from "this job
+            // never existed, so submit it".
+            bail!("{}", crate::history::describe_missing(id))
         };
     }
 

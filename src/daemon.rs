@@ -190,6 +190,7 @@ pub fn run() -> Result<()> {
     // Without this step, each unusual state directory leaves one in /tmp.
     paths::reap_stale_socket_dirs();
 
+
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
@@ -226,6 +227,9 @@ pub fn run() -> Result<()> {
     if let Some(warning) = crate::enforce::startup_warning(&cfg) {
         log(&format!("warning: {warning}"));
     }
+
+    // Delete the old lines of the job history. See `[history] keep`.
+    crate::history::prune(&cfg);
 
     let coord = Arc::new(Coordinator::new(cfg));
     recover(&coord)?;
@@ -567,6 +571,9 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         );
     }
 
+    let name_for_history = spec.name.clone();
+    let submitted_at = spec.submitted_at;
+
     {
         let mut state = coord.state.lock().unwrap();
         let priority = spec.priority;
@@ -596,6 +603,10 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
             .unwrap_or(state.queue.len());
         state.queue.insert(pos, id);
     }
+
+    // Keep a short record of this job, so a reader can tell "the record was
+    // deleted" from "this job never existed" if the record disappears.
+    crate::history::record_submit_for(&id, &name_for_history, submitted_at);
 
     coord.notify();
     Response::Submitted { id, warning }

@@ -22,6 +22,7 @@ mod config;
 mod daemon;
 mod enforce;
 mod help;
+mod history;
 mod job;
 mod lifecycle;
 mod logsel;

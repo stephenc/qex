@@ -284,6 +284,29 @@ pub fn write_status(dir: &Path, status: &JobStatus) -> Result<()> {
     write_atomic(&dir.join("status.json"), &bytes, 0o600)
 }
 
+/// Reads the record of every job from the state directory.
+///
+/// A command that watches the queue uses this function when no coordinator
+/// operates. The supervisor of each job writes its own record, so these files
+/// hold the truth whether a coordinator operates or not.
+pub fn read_all_from_disk() -> Vec<JobStatus> {
+    let Ok(dir) = crate::paths::jobs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut jobs: Vec<JobStatus> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| read_status(&e.path()).ok())
+        .collect();
+
+    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+    jobs
+}
+
 pub fn read_spec(dir: &Path) -> Result<JobSpec> {
     let path = dir.join("spec.json");
     let text = std::fs::read_to_string(&path)
