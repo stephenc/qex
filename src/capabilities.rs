@@ -92,6 +92,7 @@ pub const ALL: &[&str] = &[
     "history",
     "learn",
     "locks",
+    "pause",
     "retries",
 ];
 
@@ -131,6 +132,47 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
         out.push("groups");
     }
     out
+}
+
+/// Tests one COMMAND against a coordinator.
+///
+/// `required_by` and `check` test a job specification. A command is the other
+/// half: `qex pause` is a request name, and not a field of a job.
+///
+/// An earlier coordinator already refuses a request that it cannot read, but it
+/// answers "qex could not read this request", which states a condition and
+/// gives no remedy. The failure is also dangerous: the person believes that the
+/// machine is quiet, and the coordinator continues to start jobs. This function
+/// gives the cause and the remedy instead.
+///
+/// `name` is the capability, `command` is the words that the user typed, and
+/// `danger` says why the refusal matters.
+///
+/// The danger is a parameter, and not a fixed sentence. One capability can gate
+/// two commands whose dangers are opposite: a `qex pause` that an old
+/// coordinator ignores starts work while the person believes that the machine
+/// is quiet, and a `qex resume` that it ignores changes nothing at all. A fixed
+/// sentence would state a reason that is not true for one of them.
+pub fn require(
+    have: &[String],
+    coordinator_version: &str,
+    coordinator_pid: i32,
+    name: &str,
+    command: &str,
+    danger: &str,
+) -> Result<(), String> {
+    if have.iter().any(|h| h == name) {
+        return Ok(());
+    }
+    Err(format!(
+        "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and it \
+         cannot obey `{command}`.\n\n\
+         qex refuses this command. {danger}\n\n\
+         The coordinator stops when no job operates, and the next command then starts one that \
+         can obey. To change it now:\n\
+         \x20   kill {coordinator_pid}\n\n\
+         The jobs that operate now continue; a new coordinator reads the same records."
+    ))
 }
 
 /// Tests one job against a coordinator.
@@ -291,6 +333,64 @@ mod tests {
         // A coordinator that has locks accepts the job.
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
         assert!(check(&new, "0.6.0", 4321, &s).is_ok());
+    }
+
+    /// `qex pause` must be refused by a coordinator that cannot obey it.
+    ///
+    /// This is the dangerous direction: an earlier coordinator accepts nothing
+    /// and continues to start jobs, and the person believes that the machine is
+    /// quiet. The message must therefore give the cause and the remedy.
+    #[test]
+    fn a_pause_is_refused_by_a_coordinator_that_cannot_pause() {
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "pause")
+            .map(|c| c.to_string())
+            .collect();
+
+        let err = require(
+            &old,
+            "0.7.1",
+            3507877,
+            "pause",
+            "qex pause",
+            "The coordinator would start the jobs of the queue, and you would believe that the \
+             machine is quiet.",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("qex pause"),
+            "the message must name the command: {err}"
+        );
+        assert!(
+            err.contains("believe that the machine is quiet"),
+            "the message must give the danger: {err}"
+        );
+        assert!(
+            err.contains("kill 3507877"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(require(&new, "0.8.0", 1, "pause", "qex pause", "danger").is_ok());
+
+        // The danger of a refused `qex resume` is the opposite of the danger of
+        // a refused `qex pause`. One fixed sentence would state a reason that
+        // is not true for one of the two commands.
+        let resume = require(
+            &old,
+            "0.7.1",
+            3507877,
+            "pause",
+            "qex resume",
+            "That coordinator does not read the pause record, so it already starts the jobs of \
+             the queue. This command would change nothing.",
+        )
+        .unwrap_err();
+        assert!(
+            !resume.contains("you would believe that the machine is quiet"),
+            "the resume message must not give the danger of a pause: {resume}"
+        );
     }
 
     #[test]

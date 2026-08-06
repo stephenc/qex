@@ -41,6 +41,51 @@ pub enum Request {
     /// A CLI sends this request only to a coordinator that is new enough to
     /// answer it. See the `capabilities` module for the reason.
     Capabilities,
+    /// Stops the queue from starting work, or takes a lock for the person.
+    ///
+    /// A CLI sends this request only to a coordinator that gives the capability
+    /// `pause`. An earlier coordinator would start the jobs of the queue while
+    /// the person believes that the machine is quiet.
+    Pause {
+        target: PauseTarget,
+        /// The text of `--reason`, for the person who reads the queue later.
+        reason: Option<String>,
+        /// The moment when the pause ends by itself, in seconds since the epoch.
+        until: Option<u64>,
+        /// The process that asked. The CLI writes its own process id here.
+        ///
+        /// The coordinator cannot learn this value from the socket, and a
+        /// record that named the coordinator would name the same process for
+        /// every pause and would explain nothing.
+        #[serde(default)]
+        by_pid: i32,
+    },
+    /// Starts the queue again, or gives a lock back.
+    Resume { target: PauseTarget },
+    /// Gives what is paused now.
+    PauseState,
+}
+
+/// What a `Pause` or a `Resume` request acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PauseTarget {
+    /// The whole queue. A paused queue starts no job.
+    Queue,
+    /// One named lock. The person holds it, in place of a job.
+    Lock { name: String },
+}
+
+/// One lock that a person holds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockPause {
+    pub name: String,
+    pub record: crate::pause::PauseRecord,
+    /// The job that still holds the lock, as `a1b2c3d4 (train)`.
+    ///
+    /// The person receives the lock when that job stops. No other job takes it
+    /// in the time between.
+    pub held_by: Option<String>,
 }
 
 /// A message from the coordinator to the CLI.
@@ -82,9 +127,40 @@ pub enum Response {
         mem_budget: u64,
         cpu_claimed: u64,
         mem_claimed: u64,
+        /// What the queue does now: `running` or `paused`.
+        ///
+        /// # Why this field is an Option, and why it holds a string
+        ///
+        /// An Option, because a defaulted `false` from an earlier coordinator
+        /// would read as "the queue operates" — a lie, in the one place where
+        /// the honest answer matters most. `None` means "this coordinator does
+        /// not say", and every command prints `unknown` for it.
+        ///
+        /// A string, because a later version adds more states to this field. A
+        /// CLI that met an unknown name of a Rust enum would refuse the whole
+        /// answer, and `qex info` would then give nothing at all.
+        #[serde(default)]
+        queue_state: Option<String>,
+        /// The moment when a person paused the queue.
+        #[serde(default)]
+        paused_at: Option<u64>,
+        /// The text that the person gave with `--reason`.
+        #[serde(default)]
+        paused_reason: Option<String>,
+        /// The moment when the pause ends by itself. `None` means no end.
+        #[serde(default)]
+        paused_until: Option<u64>,
+        /// The locks that a person holds.
+        #[serde(default)]
+        paused_locks: Option<Vec<LockPause>>,
     },
     /// The things that the coordinator can do.
     Capabilities { names: Vec<String> },
+    /// What is paused now.
+    PauseState {
+        queue: Option<crate::pause::PauseRecord>,
+        locks: Vec<LockPause>,
+    },
     /// The command failed.
     Error { message: String, kind: ErrorKind },
 }
@@ -130,6 +206,24 @@ mod tests {
             Request::Cancel { id },
             Request::Clean { id },
             Request::Info,
+            Request::Pause {
+                target: PauseTarget::Queue,
+                reason: Some("recording a demo".into()),
+                until: Some(1_700_000_000),
+                by_pid: 4321,
+            },
+            Request::Pause {
+                target: PauseTarget::Lock {
+                    name: "gpu0".into(),
+                },
+                reason: None,
+                until: None,
+                by_pid: 4321,
+            },
+            Request::Resume {
+                target: PauseTarget::Queue,
+            },
+            Request::PauseState,
         ];
         for r in requests {
             let line = serde_json::to_string(&r).unwrap();
