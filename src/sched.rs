@@ -683,22 +683,36 @@ mod tests {
         );
     }
 
+    /// These sizes are small, and that is deliberate.
+    ///
+    /// `admit` makes three tests, and the third one reads the free memory of
+    /// the machine that runs the test. A test that claims 8GB thus gives
+    /// `Admit::Yes` on a machine with 28GB and `Admit::No` on a machine with
+    /// 7GB, and it would report a fault that the program does not have. A
+    /// build machine is frequently the small one.
+    ///
+    /// This test is about the arithmetic of the budget, so the numbers stay
+    /// small enough that each machine has the memory. They stay above 64MB as
+    /// well, because `budget_mem` gives 64MB as its lowest value: a budget of
+    /// zero would make each job too large for the budget.
+    /// `the_reserve_stops_a_job_when_the_machine_is_full` covers the third test
+    /// with a value that no machine can meet.
     #[test]
     fn the_budget_limits_the_jobs_that_operate_together() {
-        let cfg = cfg_with("4", "8GB");
-        let job = spec_with(2, 2 << 30);
+        let cfg = cfg_with("4", "256MB");
+        let job = spec_with(2, 64 << 20);
 
         // Two cores are in use. A job of two cores fits.
-        assert!(matches!(admit(&cfg, &job, 2, 2 << 30), Admit::Yes));
+        assert!(matches!(admit(&cfg, &job, 2, 64 << 20), Admit::Yes));
 
         // Four cores are in use. The same job must wait.
-        let Admit::No(reason) = admit(&cfg, &job, 4, 2 << 30) else {
+        let Admit::No(reason) = admit(&cfg, &job, 4, 64 << 20) else {
             panic!("a job must not start when the cores are in use");
         };
         assert!(reason.contains("cores"), "got: {reason}");
 
         // The memory is in use. The job must wait.
-        let Admit::No(reason) = admit(&cfg, &job, 0, 7 << 30) else {
+        let Admit::No(reason) = admit(&cfg, &job, 0, 224 << 20) else {
             panic!("a job must not start when the memory is in use");
         };
         assert!(reason.contains("memory"), "got: {reason}");
@@ -706,14 +720,18 @@ mod tests {
 
     /// A job that fills the budget exactly must start. An error in the compare
     /// operator here would keep such a job in the queue for ever.
+    ///
+    /// The size is small. See the note above: `admit` also reads the free
+    /// memory of the machine, and a claim of 8GB gives a different answer on a
+    /// machine of 28GB and on a machine of 7GB.
     #[test]
     fn a_job_that_fills_the_budget_exactly_starts() {
-        let cfg = cfg_with("4", "8GB");
+        let cfg = cfg_with("4", "256MB");
         assert!(matches!(
-            admit(&cfg, &spec_with(4, 8 << 30), 0, 0),
+            admit(&cfg, &spec_with(4, 256 << 20), 0, 0),
             Admit::Yes
         ));
-        assert_eq!(size_check(&cfg, &spec_with(4, 8 << 30)), Size::Fits);
+        assert_eq!(size_check(&cfg, &spec_with(4, 256 << 20)), Size::Fits);
     }
 
     /// The reserve keeps memory for the programs that qex does not control.
