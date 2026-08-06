@@ -92,6 +92,13 @@ impl EnforceMode {
 /// an error that names a Rust type and gives no remedy.
 ///
 /// A number and its text are the same value here. This function takes either.
+fn text_or_number_opt<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    text_or_number(d).map(Some)
+}
+
 fn text_or_number<'de, D>(d: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -122,7 +129,7 @@ where
         }
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
             // A whole number that TOML read as a float, such as `2.0`.
-            if v.fract() == 0.0 {
+            if v.fract() == 0.0 && v.abs() <= i64::MAX as f64 {
                 Ok((v as i64).to_string())
             } else {
                 Ok(v.to_string())
@@ -214,6 +221,7 @@ impl Default for EnforceConfig {
 pub struct PeersConfig {
     pub enabled: bool,
     pub dir: String,
+    #[serde(deserialize_with = "text_or_number")]
     pub stale_after: String,
 }
 
@@ -234,6 +242,7 @@ pub struct QueueConfig {
     /// The time that the queue must stay empty before qex starts a large job.
     ///
     /// This delay prevents a start while the last jobs stop.
+    #[serde(deserialize_with = "text_or_number")]
     pub settle: String,
 }
 
@@ -280,8 +289,10 @@ pub struct DefaultsConfig {
     /// The quantity of memory for a job.
     ///
     /// The default is the machine memory divided by the number of cores.
+    #[serde(default, deserialize_with = "text_or_number_opt")]
     pub mem: Option<String>,
     /// The time limit for a job. The default is `0`, which sets no limit.
+    #[serde(default, deserialize_with = "text_or_number_opt")]
     pub timeout: Option<String>,
 }
 
@@ -293,6 +304,7 @@ pub struct GcConfig {
     ///
     /// `qex gc` works on every directory, so this value is larger than the one
     /// hour of `qex clean --auto`, which works on one directory tree.
+    #[serde(deserialize_with = "text_or_number")]
     pub keep: String,
 }
 
@@ -313,6 +325,7 @@ pub struct HistoryConfig {
     ///
     /// An agent asks about a job of the last minutes or hours. An id of last
     /// month answers no question, so qex does not keep it.
+    #[serde(deserialize_with = "text_or_number")]
     pub keep: String,
 }
 
