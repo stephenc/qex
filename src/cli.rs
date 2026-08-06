@@ -70,6 +70,9 @@ pub enum Command {
     /// Show the version of this command and of the coordinator.
     Version(VersionArgs),
 
+    /// Find the monitor scripts on this machine that wait for a proxy.
+    Watchers(WatchersArgs),
+
     /// Run the coordinator. qex starts this process for you.
     #[command(hide = true)]
     Daemon(DaemonArgs),
@@ -349,6 +352,13 @@ pub struct SchemaArgs {
     /// The schema to write: job or status.
     #[arg(value_name = "WHICH")]
     pub which: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct WatchersArgs {
+    /// Write the output as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

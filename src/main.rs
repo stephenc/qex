@@ -41,6 +41,7 @@ mod top;
 #[cfg(test)]
 mod testutil;
 mod units;
+mod watchers;
 mod usage;
 
 use anyhow::{Context, Result};
@@ -99,6 +100,7 @@ fn run() -> Result<i32> {
         Command::Clean(args) => commands::clean(args),
         Command::Info(args) => commands::info(args),
         Command::Version(args) => commands::version(args),
+        Command::Watchers(args) => watchers::report(args.json),
         Command::Top(args) => top::run(args),
         Command::Daemon(_) => {
             daemon::run()?;

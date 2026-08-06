@@ -65,8 +65,8 @@ Every monitor that you write waits for a PROXY: a pattern in the process list, a
 line in a log file, a file that appears. A proxy can become permanently false,
 and nothing tells the monitor. It then waits for ever.
 
-These three waits were measured on one machine in one day. Together they slept
-for 54 hours, and not one of the conditions could ever become true:
+These waits were measured on one machine in one day. Together they slept for 95
+hours, and not one of the conditions could ever become true:
 
     while pgrep -f \"solve.py\"; do sleep 60; done
         The command line of this shell holds the letters `solve.py`, so the
@@ -99,6 +99,13 @@ watches a log file would still be waiting.
 The same fault applies to every search of the process list. `pgrep -f qex` also
 matches the shell command that holds those letters. To find the coordinator, use
 `qex info`, which gives the process id from the coordinator itself.
+
+    qex watchers
+
+That command finds the monitors of this kind on your machine. It removes its own
+process and the processes that started it before it reports anything, so it
+never finds itself. A user who looked for this fault with `pgrep -f pgrep` found
+the search, and that was the fourth time in one day that the fault appeared.
 
 The three commands you need
 ---------------------------
