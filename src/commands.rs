@@ -655,7 +655,14 @@ fn warn_if_version_differs(client: &mut Client) {
         ..
     }) = client.call(&Request::Info)
     {
-        if version != mine {
+        // A coordinator below the support floor gives an ERROR, with the same
+        // remedy, when the command needs the coordinator. Two messages about
+        // one fact teach a reader to read neither, so this warning stays quiet
+        // in that case.
+        let below_floor = crate::capabilities::parse(&version) < crate::capabilities::SUPPORT_FLOOR;
+        if below_floor {
+            // Say nothing. The error gives this fact and the same remedy.
+        } else if version != mine {
             eprintln!(
                 "qex: the coordinator (pid {pid}) is version {version}, and this command is \
                  version {mine}. The coordinator stops when no job operates, and the next \
