@@ -7,7 +7,7 @@ use crate::job::{JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
 use crate::spec::{JobSpec, SubmitOptions};
-use crate::units::{format_duration, format_size, parse_duration};
+use crate::units::{count_of, format_duration, format_size, parse_duration};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         after: args.after,
         locks: args.locks,
         retries: args.retries,
+        // An ordinary job measures against its own command.
+        learn_key: None,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -105,8 +107,14 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
 /// with no job. The user then holds a group that is not the file, and the only
 /// correction is to find and cancel each job by hand. qex therefore reads the
 /// input, tests the command, tests the count and makes every specification
-/// first. The only fault that can arrive after the first submission comes from
-/// the coordinator, and the message for it names the group.
+/// first.
+///
+/// A fault can still arrive after the first submission. The coordinator can
+/// refuse a job, and the connection to the coordinator can stop. A fan-out
+/// holds up to 1000 jobs, so that window is much wider than the window of a
+/// pipeline. EVERY message for such a fault names the group and the command
+/// that finds the jobs: a user who never learns the group id cannot reach the
+/// jobs that qex already made.
 ///
 /// # Why one claim covers every job
 ///
@@ -115,6 +123,14 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
 /// one claim is correct for them. A claim for each line separately would come
 /// from a different measurement for each line, and the order of the queue would
 /// then change with the history and not with the file.
+///
+/// The measurements come from the TEMPLATE, and not from the command of the
+/// line. `JobSpec::learn_key` holds the reason. The claim of the first line is
+/// thus the claim of the whole fan-out of the last run.
+///
+/// `qex status` says `fan-out` for such a claim, and not `learned`. The word
+/// `learned` means "from the earlier jobs of this command", and the command of
+/// one line can have no measurement at all.
 fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
@@ -145,8 +161,8 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
             passed.push(count_of(input.comments, "comment line"));
         }
         eprintln!(
-            "qex: {} give a job. qex passed over {}.",
-            count_of(count, "line"),
+            "qex: this input gives {}. qex passed over {}.",
+            count_of(count, "job"),
             passed.join(" and ")
         );
     }
@@ -167,14 +183,18 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
         priority: args.priority,
         env: args.env,
         env_capture,
-        // The command of the first line, so the learned claim comes from a
-        // command that qex really ran before.
+        // The command of the first line. It gives the directory, the
+        // environment and the name of the program, and the claim comes from the
+        // template below.
         command: crate::fanout::substitute(&template, &input.lines[0]),
         job_file: None,
         needs: args.needs,
         after: args.after,
         locks: args.locks,
         retries: args.retries,
+        // Every job of this fan-out measures against the template, so the whole
+        // fan-out makes one record and the next run reads it.
+        learn_key: Some(template.clone()),
     };
 
     let (first, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -230,9 +250,26 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
     let mut warned_again = 0usize;
     for spec in specs {
         let name = spec.name.clone();
-        match client.call(&Request::Submit {
+        // Take the answer in two steps. A transport fault gives an `Err` here,
+        // and the `?` of the first form would carry that fault out of this
+        // function with the group id still in this frame only. The jobs that
+        // qex already submitted are on the disk, and a user who never saw the
+        // group id has no way to reach them.
+        let answer = match client.call(&Request::Submit {
             spec: Box::new(spec),
-        })? {
+        }) {
+            Ok(answer) => answer,
+            Err(e) => {
+                partial_fan_out(
+                    &format!("qex lost the coordinator at the job `{name}`"),
+                    group,
+                    &submitted,
+                );
+                return Err(e);
+            }
+        };
+
+        match answer {
             Response::Submitted { id, warning } => {
                 if let Some(text) = warning {
                     let head = text.lines().next().unwrap_or_default().to_string();
@@ -246,11 +283,10 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
                 submitted.push((name, id));
             }
             other => {
-                eprintln!(
-                    "qex: the job `{name}` was refused. The {} jobs before it are in the \
-                     queue. Run `qex list --group {group}` to find them, and \
-                     `qex cancel <id>` to remove them.",
-                    submitted.len()
+                partial_fan_out(
+                    &format!("the coordinator refused the job `{name}`"),
+                    group,
+                    &submitted,
                 );
                 return report(other);
             }
@@ -283,13 +319,33 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// Gives a count and a word, with an `s` when the count is not one.
-fn count_of(count: usize, word: &str) -> String {
-    if count == 1 {
-        format!("1 {word}")
-    } else {
-        format!("{count} {word}s")
+/// Reports a fan-out that stopped in the middle.
+///
+/// This function exists because of the ONE thing that a user must not lose: the
+/// group id. The jobs that qex already submitted are on the disk and they
+/// operate, and the group id is the only short handle to all of them. A message
+/// that gives the fault and no group id leaves the user with jobs that they
+/// cannot find.
+///
+/// The ids come as well. `qex list --group` needs a coordinator, and this
+/// function frequently reports that qex just lost the coordinator.
+fn partial_fan_out(what: &str, group: uuid::Uuid, submitted: &[(String, uuid::Uuid)]) {
+    eprintln!(
+        "qex: {what}. {} of this fan-out {} in the queue.",
+        count_of(submitted.len(), "job"),
+        if submitted.len() == 1 { "is" } else { "are" }
+    );
+    if submitted.is_empty() {
+        return;
     }
+    eprintln!("qex: the group of those jobs is {group}. They are:");
+    for (name, id) in submitted {
+        eprintln!("{name}: {id}");
+    }
+    eprintln!(
+        "qex: Run `qex list --group {group}` to see them, and `qex cancel <id>` or \
+         `qex kill <id>` to stop them."
+    );
 }
 
 pub fn list(args: cli::ListArgs) -> Result<i32> {
@@ -584,6 +640,10 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
             // Say where the claim came from. A reader then knows that qex
             // calculated it from the earlier jobs, and that no agent chose it.
             "learned" => "  (from the earlier jobs of this command)",
+            // A job of a fan-out learns against its template, so its claim can
+            // come from a different line of an earlier run. Do not say `this
+            // command`: the command of this job can have no measurement at all.
+            "fan-out" => "  (from the earlier jobs of this fan-out)",
             "default" => "  (the default; give --cpu and --mem to change it)",
             _ => "",
         }
@@ -2031,6 +2091,8 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         after: args.submit.after,
         locks: args.submit.locks,
         retries: args.submit.retries,
+        // An ordinary job measures against its own command.
+        learn_key: None,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;

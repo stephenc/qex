@@ -2729,6 +2729,123 @@ fn a_line_with_a_space_a_quotation_mark_and_a_semicolon_is_one_argument() {
     );
 }
 
+/// A line of an input file must never put a terminal control sequence into a
+/// job name.
+///
+/// A name goes to the terminal of the user at the submission and in every later
+/// `qex list`. `{}` can go in the program position, which the documentation
+/// advertises, so BOTH parts of the name can come from the file. An escape
+/// sequence there changes the colour, moves the cursor, empties the screen or
+/// writes the title of the window, and rows of `qex list` go away in front of
+/// the reader.
+#[test]
+fn a_line_never_puts_a_control_character_into_a_job_name() {
+    let h = Harness::with_default_config("eachname");
+
+    let line = "\u{1b}[31mBOOM\u{1b}[0m \u{1b}[2J \u{1b}]0;title\u{7}";
+    let input = h.root.join("inputs.txt");
+    std::fs::write(&input, format!("{line}\nsecond\n")).unwrap();
+
+    // `{}` in the program position as well, so the line also reaches the BASE
+    // of the name. `echo` is the program, and the line is its argument.
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--",
+        "echo",
+        "{}",
+    ]);
+    assert!(out.status.success());
+    let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // Nothing that qex wrote about the submission may hold a control character.
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !err.contains('\u{1b}') && !err.contains('\u{7}'),
+        "the submission output holds a control character: {err:?}"
+    );
+
+    // The name in the record, which `qex list` writes, must be clean.
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 2);
+    for job in &jobs {
+        let name = job["name"].as_str().unwrap();
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
+            "a job name holds a character that must not reach a terminal: {name:?}"
+        );
+    }
+
+    // `qex list` itself must write no control character.
+    let listing = h.ok(&["list"]);
+    assert!(
+        !listing.contains('\u{1b}') && !listing.contains('\u{7}'),
+        "`qex list` holds a control character: {listing:?}"
+    );
+
+    // The COMMAND still holds the line exactly. qex cleans the name, which goes
+    // to the terminal, and never the data that the job receives.
+    let id = jobs[0]["id"].as_str().unwrap();
+    let status = h.status_json(id);
+    assert_eq!(
+        status["command"][1].as_str().unwrap(),
+        line,
+        "the job must receive the line as the file holds it"
+    );
+}
+
+/// The BASE of the name must be clean as well, and not the part from the line
+/// only.
+///
+/// `{}` in the program position is a use that the documentation advertises. The
+/// base is then the program name of the FIRST line, and it is file data. The
+/// program name has no `/` here, so the whole line becomes the base: this is
+/// the path that the part from the line does not cover.
+///
+/// The jobs do not start, because no such program exists. That is correct for
+/// this test: the name reaches `qex list` and the terminal of the user whatever
+/// the job does after it.
+#[test]
+fn a_placeholder_in_the_program_position_gives_a_clean_name() {
+    let h = Harness::with_default_config("eachprog");
+
+    let input = h.root.join("inputs.txt");
+    std::fs::write(&input, "\u{1b}[31mBOOM\u{1b}[0m x\nsecond\n").unwrap();
+
+    let out = h.qex(&["submit", "--each-line", input.to_str().unwrap(), "--", "{}"]);
+    assert!(out.status.success());
+
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !err.contains('\u{1b}'),
+        "the base of the name holds an escape: {err:?}"
+    );
+
+    let names: Vec<String> = h
+        .list_json()
+        .iter()
+        .map(|j| j["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names.len(), 2);
+    for name in &names {
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
+            "the base of the name holds a character that must not reach a terminal: {name:?}"
+        );
+    }
+
+    // Both jobs take the base from the FIRST line, so the escape of that line
+    // would reach the name of the second job as well.
+    assert!(
+        !h.ok(&["list"]).contains('\u{1b}'),
+        "`qex list` holds an escape"
+    );
+}
+
 /// An input with a fault must submit NO job.
 ///
 /// A fan-out that stops in the middle leaves a part of the work in the queue
