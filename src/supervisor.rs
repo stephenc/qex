@@ -478,6 +478,8 @@ mod tests {
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
+            needs: vec![],
+            after: vec![],
             submitted_at: 0,
         }
     }

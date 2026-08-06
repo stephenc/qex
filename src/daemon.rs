@@ -45,6 +45,8 @@ pub struct State {
     pub last_contact: Instant,
     /// The time when the queue became empty, for the oversized job rule.
     pub idle_since: Option<Instant>,
+    /// The number for the next job, to keep the order of submission.
+    pub next_sequence: u64,
     pub stop: bool,
 }
 
@@ -152,6 +154,7 @@ impl Coordinator {
                 queue: Vec::new(),
                 last_contact: Instant::now(),
                 idle_since: Some(Instant::now()),
+                next_sequence: 1,
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -362,6 +365,16 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         recovered += 1;
     }
 
+    // Continue the counter after the highest number that qex read. The order
+    // of the jobs of a pipeline thus stays correct after a restart.
+    state.next_sequence = state
+        .jobs
+        .values()
+        .map(|j| j.status.sequence)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
     // Put the queue back in its order: the priority first, then the time.
     queued.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
     state.queue = queued.into_iter().map(|(id, _, _)| id).collect();
@@ -520,6 +533,8 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
     {
         let mut state = coord.state.lock().unwrap();
         let priority = spec.priority;
+        status.sequence = state.next_sequence;
+        state.next_sequence += 1;
         state.jobs.insert(
             id,
             Job {

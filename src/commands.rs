@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 pub const EXIT_TIMEOUT: i32 = 124;
 /// The exit code of `qex wait` when something stopped the job.
 pub const EXIT_KILLED: i32 = 125;
+/// The exit code of `qex wait` when the job did not run.
+///
+/// A job that this job needed did not succeed. The fault is in that job, and
+/// not in this one, so this code is separate.
+pub const EXIT_SKIPPED: i32 = 126;
 /// The exit code when there is no job with the given id.
 pub const EXIT_NO_SUCH_JOB: i32 = 127;
 
@@ -41,11 +46,22 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         env_capture,
         command: args.command,
         job_file: args.job_file,
+        needs: args.needs,
+        after: args.after,
     };
 
-    let spec = JobSpec::resolve(&opts, &cfg)?;
+    let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
 
     let mut client = Client::connect()?;
+
+    // Change each dependency name into an id.
+    //
+    // A dependency must exist now. This rule makes a circle of dependencies
+    // impossible: a job can name the jobs before it only. It also gives an
+    // error at the submission, and not later, when the job would wait with no
+    // end for a job that does not exist.
+    spec.needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
+    spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
@@ -82,7 +98,9 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     if let Some(tag) = &args.tag {
         jobs.retain(|j| j.tags.iter().any(|t| t == tag));
     }
-    jobs.sort_by_key(|j| j.submitted_at);
+    // Show the jobs in the order of submission. A pipeline then reads from the
+    // first stage to the last stage.
+    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -201,6 +219,22 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     }
     if let Some(r) = &s.blocked_reason {
         println!("waits for: {r}");
+    }
+    if let Some(e) = &s.error {
+        println!("error:     {e}");
+    }
+    if !s.needs.is_empty() {
+        println!(
+            "needs:     {}",
+            s.needs
+                .iter()
+                .map(|d| d.to_string()[..8].to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(root) = &s.caused_by {
+        println!("caused by: {}", &root.to_string()[..8]);
     }
     if !s.tags.is_empty() {
         println!("tags:      {}", s.tags.join(", "));
@@ -324,6 +358,31 @@ fn wait_one(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
 
     // There is no coordinator. Read the file of the job.
     wait_on_file(raw_id, deadline)
+}
+
+/// Changes each dependency name into a job id.
+///
+/// Each name must give a job that exists now. A name that gives no job is an
+/// error at the submission.
+fn resolve_dependencies(
+    client: &mut Client,
+    names: &[String],
+    option: &str,
+) -> Result<Vec<uuid::Uuid>> {
+    let mut ids = Vec::new();
+    for name in names {
+        let id = resolve_id(client, name).map_err(|e| {
+            anyhow::anyhow!(
+                "{option}: {e}\n\n\
+                 A job can wait for the jobs that you started before it. Start the \
+                 first job, keep its id, then give that id here."
+            )
+        })?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 /// Tests if a socket fault is the time limit of the read.
@@ -537,7 +596,8 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
             "name the jobs to delete.\n\n\
              Examples:\n\
              \x20   qex clean <id>\n\
-             \x20   qex clean --state done\n\
+             \x20   qex clean completed        # or: qex clean --state completed\n\
+             \x20   qex clean done             # every job that stopped\n\
              \x20   qex clean --older-than 7d\n\
              \x20   qex clean --all"
         );
@@ -561,16 +621,33 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
 
     let now = crate::sys::now_secs();
     let mut targets: Vec<uuid::Uuid> = Vec::new();
+    let mut word_filters: Vec<StateFilter> = Vec::new();
 
     for raw in &args.ids {
-        targets.push(resolve_id(&mut client, raw)?);
+        // Accept a state name in place of a job id, so `qex clean completed`
+        // operates in the same way as `qex clean --state completed`.
+        //
+        // A job can have the name of a state. Test the jobs first, and give an
+        // error when the word gives both a job and a state.
+        let is_job = jobs
+            .iter()
+            .any(|j| j.id.to_string().starts_with(raw) || j.name == *raw);
+        match (is_job, StateFilter::parse(raw)) {
+            (true, Ok(_)) => bail!(
+                "`{raw}` is the name of a job and the name of a state. \
+                 Use the job id, or use `--state {raw}`."
+            ),
+            (false, Ok(f)) => word_filters.push(f),
+            _ => targets.push(resolve_id(&mut client, raw)?),
+        }
     }
 
     for j in &jobs {
         if !j.state.is_terminal() {
             continue;
         }
-        let by_state = filter.as_ref().map(|f| f.matches(j.state)).unwrap_or(false);
+        let by_state = filter.as_ref().map(|f| f.matches(j.state)).unwrap_or(false)
+            || word_filters.iter().any(|f| f.matches(j.state));
         let by_age = older_than
             .map(|limit| now.saturating_sub(j.finished_at.unwrap_or(j.submitted_at)) >= limit)
             .unwrap_or(false);
@@ -607,6 +684,10 @@ fn exit_code_for(status: &JobStatus, passthrough: bool) -> i32 {
     match status.state {
         JobState::Completed => 0,
         JobState::Killed | JobState::Timeout | JobState::Oom | JobState::Cancelled => EXIT_KILLED,
+        // A job that did not run has its own code. A script can then separate
+        // "my job failed" from "a job before mine failed", and it does not read
+        // the JSON output.
+        JobState::Skipped => EXIT_SKIPPED,
         _ => 1,
     }
 }
@@ -630,6 +711,12 @@ fn describe_result(s: &JobStatus) -> String {
             )
         }
         JobState::Cancelled => "the job left the queue".to_string(),
+        // Give the cause here. A reader of the last job of a pipeline then
+        // learns which job failed, with no other command.
+        JobState::Skipped => s
+            .error
+            .clone()
+            .unwrap_or_else(|| "a job that this job needed did not succeed".to_string()),
         other => format!("the job is {other}"),
     }
 }
@@ -805,8 +892,12 @@ mod tests {
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
+            sequence: 0,
             blocked_reason: None,
             error: None,
+            needs: vec![],
+            after: vec![],
+            caused_by: None,
             tags: vec![],
         }
     }

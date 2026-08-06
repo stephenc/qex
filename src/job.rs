@@ -32,6 +32,13 @@ pub enum JobState {
     Oom,
     /// qex removed the job from the queue before the job started.
     Cancelled,
+    /// A job that this job needed did not succeed, so this job did not start.
+    ///
+    /// This state is different from `failed`. In a pipeline of six stages, one
+    /// stage fails and the stages after it are `skipped`. A reader thus finds
+    /// one failure only, and that failure is the cause. With the state `failed`
+    /// for each stage, the reader must find the first failure without help.
+    Skipped,
 }
 
 impl JobState {
@@ -55,6 +62,7 @@ impl JobState {
             Self::Timeout => "timeout",
             Self::Oom => "oom",
             Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
         }
     }
 }
@@ -78,6 +86,7 @@ impl std::str::FromStr for JobState {
             "timeout" => Ok(Self::Timeout),
             "oom" => Ok(Self::Oom),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
+            "skipped" => Ok(Self::Skipped),
             other => Err(format!(
                 "unknown job state `{other}`. Use one of these states: queued, starting, \
                  running, completed, failed, killed, timeout, oom, cancelled"
@@ -127,6 +136,13 @@ pub struct JobStatus {
     /// The signal that stopped the job, if a signal stopped it.
     pub signal: Option<i32>,
     pub submitted_at: u64,
+    /// The position of this job in the order of submission.
+    ///
+    /// The time has a resolution of one second, and an agent submits the stages
+    /// of a pipeline in the same second. Without this value, `qex list` shows
+    /// those stages in an order that has no meaning to the reader.
+    #[serde(default)]
+    pub sequence: u64,
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub cpu: u64,
@@ -154,6 +170,21 @@ pub struct JobStatus {
     /// anything, and a reader of `blocked_reason` expects a queue reason.
     #[serde(default)]
     pub error: Option<String>,
+    /// The jobs that must succeed before this job starts.
+    #[serde(default)]
+    pub needs: Vec<uuid::Uuid>,
+    /// The jobs that must stop before this job starts. Their result is not
+    /// important.
+    #[serde(default)]
+    pub after: Vec<uuid::Uuid>,
+    /// The job that caused this job to stop, for a job in the state `skipped`.
+    ///
+    /// This value names the first job that failed, and not the job before this
+    /// one. In a pipeline `a -> b -> c -> d` where `a` fails, this field of `d`
+    /// names `a`. A reader of the last job thus learns the true cause with one
+    /// command, and does not follow the chain.
+    #[serde(default)]
+    pub caused_by: Option<uuid::Uuid>,
     pub tags: Vec<String>,
 }
 
@@ -170,6 +201,7 @@ impl JobStatus {
             exit_code: None,
             signal: None,
             submitted_at: spec.submitted_at,
+            sequence: 0,
             started_at: None,
             finished_at: None,
             cpu: spec.cpu,
@@ -179,6 +211,9 @@ impl JobStatus {
             forced_reason: None,
             blocked_reason: None,
             error: None,
+            needs: spec.needs.clone(),
+            after: spec.after.clone(),
+            caused_by: None,
             tags: spec.tags.clone(),
         }
     }

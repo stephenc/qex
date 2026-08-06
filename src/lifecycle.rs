@@ -160,6 +160,30 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
             }
             Some(_) => {}
         }
+
+        // Keep a job that a job in the queue needs.
+        //
+        // Without this rule, the record of the cause disappears, and a job that
+        // waits for it cannot report why it did not run.
+        let waiting: Vec<String> = state
+            .jobs
+            .values()
+            .filter(|j| !j.status.state.is_terminal())
+            .filter(|j| j.spec.needs.contains(&id) || j.spec.after.contains(&id))
+            .map(|j| format!("{} ({})", &j.status.id.to_string()[..8], j.status.name))
+            .collect();
+
+        if !waiting.is_empty() {
+            return Response::error(
+                ErrorKind::WrongState,
+                format!(
+                    "the job {id} is needed by {}. Wait for {}, or cancel {}.",
+                    waiting.join(", "),
+                    if waiting.len() == 1 { "that job" } else { "those jobs" },
+                    if waiting.len() == 1 { "it" } else { "them" }
+                ),
+            );
+        }
     }
 
     let dir = match paths::job_dir(&id) {

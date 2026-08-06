@@ -32,6 +32,15 @@ pub struct JobFile {
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<EnvCapture>,
+    /// The jobs that must succeed before this job starts.
+    ///
+    /// Give an id or a name. If one of these jobs does not succeed, this job
+    /// does not start and its state becomes `skipped`.
+    pub needs: Vec<String>,
+    /// The jobs that must stop before this job starts.
+    ///
+    /// Their result is not important. Use this field to control the order only.
+    pub after: Vec<String>,
     pub resources: Resources,
     pub env: BTreeMap<String, String>,
 }
@@ -104,6 +113,20 @@ pub struct SubmitOptions {
     pub env_capture: Option<EnvCapture>,
     pub command: Vec<String>,
     pub job_file: Option<PathBuf>,
+    /// The names or ids of the jobs that must succeed first.
+    pub needs: Vec<String>,
+    /// The names or ids of the jobs that must stop first.
+    pub after: Vec<String>,
+}
+
+/// The dependencies of a job, as the user wrote them.
+///
+/// These values are names or ids. The CLI changes them into ids, because that
+/// step needs the list of the jobs from the coordinator.
+#[derive(Debug, Clone, Default)]
+pub struct DependencyNames {
+    pub needs: Vec<String>,
+    pub after: Vec<String>,
 }
 
 /// A complete job specification. Each value here is final.
@@ -125,6 +148,12 @@ pub struct JobSpec {
     /// `qex status` shows this value. The reader can then see why the job has
     /// this environment, and does not calculate the sequence of the sources.
     pub env_capture: EnvCapture,
+    /// The jobs that must succeed before this job starts.
+    #[serde(default)]
+    pub needs: Vec<uuid::Uuid>,
+    /// The jobs that must stop before this job starts.
+    #[serde(default)]
+    pub after: Vec<uuid::Uuid>,
     pub submitted_at: u64,
 }
 
@@ -142,7 +171,23 @@ impl JobSpec {
     /// directory from the shell    ->  job file cwd    ->  --cwd D
     /// config file defaults        ->  job file        ->  command line options
     /// ```
+    /// Makes a complete specification, without the dependencies.
+    ///
+    /// The unit tests use this function. The CLI uses `resolve_with_deps`,
+    /// because it must also change each dependency name into an id.
+    #[cfg(test)]
     pub fn resolve(opts: &SubmitOptions, cfg: &Config) -> Result<Self> {
+        Self::resolve_with_deps(opts, cfg).map(|(spec, _)| spec)
+    }
+
+    /// Makes a complete specification, and gives the dependency names.
+    ///
+    /// The names come from the command line and from the job file. The CLI
+    /// changes them into ids, because that step needs the coordinator.
+    pub fn resolve_with_deps(
+        opts: &SubmitOptions,
+        cfg: &Config,
+    ) -> Result<(Self, DependencyNames)> {
         let file = match &opts.job_file {
             Some(p) => JobFile::load(p)?,
             None => JobFile::default(),
@@ -238,7 +283,14 @@ impl JobSpec {
         tags.sort();
         tags.dedup();
 
-        Ok(Self {
+        let mut deps = DependencyNames {
+            needs: file.needs,
+            after: file.after,
+        };
+        deps.needs.extend(opts.needs.iter().cloned());
+        deps.after.extend(opts.after.iter().cloned());
+
+        Ok((Self {
             id: uuid::Uuid::new_v4(),
             name,
             cwd,
@@ -250,8 +302,12 @@ impl JobSpec {
             tags,
             priority: opts.priority.or(file.priority).unwrap_or(0),
             env_capture: capture,
+            // The CLI changes each name into an id after this function, because
+            // that step needs the coordinator.
+            needs: Vec::new(),
+            after: Vec::new(),
             submitted_at: crate::sys::now_secs(),
-        })
+        }, deps))
     }
 }
 

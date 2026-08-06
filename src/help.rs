@@ -81,6 +81,7 @@ thus put the UUID in a shell variable.
     1    the job failed
     124  your wait timed out; the job still operates
     125  something stopped the job
+    126  the job did not run, because a job that it needed failed
     127  there is no job with that id
 
 Add `--timeout` to limit your wait. Example: `qex wait $ID --timeout 30m`.
@@ -140,6 +141,49 @@ claim or the machine is too small.
 
 In short: give `guess`, start the task, and read the result. Add an exact claim
 later, and only if you repeat the task.
+
+A pipeline of stages
+--------------------
+
+Do not put the stages of a pipeline in one script. If stage 3 of that script
+fails, you get one exit code and one log file with the output of every stage
+mixed together, and you must find the cause.
+
+Give each stage its own job, and name the jobs that must succeed first:
+
+    BUILD=$(qex submit --name build -- make)
+    TEST=$(qex submit --name test  --needs build  -- make test)
+    SHIP=$(qex submit --name ship  --needs test   -- ./deploy.sh)
+    qex wait $SHIP
+
+Each stage has its own log file, its own exit code and its own claim. If `build`
+fails, `test` and `ship` do not start. Their state becomes `skipped`, and their
+record names the job that failed:
+
+    qex list
+    ID        STATE     NAME   ...  NOTE
+    a1b2c3d4  failed    build  ...  the job stopped with the exit code 2
+    b2c3d4e5  skipped   test   ...  the job a1b2c3d4 (build) is failed, ...
+    c3d4e5f6  skipped   ship   ...  the job a1b2c3d4 (build) is failed, ...
+
+There is one failure only, and it is the cause. Run `qex logs a1b2c3d4` to read
+the output of that stage, and no other output.
+
+Each skipped job names the first job that failed, and not the job before it. A
+read of the last stage thus gives you the cause immediately.
+
+    --needs <id>,<id>   wait for these jobs, and stop if one does not succeed
+    --after <id>,<id>   wait for these jobs, whatever their result
+
+Use `--after` to control the order only. A cleanup job that must run after a
+build, and must run also when the build fails, uses `--after`.
+
+`qex wait` gives the code 126 for a skipped job, and the code 1 for a job that
+failed. Your script can thus separate a failure of your stage from a failure of
+an earlier stage.
+
+A job can name the jobs that you started before it. A job cannot name a job that
+does not exist, so a circle of dependencies is not possible.
 
 Other commands
 --------------
@@ -203,6 +247,8 @@ A full file
     timeout = \"4h\"                # the default is no limit
     tags = [\"ml\"]                 # for `qex list --tag ml`
     priority = 0                  # a larger number starts earlier
+    needs = [\"build\"]             # stop if these jobs do not succeed
+    after = [\"cleanup\"]           # wait for these jobs, whatever the result
     env_capture = \"all\"           # all, minimal or none
 
     [resources]
@@ -419,6 +465,9 @@ qex job states
     timeout     the job used more time than its `--timeout` value.
     oom         the out-of-memory killer stopped the job.
     cancelled   qex removed the job from the queue before it started.
+    skipped     a job that this job needed did not succeed, so this job
+                did not start. The field `caused_by` names the job that
+                failed first.
 
 The states `queued`, `starting` and `running` are not final. Each other state is
 final and does not change.
@@ -476,7 +525,9 @@ Delete the records
 ------------------
 
     qex clean <id>                 one job
-    qex clean --state done         each job that stopped
+    qex clean completed            each job that succeeded
+    qex clean done                 each job that stopped
+    qex clean --state failed       each job in one state
     qex clean --older-than 7d      each job older than 7 days
     qex clean --all                every job
 
@@ -495,6 +546,7 @@ qex exit codes
     1    the job failed (a different exit code, or a signal)
     124  your wait timed out. The job still operates.
     125  something stopped the job: kill, timeout or out-of-memory
+    126  the job did not run, because a job that it needed did not succeed
     127  there is no job with that id
 
 The code 124 has the same meaning as the code of the `timeout` command.

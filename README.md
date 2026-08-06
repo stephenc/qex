@@ -49,14 +49,15 @@ the background coordinator for you, and you do not configure a service.
 ## Commands
 
 ```
-qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--job FILE] -- COMMAND...
+qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
+           [--after ID,ID] [--name NAME] [--job FILE] -- COMMAND...
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
 qex logs   <id> [--follow] [--tail N] [--stdout|--stderr]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
-qex clean  [--all|--state done|--older-than 7d]
+qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
 qex info                    the coordinator: its pid, its budget and its load
 qex config show             the values that qex uses now
 qex schema job|status       the JSON Schema of each format
@@ -76,6 +77,7 @@ Every command that reads data accepts `--json`.
 | 1    | The job failed. |
 | 124  | Your wait reached its time limit. The job continues. |
 | 125  | Something stopped the job: kill, timeout or out-of-memory. |
+| 126  | The job did not run, because a job that it needed failed. |
 | 127  | There is no job with that id. |
 
 The code 124 has the same meaning as the code of the `timeout` command. A
@@ -118,6 +120,52 @@ Each of these results is data for you. A job that waits for ever gives no data.
 The status field `forced` is `true` for such a job, and `qex submit` writes a
 warning at the time of the submission.
 
+## A pipeline of stages
+
+Do not put the stages of a pipeline in one script. If stage 3 of that script
+fails, you get one exit code and one log file with every stage mixed together,
+and you must find the cause yourself.
+
+Give each stage its own job:
+
+```sh
+qex submit --name build -- make
+qex submit --name test  --needs build -- make test
+SHIP=$(qex submit --name ship --needs test -- ./deploy.sh)
+qex wait $SHIP
+```
+
+Each stage has its own log file, its own exit code and its own claim. If `build`
+fails, `test` and `ship` do not start:
+
+```
+ID        STATE     NAME   ...  NOTE
+a1b2c3d4  failed    build  ...  the job stopped with the exit code 2
+b2c3d4e5  skipped   test   ...  the job a1b2c3d4 (build) is failed, ...
+c3d4e5f6  skipped   ship   ...  the job a1b2c3d4 (build) is failed, ...
+```
+
+There is one failure only, and it is the cause. `qex logs a1b2c3d4` gives the
+output of that stage, and no other output.
+
+Each skipped job names the **first** job that failed, and not the job before it.
+A read of the last stage thus gives the cause immediately, and you do not follow
+the chain.
+
+| Option | Meaning |
+| ------ | ------- |
+| `--needs ID,ID` | Wait for these jobs. Do not run if one does not succeed. |
+| `--after ID,ID` | Wait for these jobs, whatever their result. |
+
+Use `--after` for a cleanup step that must run also when the build fails.
+
+`qex wait` gives 126 for a skipped job and 1 for a job that failed, so a script
+can separate a failure of its own stage from a failure of an earlier stage.
+
+Each option accepts a job name, so `--needs build` operates after
+`qex submit --name build`. A job can name the jobs that you started before it,
+so a circle of dependencies is not possible.
+
 ## Job files
 
 ```sh
@@ -136,6 +184,14 @@ mem = "8GB"
 
 [env]
 CUDA_VISIBLE_DEVICES = "0"
+```
+
+A job file also accepts `needs` and `after`:
+
+```toml
+command = ["make", "test"]
+name = "test"
+needs = ["build"]
 ```
 
 qex reads TOML, YAML and JSON. The file extension selects the format.
@@ -266,13 +322,17 @@ each start, which limits the damage, but an accurate claim is better.
 ## Development
 
 ```sh
-cargo test           # 104 unit tests and 30 end-to-end tests
+cargo test -- --test-threads=2      # 105 unit tests and 47 end-to-end tests
 cargo build --release
 ```
 
-Each end-to-end test makes its own config, state and runtime directory, starts
-its own coordinator, and stops it at the end. The tests do not touch the
-coordinator of the user.
+Each end-to-end test makes its own config and state directory, starts its own
+coordinator, and stops it at the end. The tests do not touch the coordinator of
+the user, and they turn the peer accounting off.
+
+Use two test threads. Each end-to-end test starts real processes and waits for
+them. With more threads, the machine becomes busy, a job starts late, and a test
+reports a failure that the program does not have.
 
 The documentation, the code comments, the help text and the error messages use
 Simplified Technical English (ASD-STE100).

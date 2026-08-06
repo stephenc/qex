@@ -201,6 +201,111 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<usize> {
     Ok(started)
 }
 
+/// The result of the test of the dependencies of one job.
+enum Depends {
+    /// Each job that this job needs succeeded. This job can start.
+    Ready,
+    /// A job that this job needs still operates.
+    Waiting(String),
+    /// A job that this job needs did not succeed. This job must not start.
+    ///
+    /// The id is the first job that failed, and not the job before this one.
+    Broken { reason: String, root: uuid::Uuid },
+}
+
+/// Tests the dependencies of one job.
+fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
+    let Some(job) = state.jobs.get(&id) else {
+        return Depends::Ready;
+    };
+
+    // `needs`: the job must succeed.
+    for dep in &job.spec.needs {
+        let Some(other) = state.jobs.get(dep) else {
+            // `qex clean` does not delete a job that a queued job needs, so
+            // this case is not usual. Continue, because a job that waits for a
+            // record that does not exist would wait with no end.
+            continue;
+        };
+
+        if !other.status.state.is_terminal() {
+            return Depends::Waiting(format!(
+                "waits for the job {} ({}), which is {}",
+                &dep.to_string()[..8],
+                other.status.name,
+                other.status.state
+            ));
+        }
+
+        if other.status.state != JobState::Completed {
+            // Give the first job that failed, and not the job before this one.
+            //
+            // In a pipeline `a -> b -> c -> d` where `a` fails, the reader of
+            // `d` must learn that `a` failed. Without this step, the reader of
+            // `d` learns that `c` was skipped, and must follow the chain to
+            // find the cause.
+            let root = other.status.caused_by.unwrap_or(*dep);
+            let root_name = state
+                .jobs
+                .get(&root)
+                .map(|j| j.status.name.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            let root_state = state
+                .jobs
+                .get(&root)
+                .map(|j| j.status.state.to_string())
+                .unwrap_or_else(|| other.status.state.to_string());
+
+            return Depends::Broken {
+                reason: format!(
+                    "the job {} ({}) is {}, so this job did not run. \
+                     Read `qex logs {}` for the cause.",
+                    &root.to_string()[..8],
+                    root_name,
+                    root_state,
+                    &root.to_string()[..8]
+                ),
+                root,
+            };
+        }
+    }
+
+    // `after`: the job must stop. Its result is not important.
+    for dep in &job.spec.after {
+        let Some(other) = state.jobs.get(dep) else {
+            continue;
+        };
+        if !other.status.state.is_terminal() {
+            return Depends::Waiting(format!(
+                "waits for the job {} ({}) to stop, whatever its result",
+                &dep.to_string()[..8],
+                other.status.name
+            ));
+        }
+    }
+
+    Depends::Ready
+}
+
+/// Marks a job as skipped, because a job that it needed did not succeed.
+fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: uuid::Uuid) {
+    let Some(job) = state.jobs.get_mut(&id) else {
+        return;
+    };
+    job.status.state = JobState::Skipped;
+    job.status.finished_at = Some(sys::now_secs());
+    job.status.blocked_reason = None;
+    job.status.error = Some(reason);
+    job.status.caused_by = Some(root);
+    let status = job.status.clone();
+    state.queue.retain(|q| *q != id);
+
+    if let Ok(dir) = paths::job_dir(&id) {
+        job::write_status(&dir, &status).ok();
+    }
+    log(&format!("job {id} did not run, because a job that it needed did not succeed"));
+}
+
 /// Chooses the next job to start.
 fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     let (cpu_used, mem_used) = state.claimed();
@@ -212,6 +317,7 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     // reads the jobs.
     let mut chosen = None;
     let mut reasons: Vec<(uuid::Uuid, Option<String>)> = Vec::new();
+    let mut to_skip: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
 
     for id in state.queue.iter().copied() {
         let Some(job) = state.jobs.get(&id) else {
@@ -219,6 +325,23 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
         };
         if job.status.state != JobState::Queued {
             continue;
+        }
+
+        // Test the dependencies before the capacity.
+        //
+        // A job that waits for a different job does not hold capacity. The loop
+        // thus continues to the next job. Without this rule, one long chain of
+        // jobs would stop each job behind it.
+        match depends(state, id) {
+            Depends::Ready => {}
+            Depends::Waiting(reason) => {
+                reasons.push((id, Some(reason)));
+                continue;
+            }
+            Depends::Broken { reason, root } => {
+                to_skip.push((id, reason, root));
+                continue;
+            }
         }
 
         match size_check(&cfg, &job.spec) {
@@ -286,8 +409,17 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
         }
     }
 
+    // Mark each job whose dependency did not succeed. Do this step before the
+    // reasons, so a skipped job does not also get a queue reason.
+    for (id, reason, root) in to_skip {
+        skip(state, id, reason, root);
+    }
+
     for (id, reason) in reasons {
         if let Some(job) = state.jobs.get_mut(&id) {
+            if job.status.state != JobState::Queued {
+                continue;
+            }
             if job.status.blocked_reason != reason {
                 job.status.blocked_reason = reason;
                 let status = job.status.clone();
@@ -445,6 +577,8 @@ mod tests {
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
+            needs: vec![],
+            after: vec![],
             submitted_at: 0,
         }
     }

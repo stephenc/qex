@@ -82,6 +82,18 @@ pub const JOB: &str = r##"{
       "type": "object",
       "additionalProperties": { "type": "string" },
       "description": "Environment variables. These values replace the values from your shell."
+    },
+    "needs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The jobs that must succeed before this job starts. Give an id or a name. If one of these jobs does not succeed, this job does not run and its state becomes skipped.",
+      "examples": [["build", "lint"]]
+    },
+    "after": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The jobs that must stop before this job starts. Their result is not important. Use this field for a cleanup step that must run also when an earlier stage fails.",
+      "examples": [["build"]]
     }
   }
 }
@@ -105,8 +117,8 @@ pub const STATUS: &str = r##"{
     "cwd": { "type": "string", "description": "The directory of the job." },
     "state": {
       "type": "string",
-      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled"],
-      "description": "The job state. The states queued, starting and running are not final. Each other state is final."
+      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled", "skipped"],
+      "description": "The job state. The states queued, starting and running are not final. Each other state is final. The state skipped means that a job which this job needed did not succeed, so this job did not run."
     },
     "pid": {
       "type": ["integer", "null"],
@@ -143,7 +155,30 @@ pub const STATUS: &str = r##"{
     },
     "blocked_reason": {
       "type": ["string", "null"],
-      "description": "The reason that the job waits in the queue."
+      "description": "The reason that the job waits in the queue. The value is null for a job that started."
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause."
+    },
+    "needs": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" },
+      "description": "The jobs that must succeed before this job starts."
+    },
+    "after": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" },
+      "description": "The jobs that must stop before this job starts. Their result is not important."
+    },
+    "caused_by": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "For a job in the state skipped, the first job that failed. This value is the root cause, and not the job before this one, so one read gives the true cause of a pipeline failure."
+    },
+    "sequence": {
+      "type": "integer",
+      "description": "The position of the job in the order of submission. Sort by submitted_at and then by this value to see a pipeline in order."
     },
     "tags": {
       "type": "array",
@@ -195,7 +230,7 @@ mod tests {
                 "the schema does not list the state `{state}`"
             );
         }
-        assert_eq!(listed.len(), 9, "the schema lists a state that qex does not use");
+        assert_eq!(listed.len(), 10, "the schema lists a state that qex does not use");
     }
 
     /// The job schema must list each field of the job file. A missing field
@@ -214,10 +249,12 @@ mod tests {
             "env_capture",
             "resources",
             "env",
+            "needs",
+            "after",
         ] {
             assert!(props.contains_key(field), "the schema has no field `{field}`");
         }
-        assert_eq!(props.len(), 9, "the schema has a field that the job file does not accept");
+        assert_eq!(props.len(), 11, "the schema has a field that the job file does not accept");
     }
 
     /// The example in the job schema must parse as a job file.

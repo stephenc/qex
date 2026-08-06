@@ -7,6 +7,16 @@
 //! These tests start real processes. They are slower than the unit tests, but
 //! they are the only tests that measure the behaviour that matters: a job that
 //! runs, a job that stops, and a result that stays correct after a failure.
+//!
+//! Run these tests with two threads:
+//!
+//! ```sh
+//! cargo test -- --test-threads=2
+//! ```
+//!
+//! Each test starts real processes and waits for them. With more threads, the
+//! machine becomes busy, a job starts late, and a test reports a failure that
+//! the program does not have.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -298,7 +308,7 @@ fn a_job_that_is_too_large_runs_when_the_queue_is_empty() {
 
     // Fill the queue first, so the large job must wait.
     let small = h.submit(&["submit", "--cpu", "2", "--mem", "128MB", "--", "sleep", "3"]);
-    h.until("the small job starts", Duration::from_secs(10), || {
+    h.until("the small job starts", Duration::from_secs(45), || {
         h.state_of(&small) == "running"
     });
 
@@ -366,7 +376,7 @@ fn a_kill_stops_every_process_of_a_job() {
         "sleep 60 & sleep 60 & sleep 60 & wait",
     ]);
 
-    h.until("the job starts", Duration::from_secs(10), || {
+    h.until("the job starts", Duration::from_secs(45), || {
         h.state_of(&id) == "running"
     });
 
@@ -417,7 +427,7 @@ fn a_job_survives_the_failure_of_the_coordinator() {
     let h = Harness::with_default_config("crash");
     let id = h.submit(&["submit", "--", "sh", "-c", "sleep 3; echo survived; exit 7"]);
 
-    h.until("the job starts", Duration::from_secs(10), || {
+    h.until("the job starts", Duration::from_secs(45), || {
         h.state_of(&id) == "running"
     });
 
@@ -559,7 +569,7 @@ fn a_command_line_that_holds_the_word_qex_does_not_confuse_qex() {
         "echo pretending to be qex daemon supervise; sleep 30",
     ]);
 
-    h.until("the job starts", Duration::from_secs(10), || {
+    h.until("the job starts", Duration::from_secs(45), || {
         h.state_of(&id) == "running"
     });
 
@@ -589,7 +599,7 @@ fn cancel_removes_a_job_from_the_queue() {
     );
 
     let first = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "5"]);
-    h.until("the first job starts", Duration::from_secs(10), || {
+    h.until("the first job starts", Duration::from_secs(45), || {
         h.state_of(&first) == "running"
     });
 
@@ -626,7 +636,7 @@ fn clean_deletes_the_record_of_a_job_that_stopped() {
 fn clean_refuses_a_job_that_operates() {
     let h = Harness::with_default_config("cleanrun");
     let id = h.submit(&["submit", "--", "sleep", "30"]);
-    h.until("the job starts", Duration::from_secs(10), || {
+    h.until("the job starts", Duration::from_secs(45), || {
         h.state_of(&id) == "running"
     });
 
@@ -645,7 +655,7 @@ fn a_command_that_does_not_exist_gives_a_clear_message() {
     let h = Harness::with_default_config("nocmd");
     let id = h.submit(&["submit", "--", "this-program-does-not-exist"]);
 
-    h.until("the job stops", Duration::from_secs(15), || {
+    h.until("the job stops", Duration::from_secs(45), || {
         h.status_json(&id)["state"]
             .as_str()
             .map(|s| s == "failed")
@@ -750,7 +760,7 @@ fn the_claim_word_guess_gives_one_half_of_the_budget() {
 
     // A second job of the same size must operate at the same time.
     let b = h.submit(&["submit", "--cpu", "half", "--mem", "half", "--", "sleep", "3"]);
-    h.until("both jobs operate", Duration::from_secs(15), || {
+    h.until("both jobs operate", Duration::from_secs(45), || {
         h.list_json().iter().filter(|j| j["state"] == "running").count() == 2
     });
 
@@ -783,7 +793,7 @@ fn the_claim_word_full_gives_the_whole_budget() {
         "a job that asks for the budget is a normal job, and qex must not force it"
     );
 
-    h.until("the full job starts", Duration::from_secs(15), || {
+    h.until("the full job starts", Duration::from_secs(45), || {
         h.state_of(&big) == "running"
     });
 
@@ -829,7 +839,7 @@ fn a_dead_supervisor_does_not_leave_the_job_alive() {
     let h = Harness::with_default_config("orphan");
     let id = h.submit(&["submit", "--", "sleep", "120"]);
 
-    h.until("the job starts", Duration::from_secs(15), || {
+    h.until("the job starts", Duration::from_secs(45), || {
         h.state_of(&id) == "running"
     });
 
@@ -940,7 +950,7 @@ fn a_spawn_failure_uses_the_error_field() {
     let h = Harness::with_default_config("spawnfail");
     let id = h.submit(&["submit", "--", "this-program-does-not-exist"]);
 
-    h.until("the job stops", Duration::from_secs(15), || {
+    h.until("the job stops", Duration::from_secs(45), || {
         h.state_of(&id) == "failed"
     });
 
@@ -966,7 +976,7 @@ fn every_queued_job_gives_a_reason() {
     );
 
     let running = h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "5"]);
-    h.until("the first job starts", Duration::from_secs(15), || {
+    h.until("the first job starts", Duration::from_secs(45), || {
         h.state_of(&running) == "running"
     });
 
@@ -974,7 +984,7 @@ fn every_queued_job_gives_a_reason() {
     let b = h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--", "true"]);
 
     // Give the scheduler one cycle to write the reasons.
-    h.until("both jobs give a reason", Duration::from_secs(15), || {
+    h.until("both jobs give a reason", Duration::from_secs(45), || {
         let ra = h.status_json(&a)["blocked_reason"].as_str().map(String::from);
         let rb = h.status_json(&b)["blocked_reason"].as_str().map(String::from);
         ra.is_some() && rb.is_some()
@@ -1048,6 +1058,219 @@ fn an_unknown_job_gives_the_same_code_for_each_form_of_the_name() {
             );
         }
     }
+}
+
+/// A stage that fails must stop the stages after it, and each of those stages
+/// must name the stage that failed.
+///
+/// This behaviour is the reason for the feature. A pipeline in one script gives
+/// one exit code and one log file with every stage mixed together.
+#[test]
+fn a_failed_stage_stops_the_stages_after_it() {
+    let h = Harness::with_default_config("pipeline");
+
+    let build = h.submit(&[
+        "submit",
+        "--name",
+        "build",
+        "--",
+        "sh",
+        "-c",
+        "echo compiling; echo 'error: undefined symbol' >&2; exit 2",
+    ]);
+    let test = h.submit(&["submit", "--name", "test", "--needs", "build", "--", "true"]);
+    let ship = h.submit(&["submit", "--name", "ship", "--needs", "test", "--", "true"]);
+
+    // The last stage must give the code 126: it did not run.
+    let out = h.qex(&["wait", &ship, "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(126));
+
+    assert_eq!(h.state_of(&build), "failed");
+    assert_eq!(h.state_of(&test), "skipped");
+    assert_eq!(h.state_of(&ship), "skipped");
+
+    // The last stage must name the FIRST stage that failed, and not the stage
+    // before it. A reader of the last stage thus learns the true cause.
+    let s = h.status_json(&ship);
+    assert_eq!(
+        s["caused_by"].as_str(),
+        Some(build.as_str()),
+        "the last stage must name the build, and not the test: {s}"
+    );
+    assert!(
+        s["error"].as_str().unwrap_or("").contains("build"),
+        "the reason must name the stage that failed: {s}"
+    );
+
+    // There must be one failure only, so a reader finds the cause at once.
+    let failed = h
+        .list_json()
+        .iter()
+        .filter(|j| j["state"] == "failed")
+        .count();
+    assert_eq!(failed, 1, "a pipeline must report one failure only");
+
+    // The log of the stage that failed must hold its output only.
+    let logs = h.ok(&["logs", &build]);
+    assert!(logs.contains("undefined symbol"));
+}
+
+/// Each stage of a pipeline that succeeds must run, in order.
+#[test]
+fn a_pipeline_that_succeeds_runs_each_stage_in_order() {
+    let h = Harness::with_default_config("pipeok");
+
+    let build = h.submit(&["submit", "--name", "build", "--", "sh", "-c", "echo one"]);
+    let test = h.submit(&[
+        "submit", "--name", "test", "--needs", "build", "--", "sh", "-c", "echo two",
+    ]);
+    let ship = h.submit(&[
+        "submit", "--name", "ship", "--needs", "test", "--", "sh", "-c", "echo three",
+    ]);
+
+    let out = h.qex(&["wait", &ship, "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(0));
+
+    for id in [&build, &test, &ship] {
+        assert_eq!(h.state_of(id), "completed");
+    }
+
+    // Each stage must start after the stage before it stopped.
+    let s1 = h.status_json(&build);
+    let s3 = h.status_json(&ship);
+    assert!(
+        s3["started_at"].as_u64().unwrap() >= s1["finished_at"].as_u64().unwrap(),
+        "the last stage started before the first stage stopped"
+    );
+
+    // `qex list` must show the stages in the order of submission.
+    let names: Vec<String> = h
+        .list_json()
+        .iter()
+        .map(|j| j["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names, vec!["build", "test", "ship"]);
+}
+
+/// `--after` controls the order only. Such a job runs also when the job before
+/// it fails. A cleanup step needs this behaviour.
+#[test]
+fn an_after_job_runs_when_the_job_before_it_fails() {
+    let h = Harness::with_default_config("afterjob");
+
+    let build = h.submit(&["submit", "--name", "build", "--", "sh", "-c", "exit 3"]);
+    let cleanup = h.submit(&[
+        "submit", "--name", "cleanup", "--after", "build", "--", "sh", "-c", "echo cleaned",
+    ]);
+
+    let out = h.qex(&["wait", &cleanup, "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(0), "an --after job must run");
+    assert_eq!(h.state_of(&build), "failed");
+    assert_eq!(h.state_of(&cleanup), "completed");
+    assert!(h.ok(&["logs", &cleanup]).contains("cleaned"));
+}
+
+/// A job that waits for a different job must not hold capacity.
+///
+/// Without this rule, one long chain of jobs stops every job behind it.
+#[test]
+fn a_job_that_waits_for_another_job_does_not_hold_capacity() {
+    let h = Harness::new(
+        "depcapacity",
+        "[budget]\ncpu = \"2\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    // A long job, and a job that waits for it.
+    let slow = h.submit(&["submit", "--name", "slow", "--cpu", "1", "--mem", "64MB", "--", "sleep", "4"]);
+    let waiter = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", "slow", "--", "true",
+    ]);
+
+    // A job with no dependency must not wait for the job above it.
+    let free = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let out = h.qex(&["wait", &free, "--timeout", "20s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a job with no dependency must not wait for a job that has one"
+    );
+
+    h.ok(&["wait", &waiter, "--timeout", "60s"]);
+    h.ok(&["wait", &slow, "--timeout", "60s"]);
+}
+
+/// A dependency must exist at the submission.
+///
+/// This rule makes a circle of dependencies impossible, and it gives the error
+/// at once, and not when the job waits with no end.
+#[test]
+fn a_dependency_that_does_not_exist_is_refused() {
+    let h = Harness::with_default_config("nodep");
+    let out = h.qex(&["submit", "--needs", "no-such-job", "--", "true"]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no-such-job"), "the error must name the value: {err}");
+}
+
+/// `qex clean` must keep a job that a job in the queue needs. Without that
+/// record, the job that waits cannot report why it did not run.
+#[test]
+fn clean_keeps_a_job_that_another_job_needs() {
+    let h = Harness::with_default_config("cleandep");
+
+    let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "sleep 2; exit 1"]);
+    let second = h.submit(&["submit", "--needs", "first", "--", "true"]);
+
+    let out = h.qex(&["clean", &first]);
+    assert!(!out.status.success(), "qex must keep this job");
+
+    // The second job does not run, so `wait` gives the code 126.
+    let out = h.qex(&["wait", &second, "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(126));
+    assert_eq!(h.state_of(&second), "skipped");
+}
+
+/// A state name must operate in place of a job id, so `qex clean completed`
+/// gives the same result as `qex clean --state completed`.
+#[test]
+fn clean_accepts_a_state_name() {
+    let h = Harness::with_default_config("cleanword");
+
+    let good = h.submit(&["submit", "--", "true"]);
+    let bad = h.submit(&["submit", "--", "false"]);
+    h.ok(&["wait", &good, "--timeout", "30s"]);
+    h.qex(&["wait", &bad, "--timeout", "30s"]);
+
+    h.ok(&["clean", "completed"]);
+
+    let states: Vec<String> = h
+        .list_json()
+        .iter()
+        .map(|j| j["state"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(states, vec!["failed"], "qex deleted the wrong jobs");
+}
+
+/// A job file must accept the dependencies.
+#[test]
+fn a_job_file_accepts_dependencies() {
+    let h = Harness::with_default_config("depfile");
+    let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "exit 1"]);
+
+    let file = h.root.join("second.toml");
+    std::fs::write(
+        &file,
+        "command = [\"true\"]\nname = \"second\"\nneeds = [\"first\"]\n",
+    )
+    .unwrap();
+
+    let second = h.submit(&["submit", "--job", file.to_str().unwrap()]);
+    let out = h.qex(&["wait", &second, "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(126));
+    assert_eq!(h.state_of(&second), "skipped");
+    assert_eq!(h.status_json(&second)["caused_by"].as_str(), Some(first.as_str()));
 }
 
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,

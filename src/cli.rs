@@ -112,6 +112,21 @@ pub struct SubmitArgs {
     #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
+    /// Wait for these jobs, and stop if one of them does not succeed.
+    ///
+    /// Give an id or a name. Repeat the option, or separate the values with a
+    /// comma. If a needed job does not succeed, this job does not start and its
+    /// state becomes `skipped`.
+    #[arg(long = "needs", value_name = "ID,ID", value_delimiter = ',')]
+    pub needs: Vec<String>,
+
+    /// Wait for these jobs, whatever their result.
+    ///
+    /// Use this option to control the order only. This job starts after those
+    /// jobs stop, and the result of those jobs is not important.
+    #[arg(long = "after", value_name = "ID,ID", value_delimiter = ',')]
+    pub after: Vec<String>,
+
     /// Read the job from a TOML, YAML or JSON file.
     #[arg(long = "job", value_name = "FILE")]
     pub job_file: Option<PathBuf>,
