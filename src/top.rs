@@ -378,7 +378,9 @@ fn note_for(job: &JobStatus) -> String {
             None => "failed".to_string(),
         },
         JobState::Skipped => "a job that it needed did not succeed".to_string(),
-        JobState::Oom => "out of memory".to_string(),
+        // Name the cause, and not the symptom. This column holds one short
+        // line, and the reader must learn what to correct: the claim.
+        JobState::Oom => "the memory claim was too small".to_string(),
         JobState::Timeout => "reached its time limit".to_string(),
         JobState::Killed => "stopped by a command".to_string(),
         JobState::Cancelled => "left the queue".to_string(),
@@ -422,6 +424,7 @@ mod tests {
             locks: vec![],
             attempts: 1,
             retries_left: 0,
+            oom_raises: 0,
             caused_by: None,
             tags: vec![],
         }

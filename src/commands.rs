@@ -385,6 +385,9 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
             // calculated it from the earlier jobs, and that no agent chose it.
             "learned" => "  (from the earlier jobs of this command)",
             "default" => "  (the default; give --cpu and --mem to change it)",
+            // A claim that qex raised must say so. Without this text, a reader
+            // sees a number that no agent gave and no measurement produced.
+            "raised" => "  (qex raised it, because the earlier claim was too small)",
             _ => "",
         }
     );
@@ -416,7 +419,15 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
         println!("waits for: {r}");
     }
     if let Some(e) = &s.error {
-        println!("error:     {e}");
+        // A job that succeeded can also hold a text here. qex writes the story
+        // of an out-of-memory kill in this field, and that story stays in the
+        // record after a later attempt succeeded. The word `error` would then
+        // contradict the state, so this line uses the word `note`.
+        if s.state == JobState::Completed {
+            println!("note:      {e}");
+        } else {
+            println!("error:     {e}");
+        }
     }
     if s.attempts > 1 || s.retries_left > 0 {
         println!(
@@ -1261,13 +1272,20 @@ fn describe_result(s: &JobStatus) -> String {
         },
         JobState::Killed => "a command stopped the job".to_string(),
         JobState::Timeout => "the job reached its time limit".to_string(),
-        JobState::Oom => {
+        // Say that the CLAIM was too small, and not that the machine was full.
+        //
+        // The words "the machine ran out of memory" sent the reader to the
+        // machine, and the fault was in the claim. qex holds the full story in
+        // the error field, with the claim that it tried, so give that text when
+        // qex wrote it.
+        JobState::Oom => s.error.clone().unwrap_or_else(|| {
             format!(
-                "the machine ran out of memory. The job claimed {} and used {}.",
+                "the kernel stopped the job for memory. The claim of {} was too small, and the \
+                 job reached {}. Give a larger `--mem` value.",
                 format_size(s.mem),
                 format_size(s.usage.max_rss)
             )
-        }
+        }),
         JobState::Cancelled => "the job left the queue".to_string(),
         // Give the cause here. A reader of the last job of a pipeline then
         // learns which job failed, with no other command.
@@ -1963,6 +1981,21 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     let mut spec = crate::job::read_spec(&dir)
         .with_context(|| format!("reading the specification of the job {id}"))?;
 
+    // Use the claim IN FORCE, and not the claim of the submission.
+    //
+    // The record holds the claim that the job had at the end. That value is the
+    // value of the specification, except after a kill for memory: qex then
+    // raised the claim, and the job succeeded at the larger value. A rerun from
+    // the specification would repeat the claim that the kernel already stopped,
+    // and the correction that cost a whole run would go away.
+    if let Ok(status) = crate::job::read_status(&dir) {
+        if status.mem > spec.mem {
+            spec.mem = status.mem;
+            spec.cpu = status.cpu.max(spec.cpu);
+            spec.claim_source = status.claim_source.clone();
+        }
+    }
+
     // A new job needs a new id, and it must not keep the dependencies of the
     // first job: those jobs have stopped, and a dependency on a job that
     // succeeded is not correct.
@@ -2404,6 +2437,7 @@ mod tests {
             locks: vec![],
             attempts: 1,
             retries_left: 0,
+            oom_raises: 0,
             caused_by: None,
             tags: vec![],
         }
@@ -2465,6 +2499,19 @@ mod tests {
         // The text must give the claim and the true use. An agent then corrects
         // its claim from this line.
         assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
+        // It must also name the CLAIM as the fault. The words "the machine ran
+        // out of memory" sent the reader to the machine, and the fault was in
+        // the claim.
+        assert!(text.contains("too small"), "got: {text}");
+
+        // qex writes the full story in the error field: the claim that failed,
+        // the new claim, and the attempt. That text must win, because it says
+        // more than the line above.
+        s.error = Some("qex raised the claim to 2GB and starts the job again".into());
+        assert!(
+            describe_result(&s).contains("raised the claim"),
+            "the record of qex must win"
+        );
     }
 
     #[test]

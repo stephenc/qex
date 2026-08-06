@@ -320,8 +320,17 @@ qex uses the LARGEST measurement that it holds, and it adds a margin. A claim
 that is too small stops the job, and a claim that is a little too large costs
 some capacity only.
 
-qex records a job that completed only. A job that the out-of-memory killer
-stopped shows the memory that it reached, and not the memory that it needs.
+qex records a job that completed, and a job that the kernel stopped for memory.
+The two give different evidence, and qex keeps them apart:
+
+  - a job that COMPLETED gives the memory that the job needs;
+  - a job that the KERNEL STOPPED AT ITS OWN LIMIT gives a lower bound. The true
+    need is above that value, so the next claim is above it as well. A smaller
+    run that succeeds later does not remove that lesson. qex records this
+    measurement when it applied the limit itself; see `qex help config`.
+
+qex records nothing else. A job that you stopped, or that reached its time
+limit, shows the memory that it reached and not the memory that it needs.
 
 In short: give `guess`, start the task, and read the result. Add an exact claim
 later, and only if you repeat the task. After the first run of a command, qex
@@ -395,6 +404,11 @@ Other useful options
                        The job keeps one id and one record, and the log holds
                        every attempt. Use it for a fault outside the task,
                        such as a network that is not ready.
+
+                       You do not need this option for a job that the kernel
+                       stops for memory. qex raises the claim and starts such
+                       a job again by itself, and that correction does not use
+                       this count. See `qex help config`.
 
     --lock NAME        two jobs with one lock name never operate together.
                        Use it for work that shares something that a claim
@@ -636,6 +650,10 @@ that qex uses now.
     enabled = true        # use the earlier jobs of a command as the claim
     margin = 1.5          # the multiplier for a measurement
 
+    [retry]
+    on_oom = 2            # times to raise the claim after a kill for memory
+    growth = 2.0          # the multiplier for the claim at each raise
+
     [history]
     keep = \"1d\"           # how long to keep the id of a job after its removal
 
@@ -654,6 +672,33 @@ A submission without `--cpu` or `--mem` uses the `[defaults]` section. If that
 section gives no value, qex uses 1 core and an equal part of the machine
 memory. On a machine with 16 cores and 32GB, the default job is 1 core and 2GB.
 The default job size thus scales with the machine.
+
+A kill for memory
+-----------------
+
+The kernel stops a job that uses more memory than its claim. That kill says one
+thing: the claim was too small. qex raises the claim and starts the job again,
+up to `[retry] on_oom` times, and it multiplies the claim by `growth` at each
+raise. The default values give 2 raises and 4 times the first claim.
+
+This count is separate from `--retries`. `--retries` is for a fault outside the
+task, and you chose that number for that fault. The claim is usually the work of
+qex, so qex corrects its own fault and does not spend your count.
+
+The claim never goes above `[budget] mem`. A job that already claims the whole
+budget keeps the state `oom`, and the record says that you need a larger machine
+or a larger budget. The job also goes through the QUEUE again, because the queue
+never admitted the new claim.
+
+qex acts on the evidence of THIS JOB only. With `mode = \"soft\"` or
+`mode = \"hard\"` above, qex makes a cgroup for each job and reads the count of
+that cgroup: the kernel stopped the job at the claim, so the claim was too
+small. With `mode = \"off\"`, which is the default, qex reads the count of your
+login session, and that count also rises when the kernel stops a DIFFERENT
+program of the same user. qex then reports the state `oom` and starts no new
+attempt: the machine can be full while the claim of this job is correct.
+
+Set `[enforce] mode` to get the correction. Set `on_oom = 0` to stop it.
 
 Enforcement
 -----------
@@ -747,8 +792,9 @@ these conditions are true:
 
 The `usage` field gives `max_rss` in bytes and `cpu_secs`. A task that always
 uses much less than its claim wastes capacity: put an exact claim in a job file,
-and more jobs then operate together. A task that stops with an out-of-memory
-error needs a larger claim.
+and more jobs then operate together. A task that the kernel stops for memory
+needs a larger claim, and qex gives it that claim itself: it multiplies the
+claim and starts the job again.
 
 For one task, this step is not necessary.
 
@@ -775,7 +821,8 @@ qex job states
     failed      the job stopped with an exit code that is not 0.
     killed      the command `qex kill` stopped the job.
     timeout     the job used more time than its `--timeout` value.
-    oom         the out-of-memory killer stopped the job.
+    oom         the kernel stopped the job, because the job used more
+                memory than its claim.
     cancelled   qex removed the job from the queue before it started.
     skipped     a job that this job needed did not succeed, so this job
                 did not start. The field `caused_by` names the job that
@@ -784,8 +831,20 @@ qex job states
 The states `queued`, `starting` and `running` are not final. Each other state is
 final and does not change.
 
-The state `oom` is different from `failed`. For `oom`, correct your memory claim
-or use a larger machine.
+The state `oom` is different from `failed`. It says that the kernel stopped the
+job for memory.
+
+When qex applied the memory limit itself, that kill proves that the claim was
+too small: qex raises the claim and starts the job again, up to 2 times. With no
+limit, which is the default, qex reads the count of the login session, and that
+count also rises for a different program of the same user. qex then reports the
+state and starts no new attempt. The record of the job says which of the two
+happened, and what you can do.
+
+The state `killed` also covers a kill that qex cannot explain. The kernel and
+`qex kill` both use the signal KILL, and a machine with no cgroup keeps no count
+of the kills for memory. qex then gives `killed`, which starts no new attempt,
+and the record says that qex could not tell.
 
 Use `qex list --state running` to select the jobs in one state.
 ";
