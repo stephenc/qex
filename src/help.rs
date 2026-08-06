@@ -61,19 +61,44 @@ with one command.
 Do not write a monitor script
 -----------------------------
 
-A monitor script that uses `pgrep -f` or `ps` finds its own command line. It
-counts itself as the task. The task stops, one process stays, and the script
-waits for ever. This is a frequent fault.
+Every monitor that you write waits for a PROXY: a pattern in the process list, a
+line in a log file, a file that appears. A proxy can become permanently false,
+and nothing tells the monitor. It then waits for ever.
 
-qex does not have this fault. qex is the parent process of your task. It uses
-`waitpid` on the process. It never searches a command line.
+These three waits were measured on one machine in one day. Together they slept
+for 54 hours, and not one of the conditions could ever become true:
 
-Use `qex wait`. It blocks until the job stops. Do not poll.
+    while pgrep -f \"solve.py\"; do sleep 60; done
+        The command line of this shell holds the letters `solve.py`, so the
+        pattern matches the monitor itself. The task stops, one process stays,
+        and the count never reaches zero.
 
-The same fault applies to every search of the process list. A command such as
-`pgrep -f qex` also matches the shell command that contains those letters. To
-find the coordinator, use `qex info`. It gives the process id from the
-coordinator itself.
+    until grep -q \"DONE\" run.log; do sleep 60; done
+        Correct, until somebody stopped the task that writes that line. The
+        marker will never arrive now.
+
+    until grep -q \"READY\" ~/other.log; do sleep 60; done
+        That file was never made. This monitor slept for 41 hours.
+
+The second and the third hold no pattern fault. They are careful commands. The
+fault is the proxy: a log line is evidence of the work, and evidence stops when
+the work stops, in a way that the monitor cannot see.
+
+qex waits for the process, and not for a proxy of the process. qex is the parent
+of your task and it uses `waitpid` on that exact process. A process ends or it
+does not, and no third condition exists. `qex wait` thus always gives an answer:
+
+    the job succeeded            -> 0
+    the job failed               -> 1
+    somebody stopped the job     -> 125
+    a job before it failed       -> 126
+
+A task that somebody stops gives the code 125 at that moment. A monitor that
+watches a log file would still be waiting.
+
+The same fault applies to every search of the process list. `pgrep -f qex` also
+matches the shell command that holds those letters. To find the coordinator, use
+`qex info`, which gives the process id from the coordinator itself.
 
 The three commands you need
 ---------------------------

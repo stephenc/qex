@@ -580,6 +580,29 @@ mod tests {
         assert!(text.contains("qex wait"), "the topic must give the solution");
     }
 
+    /// The topic must name the general fault, and not the pgrep fault only.
+    ///
+    /// A monitor that greps a log file holds no pattern fault, and it waits for
+    /// ever when somebody stops the task that writes the line. Three real
+    /// monitors on one machine slept for 54 hours between them, and two of them
+    /// were careful commands with no pattern in them at all.
+    #[test]
+    fn the_agents_topic_names_the_proxy_fault() {
+        let text = crate::help::AGENTS;
+        assert!(
+            text.contains("PROXY") || text.contains("proxy"),
+            "the topic must name the general fault, and not the pgrep fault only"
+        );
+        assert!(
+            text.contains("grep -q"),
+            "the topic must give the log marker example, which holds no pattern fault"
+        );
+        assert!(
+            text.contains("125"),
+            "the topic must say that a job somebody stops still gives an answer"
+        );
+    }
+
     /// The topic must show the pattern that operates inside a harness.
     ///
     /// `qex wait` blocks, and the harness of an agent reports the end of a

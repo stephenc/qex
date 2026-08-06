@@ -22,15 +22,28 @@ starts a large task, and the out-of-memory killer selects a victim. qex holds a
 budget for the machine. A job starts when the machine has capacity for its
 claim, and it waits when the machine does not.
 
-**2. A monitor script counts itself.** An agent that has no way to wait writes a
-monitor script. That script uses `pgrep -f train.py`, which also matches the
-command line of the script. The script sees two processes, the task stops, one
-process stays, and the script waits for ever. The agent then writes a monitor
-for the monitor.
+**2. Every hand-rolled watcher waits on a proxy, and a proxy can go permanently
+false.** An agent with no way to wait writes a monitor. That monitor watches a
+*proxy* for the work — a pattern in the process list, a line in a log, a file
+that should appear — and a proxy can stop being reachable without anything
+noticing. Three real watchers on one machine, in one day, slept for **54 hours
+combined** on conditions that could never become true:
 
-qex does not search a command line. It is the parent process of your task, and
-it uses `waitpid` on that exact process. `qex wait` blocks until the job stops
-and gives you the result in its exit code.
+```sh
+while pgrep -f "solve.py"; do sleep 60; done      # matches its own command line
+until grep -q "DONE" run.log; do sleep 60; done   # the writer was killed
+until grep -q "READY" ~/other.log; do sleep 60; done  # that file never existed
+```
+
+Only the first is the classic `pgrep -f` self-match. The other two contain no
+pattern bug at all — they are careful commands whose evidence simply stopped
+arriving. That is the general failure, and it is why the fix is not "write a
+better pattern".
+
+qex waits on the **process**, not on a proxy for it. qex is the parent of your
+task and calls `waitpid` on that exact process: it exits or it does not, and
+there is no third outcome. `qex wait` therefore always returns — including 125
+the moment somebody kills the job, where a log-watcher would still be sleeping.
 
 **3. There is no handle on a running task.** qex gives each job a UUID. Use that
 id to read the state of the job, read its output, stop it, or remove it from the
