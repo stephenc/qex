@@ -145,12 +145,20 @@ fn render(
         // Say the pause on the page. A person who watches a queue that starts
         // nothing must read the cause here, and not look for it.
         let now = sys::now_secs();
-        if let (Some("paused"), Some(at)) = (queue_state.as_deref(), paused_at) {
+        let fault = queue_state.as_deref() == Some("paused-by-fault");
+        if let (true, Some(at)) = (
+            matches!(
+                queue_state.as_deref(),
+                Some("paused") | Some("paused-by-fault")
+            ),
+            paused_at,
+        ) {
             let record = crate::pause::PauseRecord {
                 paused_at: *at,
                 by_pid: 0,
                 reason: paused_reason.clone(),
                 until: *paused_until,
+                fault,
             };
             out.push_str(&crate::style::warning(&format!(
                 "      QUEUE PAUSED: qex starts no job. {}",

@@ -145,13 +145,21 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
 /// machine is quiet, and the coordinator continues to start jobs. This function
 /// gives the cause and the remedy instead.
 ///
-/// `name` is the capability, and `command` is the words that the user typed.
+/// `name` is the capability, `command` is the words that the user typed, and
+/// `danger` says why the refusal matters.
+///
+/// The danger is a parameter, and not a fixed sentence. One capability can gate
+/// two commands whose dangers are opposite: a `qex pause` that an old
+/// coordinator ignores starts work while the person believes that the machine
+/// is quiet, and a `qex resume` that it ignores changes nothing at all. A fixed
+/// sentence would state a reason that is not true for one of them.
 pub fn require(
     have: &[String],
     coordinator_version: &str,
     coordinator_pid: i32,
     name: &str,
     command: &str,
+    danger: &str,
 ) -> Result<(), String> {
     if have.iter().any(|h| h == name) {
         return Ok(());
@@ -159,8 +167,7 @@ pub fn require(
     Err(format!(
         "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and it \
          cannot obey `{command}`.\n\n\
-         qex refuses this command. The coordinator would start the jobs of the queue, and you \
-         would believe that the machine is quiet.\n\n\
+         qex refuses this command. {danger}\n\n\
          The coordinator stops when no job operates, and the next command then starts one that \
          can obey. To change it now:\n\
          \x20   kill {coordinator_pid}\n\n\
@@ -341,7 +348,16 @@ mod tests {
             .map(|c| c.to_string())
             .collect();
 
-        let err = require(&old, "0.7.1", 3507877, "pause", "qex pause").unwrap_err();
+        let err = require(
+            &old,
+            "0.7.1",
+            3507877,
+            "pause",
+            "qex pause",
+            "The coordinator would start the jobs of the queue, and you would believe that the \
+             machine is quiet.",
+        )
+        .unwrap_err();
         assert!(
             err.contains("qex pause"),
             "the message must name the command: {err}"
@@ -356,7 +372,25 @@ mod tests {
         );
 
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
-        assert!(require(&new, "0.8.0", 1, "pause", "qex pause").is_ok());
+        assert!(require(&new, "0.8.0", 1, "pause", "qex pause", "danger").is_ok());
+
+        // The danger of a refused `qex resume` is the opposite of the danger of
+        // a refused `qex pause`. One fixed sentence would state a reason that
+        // is not true for one of the two commands.
+        let resume = require(
+            &old,
+            "0.7.1",
+            3507877,
+            "pause",
+            "qex resume",
+            "That coordinator does not read the pause record, so it already starts the jobs of \
+             the queue. This command would change nothing.",
+        )
+        .unwrap_err();
+        assert!(
+            !resume.contains("you would believe that the machine is quiet"),
+            "the resume message must not give the danger of a pause: {resume}"
+        );
     }
 
     #[test]

@@ -532,6 +532,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         // Give the machine a moment. A task that fails at once, such as a
         // network that is not ready, needs the time more than the CPU.
         std::thread::sleep(Duration::from_secs(1));
+        wait_while_paused(&dir, &spec, &mut status);
         return main(id);
     }
 
@@ -540,6 +541,63 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     crate::usage::record(&spec, &status);
 
     Ok(code.unwrap_or(0))
+}
+
+/// Waits while a person holds the queue, or a lock of this job.
+///
+/// # The fault that this function prevents
+///
+/// A retry starts the next attempt IN THIS PROCESS. It does not give the job
+/// back to `sched::choose`, so the pause test of the scheduler never sees it.
+/// Without this wait, a job with `--retries` starts a new process minutes after
+/// `qex pause queue` answered "paused" and after `qex info` reported it. A job
+/// that fails quickly repeats that for the whole length of the pause.
+///
+/// This is also why the pause is a FILE. The supervisor is a separate process
+/// with no connection to the coordinator, and a file is a state that every
+/// process can read.
+///
+/// The lock has the same rule: a person who holds `gpu0` must not lose it to
+/// the second attempt of a job that held it before.
+fn wait_while_paused(
+    dir: &std::path::Path,
+    spec: &crate::spec::JobSpec,
+    status: &mut job::JobStatus,
+) {
+    let mut said = false;
+    loop {
+        let mut paused = crate::pause::Paused::read();
+        paused.expire(sys::now_secs());
+
+        let reason = match &paused.queue {
+            Some(record) => Some(crate::pause::queue_reason(record)),
+            None => spec
+                .locks
+                .iter()
+                .find(|name| paused.locks.contains_key(*name))
+                .map(|name| crate::pause::lock_reason(name)),
+        };
+
+        let Some(reason) = reason else {
+            if said {
+                status.blocked_reason = None;
+                job::write_status(dir, status).ok();
+                log("the pause ended; the next attempt of this job starts");
+            }
+            return;
+        };
+
+        // Write the reason one time only. The text holds no number that
+        // changes, so a second write would give the same bytes and two more
+        // `fsync` calls, twice a second, for the whole length of the pause.
+        if !said {
+            said = true;
+            status.blocked_reason = Some(reason.clone());
+            job::write_status(dir, status).ok();
+            log(&format!("the next attempt of this job waits: {reason}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Makes a file that the other users of the machine cannot read.

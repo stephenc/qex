@@ -642,6 +642,15 @@ A pause with no end continues until you run `qex resume`. Every command that
 lists jobs says so, because a pause that a person forgets gives an empty queue
 in the morning.
 
+A second `qex pause queue` KEEPS the end and the reason of the first one. A
+command that replaced them would change a pause of 30 minutes into a pause with
+no end. To replace an end, run `qex resume queue` first.
+
+`--for 0` is an error. To end a pause now, run `qex resume queue`.
+
+A job with `--retries` starts its next attempt inside its own supervisor, and
+that supervisor reads the pause as well. The next attempt waits.
+
 Pause a lock
 ------------
 
@@ -664,6 +673,10 @@ What survives
 
 The pause is a file beside the job records, so it survives a coordinator that
 stops. A new coordinator reads it and the queue stays paused.
+
+If qex cannot read that file, it HOLDS the queue and says so. A file that qex
+cannot read can hold a pause, and qex does not know. `qex resume queue` writes
+a new file and starts the queue again.
 
 The pause covers YOUR queue only. It does not pause another user of the
 machine. `qex info` says so.

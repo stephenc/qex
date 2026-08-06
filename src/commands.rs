@@ -1477,12 +1477,13 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             // do not write `running`: a guess in this place is a lie, and this
             // is the one place where the honest answer matters most.
             let line = match (queue_state.as_deref(), paused_at) {
-                (Some("paused"), Some(at)) => {
+                (Some(state @ ("paused" | "paused-by-fault")), Some(at)) => {
                     let record = crate::pause::PauseRecord {
                         paused_at: at,
                         by_pid: pid,
                         reason: paused_reason,
                         until: paused_until,
+                        fault: state == "paused-by-fault",
                     };
                     format!(
                         "{} · other users are not paused",
@@ -1532,21 +1533,43 @@ fn warn_if_paused(client: &mut Client) {
 }
 
 /// Changes `--for 30m` into the moment when the pause ends.
+///
+/// `--for 0` is an error. `parse_duration` gives "no limit" for zero, which is
+/// correct for `--timeout` and is the opposite of what this option asks for: a
+/// person who writes `--for 0` wants a short pause, and would get a pause with
+/// no end.
 fn end_of_pause(duration: Option<&str>) -> Result<Option<u64>> {
     let Some(text) = duration else {
         return Ok(None);
     };
-    let d = crate::units::parse_duration(text).map_err(|e| anyhow::anyhow!("--for: {e}"))?;
-    Ok(d.map(|d| crate::sys::now_secs() + d.as_secs()))
+    match crate::units::parse_duration(text).map_err(|e| anyhow::anyhow!("--for: {e}"))? {
+        Some(d) => Ok(Some(crate::sys::now_secs() + d.as_secs())),
+        None => bail!(
+            "--for: give a time that is longer than zero, such as `30m`.\n\
+             To end a pause now, run `qex resume queue`."
+        ),
+    }
 }
 
 /// Refuses a command that the coordinator cannot obey.
-fn require_command(client: &mut Client, name: &str, command: &str) -> Result<()> {
+fn require_command(client: &mut Client, name: &str, command: &str, danger: &str) -> Result<()> {
     let (have, version, pid) = coordinator_capabilities(client);
     crate::capabilities::check_floor(&version, pid).map_err(|e| anyhow::anyhow!("{e}"))?;
-    crate::capabilities::require(&have, &version, pid, name, command)
+    crate::capabilities::require(&have, &version, pid, name, command, danger)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
+
+/// Why a refused `qex pause` matters.
+const PAUSE_DANGER: &str = "The coordinator would start the jobs of the queue, and you would \
+     believe that the machine is quiet.";
+
+/// Why a refused `qex resume` matters.
+///
+/// The danger of a refused resume is the opposite of the danger of a refused
+/// pause. A message that gave the pause words here would state a reason that is
+/// not true, and a reader who acts on it acts on a fault that does not exist.
+const RESUME_DANGER: &str = "That coordinator does not read the pause record, so it already \
+     starts the jobs of the queue. This command would change nothing.";
 
 /// Writes what is paused now, as text or as JSON.
 fn print_pause_state(
@@ -1604,12 +1627,13 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
         } => {
             let until = end_of_pause(duration.as_deref())?;
             let mut client = Client::connect()?;
-            require_command(&mut client, "pause", "qex pause")?;
+            require_command(&mut client, "pause", "qex pause", PAUSE_DANGER)?;
 
             let response = client.call(&Request::Pause {
                 target: PauseTarget::Queue,
                 reason,
                 until,
+                by_pid: std::process::id() as i32,
             })?;
             let Response::PauseState { queue, locks } = response else {
                 return report(response);
@@ -1642,12 +1666,13 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
         } => {
             let until = end_of_pause(duration.as_deref())?;
             let mut client = Client::connect()?;
-            require_command(&mut client, "pause", "qex pause")?;
+            require_command(&mut client, "pause", "qex pause", PAUSE_DANGER)?;
 
             let response = client.call(&Request::Pause {
                 target: PauseTarget::Lock { name: name.clone() },
                 reason,
                 until,
+                by_pid: std::process::id() as i32,
             })?;
             let Response::PauseState { queue, locks } = response else {
                 return report(response);
@@ -1696,7 +1721,7 @@ pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
     };
 
     let mut client = Client::connect()?;
-    require_command(&mut client, "pause", "qex resume")?;
+    require_command(&mut client, "pause", "qex resume", RESUME_DANGER)?;
 
     let response = client.call(&Request::Resume { target })?;
     let Response::PauseState { queue, locks } = response else {
@@ -1725,7 +1750,14 @@ fn pause_report(json: bool) -> Result<i32> {
         // file is the whole truth.
     }
 
-    let paused = crate::pause::Paused::read();
+    // End a pause that reached the time of `--for`.
+    //
+    // The scheduler does this step, and no scheduler operates now. Without it
+    // this command reports a pause that the next command ends at once — a
+    // report that lies in the dangerous direction, because the reader believes
+    // that the machine stays quiet.
+    let mut paused = crate::pause::Paused::read();
+    paused.expire(crate::sys::now_secs());
     let jobs = crate::job::read_all_from_disk();
     let locks: Vec<crate::proto::LockPause> = paused
         .locks

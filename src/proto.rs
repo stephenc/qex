@@ -52,6 +52,13 @@ pub enum Request {
         reason: Option<String>,
         /// The moment when the pause ends by itself, in seconds since the epoch.
         until: Option<u64>,
+        /// The process that asked. The CLI writes its own process id here.
+        ///
+        /// The coordinator cannot learn this value from the socket, and a
+        /// record that named the coordinator would name the same process for
+        /// every pause and would explain nothing.
+        #[serde(default)]
+        by_pid: i32,
     },
     /// Starts the queue again, or gives a lock back.
     Resume { target: PauseTarget },
@@ -203,6 +210,7 @@ mod tests {
                 target: PauseTarget::Queue,
                 reason: Some("recording a demo".into()),
                 until: Some(1_700_000_000),
+                by_pid: 4321,
             },
             Request::Pause {
                 target: PauseTarget::Lock {
@@ -210,6 +218,7 @@ mod tests {
                 },
                 reason: None,
                 until: None,
+                by_pid: 4321,
             },
             Request::Resume {
                 target: PauseTarget::Queue,
