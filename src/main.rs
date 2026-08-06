@@ -47,6 +47,8 @@ mod enforce;
 #[cfg(unix)]
 mod events;
 #[cfg(unix)]
+mod fanout;
+#[cfg(unix)]
 mod help;
 #[cfg(unix)]
 mod history;

@@ -275,6 +275,32 @@ impl Harness {
         panic!("`qex run` did not write its id file in 30 seconds");
     }
 
+    /// Runs a command and gives it this text on standard input.
+    ///
+    /// `qex submit --each-line -` reads the lines from another program, and a
+    /// test must measure that path with real pipes.
+    fn qex_stdin(&self, args: &[&str], input: &str) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_qex"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("qex did not start");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().expect("qex did not stop")
+    }
+
     /// Writes the config file again, while the installation operates.
     ///
     /// A user does this with an editor. The coordinator that already operates
@@ -5375,6 +5401,285 @@ fn qex_logs_hook_says_when_there_was_no_stop_hook() {
         String::from_utf8_lossy(&out.stdout).is_empty(),
         "the standard output must hold the log only"
     );
+}
+
+/// `--each-line` must give one job for each line, all in one group, and the
+/// group id must reach stdout alone.
+///
+/// The group id is the handle to the whole fan-out. Without it on stdout,
+/// `GROUP=$(qex submit --each-line ...)` gives nothing and the user must find
+/// the jobs again by hand.
+#[test]
+fn each_line_gives_one_job_for_each_line_in_one_group() {
+    let h = Harness::with_default_config("eachline");
+
+    let input = h.root.join("inputs.txt");
+    std::fs::write(&input, "alpha\nbeta\ngamma\n").unwrap();
+
+    let ids = h.root.join("ids.env");
+    let group = h.ok(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--id-file",
+        ids.to_str().unwrap(),
+        "--",
+        "echo",
+        "value={}",
+    ]);
+    assert_eq!(
+        group.lines().count(),
+        1,
+        "stdout must hold the group id only: {group}"
+    );
+    assert!(
+        group.parse::<uuid::Uuid>().is_ok(),
+        "stdout must hold a group id, and it holds: {group}"
+    );
+
+    // Three jobs, and every one of them in this group.
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 3, "three lines must give three jobs: {text}");
+    assert_eq!(h.list_json().len(), 3, "no other job may exist");
+
+    // Each job must have received its own line, and no other line.
+    let mut seen: Vec<String> = Vec::new();
+    for job in &jobs {
+        let id = job["id"].as_str().unwrap();
+        h.ok(&["wait", id, "--timeout", "60s"]);
+        assert_eq!(h.state_of(id), "completed");
+        seen.push(h.ok(&["logs", id, "--stdout"]).trim().to_string());
+    }
+    seen.sort();
+    assert_eq!(seen, vec!["value=alpha", "value=beta", "value=gamma"]);
+
+    // The name must hold the position and the line, so `qex list` is readable.
+    let names: Vec<String> = jobs
+        .iter()
+        .map(|j| j["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        names.contains(&"echo-1-alpha".to_string()),
+        "got the names: {names:?}"
+    );
+
+    // The id file must hold the group and every job, for a later command.
+    let text = std::fs::read_to_string(&ids).unwrap();
+    assert!(text.contains(&format!("group={group}")), "got: {text}");
+    assert_eq!(text.lines().count(), 4, "group and three jobs: {text}");
+}
+
+/// A line of an input file is DATA. It must become exactly one argument, and no
+/// shell may read it.
+///
+/// This is the security property of `--each-line`. An input file frequently
+/// comes from a directory listing, a database or another program, and a line
+/// that became a command would give that source the machine of the user.
+#[test]
+fn a_line_with_a_space_a_quotation_mark_and_a_semicolon_is_one_argument() {
+    let h = Harness::with_default_config("eachsafe");
+
+    // The mark that a shell would leave. `$HOME` is a real directory, so a
+    // shell that read this line would make the file.
+    let mark = h.root.join("SHELL-RAN");
+    let line = format!(
+        "a b\"; touch {}; echo $HOME `id` $(id) 'x'",
+        mark.to_str().unwrap()
+    );
+
+    let input = h.root.join("inputs.txt");
+    std::fs::write(&input, format!("{line}\n")).unwrap();
+
+    let group = h.ok(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--",
+        "printf",
+        "[%s]",
+        "{}",
+    ]);
+
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 1);
+    let id = jobs[0]["id"].as_str().unwrap();
+    h.ok(&["wait", id, "--timeout", "60s"]);
+
+    // `printf "[%s]"` writes its arguments one after the other. One argument
+    // thus gives ONE pair of brackets. Two arguments would give two pairs.
+    let out = h.ok(&["logs", id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        format!("[{line}]"),
+        "the line must become exactly one argument"
+    );
+
+    // The command of the record must hold the line as one element, so nothing
+    // divided it on the way to the job either.
+    let status = h.status_json(id);
+    let command: Vec<String> = status["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(command, vec!["printf", "[%s]", &line]);
+
+    // Nothing ran a shell.
+    assert!(
+        !mark.exists(),
+        "a shell read the line and made the file {}",
+        mark.display()
+    );
+}
+
+/// An input with a fault must submit NO job.
+///
+/// A fan-out that stops in the middle leaves a part of the work in the queue
+/// and a part with no job. The user then holds a group that is not the file.
+#[test]
+fn an_input_with_a_bad_line_submits_no_job_at_all() {
+    let h = Harness::with_default_config("eachbad");
+
+    // Ninety correct lines, and one line that is not UTF-8.
+    let input = h.root.join("inputs.txt");
+    let mut bytes: Vec<u8> = Vec::new();
+    for i in 1..=90 {
+        bytes.extend_from_slice(format!("line{i}\n").as_bytes());
+    }
+    bytes.extend_from_slice(b"bad \xff line\n");
+    std::fs::write(&input, &bytes).unwrap();
+
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--",
+        "echo",
+        "{}",
+    ]);
+    assert!(!out.status.success(), "a bad line must give an error");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("line 91"), "the error must say where: {err}");
+
+    assert!(
+        h.list_json().is_empty(),
+        "the 90 correct lines must not become jobs"
+    );
+
+    // A command with no place for the line is the same rule: no job at all.
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--",
+        "echo",
+        "the same",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("holds no `{}`"), "got: {err}");
+    assert!(h.list_json().is_empty());
+}
+
+/// An empty line and a comment line must give no job, and qex must SAY how many
+/// lines it passed over.
+///
+/// A line that a user expected to run, and that qex passed over in silence, is
+/// the quiet wrong answer that this project exists to prevent.
+#[test]
+fn an_empty_line_and_a_comment_line_give_no_job_and_qex_reports_them() {
+    let h = Harness::with_default_config("eachskip");
+
+    let input = h.root.join("inputs.txt");
+    // No final newline on the last line, and one CRLF ending.
+    std::fs::write(&input, "# a note\n\nalpha\r\n   \n#\nbeta").unwrap();
+
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--",
+        "echo",
+        "{}",
+    ]);
+    assert!(out.status.success());
+    let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        err.contains("2 empty lines") && err.contains("2 comment lines"),
+        "qex must say what it passed over: {err}"
+    );
+
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 2, "two lines give a job: {text}");
+
+    let mut seen: Vec<String> = Vec::new();
+    for job in &jobs {
+        let id = job["id"].as_str().unwrap();
+        h.ok(&["wait", id, "--timeout", "60s"]);
+        seen.push(h.ok(&["logs", id, "--stdout"]).trim().to_string());
+    }
+    seen.sort();
+    // The CRLF ending must not reach the job, and the last line counts although
+    // the file has no final newline.
+    assert_eq!(seen, vec!["alpha", "beta"]);
+}
+
+/// The name `-` must read the lines from another program.
+///
+/// `qex submit` reads nothing else from standard input, so this name is free.
+/// A fan-out over the output of `ls` or of a query is the common use.
+#[test]
+fn each_line_reads_the_lines_from_standard_input() {
+    let h = Harness::with_default_config("eachstdin");
+
+    let out = h.qex_stdin(
+        &["submit", "--each-line", "-", "--", "echo", "{}"],
+        "one\ntwo\n",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(group.parse::<uuid::Uuid>().is_ok(), "got: {group}");
+
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 2);
+}
+
+/// The limit must stop a fan-out that would fill the state directory, and the
+/// message must say how to raise it. It must never wait for a key: the main
+/// user of qex is an agent, and an agent cannot answer a prompt.
+#[test]
+fn a_fan_out_above_the_limit_is_refused_with_no_prompt() {
+    let h = Harness::with_default_config("eachlimit");
+
+    let input = h.root.join("inputs.txt");
+    let text: String = (1..=20).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(&input, text).unwrap();
+
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--max-jobs",
+        "5",
+        "--",
+        "echo",
+        "{}",
+    ]);
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--max-jobs 20"), "got: {err}");
+    assert!(h.list_json().is_empty(), "no job may start");
 }
 
 fn _unused(_: &Path) {}

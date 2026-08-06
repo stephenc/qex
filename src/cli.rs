@@ -256,6 +256,8 @@ pub struct SubmitArgs {
     ///
     /// A shell variable does not last, and an agent frequently needs the id in
     /// a later command. A file holds it.
+    ///
+    /// With `--each-line`, the file holds the group id and the id of each job.
     #[arg(long, value_name = "FILE")]
     pub id_file: Option<PathBuf>,
 
@@ -266,6 +268,20 @@ pub struct SubmitArgs {
     /// `ID=$(qex submit ...)` stays correct.
     #[arg(long)]
     pub json: bool,
+    /// Submit one job for each line of this file. Use `-` for standard input.
+    ///
+    /// Put `{}` in the command. Each job gets the text of one line in the place
+    /// of `{}`. The jobs share one group id, and that id goes to stdout.
+    ///
+    /// qex starts no shell, so the line becomes exactly one argument, whatever
+    /// characters it holds. An empty line and a line that starts with `#` give
+    /// no job, and qex reports how many it passed over.
+    #[arg(long, value_name = "FILE", conflicts_with = "job_file")]
+    pub each_line: Option<PathBuf>,
+
+    /// The largest number of jobs that `--each-line` submits. The default is 1000.
+    #[arg(long, value_name = "N", requires = "each_line")]
+    pub max_jobs: Option<usize>,
 
     /// The command to run. Write it after `--`.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
