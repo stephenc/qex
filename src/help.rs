@@ -1684,6 +1684,21 @@ never inside the text of the script:
 
     qex submit --each-line names.txt -- bash -c 'echo \"$1\" | tr a-z A-Z' _ {}
 
+A line that starts with a dash
+------------------------------
+
+A line becomes an argument, so a line such as `-v` or `--out=/etc/passwd`
+becomes an OPTION of your program. qex cannot know which arguments your program
+reads as options, so it does not change the line.
+
+Put `--` in the command before `{}`. Almost every program then reads the line as
+data and not as an option:
+
+    qex submit --each-line names.txt -- ./process -- {}
+
+This is the same rule as `xargs`. Use it for input that you did not write
+yourself.
+
 Which lines give a job
 ----------------------
 
@@ -1726,6 +1741,9 @@ file, and as much of the line as fits.
 
 Give `--name` to change the first part and the name of the group.
 
+A name holds the letters, the numbers, `.`, `_` and `-` only. A line can hold a
+terminal control sequence, and a name goes to your terminal in `qex list`.
+
 The other options
 -----------------
 
@@ -1734,6 +1752,19 @@ The other options
 
 qex calculates the claim one time, from the command of the FIRST line, and
 gives it to every job. The lines of a fan-out are the same kind of work.
+
+A fan-out learns as one task
+----------------------------
+
+qex records what each job used, and gives that measurement to the next job of
+the same command. A fan-out does not fit that rule: `./process a.csv` and
+`./process b.csv` are two commands, and each one runs one time.
+
+qex therefore measures every job of a fan-out against the TEMPLATE
+`./process {}`. One fan-out makes one record, and the second run of the same
+fan-out gets its claim from the first run.
+
+`qex status` says `(from the earlier jobs of this fan-out)` for such a claim.
 
 Use `--lock` when the jobs must not operate together:
 

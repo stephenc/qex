@@ -101,13 +101,27 @@ pub fn read(path: &Path) -> Result<Input> {
     let bytes = if path == Path::new("-") {
         use std::io::Read;
         let mut buffer = Vec::new();
-        std::io::stdin()
-            .read_to_end(&mut buffer)
-            .map_err(|e| anyhow::anyhow!("reading the lines from standard input: {e}"))?;
+        std::io::stdin().read_to_end(&mut buffer).map_err(|e| {
+            anyhow::anyhow!(
+                "qex cannot read the lines from standard input: {e}\n\n\
+                 `--each-line -` needs those lines, and one line makes one job, so qex \
+                 submits nothing.\n\n\
+                 Send the lines through a pipe, or give the path of a file:\n\
+                 \x20   ls *.csv | qex submit --each-line - -- ./process {PLACEHOLDER}"
+            )
+        })?;
         buffer
     } else {
-        std::fs::read(path)
-            .map_err(|e| anyhow::anyhow!("reading the input file {}: {e}", path.display()))?
+        std::fs::read(path).map_err(|e| {
+            anyhow::anyhow!(
+                "qex cannot read the input file {}: {e}\n\n\
+                 `--each-line` needs that file, and one line makes one job, so qex \
+                 submits nothing.\n\n\
+                 Give the path of a file that exists, or use `-` to read the lines from \
+                 another program.",
+                path.display()
+            )
+        })?
     };
 
     // The text must be UTF-8, and qex refuses the whole file when it is not.
@@ -228,10 +242,12 @@ pub fn check_count(count: usize, max: usize) -> Result<()> {
     }
     if count > max {
         bail!(
-            "the input holds {count} lines, and the limit is {max} jobs.\n\n\
+            "the input holds {}, and the limit is {}.\n\n\
              Each job takes a directory in the state of qex, so a very large fan-out \
              fills the disk and makes `qex list` hard to read.\n\n\
-             Give fewer lines, or raise the limit with `--max-jobs {count}`."
+             Give fewer lines, or raise the limit with `--max-jobs {count}`.",
+            crate::units::count_of(count, "line"),
+            crate::units::count_of(max, "job")
         );
     }
     Ok(())
@@ -245,9 +261,22 @@ pub fn check_count(count: usize, max: usize) -> Result<()> {
 /// lines that start with the same text never give one name.
 ///
 /// `index` counts from 1, and `count` is the number of jobs.
+///
+/// # Both parts of the name come from the file
+///
+/// The line is data of the file, and so is the BASE. `{}` can go in the program
+/// position, which the documentation advertises, and the base is then the
+/// program name of the first line.
+///
+/// A name goes to the terminal of the user, in the output of the submission and
+/// in every later `qex list`. A line that holds a terminal control sequence
+/// would move the cursor, change the colour, empty the screen or write the
+/// title of the window, and rows of `qex list` would go away in front of the
+/// reader. `slug` therefore cleans BOTH parts, and this function can give the
+/// letters, the numbers, `.`, `_` and `-` only.
 pub fn job_name(base: &str, index: usize, count: usize, line: &str) -> String {
     let width = count.to_string().len();
-    let base = cut(base.trim(), MAX_BASE);
+    let base = cut(&slug(base), MAX_BASE);
     let base = if base.is_empty() {
         "job"
     } else {
@@ -263,11 +292,13 @@ pub fn job_name(base: &str, index: usize, count: usize, line: &str) -> String {
     cut(&name, MAX_NAME)
 }
 
-/// Changes a line into the part of a job name that a person reads.
+/// Changes text into the part of a job name that a person reads.
 ///
 /// A line is a path, a URL or a record, and it holds characters that make a
-/// name hard to read and hard to type in `qex status <name>`. Each run of such
-/// characters becomes one dash.
+/// name hard to read and hard to type in `qex status <name>`. A line can also
+/// hold a terminal control sequence, and a name goes to the terminal of the
+/// user. This function keeps the letters, the numbers, `.` and `_`, and each
+/// run of the other characters becomes one dash.
 fn slug(line: &str) -> String {
     let mut out = String::new();
     let mut dash = false;
@@ -420,6 +451,39 @@ mod tests {
         assert_ne!(one, two);
         assert!(one.len() <= MAX_NAME, "{one} is too long");
         assert!(one.starts_with("p-001-"), "got: {one}");
+    }
+
+    /// A job name must hold no terminal control character, in EITHER part.
+    ///
+    /// The line is data of the file, and so is the base: `{}` can go in the
+    /// program position, and the base is then the program name of the first
+    /// line. A name goes to the terminal of the user at the submission and in
+    /// every later `qex list`. An escape sequence there changes the colour,
+    /// moves the cursor, empties the screen or writes the window title, and
+    /// rows of `qex list` go away in front of the reader.
+    #[test]
+    fn a_job_name_holds_no_control_character_from_the_file() {
+        // The base and the line both hold escape sequences.
+        let name = job_name(
+            "\u{1b}[31mBOOM\u{1b}[0m",
+            1,
+            9,
+            "\u{1b}[2J\u{1b}]0;title\u{7}x",
+        );
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'),
+            "the name holds a character that must not reach a terminal: {name:?}"
+        );
+        assert!(!name.contains('\u{1b}'), "got: {name:?}");
+
+        // A name that a file made must never hold a newline either. A newline
+        // would make one row of `qex list` into two.
+        let name = job_name("a\nb", 2, 9, "c\r\nd");
+        assert!(
+            !name.contains('\n') && !name.contains('\r'),
+            "got: {name:?}"
+        );
     }
 
     /// A line with no letter and no number still gives a name, because the

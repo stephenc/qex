@@ -20,6 +20,11 @@
 //!   one command and very different needs, so the directory must be in the key
 //!   as well.
 //!
+//! A job can name a different command to be measured against. `qex submit
+//! --each-line` does that: the command of each job holds one line of the input
+//! and is used one time only, so the jobs of one fan-out measure against their
+//! template. See `JobSpec::learn_key`.
+//!
 //! The record holds a hash of those two values, and never the values
 //! themselves. A command line can hold a token or a password, and a directory
 //! names the work of a user. This file must not become a second place that
@@ -159,11 +164,13 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
         libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
     }
 
+    // A job of a fan-out gives its template here, so one fan-out makes one
+    // entry and not one entry for each line. `JobSpec::learn_key` holds the
+    // reason in full.
+    let against = spec.learn_key.as_deref().unwrap_or(&spec.command);
+
     let mut store = load();
-    let entry = store
-        .commands
-        .entry(key(&spec.cwd, &spec.command))
-        .or_default();
+    let entry = store.commands.entry(key(&spec.cwd, against)).or_default();
     entry.name = spec.name.clone();
     entry.samples.push(Sample {
         max_rss: status.usage.max_rss,
@@ -368,6 +375,33 @@ mod tests {
             suggest(&store, &large, &cmd, 1.5).is_none(),
             "a different directory must not use this record"
         );
+    }
+
+    /// Every job of one fan-out must read one record.
+    ///
+    /// The command of each job holds one line and runs one time, so a key on
+    /// the command would give a record that no later job can read, and one
+    /// entry for every line of every fan-out with no end. The key is therefore
+    /// the template, and every line of the fan-out reaches it.
+    #[test]
+    fn every_line_of_a_fan_out_shares_one_record() {
+        let template: Vec<String> = vec!["./process".into(), "{}".into()];
+        let line_a: Vec<String> = vec!["./process".into(), "a.csv".into()];
+        let line_b: Vec<String> = vec!["./process".into(), "b.csv".into()];
+
+        // Without the template, the two lines are two records.
+        assert_ne!(key(&dir(), &line_a), key(&dir(), &line_b));
+        // With it, they are one.
+        assert_eq!(key(&dir(), &template), key(&dir(), &template));
+
+        // A measurement of line A must give the claim of line B.
+        let store = store_with(&["./process", "{}"], vec![sample(400 << 20, 1.0, 10)]);
+        assert!(
+            suggest(&store, &dir(), &line_b, 1.5).is_none(),
+            "the command of the line must not reach the record"
+        );
+        let s = suggest(&store, &dir(), &template, 1.5).unwrap();
+        assert_eq!(s.mem, (400 << 20) * 3 / 2);
     }
 
     /// The key must not hold the command or the directory. A command line can

@@ -782,6 +782,7 @@ mod tests {
             max_queue_time: None,
             dedupe_key: None,
             dedupe_window: 0,
+            learn_key: None,
             submitted_at: 0,
         };
         let status = JobStatus::new(&spec);

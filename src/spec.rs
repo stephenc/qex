@@ -171,6 +171,11 @@ pub struct SubmitOptions {
     pub dedupe_key: Option<String>,
     /// The time for which a job that succeeded keeps its key.
     pub dedupe_window: Option<String>,
+    /// The command that qex measures against, when it is not the command
+    /// itself. `qex submit --each-line` gives the template here.
+    ///
+    /// See `JobSpec::learn_key` for the reason.
+    pub learn_key: Option<Vec<String>>,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -281,6 +286,31 @@ pub struct JobSpec {
     /// succeeded only, so no second copy of work that operates can start.
     #[serde(default)]
     pub dedupe_window: u64,
+    /// The command that qex measures this job against, when it is not the
+    /// command of the job.
+    ///
+    /// # Why a job can learn against a different command
+    ///
+    /// qex keeps the measurement of a job under the directory and the command,
+    /// so the next job of the same command gets an accurate claim. A fan-out
+    /// breaks that rule: `./process a.csv` and `./process b.csv` are two
+    /// commands, and each one is used one time only.
+    ///
+    /// Two faults follow. The record of each line is never read again, and
+    /// `usage.json` grows by one entry for every line of every fan-out with no
+    /// end. A fan-out of 1000 lines thus adds 1000 entries that no later job
+    /// can use.
+    ///
+    /// The template `./process {}` is the value that repeats, and the lines of
+    /// a fan-out are the same kind of work. qex therefore measures every job of
+    /// a fan-out against the template. One fan-out gives one entry, and the
+    /// second run of the same fan-out gets a claim from the first run.
+    ///
+    /// The value `None` means the command of the job, which is the ordinary
+    /// case. An earlier coordinator does not know this field and measures
+    /// against the command, which is the behaviour before this field existed.
+    #[serde(default)]
+    pub learn_key: Option<Vec<String>>,
     pub submitted_at: u64,
 }
 
@@ -403,8 +433,15 @@ impl JobSpec {
         // This step is the reason that qex measures each job. `guess` is safe
         // and frequently far too large: a test suite that uses 165MB would hold
         // one half of the budget and stop other work for the length of the run.
+        // A job of a fan-out learns against its template, and not against its
+        // own command. The claim of every job of one fan-out then comes from
+        // the same measurements, and `learned` says the same true thing about
+        // each of them.
+        let learn_key = opts.learn_key.clone();
+        let learn_against = learn_key.as_deref().unwrap_or(&command);
+
         let learned = if cfg.learn.enabled && (asked_cpu.is_none() || asked_mem.is_none()) {
-            crate::usage::suggest(&crate::usage::load(), &cwd, &command, cfg.learn.margin)
+            crate::usage::suggest(&crate::usage::load(), &cwd, learn_against, cfg.learn.margin)
         } else {
             None
         };
@@ -499,6 +536,18 @@ impl JobSpec {
 
         if hints && chosen && capture != EnvCapture::None {
             export_claim(&mut env, cpu, mem, &cfg.claims.also);
+        }
+
+        // A job that learns against a different command says so.
+        //
+        // `qex status` writes where a claim came from, and the word `learned`
+        // there means "from the earlier jobs of THIS command". A job of a
+        // fan-out learns against its template, so its claim comes from the
+        // earlier jobs of the fan-out and frequently from a different line. To
+        // write `learned` for it would give the reader a statement about its
+        // own command that is not true.
+        if source == "learned" && learn_key.is_some() {
+            source = "fan-out";
         }
 
         let timeout = match opts.timeout.as_ref().or(file.timeout.as_ref()) {
@@ -638,6 +687,7 @@ impl JobSpec {
                 nice,
                 dedupe_key,
                 dedupe_window,
+                learn_key,
                 // The CLI changes each name into an id after this function, because
                 // that step needs the coordinator.
                 needs: Vec::new(),
@@ -1123,6 +1173,25 @@ mod tests {
         let d = std::env::temp_dir().join(format!("qex-spec-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The specification must carry the command that qex measures the job
+    /// against, so the supervisor records every line of a fan-out in one place.
+    #[test]
+    fn a_job_carries_the_command_that_it_learns_against() {
+        let _guard = env_lock();
+
+        // An ordinary job learns against its own command.
+        let spec = JobSpec::resolve(&opts(&["true"]), &cfg_without_learning()).unwrap();
+        assert_eq!(spec.learn_key, None);
+
+        // A job of a fan-out learns against its template.
+        let template: Vec<String> = vec!["./process".into(), "{}".into()];
+        let mut o = opts(&["./process", "a.csv"]);
+        o.learn_key = Some(template.clone());
+        let spec = JobSpec::resolve(&o, &cfg_without_learning()).unwrap();
+        assert_eq!(spec.command, vec!["./process", "a.csv"]);
+        assert_eq!(spec.learn_key, Some(template));
     }
 
     #[test]

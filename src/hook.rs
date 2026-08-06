@@ -660,6 +660,7 @@ mod tests {
             max_queue_time: None,
             dedupe_key: None,
             dedupe_window: 0,
+            learn_key: None,
             needs: vec![],
             after: vec![],
             submitted_at: 0,

@@ -600,6 +600,22 @@ not put `{}` inside the text of the script:
 qex submit --each-line names.txt -- bash -c 'echo "$1" | tr a-z A-Z' _ {}
 ```
 
+### A line that starts with a dash
+
+A line becomes an argument, so a line such as `-v` or `--out=/etc/passwd`
+becomes an **option** of your program. qex cannot know which arguments your
+program reads as options, so it does not change the line.
+
+Put `--` in the command before `{}`. Almost every program then reads the line
+as data and not as an option:
+
+```sh
+qex submit --each-line names.txt -- ./process -- {}
+```
+
+This is the same rule as `xargs`. Use it for input that you did not write
+yourself.
+
 ### Where `{}` goes
 
 `{}` goes in any argument, in the program name, or inside an argument:
@@ -661,6 +677,9 @@ The position comes before the line and it has the same width for every job, so
 the names sort in the order of the file and two long lines never give one name.
 Give `--name` to change the first part and the name of the group.
 
+A name holds the letters, the numbers, `.`, `_` and `-` only. A line can hold a
+terminal control sequence, and a name goes to your terminal in `qex list`.
+
 ### The other options
 
 `--cpu`, `--mem`, `--timeout`, `--lock`, `--tag`, `--priority`, `--env`,
@@ -669,6 +688,22 @@ Give `--name` to change the first part and the name of the group.
 qex calculates the claim one time, from the command of the **first** line, and
 gives it to every job. The lines of a fan-out are the same kind of work, so one
 claim is correct for them.
+
+### A fan-out learns as one task
+
+qex records what each job used, and gives that measurement to the next job of
+the same command. A fan-out does not fit that rule: `./process a.csv` and
+`./process b.csv` are two commands, and each one runs one time.
+
+qex therefore measures every job of a fan-out against the **template**
+`./process {}`. One fan-out makes one record, and the second run of the same
+fan-out gets its claim from the first run. Without this rule a fan-out of 1000
+lines would add 1000 records that no later job can use.
+
+The record keeps the largest measurement, so the claim goes to the size of the
+largest line. `qex status` says `(from the earlier jobs of this fan-out)` for
+such a claim, and not `(from the earlier jobs of this command)`: the command of
+one line can have no measurement at all.
 
 `--id-file` writes the group id and the id of each job. A name that ends in
 `.json` gives a JSON object.
