@@ -1,0 +1,125 @@
+name: CI
+
+# Every push and every pull request. The release workflow runs the same tests
+# again on main, because a release must never come from an untested commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to one branch stops the run of the earlier push. The result of the
+# earlier push has no value once a newer commit exists.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  style:
+    name: Style
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: The layout of the code
+        run: cargo fmt --all --check
+      - name: The advice of clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: The unit tests
+        run: cargo test --bins
+      # The end-to-end tests start real processes, and a coordinator makes a
+      # decision from the load of the machine. Two of these tests together on a
+      # shared machine change that load, so they run two at a time at the most.
+      - name: The end-to-end tests
+        run: cargo test --test e2e -- --test-threads=2
+
+  # Cargo.toml names the earliest version of Rust that qex needs. A number that
+  # nothing tests is a guess, and a user with that version meets the error.
+  msrv:
+    name: The earliest Rust that qex needs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the number from Cargo.toml
+        id: msrv
+        run: |
+          version="$(awk -F'"' '/^rust-version *= *"/ { print $2; exit }' Cargo.toml)"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "Cargo.toml says that qex needs Rust $version."
+      - run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+      - run: cargo +${{ steps.msrv.outputs.version }} check --all-targets --locked
+
+  commits:
+    name: The form of the commit messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Each commit must follow Conventional Commits
+        run: |
+          .github/scripts/check-commits.sh \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}"
+
+  # Prove that each target of the release builds, before a merge to main and not
+  # after it. A release that fails to build for one machine is a release that
+  # must be made again.
+  cross:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust for ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # qex has no dependency that holds C, so the linker of Rust itself can
+      # make a binary for another machine. No other toolchain is necessary.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
