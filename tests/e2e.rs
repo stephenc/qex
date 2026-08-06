@@ -1343,6 +1343,33 @@ fn a_job_that_never_starts_gives_up_and_says_why() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // A job that needed this one must NOT be told to read a log file.
+    //
+    // An expired job never started, so it wrote no output. A reader who obeys
+    // that instruction finds an empty file, `qex logs` gives the code 0, and
+    // the reader learns nothing. The same rule already holds for a job that a
+    // user cancelled.
+    let after = h.submit(&["submit", "--needs", &id, "--", "echo", "after"]);
+    h.until(
+        "the job behind it gives up",
+        Duration::from_secs(45),
+        || h.state_of(&after) == "skipped",
+    );
+    let status = h.status_json(&after);
+    let text = format!(
+        "{} {}",
+        status["error"].as_str().unwrap_or(""),
+        status["blocked_reason"].as_str().unwrap_or("")
+    );
+    assert!(
+        text.contains("expired"),
+        "the text must name the state of the job that it needed: {text}"
+    );
+    assert!(
+        !text.contains("qex logs"),
+        "an expired job wrote no log, so the text must not name one: {text}"
+    );
 }
 
 /// qex must record the environment and the directory of the shell that

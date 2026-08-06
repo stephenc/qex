@@ -349,9 +349,14 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
                 .unwrap_or_else(|| other.status.state.to_string());
 
             // Name the log file only when the job wrote one. A cancelled job
-            // never started, so a reader who follows that instruction finds an
-            // empty file and learns nothing.
-            let advice = if root_state == "cancelled" {
+            // and an expired job never started, so a reader who follows that
+            // instruction finds an empty file and learns nothing.
+            //
+            // Add every state that a job can reach without a start to this
+            // list. The list is short, and a state that is missing from it
+            // sends the reader to an empty file.
+            let never_ran = matches!(root_state.as_str(), "cancelled" | "expired");
+            let advice = if never_ran {
                 String::new()
             } else {
                 format!(" Read `qex logs {}` for the cause.", &root.to_string()[..8])
@@ -435,10 +440,23 @@ fn expire(state: &mut crate::daemon::State, id: uuid::Uuid, waited: u64, last_re
     // The queue reason goes into the text below, so this field becomes empty: a
     // job that stopped waits for nothing.
     job.status.blocked_reason = None;
+    // Give the remedy that fits the cause.
+    //
+    // A job that waited for a job that it needs did not wait for capacity, and
+    // a smaller claim changes nothing for it. A remedy that does not fit sends
+    // the reader to make a change that cannot help.
+    let waited_for_a_job = last_reason.contains("waits for the job");
+    let remedy = if waited_for_a_job {
+        "The job waited for a job that it needs, and not for capacity. Give a \
+         --max-queue-time that covers the whole pipeline, or give no value on a stage \
+         that waits for an earlier stage."
+    } else {
+        "Give the job a smaller claim, wait until the machine is quiet, or give a longer \
+         --max-queue-time, then submit the job again."
+    };
     job.status.error = Some(format!(
         "the job did not start. It waited {} in the queue, and its --max-queue-time is {}. \
-         The last reason was: {last_reason}. Give the job a smaller claim, wait until the \
-         machine is quiet, or give a longer --max-queue-time, then submit the job again.",
+         The last reason was: {last_reason}. {remedy}",
         crate::units::format_duration(Duration::from_secs(waited)),
         crate::units::format_duration(Duration::from_secs(limit)),
     ));

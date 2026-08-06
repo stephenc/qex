@@ -384,6 +384,10 @@ fn note_for(job: &JobStatus) -> String {
         JobState::Timeout => "reached its time limit".to_string(),
         JobState::Killed => "stopped by a command".to_string(),
         JobState::Cancelled => "left the queue".to_string(),
+        JobState::Expired => "it never started; it waited too long".to_string(),
+        // Every state that a job STOPS in must give a note. A reader of `qex
+        // top` sees the state and the note together, and a note that is empty
+        // makes the reader open a second command to learn the cause.
         _ => String::new(),
     }
 }
