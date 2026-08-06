@@ -15,21 +15,75 @@
 //!
 //! # How the CLI asks
 //!
-//! The `Capabilities` request did not exist in the first versions, and an
-//! earlier coordinator gives an error for a request that it cannot read. The
-//! CLI thus asks only a coordinator that is new enough to answer, and it reads
-//! the version first, because every version answers `Info`.
+//! The CLI reads the version first, because every version answers `Info`. It
+//! then asks the coordinator what it can do.
 //!
-//! For an earlier coordinator, the CLI uses the table below. A version says
-//! what that build could do.
+//! Every version that qex supports answers the `Capabilities` request, so there
+//! is one path and no table of earlier versions. `SUPPORT_FLOOR` is what makes
+//! that true: a coordinator below it is refused before any question about one
+//! job.
+//!
+//! # The rule for the wire format: IT IS ADDITIVE ONLY
+//!
+//! The design above rests on one promise, and this is the statement of it:
+//!
+//!   * A new version can ADD a field to a request or to a response.
+//!   * A new version can ADD a request name.
+//!   * A new version MUST NOT change the meaning of a field that exists, and it
+//!     MUST NOT change the meaning of a request name that exists.
+//!   * A change that cannot obey the two rules above takes A NEW NAME, and a
+//!     capability gates it.
+//!
+//! Each side thus ignores what it does not know, and it is correct to do that:
+//! a field that a program does not know is a field that did not exist when
+//! somebody made that program, so no earlier behaviour depends on it.
+//!
+//! This promise is the reason that the CLI does not refuse a coordinator that
+//! is NEWER than itself. An early CLI sends the fields that it knows, and the
+//! new coordinator understands each of them. The opposite direction is the
+//! dangerous one, and the capability handshake covers it: a new CLI asks the
+//! coordinator what it can do, and it refuses a job that the coordinator cannot
+//! obey.
+//!
+//! # The support floor
+//!
+//! `SUPPORT_FLOOR` is the first version that qex published. A coordinator below
+//! it comes from a build that no release holds, and qex has no promise about
+//! it. The CLI refuses such a coordinator, and it gives the way to correct the
+//! problem.
 
 use crate::spec::JobSpec;
 
-/// The first version that answers the `Capabilities` request.
+/// The first version that qex published, and thus the earliest version that
+/// qex supports.
 ///
-/// The CLI does not send that request to an earlier coordinator, because an
-/// earlier coordinator gives an error for a request that it cannot read.
-pub const ASK_FROM_VERSION: (u32, u32, u32) = (0, 5, 1);
+/// A build below this number never reached a release. Two agents that share a
+/// machine can each hold a different build, and a coordinator can operate for
+/// hours, so a mixture of versions is normal and qex must say which mixtures it
+/// supports. The answer is: this number and above.
+pub const SUPPORT_FLOOR: (u32, u32, u32) = (0, 6, 0);
+
+/// Tests the version of the coordinator against the support floor.
+///
+/// The message gives the remedy, because a user cannot correct a fault that has
+/// no instruction: the coordinator stops when no job operates, and the next
+/// command starts a new one from the program that the user has now.
+pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Result<(), String> {
+    if parse(coordinator_version) >= SUPPORT_FLOOR {
+        return Ok(());
+    }
+    let (major, minor, patch) = SUPPORT_FLOOR;
+    Err(format!(
+        "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and qex \
+         supports {major}.{minor}.{patch} and above.\n\n\
+         That coordinator comes from a build that no release holds, so qex gives no promise \
+         about it.\n\n\
+         The coordinator stops when no job operates, and the next command then starts one from \
+         the program that you have now. To change it now:\n\
+         \x20   kill {coordinator_pid}\n\n\
+         The jobs that operate now continue; a new coordinator reads the same records."
+    ))
+}
 
 /// Everything that this build can do.
 pub const ALL: &[&str] = &[
@@ -41,39 +95,11 @@ pub const ALL: &[&str] = &[
     "retries",
 ];
 
-/// Gives what a coordinator of one version could do.
-///
-/// The CLI uses this table for a coordinator that came before the
-/// `Capabilities` request.
-pub fn implied_by_version(version: &str) -> Vec<&'static str> {
-    let v = parse(version);
-    let mut out = Vec::new();
-
-    // 0.2.0 added the job dependencies and the record of each job.
-    if v >= (0, 2, 0) {
-        out.push("dependencies");
-        out.push("history");
-    }
-    // 0.3.0 added the pipeline file and the group of a pipeline.
-    if v >= (0, 3, 0) {
-        out.push("groups");
-    }
-    // 0.4.0 kept the measurement of each job and used it as the claim.
-    if v >= (0, 4, 0) {
-        out.push("learn");
-    }
-    // 0.5.0 added the locks and the retries.
-    if v >= (0, 5, 0) {
-        out.push("locks");
-        out.push("retries");
-    }
-    out
-}
-
 /// Reads a version such as `0.5.1`.
 ///
-/// A version that this function cannot read gives the lowest value, so the CLI
-/// treats an unknown coordinator as an early one and asks for nothing.
+/// A version that this function cannot read gives the lowest value. Such a
+/// coordinator is thus below the support floor and the CLI refuses it, which is
+/// the safe direction.
 pub fn parse(version: &str) -> (u32, u32, u32) {
     let mut parts = version.trim().split('.').map(|p| {
         p.chars()
@@ -190,27 +216,43 @@ mod tests {
         assert_eq!(parse(""), (0, 0, 0));
     }
 
+    /// A coordinator below the first published version must be refused.
+    ///
+    /// Two agents on one machine can hold different builds, and a coordinator
+    /// operates for hours. qex must therefore say which mixtures of versions it
+    /// supports, and the answer is: the first release and above.
     #[test]
-    fn the_table_grows_with_the_version() {
-        assert!(implied_by_version("0.1.0").is_empty());
-        assert!(implied_by_version("0.2.0").contains(&"dependencies"));
-        assert!(!implied_by_version("0.2.0").contains(&"locks"));
-        assert!(implied_by_version("0.3.0").contains(&"groups"));
-        assert!(implied_by_version("0.5.0").contains(&"locks"));
-        assert!(implied_by_version("0.5.0").contains(&"retries"));
+    fn a_coordinator_below_the_floor_is_refused() {
+        let err = check_floor("0.5.2", 4321).unwrap_err();
+        assert!(
+            err.contains("0.6.0"),
+            "the message must name the floor: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+
+        assert!(
+            check_floor("0.6.0", 1).is_ok(),
+            "the floor itself is supported"
+        );
+        assert!(check_floor("0.7.3", 1).is_ok());
+        assert!(check_floor("1.0.0", 1).is_ok());
+
+        // A version that this code cannot read gives the lowest value, so such
+        // a coordinator is refused. That is the safe direction.
+        assert!(check_floor("", 1).is_err());
     }
 
-    /// This build must be able to do everything that its own version implies.
-    /// Without this test, the table and the code could disagree.
+    /// This build must never be below its own floor. A release that qex itself
+    /// would refuse cannot exist.
     #[test]
-    fn this_build_can_do_what_its_version_implies() {
-        let mine = env!("CARGO_PKG_VERSION");
-        for name in implied_by_version(mine) {
-            assert!(
-                ALL.contains(&name),
-                "the table says that {mine} can do `{name}`, and this build cannot"
-            );
-        }
+    fn this_build_is_not_below_the_floor() {
+        assert!(
+            parse(env!("CARGO_PKG_VERSION")) >= SUPPORT_FLOOR,
+            "this build is below the support floor"
+        );
     }
 
     #[test]
@@ -226,21 +268,29 @@ mod tests {
         let mut s = spec();
         s.locks = vec!["target".into()];
 
-        let old: Vec<String> = implied_by_version("0.3.0")
+        // A coordinator that answers with everything except the locks.
+        let old: Vec<String> = ALL
             .iter()
-            .map(|s| s.to_string())
+            .filter(|c| **c != "locks")
+            .map(|c| c.to_string())
             .collect();
-        let err = check(&old, "0.3.0", 4321, &s).unwrap_err();
-        assert!(err.contains("--lock"), "the message must name the option: {err}");
-        assert!(err.contains("in silence"), "the message must give the danger: {err}");
-        assert!(err.contains("kill 4321"), "the message must give the remedy: {err}");
+        let err = check(&old, "0.6.0", 4321, &s).unwrap_err();
+        assert!(
+            err.contains("--lock"),
+            "the message must name the option: {err}"
+        );
+        assert!(
+            err.contains("in silence"),
+            "the message must give the danger: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
 
         // A coordinator that has locks accepts the job.
-        let new: Vec<String> = implied_by_version("0.5.0")
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert!(check(&new, "0.5.0", 4321, &s).is_ok());
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check(&new, "0.6.0", 4321, &s).is_ok());
     }
 
     #[test]
@@ -262,6 +312,9 @@ mod tests {
         s.locks = vec!["a".into()];
         s.retries = 1;
         let err = check(&[], "0.1.0", 7, &s).unwrap_err();
-        assert!(err.contains("--lock") && err.contains("--retries"), "got: {err}");
+        assert!(
+            err.contains("--lock") && err.contains("--retries"),
+            "got: {err}"
+        );
     }
 }
