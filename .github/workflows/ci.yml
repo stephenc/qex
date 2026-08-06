@@ -20,7 +20,7 @@ env:
 jobs:
   style:
     name: Style
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -39,7 +39,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        # Each version is named, and `ubuntu-latest` is not used. qex reads
+        # /proc and controls processes, so the version of the system is part of
+        # the test. A name that moves would change the test with no commit, and
+        # a failure would then have no cause that a person can see.
+        #
+        # Two versions of Ubuntu, because a fault that appears on one of them
+        # and not on the other says immediately where to look.
+        os: [ubuntu-22.04, ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -57,7 +64,7 @@ jobs:
   # nothing tests is a guess, and a user with that version meets the error.
   msrv:
     name: The earliest Rust that qex needs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +82,7 @@ jobs:
 
   commits:
     name: The form of the commit messages
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     if: github.event_name == 'pull_request'
     steps:
@@ -100,9 +107,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: x86_64-apple-darwin
             os: macos-14
           - target: aarch64-apple-darwin

@@ -19,7 +19,7 @@ env:
 jobs:
   version:
     name: The next version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       version: ${{ steps.next.outputs.version }}
@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
@@ -74,10 +74,10 @@ jobs:
           # reader can take the correct file with one line of shell.
           - name: Linux-x86_64
             target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - name: Linux-aarch64
             target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - name: Darwin-x86_64
             target: x86_64-apple-darwin
             os: macos-14
@@ -141,7 +141,7 @@ jobs:
   publish:
     name: Tag and publish
     needs: [version, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
@@ -219,7 +219,7 @@ jobs:
   crate:
     name: Publish to crates.io
     needs: [version, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

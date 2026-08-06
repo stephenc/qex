@@ -112,6 +112,16 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 let job_pid = other.ok().and_then(|s| s.pid).or(job.status.pid);
                 let mut note = "the supervisor stopped without a result".to_string();
 
+                // Give the words of the supervisor itself.
+                //
+                // The supervisor writes each fault to its own log, and NO
+                // COMMAND READ THAT FILE. A user thus met "the supervisor
+                // stopped without a result", which names no cause and gives no
+                // remedy, while the cause was on the disk beside the record.
+                if let Some(text) = supervisor_log_tail(&dir) {
+                    note.push_str(&format!(". The supervisor said: {text}"));
+                }
+
                 if let Some(pid) = job_pid {
                     if sys::pid_alive(pid) {
                         log(&format!(
@@ -514,6 +524,41 @@ const RACE_JOB: u8 = 1;
 /// The timer fired first, so the job reached its time limit.
 const RACE_TIMER: u8 = 2;
 
+/// Gives the last words of the supervisor of a job.
+///
+/// The supervisor writes its faults to `supervisor.log`, and a supervisor that
+/// stops before it writes a result has frequently written the reason there. The
+/// coordinator puts this text in the record, so that the reason travels with
+/// the job and a reader needs no second file.
+///
+/// The result holds the last lines only, and it is one line of text, because it
+/// goes into a field that `qex status` shows.
+fn supervisor_log_tail(dir: &std::path::Path) -> Option<String> {
+    const KEEP: usize = 3;
+    const LIMIT: usize = 400;
+
+    let raw = std::fs::read(dir.join("supervisor.log")).ok()?;
+    // The log of a job holds the output of a program, which is not always
+    // valid text.
+    let text = String::from_utf8_lossy(&raw);
+
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = lines.len().saturating_sub(KEEP);
+    let mut joined = lines[start..].join(" / ");
+    if joined.chars().count() > LIMIT {
+        joined = joined.chars().take(LIMIT).collect::<String>() + "...";
+    }
+    Some(joined)
+}
+
 /// Waits for a process, but keeps its process id reserved.
 ///
 /// The `WNOWAIT` option tells the kernel to report the result and keep the
@@ -627,6 +672,47 @@ fn read_usage() -> Usage {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// The words of the supervisor must reach the record of the job.
+    ///
+    /// A user met "the supervisor stopped without a result", which names no
+    /// cause and gives no remedy, while the cause was in `supervisor.log` beside
+    /// the record. No command read that file.
+    #[test]
+    fn the_last_words_of_the_supervisor_reach_the_record() {
+        let dir = std::env::temp_dir().join(format!("qex-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No file, and an empty file, both give nothing. A note that says
+        // "the supervisor said:" and then nothing is worse than no note.
+        assert_eq!(supervisor_log_tail(&dir), None);
+        std::fs::write(dir.join("supervisor.log"), b"\n  \n").unwrap();
+        assert_eq!(supervisor_log_tail(&dir), None);
+
+        // The LAST lines, because the fault that stopped the supervisor is the
+        // last thing that it wrote.
+        std::fs::write(
+            dir.join("supervisor.log"),
+            b"one\ntwo\nthree\nfour\nError: renaming status.json into place\n",
+        )
+        .unwrap();
+        let tail = supervisor_log_tail(&dir).unwrap();
+        assert!(tail.contains("renaming status.json"), "got: {tail}");
+        assert!(!tail.contains("one"), "the oldest lines must go: {tail}");
+
+        // The text goes into a field that `qex status` shows, so it stays one
+        // line and it has a limit.
+        std::fs::write(dir.join("supervisor.log"), "x".repeat(5000).as_bytes()).unwrap();
+        let tail = supervisor_log_tail(&dir).unwrap();
+        assert!(tail.chars().count() <= 405, "the text must have a limit");
+        assert!(!tail.contains('\n'), "the text must be one line");
+
+        // Output that is not valid text must not lose the message.
+        std::fs::write(dir.join("supervisor.log"), b"bad \xff\xfe byte").unwrap();
+        assert!(supervisor_log_tail(&dir).unwrap().contains("bad"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn spec() -> JobSpec {
         JobSpec {
