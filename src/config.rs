@@ -81,16 +81,70 @@ impl EnforceMode {
     }
 }
 
+/// Reads a value that a person can write as a number or as text.
+///
+/// # The fault that this removes
+///
+/// `[budget] cpu` takes an integer or a percentage, so the field is text. TOML
+/// then refuses `cpu = 2` with `invalid type: integer, expected a string`,
+/// while `[defaults] cpu = 1` accepts an integer in the same file — and
+/// `qex help config` shows both forms. A user who writes the obvious thing gets
+/// an error that names a Rust type and gives no remedy.
+///
+/// A number and its text are the same value here. This function takes either.
+fn text_or_number<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct Either;
+
+    impl Visitor<'_> for Either {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a number such as 2, or text such as \"75%\" or \"8GB\"")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<String, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
+            // A whole number that TOML read as a float, such as `2.0`.
+            if v.fract() == 0.0 {
+                Ok((v as i64).to_string())
+            } else {
+                Ok(v.to_string())
+            }
+        }
+    }
+
+    d.deserialize_any(Either)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     /// The number of cores that qex can use.
     ///
     /// Give an integer, or a percentage of the machine.
+    #[serde(deserialize_with = "text_or_number")]
     pub cpu: String,
     /// The quantity of memory that qex can use.
     ///
     /// Give a size, or a percentage of the machine.
+    #[serde(deserialize_with = "text_or_number")]
     pub mem: String,
 }
 
@@ -111,6 +165,7 @@ pub struct SystemConfig {
     /// qex does not start a job if the job decreases the available memory below
     /// this value. This test finds the load from other users and from programs
     /// that qex does not control.
+    #[serde(deserialize_with = "text_or_number")]
     pub reserve_mem: String,
     /// The maximum permitted memory pressure.
     ///
@@ -555,6 +610,37 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// A number must be accepted where the field takes a number or text.
+    ///
+    /// `[budget] cpu = 2` gave `invalid type: integer, expected a string`
+    /// while `[defaults] cpu = 1` accepted an integer in the same file, and
+    /// `qex help config` shows both forms. A user who writes the obvious thing
+    /// met an error that named a Rust type and gave no remedy.
+    #[test]
+    fn a_budget_accepts_a_number_and_text_alike() {
+        let c: Config = toml::from_str("[budget]\ncpu = 2\nmem = 2147483648\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.budget.cpu, "2");
+        assert_eq!(c.budget_cpu().unwrap(), 2);
+        assert_eq!(c.budget_mem().unwrap(), 2 << 30);
+
+        // The text forms still operate.
+        let c: Config = toml::from_str("[budget]\ncpu = \"75%\"\nmem = \"8GB\"\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.budget_mem().unwrap(), 8 << 30);
+
+        // And the reserve, which has the same shape.
+        let c: Config = toml::from_str("[system]\nreserve_mem = 0\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.reserve_mem().unwrap(), 0);
+
+        // A value that means nothing must still give an error, and that error
+        // must name the field.
+        let c: Config = toml::from_str("[budget]\ncpu = \"two\"\n").unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("budget"), "the error must name the field: {e}");
+    }
+
     use super::*;
 
     /// A field that qex does not know must give the order of the steps.
