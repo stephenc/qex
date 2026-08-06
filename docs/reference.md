@@ -23,6 +23,8 @@ qex cancel <id>...          remove a job from the queue
 qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
 qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
+qex pause  [queue|lock NAME] [--reason TEXT] [--for TIME] [--drain]
+qex resume [queue|lock NAME]
 qex config show             the values that qex uses now
 qex schema job|status|pipeline|event    the JSON Schema of each format
 qex completions <shell>     the completions for bash, zsh or fish
@@ -413,6 +415,45 @@ job.
 
 A pipeline stage has no dedupe key. A key on one stage would answer for that
 stage alone, and the stages after it would wait for a job of an earlier run.
+
+## Pause the queue, or one lock
+
+A person sometimes needs the machine back: a video call starts, the laptop goes
+on battery, or an interactive task needs the cores.
+
+```sh
+qex pause queue --reason "recording a demo"   # start no new job
+qex pause queue --for 30m                     # end the pause by itself
+qex pause queue --drain                       # wait for a quiet machine
+qex resume queue                              # start the queue again
+```
+
+A paused queue starts **nothing**. The jobs that operate now continue, because
+each one already holds its capacity and a stop would lose that work. Use
+`qex kill <id>` to stop one.
+
+A lock is the better half:
+
+```sh
+qex pause lock gpu0     # the lock goes to you, and every job that needs it waits
+qex resume lock gpu0    # the next job takes it
+```
+
+`qex pause lock` never fails when a job holds the lock now. qex records the
+request, that job keeps the lock, no other job takes it, and the lock comes to
+you when that job stops.
+
+```
+ID        STATE   NAME   ...  NOTE
+b0bb2614  queued  train  ...  waits for the lock `gpu0`, which a person holds
+```
+
+The pause is a file beside the job records, so it survives a coordinator that
+stops. It covers your queue only; it does not pause another user of the
+machine.
+
+`qex pause` with no word says what is paused now. `qex info`, `qex top` and
+`qex list` say it too, and a pause with no end is reported loudly each time.
 
 ## A pipeline of stages
 
@@ -1534,6 +1575,7 @@ qex help states      each job state and what causes it
 qex help events      the event stream, its numbers and its gaps
 qex help exit-codes  the exit code of each command
 qex help config      each configuration field
+qex help pause       stop the queue, or take a lock for yourself
 qex schema job       the JSON Schema of a job file
 qex schema status    the JSON Schema of status.json
 qex schema event     the JSON Schema of one line of `qex events`

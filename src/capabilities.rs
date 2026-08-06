@@ -189,6 +189,7 @@ pub const ALL: &[&str] = &[
     "learn",
     "locks",
     "max-queue-time",
+    "pause",
     "politeness",
     "retries",
 ];
@@ -685,6 +686,39 @@ mod tests {
 
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
         assert!(check_command(&new, "0.8.0", 4321, "events", "qex events").is_ok());
+    }
+
+    /// `qex pause` must be refused by a coordinator that cannot obey it.
+    ///
+    /// The failure to prevent is the silent one: the person types `qex pause
+    /// queue`, gets no clear reason, and believes that the machine is quiet
+    /// while the coordinator continues to start jobs.
+    #[test]
+    fn a_pause_is_refused_by_a_coordinator_that_cannot_pause() {
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "pause")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check_command(&old, "0.7.1", 3507877, "pause", "qex pause queue").unwrap_err();
+        assert!(
+            err.contains("qex pause queue"),
+            "the message must name the command: {err}"
+        );
+        assert!(
+            err.contains("kill 3507877"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check_command(&new, "0.8.0", 1, "pause", "qex pause queue").is_ok());
+    }
+
+    /// This build must say that it can pause. Without the name in this list,
+    /// every new CLI refuses every new coordinator.
+    #[test]
+    fn this_build_says_that_it_can_pause() {
+        assert!(ALL.contains(&"pause"));
     }
 
     /// This build must say that it has the event stream. Without the name in

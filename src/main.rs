@@ -67,6 +67,8 @@ mod logsel;
 #[cfg(unix)]
 mod paths;
 #[cfg(unix)]
+mod pause;
+#[cfg(unix)]
 mod peers;
 #[cfg(unix)]
 mod pipeline;
@@ -167,6 +169,8 @@ fn run() -> Result<i32> {
         Command::Gc(args) => commands::gc(args),
         Command::Du(args) => commands::du(args),
         Command::Info(args) => commands::info(args),
+        Command::Pause(args) => commands::pause(args),
+        Command::Resume(args) => commands::resume(args),
         Command::Version(args) => commands::version(args),
         Command::Watchers(args) => watchers::report(args.json),
         Command::Completions(args) => cmd_completions(args.shell),
