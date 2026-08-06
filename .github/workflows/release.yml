@@ -5,6 +5,20 @@ name: Release
 on:
   push:
     branches: [main]
+    # A change to the words only does not make a release.
+    #
+    # A `docs:` commit already gives no release, because the type of the commit
+    # gives the version number. This stops the workflow from STARTING at all for
+    # such a push, so the list of runs holds the releases and not a line of runs
+    # that did nothing.
+    #
+    # GitHub skips the run when EVERY file of the push matches this list. A push
+    # that changes the code and the words together still makes a release.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.github/ISSUE_TEMPLATE/**'
   workflow_dispatch:
 
 # One release at a time. Two together would compute one version number twice.
