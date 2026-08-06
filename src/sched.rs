@@ -582,22 +582,36 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
 
     match crate::supervisor::spawn(id) {
         Ok(pid) => {
-            let status = {
+            {
                 let mut state = coord.state.lock().unwrap();
-                match state.jobs.get_mut(&id) {
-                    Some(job) => {
-                        job.supervisor_pid = Some(pid);
-                        // Record the supervisor in the file. A coordinator that
-                        // starts again then knows that this job continues.
-                        job.status.supervisor_pid = Some(pid);
-                        Some(job.status.clone())
-                    }
-                    None => None,
+                if let Some(job) = state.jobs.get_mut(&id) {
+                    job.supervisor_pid = Some(pid);
+                    job.status.supervisor_pid = Some(pid);
                 }
-            };
-            if let Some(status) = status {
-                write_started(&id, &status).ok();
             }
+
+            // THIS CODE MUST NOT WRITE THE RECORD NOW.
+            //
+            // The supervisor owns the record from the moment that it starts.
+            // It writes its own process id, and then it writes `running` with
+            // the process id of the job.
+            //
+            // A write here would race those two. The supervisor frequently wins
+            // that race, and this code then returned the record to `starting`
+            // with no pid — and the supervisor does not write again until the
+            // job stops. A job of five minutes thus said `starting` for five
+            // minutes, `qex top` could measure nothing, and `qex kill` refused
+            // the job with "the job starts now. Try the command again."
+            //
+            // One writer at a time: the coordinator until the supervisor
+            // starts, and the supervisor after that.
+            //
+            // The pid of the supervisor goes to a FILE OF ITS OWN instead. A
+            // coordinator that starts again needs that pid to learn that the
+            // job continues, and it needs it from the moment of the fork: the
+            // supervisor cannot write its own pid before it exists. Each file
+            // thus has one writer, and no write races another.
+            crate::supervisor::record_supervisor_pid(&id, pid);
 
             log(&format!(
                 "job {id} ({name}) started; the supervisor pid is {pid}"

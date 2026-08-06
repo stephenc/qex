@@ -113,9 +113,88 @@ impl Harness {
             if test() {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            // Each test spawns a `qex` process, and two tests operate together.
+            // At 50ms that was 40 processes each second on a machine with four
+            // cores, and the test then held the cores that the job needed. The
+            // test must not make the load that it waits for.
+            std::thread::sleep(Duration::from_millis(200));
         }
-        panic!("qex did not reach this condition in {limit:?}: {what}");
+
+        // Say WHY the condition did not arrive.
+        //
+        // Without this, a failure on a build machine gives "the job starts"
+        // and nothing else, and the machine goes away with the answer. qex
+        // holds the reason for each job that waits, and `qex info` holds the
+        // budget and the load, so a test must show them both.
+        let jobs = String::from_utf8_lossy(&self.qex(&["list"]).stdout).to_string();
+        let info = String::from_utf8_lossy(&self.qex(&["info", "--no-start"]).stdout).to_string();
+
+        // A job that did not reach its state leaves its evidence in its own
+        // directory: the record, the log of its supervisor, and the supervisor
+        // process itself. A build machine goes away with that evidence, so the
+        // test must read it here.
+        let mut detail = String::new();
+        for job in self.list_json() {
+            let state = job["state"].as_str().unwrap_or("");
+            if matches!(
+                state,
+                "completed" | "failed" | "killed" | "cancelled" | "skipped"
+            ) {
+                continue;
+            }
+            let id = job["id"].as_str().unwrap_or("").to_string();
+            let sup = job["supervisor_pid"].as_i64();
+            let alive = match sup {
+                Some(pid) => {
+                    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                        "alive"
+                    } else {
+                        "DEAD"
+                    }
+                }
+                None => "none",
+            };
+            detail.push_str(&format!(
+                "\njob {id}  state={state}  supervisor={sup:?} ({alive})\n"
+            ));
+
+            let dir = self.root.join("state/qex/jobs").join(&id);
+            for file in ["status.json", "supervisor.log", "stderr.log"] {
+                if let Ok(text) = std::fs::read(dir.join(file)) {
+                    let text = String::from_utf8_lossy(&text);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        detail.push_str(&format!("  --- {file} ---\n  {:.900}\n", text));
+                    }
+                }
+            }
+            if let Some(pid) = sup {
+                if let Ok(out) = std::process::Command::new("ps")
+                    .args(["-o", "pid=,stat=,wchan:20=,args=", "-p", &pid.to_string()])
+                    .output()
+                {
+                    detail.push_str(&format!(
+                        "  --- ps ---\n  {}\n",
+                        String::from_utf8_lossy(&out.stdout).trim()
+                    ));
+                }
+            }
+        }
+
+        panic!(
+            "qex did not reach this condition in {limit:?}: {what}\n\n\
+             --- qex list ---\n{jobs}\n--- qex info ---\n{info}\n{detail}"
+        );
+    }
+
+    /// Tests if a job left the queue.
+    ///
+    /// THIS IS MONOTONIC: once a job starts, it stays true. A test that waits
+    /// for `state == "running"` waits for a window, and a job that stops before
+    /// the test looks makes that condition false FOR EVER — which is the fault
+    /// that qex exists to remove, in the tests of qex.
+    fn has_started(&self, id: &str) -> bool {
+        !matches!(self.state_of(id).as_str(), "queued" | "starting")
     }
 
     /// Gives the process id of the coordinator.
@@ -272,13 +351,31 @@ fn the_budget_limits_the_jobs_that_operate_together() {
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
     );
 
-    for _ in 0..3 {
-        h.submit(&["submit", "--cpu", "2", "--mem", "128MB", "--", "sleep", "3"]);
-    }
+    // Each job sleeps for a long time, and the test stops them all at its end.
+    // With a short sleep, a machine with other work can start and finish the
+    // jobs OUTSIDE the window in which the test measures, and the test then
+    // reports that no job ever started.
+    let ids: Vec<String> = (0..3)
+        .map(|_| {
+            h.submit(&[
+                "submit", "--cpu", "2", "--mem", "128MB", "--", "sleep", "300",
+            ])
+        })
+        .collect();
+
+    // Two jobs of two cores fill a budget of four cores. Wait for that state,
+    // and then measure: the question is whether a THIRD job joins them.
+    h.until("two jobs operate", Duration::from_secs(45), || {
+        h.list_json()
+            .iter()
+            .filter(|j| j["state"] == "running")
+            .count()
+            == 2
+    });
 
     // Measure the number that operate together, many times.
     let mut peak = 0;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         let running = h
             .list_json()
@@ -294,6 +391,13 @@ fn the_budget_limits_the_jobs_that_operate_together() {
         peak <= 2,
         "the budget of 4 cores must hold two jobs of 2 cores, and {peak} jobs operated together"
     );
+
+    // Stop each job. Two of them operate and one waits, so this uses both
+    // commands and it tests neither.
+    for id in &ids {
+        h.qex(&["kill", id, "--grace", "1s"]);
+        h.qex(&["cancel", id]);
+    }
 }
 
 /// A job that is larger than the budget must not wait for ever. qex starts it
@@ -309,7 +413,13 @@ fn a_job_that_is_too_large_runs_when_the_queue_is_empty() {
     );
 
     // Fill the queue first, so the large job must wait.
-    let small = h.submit(&["submit", "--cpu", "2", "--mem", "128MB", "--", "sleep", "3"]);
+    // A LONG sleep, and the test stops the job when it no longer needs it to
+    // hold the capacity. A short sleep makes a window: the test waits for the
+    // job to be `running`, and a machine with other work can look after the job
+    // has stopped. The condition is then false for ever.
+    let small = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "128MB", "--", "sleep", "300",
+    ]);
     h.until("the small job starts", Duration::from_secs(45), || {
         h.state_of(&small) == "running"
     });
@@ -340,7 +450,9 @@ fn a_job_that_is_too_large_runs_when_the_queue_is_empty() {
         .to_string();
     assert!(!reason.is_empty(), "qex must give the reason for the wait");
 
-    // The large job must start after the queue becomes empty.
+    // The large job must start after the queue becomes empty. Stop the small
+    // job, so this happens at a moment that the test chooses.
+    h.ok(&["kill", &small, "--grace", "1s"]);
     h.until("the large job stops", Duration::from_secs(30), || {
         h.state_of(&big) == "completed"
     });
@@ -467,7 +579,16 @@ fn count_in_group(pgid: i32) -> usize {
 #[test]
 fn a_job_survives_the_failure_of_the_coordinator() {
     let h = Harness::with_default_config("crash");
-    let id = h.submit(&["submit", "--", "sh", "-c", "sleep 3; echo survived; exit 7"]);
+    // Ten seconds, and not three: the coordinator must fail WHILE the job
+    // operates, and a machine with other work can need several seconds to reach
+    // the line below.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "sleep 10; echo survived; exit 7",
+    ]);
 
     h.until("the job starts", Duration::from_secs(45), || {
         h.state_of(&id) == "running"
@@ -646,7 +767,9 @@ fn cancel_removes_a_job_from_the_queue() {
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
     );
 
-    let first = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "5"]);
+    let first = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
     h.until("the first job starts", Duration::from_secs(45), || {
         h.state_of(&first) == "running"
     });
@@ -814,7 +937,7 @@ fn the_claim_word_guess_gives_one_half_of_the_budget() {
     );
 
     let a = h.submit(&[
-        "submit", "--cpu", "guess", "--mem", "guess", "--", "sleep", "3",
+        "submit", "--cpu", "guess", "--mem", "guess", "--", "sleep", "300",
     ]);
     let status = h.status_json(&a);
     assert_eq!(status["cpu"], 4, "one half of 8 cores is 4 cores");
@@ -825,8 +948,12 @@ fn the_claim_word_guess_gives_one_half_of_the_budget() {
     );
 
     // A second job of the same size must operate at the same time.
+    //
+    // Both jobs sleep for a long time, and the test stops them when it has its
+    // answer. With a short sleep the two jobs must be `running` in one window,
+    // and a machine with other work can look after that window has closed.
     let b = h.submit(&[
-        "submit", "--cpu", "half", "--mem", "half", "--", "sleep", "3",
+        "submit", "--cpu", "half", "--mem", "half", "--", "sleep", "300",
     ]);
     h.until("both jobs operate", Duration::from_secs(45), || {
         h.list_json()
@@ -840,9 +967,10 @@ fn the_claim_word_guess_gives_one_half_of_the_budget() {
     let c = h.submit(&["submit", "--cpu", "guess", "--mem", "guess", "--", "true"]);
     assert_eq!(h.state_of(&c), "queued");
 
-    for id in [&a, &b, &c] {
-        h.ok(&["wait", id, "--timeout", "30s"]);
-    }
+    // Give the capacity back, and the third job then operates.
+    h.ok(&["kill", &a, "--grace", "1s"]);
+    h.ok(&["kill", &b, "--grace", "1s"]);
+    h.ok(&["wait", &c, "--timeout", "30s"]);
 }
 
 /// The word `full` gives the whole budget, so the job operates alone. qex must
@@ -875,7 +1003,9 @@ fn the_claim_word_full_gives_the_whole_budget() {
     let other = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
     assert_eq!(h.state_of(&other), "queued");
 
-    h.ok(&["wait", &big, "--timeout", "30s"]);
+    // Give the capacity back, so the other job operates now.
+    h.ok(&["kill", &big, "--grace", "1s"]);
+
     h.ok(&["wait", &other, "--timeout", "30s"]);
 }
 
@@ -1061,7 +1191,9 @@ fn every_queued_job_gives_a_reason() {
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
     );
 
-    let running = h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "5"]);
+    let running = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "64MB", "--", "sleep", "300",
+    ]);
     h.until("the first job starts", Duration::from_secs(45), || {
         h.state_of(&running) == "running"
     });
@@ -1522,12 +1654,23 @@ fn a_failed_dependency_is_seen_behind_a_blocked_queue() {
         "-c",
         "sleep 2; exit 1",
     ]);
-    // This job holds the rest of the budget.
+    // This job holds the rest of the budget while the test operates.
     let blocker = h.submit(&[
-        "submit", "--cpu", "1", "--mem", "64MB", "--name", "blocker", "--", "sleep", "20",
+        "submit", "--cpu", "1", "--mem", "64MB", "--name", "blocker", "--", "sleep", "60",
     ]);
-    h.until("both jobs operate", Duration::from_secs(45), || {
-        h.state_of(&failer) == "running" && h.state_of(&blocker) == "running"
+
+    // Wait for a condition that CANNOT go false again.
+    //
+    // This test waited for both jobs to be `running` together. `failer` lives
+    // for two seconds, so that window is short, and on a machine with other
+    // work the test looked after the window had closed. The condition was then
+    // false for ever and the test waited to its limit — the exact fault that
+    // this tool exists to remove.
+    //
+    // `failer` must only have STARTED, because the test needs it to fail; and
+    // `blocker` must hold its core, which it does for 60 seconds.
+    h.until("both jobs started", Duration::from_secs(45), || {
+        h.has_started(&failer) && h.state_of(&blocker) == "running"
     });
 
     // This job needs two cores, so it waits for capacity at the front.
@@ -1548,6 +1691,62 @@ fn a_failed_dependency_is_seen_behind_a_blocked_queue() {
     assert_eq!(out.status.code(), Some(126));
 
     h.ok(&["kill", &blocker, "--grace", "1s"]);
+}
+
+/// A job that operates must say `running`, and it must give its pid.
+///
+/// # The fault that this test holds
+///
+/// Two processes wrote one record. The coordinator wrote `starting` and the
+/// process id of the supervisor AFTER it started the supervisor, and the
+/// supervisor wrote `running` and the process id of the job. The supervisor
+/// frequently won that race, and the write from the coordinator then returned
+/// the record to `starting`.
+///
+/// The supervisor does not write again until the job stops, so a job of five
+/// minutes said `starting` for five minutes. `qex top` could measure nothing,
+/// `qex kill` refused the job with "the job starts now. Try the command again.",
+/// and the tests of qex failed on a busy machine about one time in six.
+///
+/// The record now has ONE writer at each moment.
+#[test]
+fn a_job_that_operates_says_running_and_gives_its_pid() {
+    let h = Harness::with_default_config("onewriter");
+
+    // Several jobs together, because the fault is a race and one job hides it.
+    let ids: Vec<String> = (0..6)
+        .map(|_| {
+            h.submit(&[
+                "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+            ])
+        })
+        .collect();
+
+    for id in &ids {
+        h.until("the job says running", Duration::from_secs(45), || {
+            h.state_of(id) == "running"
+        });
+
+        // The pid must arrive with the state. A job that operates with no pid
+        // cannot be measured and cannot be stopped.
+        let status = h.status_json(id);
+        assert!(
+            status["pid"].as_i64().is_some(),
+            "a job that operates must give its pid: {status}"
+        );
+
+        // The record must not return to `starting` after that. This is the
+        // write that the coordinator used to make.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            h.state_of(id),
+            "running",
+            "the record must not return to an earlier state"
+        );
+
+        // `qex kill` must accept the job. It refused a job with no pid.
+        h.ok(&["kill", id, "--grace", "1s"]);
+    }
 }
 
 /// `qex logs` with a job that does not exist must not give the code 0 with no

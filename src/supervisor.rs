@@ -60,6 +60,37 @@ pub fn spawn(id: uuid::Uuid) -> Result<i32> {
     Ok(child.id() as i32)
 }
 
+/// Writes the pid of the supervisor of a job, in a file of its own.
+///
+/// The coordinator knows this pid at the fork, and the supervisor cannot write
+/// it before it exists. A coordinator that starts again reads this file to learn
+/// that a job continues; without it, that coordinator finds a job that says
+/// `starting` with no process and it marks the job failed, while the supervisor
+/// operates and the job runs.
+///
+/// This is a file of its own, and not a field of `status.json`, because the
+/// supervisor owns that record from the moment that it starts. Two processes
+/// that write one file give the fault that `a_job_that_operates_says_running_
+/// and_gives_its_pid` holds.
+pub fn record_supervisor_pid(id: &uuid::Uuid, pid: i32) {
+    let Ok(dir) = paths::job_dir(id) else { return };
+    crate::job::write_atomic(
+        &dir.join("supervisor.pid"),
+        pid.to_string().as_bytes(),
+        0o600,
+    )
+    .ok();
+}
+
+/// Reads that pid.
+pub fn supervisor_pid_of(dir: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(dir.join("supervisor.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Waits for one supervisor and puts its result in the coordinator.
 ///
 /// This function operates in its own thread. It uses `waitpid` on the exact
@@ -188,6 +219,15 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let dir = paths::job_dir(&id)?;
     let spec = job::read_spec(&dir).context("reading the job specification")?;
     let mut status = job::read_status(&dir).context("reading the job status")?;
+
+    // Take the record, and say which process holds it.
+    //
+    // The coordinator knows this pid, and it deliberately does not write it:
+    // a write from the coordinator would race the writes below. This process
+    // writes it instead, before it does anything that can take time, so a
+    // coordinator that starts again finds the supervisor of this job.
+    status.supervisor_pid = Some(std::process::id() as i32);
+    job::write_status(&dir, &status).context("writing the job status")?;
 
     // The output of a job holds secrets as frequently as its environment, so
     // these files use the same mode as the job specification.

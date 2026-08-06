@@ -332,13 +332,21 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         // disk while the coordinator reports a failure for ever.
         if status.state.is_active() {
             let job_alive = status.pid.map(sys::pid_alive).unwrap_or(false);
-            let supervisor_alive = status.supervisor_pid.map(sys::pid_alive).unwrap_or(false);
+            // The pid comes from the record, or from the file that the
+            // coordinator wrote at the fork. The second one covers the moment
+            // between the fork and the first write of the supervisor: without
+            // it, a coordinator that starts again in that moment finds a job
+            // with no process and marks it failed, while the job runs.
+            let supervisor_pid = status
+                .supervisor_pid
+                .or_else(|| crate::supervisor::supervisor_pid_of(&path));
+            let supervisor_alive = supervisor_pid.map(sys::pid_alive).unwrap_or(false);
 
             if job_alive || supervisor_alive {
                 // The job continues. Keep its state, and let the supervisor
                 // write the result.
                 if supervisor_alive {
-                    if let Some(pid) = status.supervisor_pid {
+                    if let Some(pid) = supervisor_pid {
                         // Watch the supervisor again, so the coordinator learns
                         // when the job stops.
                         let coord2 = Arc::clone(coord);
