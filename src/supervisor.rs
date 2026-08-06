@@ -299,6 +299,53 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             crate::config::Config::default()
         }
     };
+    // Tell the job which devices it received.
+    //
+    // These values REPLACE the captured environment. The coordinator owns the
+    // assignment, so a value that came from the shell of the user would send
+    // the job to a device that qex gave to a different job.
+    //
+    // The job sees the record as well as the environment. The environment is
+    // what a framework reads with no change to its code; the record is what an
+    // agent reads AFTERWARDS to explain a failure, and the record survives.
+    for (name, given) in &status.assigned {
+        let upper = name.to_ascii_uppercase().replace('-', "_");
+        if given.devices.is_empty() {
+            cmd.env(format!("QEX_CLAIM_{upper}"), given.units.to_string());
+            continue;
+        }
+        let list = given
+            .devices
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        cmd.env(format!("QEX_{upper}_DEVICES"), &list);
+        if let Some(pool) = cfg.pool(name) {
+            if let Some(var) = &pool.env {
+                cmd.env(var, &list);
+            }
+            // The quantity that the job may use on EACH device. A claim with
+            // no size takes the whole device, so the value is the capacity of
+            // the smallest device that the job received.
+            let size = given.size.or_else(|| {
+                given
+                    .devices
+                    .iter()
+                    .filter_map(|i| pool.devices.get(*i as usize).copied())
+                    .min()
+            });
+            if let Some(size) = size {
+                let quantity = pool
+                    .size_name
+                    .as_deref()
+                    .unwrap_or("size")
+                    .to_ascii_uppercase();
+                cmd.env(format!("QEX_{upper}_{quantity}"), size.to_string());
+            }
+        }
+    }
+
     let mut cgroup_dir: Option<std::path::PathBuf> = None;
     let mut enforce_warning: Option<String> = None;
     if cfg.enforce.mode.is_on() {
@@ -771,6 +818,7 @@ mod tests {
             group: None,
             group_name: None,
             locks: vec![],
+            claims: Default::default(),
             retries: 0,
             needs: vec![],
             after: vec![],

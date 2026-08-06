@@ -82,11 +82,48 @@ pub enum Response {
         mem_budget: u64,
         cpu_claimed: u64,
         mem_claimed: u64,
+        /// The pools of countable resources, and what holds them.
+        ///
+        /// THIS FIELD IS AN OPTION, AND NOT A DEFAULTED LIST. `None` means
+        /// "this coordinator cannot say", and `qex info` writes `unknown` for
+        /// it. A defaulted empty list would read as "this machine has no
+        /// pool", which is a different statement and can be a lie.
+        #[serde(default)]
+        pools: Option<Vec<PoolReport>>,
     },
     /// The things that the coordinator can do.
     Capabilities { names: Vec<String> },
     /// The command failed.
     Error { message: String, kind: ErrorKind },
+}
+
+/// One pool of a countable resource, as `qex info` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolReport {
+    pub name: String,
+    /// The number of units, or of devices.
+    pub total: u64,
+    /// The units that the jobs of this queue hold.
+    pub used: u64,
+    /// The units that the other users hold.
+    pub peer_used: u64,
+    /// The name of the quantity that each device holds, such as `vram`.
+    #[serde(default)]
+    pub size_name: Option<String>,
+    /// The devices of an indexed pool. The list is empty for a plain pool.
+    #[serde(default)]
+    pub devices: Vec<DeviceReport>,
+}
+
+/// One device of an indexed pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceReport {
+    pub index: u32,
+    pub capacity: u64,
+    /// The quantity that the jobs of this queue hold on this device.
+    pub used: u64,
+    /// True when another user holds this device.
+    pub peer: bool,
 }
 
 /// The type of a failure. The CLI maps this value to an exit code.

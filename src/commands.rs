@@ -56,6 +56,9 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         after: args.after,
         locks: args.locks,
         retries: args.retries,
+        gpu: args.gpu,
+        vram: args.vram,
+        claims: args.claims,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -431,6 +434,40 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     }
     if !s.locks.is_empty() {
         println!("locks:     {}", s.locks.join(", "));
+    }
+    if !s.claims.is_empty() {
+        println!(
+            "claims:    {}",
+            s.claims
+                .iter()
+                .map(|(name, c)| match c.size {
+                    Some(size) => format!("{name} {} ({} each)", c.count, format_size(size)),
+                    None => format!("{name} {}", c.count),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // Show the devices that the job received. The environment of a job goes
+    // away with the job. This record stays, and it is what an agent reads
+    // AFTERWARDS to explain a failure.
+    for (name, given) in &s.assigned {
+        if given.devices.is_empty() {
+            continue;
+        }
+        let each = match given.size {
+            Some(size) => format!(" ({} each)", format_size(size)),
+            None => " (the whole of each device)".to_string(),
+        };
+        println!(
+            "devices:   {name} {}{each}",
+            given
+                .devices
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
     if !s.needs.is_empty() {
         println!(
@@ -1409,6 +1446,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             mem_budget,
             cpu_claimed,
             mem_claimed,
+            pools,
         } => {
             if args.json {
                 println!(
@@ -1425,6 +1463,9 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "mem_budget": mem_budget,
                         "cpu_claimed": cpu_claimed,
                         "mem_claimed": mem_claimed,
+                        // `null` says that this coordinator cannot answer. It
+                        // does not say that the machine has no pool.
+                        "pools": pools,
                     }))?
                 );
                 return Ok(0);
@@ -1451,6 +1492,43 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 format_size(mem_claimed),
                 format_size(mem_budget)
             );
+            match pools {
+                // Say `unknown`, and never `none`. An earlier coordinator
+                // cannot answer this question, and "this machine has no pool"
+                // is a different statement.
+                None => println!(
+                    "pools:           unknown; this coordinator is version {version} and it \
+                     does not report the pools"
+                ),
+                Some(list) if list.is_empty() => {}
+                Some(list) => {
+                    for p in list {
+                        let peers = if p.peer_used > 0 {
+                            format!(", {} held by other users", p.peer_used)
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "pool {:<11} {} of {} in use{peers}",
+                            format!("{}:", p.name),
+                            p.used,
+                            p.total
+                        );
+                        for d in &p.devices {
+                            let who = if d.peer {
+                                "held by another user".to_string()
+                            } else {
+                                format!(
+                                    "{} of {} in use",
+                                    format_size(d.used),
+                                    format_size(d.capacity)
+                                )
+                            };
+                            println!("  {} {}: {who}", p.name, d.index);
+                        }
+                    }
+                }
+            }
             Ok(0)
         }
         other => report(other),
@@ -1818,6 +1896,9 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         after: args.submit.after,
         locks: args.submit.locks,
         retries: args.submit.retries,
+        gpu: args.submit.gpu,
+        vram: args.submit.vram,
+        claims: args.submit.claims,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -2402,6 +2483,8 @@ mod tests {
             needs: vec![],
             after: vec![],
             locks: vec![],
+            claims: Default::default(),
+            assigned: Default::default(),
             attempts: 1,
             retries_left: 0,
             caused_by: None,

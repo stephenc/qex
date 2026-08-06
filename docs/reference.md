@@ -10,8 +10,9 @@ description: Every command, option, claim word and configuration field.
 ## Commands
 
 ```
-qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
-           [--after ID,ID] [--name NAME] [--job FILE] -- COMMAND...
+qex submit [--cpu N] [--mem SIZE] [--gpu N] [--vram SIZE] [--claim NAME=N]
+           [--lock NAME] [--timeout TIME] [--needs ID,ID] [--after ID,ID]
+           [--name NAME] [--job FILE] -- COMMAND...
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
@@ -100,6 +101,100 @@ Each of these results is data for you. A job that waits for ever gives no data.
 The status field `forced` is `true` for such a job, and `qex submit` writes a
 warning at the time of the submission.
 
+## Pools: GPUs, VRAM and counted locks
+
+The cores and the memory are two quantities. Everything else that a machine can
+count is a **pool**: a name, a total, and — when qex must say *which* one — a
+list of devices.
+
+| Option | Meaning |
+| ------ | ------- |
+| `--gpu N` | Claim N devices from the pool `gpu`. |
+| `--vram SIZE` | Claim SIZE on **each** GPU that this job gets. |
+| `--claim NAME=N` | Claim N units of the pool NAME. |
+| `--lock NAME` | The same as `--claim NAME=1`. Unchanged. |
+
+```sh
+qex submit --cpu 4 --mem 16GB --gpu 1 --vram 20GB -- uv run train.py
+qex submit --cpu 8 --mem 32GB --gpu 2 -- uv run train.py    # 2 whole devices
+qex submit --claim net=1 -- ./download.sh
+qex run --lock target -- cargo test                         # unchanged
+```
+
+Declare a pool in `~/.config/qex.toml`:
+
+```toml
+# A pool with devices. qex says WHICH one each job gets.
+[[pool]]
+name    = "gpu"
+size    = "vram"                              # the quantity each device holds
+devices = ["24GB", "24GB", "24GB", "24GB"]
+env     = "CUDA_VISIBLE_DEVICES"
+
+# A pool with no devices. The number is sufficient.
+[[pool]]
+name  = "net"
+count = 4
+```
+
+Give `count` or `devices`, and not both. A name that the configuration does not
+declare is a pool of one unit — which is exactly a lock, so `--lock` needs no
+configuration and never did.
+
+### qex does not add the VRAM of the devices together
+
+**A job that needs 40GB on one device cannot run on two devices of 24GB.** qex
+refuses such a job and says that it can never start.
+
+`--vram SIZE` is the quantity on **each** device that the job gets. With no
+`--vram`, the job takes the whole of each device that it gets. That is the safe
+default: a claim that consumed nothing would let qex put four unlimited jobs on
+one card. `[defaults] vram` lets you change it.
+
+### qex says which device, and it tells the job
+
+qex gives the devices with the most free capacity first, and the lowest index
+for a tie. The choice happens when the job starts, and it goes into
+`status.json` — not into `spec.json`, because an assignment is a result and not
+a request. The job then sees both:
+
+```
+CUDA_VISIBLE_DEVICES=2,3      # because the pool `gpu` names this variable
+QEX_GPU_DEVICES=2,3           # always, for every indexed pool
+QEX_GPU_VRAM=21474836480      # the quantity on each device, in bytes
+QEX_CLAIM_NET=1               # for a pool with no devices
+```
+
+```sh
+qex status <id>          # the line `devices: gpu 2,3`
+qex status <id> --json   # the field `assigned`
+```
+
+The variable is what a framework reads with no change to its code. The record is
+what you read **afterwards** to explain a failure: the record stays, and the
+environment goes with the job.
+
+**Do not set `CUDA_VISIBLE_DEVICES` yourself for a job that claims a GPU.** qex
+refuses that job, because the two values would disagree.
+
+### qex does not read a driver
+
+The devices come from the configuration only. A machine with no CUDA and no
+driver library thus schedules GPU claims correctly: a count in the file, a claim
+on the job, and the same arithmetic that admits a job today.
+
+Two users who give different device counts disagree, in the same way and for the
+same reason that they can disagree about `[budget]`. The accounting is
+cooperative, and each coordinator publishes the device indices that it gave
+away, so two users do not put two jobs on one card.
+
+### A claim above the pool total is always refused
+
+This is different from the cores and the memory. A memory job that is too large
+can run alone and swap, and that result is data. An empty machine does not make
+a fifth GPU, so `qex submit --gpu 8` against a pool of 4 gives an error at the
+submission, whatever `[queue] oversized` says.
+
 ## A pipeline of stages
 
 Do not put the stages of a pipeline in one script. If stage 3 of that script
@@ -173,12 +268,21 @@ timeout = "4h"
 tags = ["ml"]
 
 [resources]
-cpu = 3          # or "guess", or "full"
-mem = "8GB"
+cpu  = 3          # or "guess", or "full"
+mem  = "8GB"
+gpu  = 1          # devices from the pool `gpu`
+vram = "20GB"     # on EACH device that this job gets
+
+[resources.claims]
+net = 1           # 1 unit of the pool `net`
 
 [env]
-CUDA_VISIBLE_DEVICES = "0"
+HF_HOME = "/data/hf"
 ```
+
+Do **not** set `CUDA_VISIBLE_DEVICES` in `[env]` here. qex gives the devices to
+the job and writes that variable itself, so the two values would disagree. qex
+refuses such a job and says so.
 
 A job file also accepts `needs` and `after`:
 
@@ -238,6 +342,19 @@ oversized = "run-when-idle"   # run-when-idle, reject or queue
 cpu = 1               # the default is 1 core
 mem = "2GB"           # the default is the machine memory / the core count
 timeout = "0"         # the default is no limit
+vram = "0"            # 0 means: a job with no --vram takes the whole device
+
+# A pool with devices. qex says WHICH one each job gets.
+[[pool]]
+name    = "gpu"
+size    = "vram"
+devices = ["24GB", "24GB"]
+env     = "CUDA_VISIBLE_DEVICES"
+
+# A pool with no devices. The number is sufficient.
+[[pool]]
+name  = "net"
+count = 4
 ```
 
 With no `[defaults]` section, a job gets 1 core and an equal part of the machine
@@ -252,7 +369,8 @@ Each topic below is also in the binary, so an agent needs no network:
 ```sh
 qex help agents      the one page for an agent
 qex help job-file    the fields of a job file
-qex help resources   claims, the budget and the several-user accounting
+qex help resources   claims, the pools, the budget and the several-user
+                     accounting
 qex help states      each job state and what causes it
 qex help exit-codes  the exit code of each command
 qex help config      each configuration field

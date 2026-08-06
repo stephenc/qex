@@ -58,6 +58,11 @@ pub struct Stage {
     pub locks: Vec<String>,
     /// The number of times to run this stage again when it fails.
     pub retries: Option<u32>,
+    /// The claims of this stage: `cpu`, `mem`, `gpu`, `vram` and `claims`.
+    ///
+    /// `Stage` mirrors `JobFile` field by field, and `stage_spec` below copies
+    /// each one. A field that goes into two of those three places makes a
+    /// pipeline stage drop a claim IN SILENCE.
     pub resources: crate::spec::Resources,
     pub env: BTreeMap<String, String>,
 }
