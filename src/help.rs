@@ -133,6 +133,12 @@ code and the last lines of the error output. One command gives everything.
 `qex submit` writes the job UUID to stdout and writes nothing else. You can
 thus put the UUID in a shell variable.
 
+A shell variable does not last between your commands. Use `--id-file` to keep
+the id in a file:
+
+    qex submit --id-file build.id -- make
+    qex status \"$(cat build.id)\" --wait
+
 One command gives the result and the cause
 ------------------------------------------
 
@@ -772,6 +778,14 @@ Every stage of one submission shares a group id:
 
     GROUP=$(qex pipeline ci.toml)
     qex list --group $GROUP
+
+Use `--id-file` to keep every id in a file:
+
+    qex pipeline ci.toml --id-file ids.env
+    . ids.env                       # gives $group, $build, $unit, ...
+    qex status \"$ship\" --wait
+
+A name that ends in `.json` gives a JSON object instead, for a parser.
 
 qex reads the whole file before it submits anything. A circle of stages, a name
 that no stage has, and a stage with no command each give an error, and no job

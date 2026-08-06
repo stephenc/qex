@@ -8,7 +8,7 @@ use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
 use crate::spec::{JobSpec, SubmitOptions};
 use crate::units::{format_duration, format_size, parse_duration};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
 /// The exit code of `qex wait` when the wait reached its time limit.
@@ -71,6 +71,9 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             // command `ID=$(qex submit ...)` continues to operate.
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
+            }
+            if let Some(path) = &args.id_file {
+                write_id_file(path, &format!("{id}\n"))?;
             }
             println!("{id}");
             Ok(0)
@@ -1415,6 +1418,11 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
         }
     }
 
+    if let Some(path) = &args.id_file {
+        let text = pipeline_id_file(path, group, &group_name, &submitted)?;
+        write_id_file(path, &text)?;
+    }
+
     if args.json {
         let jobs: Vec<serde_json::Value> = submitted
             .iter()
@@ -1502,4 +1510,56 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Writes the id of a job to a file.
+///
+/// A shell variable does not last between the commands of an agent, and an
+/// agent that loses an id must search for it. A file holds the id.
+fn write_id_file(path: &std::path::Path, text: &str) -> Result<()> {
+    // A job id gives no access to anything, so this file uses the usual mode.
+    crate::job::write_atomic(path, text.as_bytes(), 0o644)
+        .with_context(|| format!("writing the id file {}", path.display()))
+}
+
+/// Makes the contents of the id file of a pipeline.
+///
+/// A name that ends in `.json` gives a JSON object, because an agent reads JSON
+/// with a parser. Every other name gives `name=id` lines, which a shell reads
+/// with `.` or `source`.
+fn pipeline_id_file(
+    path: &std::path::Path,
+    group: uuid::Uuid,
+    group_name: &str,
+    jobs: &[(String, uuid::Uuid)],
+) -> Result<String> {
+    let json = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if json {
+        let stages: serde_json::Map<String, serde_json::Value> = jobs
+            .iter()
+            .map(|(name, id)| (name.clone(), serde_json::Value::from(id.to_string())))
+            .collect();
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "group": group.to_string(),
+            "group_name": group_name,
+            "jobs": stages,
+        }))?);
+    }
+
+    let mut text = format!("group={group}\n");
+    for (name, id) in jobs {
+        // A shell reads a name with a dash as a command, so change those
+        // characters. The original name stays in the JSON form.
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        text.push_str(&format!("{safe}={id}\n"));
+    }
+    Ok(text)
 }

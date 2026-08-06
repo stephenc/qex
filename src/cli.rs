@@ -143,6 +143,13 @@ pub struct SubmitArgs {
     #[arg(long = "job", value_name = "FILE")]
     pub job_file: Option<PathBuf>,
 
+    /// Write the job id to this file as well as to stdout.
+    ///
+    /// A shell variable does not last, and an agent frequently needs the id in
+    /// a later command. A file holds it.
+    #[arg(long, value_name = "FILE")]
+    pub id_file: Option<PathBuf>,
+
     /// The command to run. Write it after `--`.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
@@ -156,6 +163,14 @@ pub struct PipelineArgs {
     /// A name for this pipeline, to show in `qex list`.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Write the ids to this file as well as to stdout.
+    ///
+    /// A name that ends in `.json` gives a JSON object. Every other name gives
+    /// one `name=id` line for each stage, with `group=` first, so a shell can
+    /// read the file with `.` or `source`.
+    #[arg(long, value_name = "FILE")]
+    pub id_file: Option<PathBuf>,
 
     /// Write the ids as JSON.
     #[arg(long)]

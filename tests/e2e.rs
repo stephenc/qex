@@ -1804,6 +1804,75 @@ fn a_closed_pipe_does_not_give_a_panic() {
     assert!(!err.contains("Broken pipe"), "got: {err}");
 }
 
+/// `--id-file` must hold the id, because a shell variable does not last
+/// between the commands of an agent.
+#[test]
+fn the_id_file_holds_the_id() {
+    let h = Harness::with_default_config("idfile");
+    let file = h.root.join("job.id");
+
+    let id = h.submit(&[
+        "submit",
+        "--id-file",
+        file.to_str().unwrap(),
+        "--",
+        "true",
+    ]);
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(written.trim(), id, "the file must hold the id");
+
+    // The id in the file must work in a later command.
+    h.ok(&["wait", written.trim(), "--timeout", "45s"]);
+}
+
+/// The id file of a pipeline must hold every stage, in a form that a shell
+/// reads and in a form that a parser reads.
+#[test]
+fn the_id_file_of_a_pipeline_holds_every_stage() {
+    let h = Harness::with_default_config("pipeidfile");
+
+    let pipeline = h.root.join("ci.toml");
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"build\"\ncommand = [\"true\"]\n\n\
+         [[jobs]]\nname = \"test\"\ncommand = [\"true\"]\nneeds = [\"build\"]\n",
+    )
+    .unwrap();
+
+    // The shell form.
+    let env_file = h.root.join("ids.env");
+    let group = h.ok(&[
+        "pipeline",
+        pipeline.to_str().unwrap(),
+        "--id-file",
+        env_file.to_str().unwrap(),
+    ]);
+    let text = std::fs::read_to_string(&env_file).unwrap();
+    assert!(text.contains(&format!("group={group}")), "got: {text}");
+    assert!(text.contains("build="), "the build stage is missing: {text}");
+    assert!(text.contains("test="), "the test stage is missing: {text}");
+
+    // Every value must be a job that exists.
+    for line in text.lines() {
+        let (_, id) = line.split_once('=').unwrap();
+        assert!(id.parse::<uuid::Uuid>().is_ok(), "not an id: {line}");
+    }
+
+    // The JSON form.
+    let json_file = h.root.join("ids.json");
+    h.ok(&[
+        "pipeline",
+        pipeline.to_str().unwrap(),
+        "--id-file",
+        json_file.to_str().unwrap(),
+    ]);
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_file).unwrap()).unwrap();
+    assert!(v["group"].as_str().is_some());
+    assert!(v["jobs"]["build"].as_str().is_some());
+    assert!(v["jobs"]["test"].as_str().is_some());
+}
+
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,
 /// and a test harness gives a long path.
 #[test]
