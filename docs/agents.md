@@ -21,13 +21,25 @@ qex logs $ID
 `qex submit` writes the id to stdout and writes nothing else, so `ID=$(qex
 submit ...)` is correct. A warning goes to stderr.
 
-For work that you wait for now, put `qex run` in front of the command instead:
+For work that is **short and heavy** and that you wait for now — a test suite, a
+release build, a data conversion — put `qex run` in front instead:
 
 ```sh
 qex run -- make test
 ```
 
-The output arrives as it happens, and the exit code is the exit code of the job.
+The job goes in the queue, so the other people and agents on the machine keep
+the capacity they claimed. The output arrives as it happens, and the exit code
+is the exit code of the job.
+
+**What you give up.** `qex run` ties the job to that command: Ctrl-C stops the
+job, and if somebody stops your session the job stops with it. That is right for
+work you are waiting for and wrong for work that outlives your attention.
+
+| | |
+| --- | --- |
+| short, and you wait for it now | `qex run -- ...` |
+| long, or you come back to it | `qex submit`, then `qex status <id> --wait` |
 
 ## Your session can stop, and the work continues
 

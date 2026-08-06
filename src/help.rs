@@ -122,19 +122,30 @@ process and the processes that started it before it reports anything, so it
 never finds itself. A user who looked for this fault with `pgrep -f pgrep` found
 the search, and that was the fourth time in one day that the fault appeared.
 
-The shortest way: put `qex run` in front
-----------------------------------------
+When to use `qex run`
+---------------------
 
     qex run -- make test
 
-That command goes in the queue, and this command waits here for it. The output
-arrives as it happens, on the same two streams, and the exit code is the exit
-code of the job. Nothing else in your script changes.
+Use `qex run` for work that is SHORT AND HEAVY and that you wait for now: a test
+suite, a release build, a data conversion. The job goes in the queue, so it
+starts when the machine has room, and the other people and agents on this
+machine keep the capacity that they claimed. The output arrives as it happens,
+on the same two streams, and the exit code is the exit code of the job. Nothing
+else in your script changes.
 
-Use `qex run` for the work that you wait for now. Use `qex submit` for the work
-that you come back to later.
+WHAT YOU GIVE UP. `qex run` ties the job to this command:
 
-Ctrl-C stops the job, and not this command only.
+    Ctrl-C stops the job, and not this command only.
+    Somebody stops your session, and the job stops with it.
+
+That is correct for work that you are waiting for, and it is WRONG for work that
+lives longer than your attention. `qex submit` gives the job a life of its own:
+it continues when your session stops, and a later session reaches it with the
+id.
+
+    short, and you wait for it now    ->  qex run -- ...
+    long, or you come back to it      ->  qex submit, then qex status <id> --wait
 
 The three commands you need
 ---------------------------
