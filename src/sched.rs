@@ -65,6 +65,32 @@ enum Admit {
     No(String),
 }
 
+/// Tests if a lock of this job is held by a job that operates.
+///
+/// A resource claim cannot express this need. Two builds in one directory need
+/// the same quantity of memory as one build, and they still destroy each
+/// other's files. Two servers need one port, whatever their size.
+fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String> {
+    if spec.locks.is_empty() {
+        return None;
+    }
+    for job in state.jobs.values() {
+        if !job.status.state.is_active() {
+            continue;
+        }
+        for name in &spec.locks {
+            if job.spec.locks.contains(name) {
+                return Some(format!(
+                    "waits for the lock `{name}`, which the job {} ({}) holds",
+                    &job.status.id.to_string()[..8],
+                    job.status.name
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Tests if a job can start now.
 fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
@@ -354,10 +380,21 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     }
 
     // Pass 2: choose one job from the jobs that have no dependency left.
+    //
+    // The scheduler starts one job for each call, so a lock that this pass gives
+    // away cannot be given again: the next call sees the job as active.
     for id in ready.iter().copied() {
         let Some(job) = state.jobs.get(&id) else {
             continue;
         };
+
+        // A lock comes before the capacity. A job that waits for a lock does
+        // not hold capacity, in the same way as a job that waits for a
+        // different job, so the loop continues to the next job.
+        if let Some(reason) = lock_conflict(state, &job.spec) {
+            reasons.push((id, Some(reason)));
+            continue;
+        }
 
         match size_check(&cfg, &job.spec) {
             Size::Fits => match admit(&cfg, &job.spec, cpu_used, mem_used) {
@@ -594,6 +631,8 @@ mod tests {
             claim_source: "explicit".into(),
             group: None,
             group_name: None,
+            locks: vec![],
+            retries: 0,
             needs: vec![],
             after: vec![],
             submitted_at: 0,

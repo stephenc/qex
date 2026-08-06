@@ -179,10 +179,22 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 
     // The output of a job holds secrets as frequently as its environment, so
     // these files use the same mode as the job specification.
-    let stdout = create_private(&dir.join("stdout.log"))
+    //
+    // A second attempt adds to the file and does not replace it. The output of
+    // the attempt that failed is the reason for the retry, and a reader needs
+    // it. A mark separates the attempts.
+    let again = status.attempts > 0;
+    let stdout = create_private(&dir.join("stdout.log"), again)
         .context("opening the standard output file of the job")?;
-    let stderr = create_private(&dir.join("stderr.log"))
+    let stderr = create_private(&dir.join("stderr.log"), again)
         .context("opening the standard error file of the job")?;
+
+    if again {
+        use std::io::Write;
+        let mark = format!("\n--- attempt {} ---\n", status.attempts + 1);
+        (&stdout).write_all(mark.as_bytes()).ok();
+        (&stderr).write_all(mark.as_bytes()).ok();
+    }
 
     let mut cmd = std::process::Command::new(&spec.command[0]);
     cmd.args(&spec.command[1..])
@@ -291,6 +303,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // process id, so it writes the correct value and no race is possible.
     status.supervisor_pid = Some(std::process::id() as i32);
     status.started_at = Some(sys::now_secs());
+    status.attempts += 1;
     job::write_status(&dir, &status)?;
 
     // The job and the timer race each other. This value records the winner.
@@ -396,6 +409,33 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     status.pid = Some(pid);
     job::write_status(&dir, &status)?;
 
+    // Run the job again when it failed and a retry is left.
+    //
+    // The job keeps one id and one record, so `qex wait` gives the final result
+    // and an agent needs no extra command. A new job for each attempt would
+    // give the agent an id that answers only for one attempt.
+    if status.state == JobState::Failed && status.retries_left > 0 {
+        status.retries_left -= 1;
+        status.state = JobState::Queued;
+        status.error = Some(format!(
+            "attempt {} failed with the exit code {}; qex starts the job again",
+            status.attempts,
+            code.unwrap_or(-1)
+        ));
+        status.pid = None;
+        status.finished_at = None;
+        job::write_status(&dir, &status)?;
+
+        log(&format!(
+            "job {id} failed and starts again; {} attempt(s) left",
+            status.retries_left
+        ));
+        // Give the machine a moment. A task that fails at once, such as a
+        // network that is not ready, needs the time more than the CPU.
+        std::thread::sleep(Duration::from_secs(1));
+        return main(id);
+    }
+
     // Keep the measurement, so the next job of this command gets an accurate
     // claim with no effort from the agent.
     crate::usage::record(&spec, &status);
@@ -407,12 +447,13 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 ///
 /// The output of a job frequently holds a token or a password, in the same way
 /// as its environment.
-fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+fn create_private(path: &std::path::Path, append: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(!append)
+        .append(append)
         .mode(0o600)
         .open(path)
 }
@@ -533,6 +574,8 @@ mod tests {
             claim_source: "explicit".into(),
             group: None,
             group_name: None,
+            locks: vec![],
+            retries: 0,
             needs: vec![],
             after: vec![],
             submitted_at: 0,

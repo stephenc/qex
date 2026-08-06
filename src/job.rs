@@ -189,6 +189,18 @@ pub struct JobStatus {
     /// important.
     #[serde(default)]
     pub after: Vec<uuid::Uuid>,
+    /// The locks that this job holds while it operates.
+    #[serde(default)]
+    pub locks: Vec<String>,
+    /// The number of times that qex started this job.
+    ///
+    /// The value is more than 1 when the job failed and `--retries` let qex
+    /// start it again.
+    #[serde(default)]
+    pub attempts: u32,
+    /// The number of times that qex may still start this job again.
+    #[serde(default)]
+    pub retries_left: u32,
     /// The job that caused this job to stop, for a job in the state `skipped`.
     ///
     /// This value names the first job that failed, and not the job before this
@@ -228,6 +240,9 @@ impl JobStatus {
             error: None,
             needs: spec.needs.clone(),
             after: spec.after.clone(),
+            locks: spec.locks.clone(),
+            attempts: 0,
+            retries_left: spec.retries,
             caused_by: None,
             tags: spec.tags.clone(),
         }

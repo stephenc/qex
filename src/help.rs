@@ -107,6 +107,20 @@ process and the processes that started it before it reports anything, so it
 never finds itself. A user who looked for this fault with `pgrep -f pgrep` found
 the search, and that was the fourth time in one day that the fault appeared.
 
+The shortest way: put `qex run` in front
+----------------------------------------
+
+    qex run -- make test
+
+That command goes in the queue, and this command waits here for it. The output
+arrives as it happens, on the same two streams, and the exit code is the exit
+code of the job. Nothing else in your script changes.
+
+Use `qex run` for the work that you wait for now. Use `qex submit` for the work
+that you come back to later.
+
+Ctrl-C stops the job, and not this command only.
+
 The three commands you need
 ---------------------------
 
@@ -311,6 +325,25 @@ your stage would start immediately and wait for nothing. qex refuses a name in
 that case and tells you what happened.
 
 Use an id in a script. Use a name when you type a command yourself.
+
+Other useful options
+--------------------
+
+    --retries 3        run the job again when it fails, up to 3 times.
+                       The job keeps one id and one record, and the log holds
+                       every attempt. Use it for a fault outside the task,
+                       such as a network that is not ready.
+
+    --lock NAME        two jobs with one lock name never operate together.
+                       Use it for work that shares something that a claim
+                       cannot express: a build directory, a port, a database.
+                       `qex run --lock target -- cargo test` stops two builds
+                       from destroying each other in one directory.
+
+    --id-file FILE     write the job id to a file as well as to stdout.
+
+    qex wait A B --any   give control back when the FIRST job stops.
+    qex rerun <id>       submit the same job again, with a new id.
 
 Other commands
 --------------
@@ -724,7 +757,9 @@ pub const PIPELINE: &str = "\
 qex pipelines
 =============
 
-A pipeline file describes several stages, and one command submits them all:
+A pipeline file describes several jobs, and one command submits them all. The
+key in the file is `[[jobs]]`, and each entry becomes a qex job with its own id,
+its own record and its own log file. This text says `job` for that reason.
 
     qex pipeline ci.toml
 
@@ -757,14 +792,14 @@ so `GROUP=$(qex pipeline ci.toml)` operates.
     command = [\"./clean.sh\"]
     after = [\"ship\"]
 
-Each stage takes every field of a job file: `cwd`, `env`, `timeout`, `tags`,
+Each job in the file takes every field of a job file: `cwd`, `env`, `timeout`, `tags`,
 `priority`, `env_capture` and `[resources]`.
 
 Why a pipeline file, and not several submissions
 ------------------------------------------------
 
 A name is easy to write, and a name is not unique in time. If you run the same
-four stages twice with `qex submit --needs build`, that name gives two jobs.
+four jobs twice with `qex submit --needs build`, that name gives two jobs.
 
 The names in a pipeline file belong to that file and to that one submission.
 qex changes each one into the id that it made a moment before, and no name
@@ -774,7 +809,7 @@ the two runs never meet.
 One command for the whole pipeline
 ----------------------------------
 
-Every stage of one submission shares a group id:
+Every job of one submission shares a group id:
 
     GROUP=$(qex pipeline ci.toml)
     qex list --group $GROUP
@@ -787,8 +822,8 @@ Use `--id-file` to keep every id in a file:
 
 A name that ends in `.json` gives a JSON object instead, for a parser.
 
-qex reads the whole file before it submits anything. A circle of stages, a name
-that no stage has, and a stage with no command each give an error, and no job
+qex reads the whole file before it submits anything. A circle of jobs, a name
+that no job has, and a job with no command each give an error, and no job
 starts.
 
 ";

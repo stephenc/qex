@@ -1,5 +1,9 @@
-//! This module reads a file that describes several stages, and submits them
+//! This module reads a file that describes several jobs, and submits them
 //! together.
+//!
+//! The key in the file is `[[jobs]]`, and each entry becomes a qex job with its
+//! own id, its own record and its own log file. This module says `job` for that
+//! reason, and not `stage`.
 //!
 //! # Why a pipeline file, and not several submissions
 //!
@@ -27,14 +31,14 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct PipelineFile {
     /// A name for the whole pipeline, for `qex list` to show.
     pub name: Option<String>,
-    /// The stages. Each one is a job file with a name.
+    /// The jobs. Each one is a job file with a name.
     pub jobs: Vec<Stage>,
 }
 
-/// One stage of a pipeline.
+/// One job of a pipeline.
 ///
-/// A stage holds every field of a job file, and its name is necessary. The
-/// other stages use that name.
+/// It holds every field of a job file, and its name is necessary, because the
+/// other jobs of the file use that name.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Stage {
@@ -50,6 +54,10 @@ pub struct Stage {
     pub needs: Vec<String>,
     /// The stages that must stop before this one, whatever their result.
     pub after: Vec<String>,
+    /// The locks that this stage holds while it operates.
+    pub locks: Vec<String>,
+    /// The number of times to run this stage again when it fails.
+    pub retries: Option<u32>,
     pub resources: crate::spec::Resources,
     pub env: BTreeMap<String, String>,
 }
@@ -77,30 +85,30 @@ impl PipelineFile {
     /// Tests the file for the faults that a person makes.
     pub fn validate(&self) -> Result<()> {
         if self.jobs.is_empty() {
-            bail!("this pipeline file has no stage. Add a `[[jobs]]` section.");
+            bail!("this pipeline file has no job. Add a `[[jobs]]` section.");
         }
 
         let mut seen = BTreeSet::new();
         for stage in &self.jobs {
             if stage.name.trim().is_empty() {
-                bail!("each stage needs a name, because the other stages use it");
+                bail!("each job needs a name, because the other jobs of the file use it");
             }
             if stage.name.parse::<uuid::Uuid>().is_ok() {
                 bail!(
-                    "the stage name `{}` has the form of a job id. Use a name that a person \
+                    "the job name `{}` has the form of a job id. Use a name that a person \
                      can read, such as `build`.",
                     stage.name
                 );
             }
             if !seen.insert(stage.name.clone()) {
                 bail!(
-                    "two stages have the name `{}`. Each name in a pipeline must be \
-                     different, because the other stages use it.",
+                    "two jobs have the name `{}`. Each name in a pipeline must be \
+                     different, because the other jobs of the file use it.",
                     stage.name
                 );
             }
             if stage.command.is_empty() {
-                bail!("the stage `{}` has no command", stage.name);
+                bail!("the job `{}` has no command", stage.name);
             }
         }
 
@@ -109,9 +117,9 @@ impl PipelineFile {
             for dep in stage.needs.iter().chain(stage.after.iter()) {
                 if !seen.contains(dep) {
                     bail!(
-                        "the stage `{}` waits for `{dep}`, and this file has no stage with \
-                         that name. A stage can wait for the stages of its own file only.\n\n\
-                         The stages of this file are: {}",
+                        "the job `{}` waits for `{dep}`, and this file has no job with \
+                         that name. A job can wait for the jobs of its own file only.\n\n\
+                         The jobs of this file are: {}",
                         stage.name,
                         self.jobs
                             .iter()
@@ -170,8 +178,8 @@ impl PipelineFile {
                 .collect();
             names.push(self.jobs[at].name.as_str());
             bail!(
-                "the stages make a circle: {}. A stage cannot wait for itself, and no \
-                 stage can start.",
+                "the jobs make a circle: {}. A job cannot wait for itself, and no \
+                 job of this circle can start.",
                 names.join(" -> ")
             );
         }
@@ -231,6 +239,8 @@ pub fn stage_spec(
         // The caller resolves these names inside the file.
         needs: Vec::new(),
         after: Vec::new(),
+        locks: stage.locks.clone(),
+        retries: stage.retries,
         resources: stage.resources.clone(),
         env: stage.env.clone(),
     };
@@ -357,7 +367,7 @@ needs = ["build"]
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("no stage with that name"), "got: {err}");
+        assert!(err.contains("no job with that name"), "got: {err}");
         assert!(err.contains("test"), "the error must list the stages: {err}");
     }
 
@@ -376,7 +386,7 @@ command = ["false"]
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("two stages"), "got: {err}");
+        assert!(err.contains("two jobs have the name"), "got: {err}");
     }
 
     #[test]
@@ -392,7 +402,7 @@ command = ["false"]
         assert!(file("")
             .unwrap_err()
             .to_string()
-            .contains("no stage"));
+            .contains("no job"));
     }
 
     /// A stage name with the form of an id would break the rule that qex uses

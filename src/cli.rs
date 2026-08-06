@@ -28,6 +28,13 @@ pub enum Command {
     /// Put a job in the queue. Writes the job id to stdout.
     Submit(SubmitArgs),
 
+    /// Run a command through the queue, and wait for it here.
+    ///
+    /// This command writes the output of the job as it arrives, and it exits
+    /// with the exit code of the job. Put `qex run` before any command to give
+    /// that command a place in the queue.
+    Run(RunArgs),
+
     /// Submit several stages from one file, as a pipeline.
     Pipeline(PipelineArgs),
 
@@ -48,6 +55,9 @@ pub enum Command {
 
     /// Remove a job from the queue before it starts.
     Cancel(CancelArgs),
+
+    /// Submit the same job again, with the same command and claim.
+    Rerun(RerunArgs),
 
     /// Delete the records of the jobs that stopped.
     Clean(CleanArgs),
@@ -143,6 +153,22 @@ pub struct SubmitArgs {
     #[arg(long = "job", value_name = "FILE")]
     pub job_file: Option<PathBuf>,
 
+    /// Run the job again when it fails, up to N times.
+    ///
+    /// Use this option for a task that fails sometimes for a reason that is not
+    /// in the task, such as a network that is not ready. The job keeps one id
+    /// and one record, and its status counts the attempts.
+    #[arg(long, value_name = "N")]
+    pub retries: Option<u32>,
+
+    /// Hold this lock while the job operates. Repeat the option as needed.
+    ///
+    /// Two jobs with one lock name never operate together. Use it for work that
+    /// shares something that a resource claim cannot express: a build directory,
+    /// a port, or a database.
+    #[arg(long = "lock", value_name = "NAME")]
+    pub locks: Vec<String>,
+
     /// Write the job id to this file as well as to stdout.
     ///
     /// A shell variable does not last, and an agent frequently needs the id in
@@ -153,6 +179,16 @@ pub struct SubmitArgs {
     /// The command to run. Write it after `--`.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub submit: SubmitArgs,
+
+    /// Write the id of the job to stderr before the output of the job.
+    #[arg(long)]
+    pub show_id: bool,
 }
 
 #[derive(Debug, Args)]
@@ -241,6 +277,13 @@ pub struct WaitArgs {
     #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
+    /// Give control back when the FIRST job stops, and not when all stop.
+    ///
+    /// Use this option to read a result as soon as it arrives, in place of the
+    /// order of submission.
+    #[arg(long)]
+    pub any: bool,
+
     /// Exit with the exit code of the job.
     #[arg(long)]
     pub passthrough: bool,
@@ -289,6 +332,16 @@ pub struct CancelArgs {
     /// The job ids to remove from the queue.
     #[arg(required = true)]
     pub ids: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RerunArgs {
+    /// The job to run again. Give its id or its name.
+    pub id: String,
+
+    /// Write the id of the new job to this file as well as to stdout.
+    #[arg(long, value_name = "FILE")]
+    pub id_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]

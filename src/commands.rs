@@ -48,6 +48,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         job_file: args.job_file,
         needs: args.needs,
         after: args.after,
+        locks: args.locks,
+        retries: args.retries,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -387,6 +389,20 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     if let Some(e) = &s.error {
         println!("error:     {e}");
     }
+    if s.attempts > 1 || s.retries_left > 0 {
+        println!(
+            "attempts:  {}{}",
+            s.attempts,
+            if s.retries_left > 0 {
+                format!(" ({} retry left)", s.retries_left)
+            } else {
+                String::new()
+            }
+        );
+    }
+    if !s.locks.is_empty() {
+        println!("locks:     {}", s.locks.join(", "));
+    }
     if !s.needs.is_empty() {
         println!(
             "needs:     {}",
@@ -426,6 +442,13 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         None => None,
     };
 
+    // With `--any`, give control back when the FIRST job stops. An agent that
+    // started several jobs can then read a result as soon as it arrives, in
+    // place of the order of submission.
+    if args.any {
+        return wait_for_any(&args, deadline);
+    }
+
     let mut results: Vec<JobStatus> = Vec::new();
     let mut worst = 0i32;
 
@@ -464,6 +487,63 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     }
 
     Ok(worst)
+}
+
+/// Waits until the first job of a set stops.
+///
+/// This function tests each job in turn with a short limit, so no job holds the
+/// wait while a different job is ready. It is the one place where qex polls,
+/// and it polls its own records, which always answer.
+fn wait_for_any(args: &cli::WaitArgs, deadline: Option<Instant>) -> Result<i32> {
+    let mut delay = Duration::from_millis(50);
+
+    loop {
+        for raw in &args.ids {
+            let status = match Client::connect_existing() {
+                Some(mut client) => match resolve_id(&mut client, raw) {
+                    Ok(id) => match client.call(&Request::Status { id })? {
+                        Response::Status { status } => Some(*status),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                },
+                None => find_id_on_disk(raw)?
+                    .and_then(|id| paths::job_dir(&id).ok())
+                    .and_then(|dir| crate::job::read_status(&dir).ok()),
+            };
+
+            let Some(status) = status else {
+                eprintln!("qex: there is no job with the id {raw}");
+                return Ok(EXIT_NO_SUCH_JOB);
+            };
+
+            if status.state.is_terminal() {
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&vec![&status])?);
+                } else {
+                    println!(
+                        "{}: {} — {}",
+                        short_id(&status.id),
+                        status.state,
+                        describe_result(&status)
+                    );
+                }
+                return Ok(exit_code_for(&status, args.passthrough));
+            }
+        }
+
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                if !args.json {
+                    eprintln!("qex: no job stopped before the time limit. They continue.");
+                }
+                return Ok(EXIT_TIMEOUT);
+            }
+        }
+
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_millis(500));
+    }
 }
 
 enum WaitOutcome {
@@ -1285,6 +1365,9 @@ mod tests {
             error: None,
             needs: vec![],
             after: vec![],
+            locks: vec![],
+            attempts: 1,
+            retries_left: 0,
             caused_by: None,
             tags: vec![],
         }
@@ -1562,4 +1645,224 @@ fn pipeline_id_file(
         text.push_str(&format!("{safe}={id}\n"));
     }
     Ok(text)
+}
+
+/// True when the user pressed Ctrl-C during `qex run`.
+static RUN_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_interrupt(_signal: libc::c_int) {
+    // A signal handler may use an atomic store and very little else.
+    RUN_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Runs a command through the queue and waits for it here.
+///
+/// This command exists for one reason: an agent uses the tools that it already
+/// knows. `qex run` goes before an existing command, and the output and the
+/// exit code are the same as before. The command takes a place in the queue, so
+/// it waits when the machine is busy, and it holds a claim while it operates.
+///
+/// A job of `qex run` is a job like any other. It has a record, a log file and
+/// an id, and it continues when this command stops.
+pub fn run(args: cli::RunArgs) -> Result<i32> {
+    let cfg = Config::load()?;
+    cfg.validate()?;
+
+    let env_capture = if args.submit.no_env_capture {
+        Some(EnvCapture::None)
+    } else {
+        args.submit.env_capture
+    };
+
+    let opts = SubmitOptions {
+        name: args.submit.name,
+        cwd: args.submit.cwd,
+        cpu: args.submit.cpu,
+        mem: args.submit.mem,
+        timeout: args.submit.timeout,
+        tags: args.submit.tags,
+        priority: args.submit.priority,
+        env: args.submit.env,
+        env_capture,
+        command: args.submit.command,
+        job_file: args.submit.job_file,
+        needs: args.submit.needs,
+        after: args.submit.after,
+        locks: args.submit.locks,
+        retries: args.submit.retries,
+    };
+
+    let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
+    let mut client = Client::connect()?;
+    warn_if_version_differs(&mut client);
+    spec.needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
+    spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
+
+    let id = match client.call(&Request::Submit {
+        spec: Box::new(spec),
+    })? {
+        Response::Submitted { id, warning } => {
+            if let Some(text) = warning {
+                eprintln!("qex: {text}");
+            }
+            id
+        }
+        other => return report(other),
+    };
+
+    if let Some(path) = &args.submit.id_file {
+        write_id_file(path, &format!("{id}\n"))?;
+    }
+    if args.show_id {
+        eprintln!("qex: job {id}");
+    }
+
+    // Catch Ctrl-C, and stop the job with it.
+    //
+    // Without this, Ctrl-C would stop this command and leave the job in the
+    // queue. A user expects Ctrl-C to stop the work, because `qex run` looks
+    // like the command that it replaces.
+    unsafe {
+        let handler = on_interrupt as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+
+    let dir = paths::job_dir(&id)?;
+    stream_until_done(&mut client, id, &dir)
+}
+
+/// Writes the output of a job as it arrives, until the job stops.
+fn stream_until_done(
+    client: &mut Client,
+    id: uuid::Uuid,
+    dir: &std::path::Path,
+) -> Result<i32> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut handles: Vec<(bool, Option<std::fs::File>)> = vec![(false, None), (true, None)];
+    let mut announced_wait = false;
+
+    loop {
+        if RUN_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("\nqex: stopping the job {id}");
+            client
+                .call(&Request::Kill {
+                    id,
+                    signal: libc::SIGTERM,
+                    grace_secs: 10,
+                })
+                .ok();
+            RUN_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // Open each log file when the supervisor makes it.
+        for (is_err, handle) in handles.iter_mut() {
+            if handle.is_none() {
+                let name = if *is_err { "stderr.log" } else { "stdout.log" };
+                if let Ok(mut f) = std::fs::File::open(dir.join(name)) {
+                    f.seek(SeekFrom::Start(0)).ok();
+                    *handle = Some(f);
+                }
+            }
+        }
+
+        let mut moved = false;
+        for (is_err, handle) in handles.iter_mut() {
+            if let Some(file) = handle {
+                let mut buf = Vec::new();
+                if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                    moved = true;
+                    // Send each stream to the same stream of this command, so
+                    // a pipe and a redirection behave as they did before.
+                    if *is_err {
+                        std::io::stderr().write_all(&buf).ok();
+                        std::io::stderr().flush().ok();
+                    } else {
+                        std::io::stdout().write_all(&buf).ok();
+                        std::io::stdout().flush().ok();
+                    }
+                }
+            }
+        }
+
+        let status = match client.call(&Request::Status { id })? {
+            Response::Status { status } => status,
+            other => return report(other),
+        };
+
+        // Say why nothing happens yet. A user of `qex run` sees no output while
+        // the job waits, and silence with no reason is the fault that qex
+        // removes everywhere else.
+        if !announced_wait && status.state == JobState::Queued {
+            if let Some(reason) = &status.blocked_reason {
+                eprintln!("qex: {reason}");
+                announced_wait = true;
+            }
+        }
+
+        if status.state.is_terminal() && !moved {
+            let code = exit_code_for(&status, true);
+            match status.state {
+                JobState::Completed | JobState::Failed => {}
+                other => eprintln!("qex: the job {other}"),
+            }
+            return Ok(code);
+        }
+
+        std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+/// Submits the same job again, with the same command, environment and claim.
+///
+/// A job that failed for a reason outside itself needs no new command line. The
+/// new job has a new id, and the record of the first job stays, so a reader can
+/// compare the two.
+pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
+    let mut client = Client::connect()?;
+    warn_if_version_differs(&mut client);
+
+    let id = match resolve_id(&mut client, &args.id) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("qex: {e}");
+            return Ok(EXIT_NO_SUCH_JOB);
+        }
+    };
+
+    // Read the specification of the first job. It holds the environment and the
+    // directory of the shell that submitted it, so the new job runs in the same
+    // way as the first.
+    let dir = paths::job_dir(&id)?;
+    let mut spec = crate::job::read_spec(&dir)
+        .with_context(|| format!("reading the specification of the job {id}"))?;
+
+    // A new job needs a new id, and it must not keep the dependencies of the
+    // first job: those jobs have stopped, and a dependency on a job that
+    // succeeded is not correct.
+    spec.id = uuid::Uuid::new_v4();
+    spec.submitted_at = crate::sys::now_secs();
+    spec.needs.clear();
+    spec.after.clear();
+    spec.group = None;
+    spec.group_name = None;
+
+    match client.call(&Request::Submit {
+        spec: Box::new(spec),
+    })? {
+        Response::Submitted { id: new_id, warning } => {
+            if let Some(text) = warning {
+                eprintln!("qex: {text}");
+            }
+            eprintln!("qex: the job {} runs again as {new_id}", &id.to_string()[..8]);
+            if let Some(path) = &args.id_file {
+                write_id_file(path, &format!("{new_id}\n"))?;
+            }
+            println!("{new_id}");
+            Ok(0)
+        }
+        other => report(other),
+    }
 }

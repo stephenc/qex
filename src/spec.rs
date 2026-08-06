@@ -41,6 +41,12 @@ pub struct JobFile {
     ///
     /// Their result is not important. Use this field to control the order only.
     pub after: Vec<String>,
+    /// The locks that this job holds while it operates.
+    ///
+    /// Two jobs with one lock name never operate together.
+    pub locks: Vec<String>,
+    /// The number of times to run this job again when it fails.
+    pub retries: Option<u32>,
     pub resources: Resources,
     pub env: BTreeMap<String, String>,
 }
@@ -117,6 +123,10 @@ pub struct SubmitOptions {
     pub needs: Vec<String>,
     /// The names or ids of the jobs that must stop first.
     pub after: Vec<String>,
+    /// The locks that this job holds while it operates.
+    pub locks: Vec<String>,
+    /// The number of times to run the job again when it fails.
+    pub retries: Option<u32>,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -164,6 +174,16 @@ pub struct JobSpec {
     /// The jobs that must stop before this job starts.
     #[serde(default)]
     pub after: Vec<uuid::Uuid>,
+    /// The locks that this job holds while it operates.
+    ///
+    /// Two jobs with one lock name never operate together. A resource claim
+    /// cannot express this: two builds in one directory need the same
+    /// quantity of memory as one, and they still destroy each other.
+    #[serde(default)]
+    pub locks: Vec<String>,
+    /// The number of times to run the job again when it fails.
+    #[serde(default)]
+    pub retries: u32,
     pub submitted_at: u64,
 }
 
@@ -285,7 +305,7 @@ impl JobSpec {
         // and frequently far too large: a test suite that uses 165MB would hold
         // one half of the budget and stop other work for the length of the run.
         let learned = if cfg.learn.enabled && (asked_cpu.is_none() || asked_mem.is_none()) {
-            crate::usage::suggest(&crate::usage::load(), &command, cfg.learn.margin)
+            crate::usage::suggest(&crate::usage::load(), &cwd, &command, cfg.learn.margin)
         } else {
             None
         };
@@ -379,6 +399,14 @@ impl JobSpec {
             claim_source: source.to_string(),
             group: None,
             group_name: None,
+            locks: {
+                let mut all = file.locks.clone();
+                all.extend(opts.locks.iter().cloned());
+                all.sort();
+                all.dedup();
+                all
+            },
+            retries: opts.retries.or(file.retries).unwrap_or(0),
             // The CLI changes each name into an id after this function, because
             // that step needs the coordinator.
             needs: Vec::new(),

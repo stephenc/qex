@@ -407,6 +407,9 @@ mod tests {
             error: None,
             needs: vec![],
             after: vec![],
+            locks: vec![],
+            attempts: 1,
+            retries_left: 0,
             caused_by: None,
             tags: vec![],
         }

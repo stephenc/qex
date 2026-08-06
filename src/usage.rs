@@ -11,13 +11,19 @@
 //!
 //! # What this module records
 //!
-//! The key is the command, and not the name. A name is for a person to read,
-//! and one program does very different work: `cargo build` and `cargo test`
-//! have the same program name and very different needs.
+//! The key is the directory and the command together, and not the name. A name
+//! is for a person to read, and one program does very different work:
 //!
-//! The record holds a hash of the command, and not the command itself. A
-//! command line can hold a token or a password, and this file must not become a
-//! second place that holds one.
+//! - `cargo build` and `cargo test` have one program name and very different
+//!   needs, so the command must be in the key.
+//! - `cargo test` in a small library and `cargo test` in a large program have
+//!   one command and very different needs, so the directory must be in the key
+//!   as well.
+//!
+//! The record holds a hash of those two values, and never the values
+//! themselves. A command line can hold a token or a password, and a directory
+//! names the work of a user. This file must not become a second place that
+//! holds either.
 //!
 //! # Which jobs qex records
 //!
@@ -75,12 +81,22 @@ pub struct Suggestion {
     pub samples: usize,
 }
 
-/// Gives the key for one command.
+/// Gives the key for one command in one directory.
 ///
-/// The key is a hash, so this file never holds a command line. A command line
-/// can hold a token or a password.
-pub fn key(command: &[String]) -> String {
+/// The key is a hash, so this file never holds a command line or a path. A
+/// command line can hold a token, and a path names the work of a user.
+pub fn key(cwd: &std::path::Path, command: &[String]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
+
+    // The directory comes first. `cargo test` in a small library and the same
+    // command in a large program need very different claims.
+    for byte in cwd.to_string_lossy().as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= 0xfe;
+    hash = hash.wrapping_mul(0x100000001b3);
+
     for part in command {
         for byte in part.as_bytes() {
             hash ^= *byte as u64;
@@ -144,7 +160,10 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
     }
 
     let mut store = load();
-    let entry = store.commands.entry(key(&spec.command)).or_default();
+    let entry = store
+        .commands
+        .entry(key(&spec.cwd, &spec.command))
+        .or_default();
     entry.name = spec.name.clone();
     entry.samples.push(Sample {
         max_rss: status.usage.max_rss,
@@ -174,8 +193,13 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
 /// Gives the claim for a command, from the measurements of the earlier jobs.
 ///
 /// The result is `None` when qex has no measurement for this command.
-pub fn suggest(store: &Store, command: &[String], margin: f64) -> Option<Suggestion> {
-    let entry = store.commands.get(&key(command))?;
+pub fn suggest(
+    store: &Store,
+    cwd: &std::path::Path,
+    command: &[String],
+    margin: f64,
+) -> Option<Suggestion> {
+    let entry = store.commands.get(&key(cwd, command))?;
     if entry.samples.is_empty() {
         return None;
     }
@@ -225,11 +249,15 @@ mod tests {
         }
     }
 
+    fn dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/project")
+    }
+
     fn store_with(command: &[&str], samples: Vec<Sample>) -> Store {
         let cmd: Vec<String> = command.iter().map(|s| s.to_string()).collect();
         let mut store = Store::default();
         store.commands.insert(
-            key(&cmd),
+            key(&dir(), &cmd),
             Entry {
                 name: "test".into(),
                 samples,
@@ -241,7 +269,7 @@ mod tests {
     #[test]
     fn with_no_measurement_there_is_no_claim() {
         let store = Store::default();
-        assert_eq!(suggest(&store, &["cargo".into()], 1.5), None);
+        assert_eq!(suggest(&store, &dir(), &["cargo".into()], 1.5), None);
     }
 
     /// The claim comes from the largest measurement, and not from the average.
@@ -257,7 +285,7 @@ mod tests {
             ],
         );
         let cmd: Vec<String> = vec!["cargo".into(), "test".into()];
-        let s = suggest(&store, &cmd, 1.5).unwrap();
+        let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
         assert_eq!(s.mem, (400 << 20) * 3 / 2, "400MB and one half");
         assert_eq!(s.samples, 3);
     }
@@ -270,12 +298,12 @@ mod tests {
 
         // Two cores for 10 seconds.
         let store = store_with(&["make"], vec![sample(1 << 20, 20.0, 10)]);
-        assert_eq!(suggest(&store, &cmd, 1.0).unwrap().cpu, 2);
+        assert_eq!(suggest(&store, &dir(), &cmd, 1.0).unwrap().cpu, 2);
 
         // A test suite that waits: 1.9 seconds of CPU time in 19 seconds. This
         // is the measurement of the qex test suite itself.
         let store = store_with(&["make"], vec![sample(165 << 20, 1.9, 19)]);
-        let s = suggest(&store, &cmd, 1.5).unwrap();
+        let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
         assert_eq!(s.cpu, 1, "a job that waits needs one core");
         assert!(
             s.mem < (300 << 20),
@@ -290,7 +318,7 @@ mod tests {
     fn a_small_measurement_gives_the_smallest_useful_claim() {
         let cmd: Vec<String> = vec!["true".into()];
         let store = store_with(&["true"], vec![sample(1 << 20, 0.0, 0)]);
-        let s = suggest(&store, &cmd, 1.5).unwrap();
+        let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
         assert_eq!(s.mem, MIN_MEMORY);
         assert_eq!(s.cpu, 1);
     }
@@ -301,12 +329,12 @@ mod tests {
     fn two_commands_have_two_records() {
         let build: Vec<String> = vec!["cargo".into(), "build".into()];
         let test: Vec<String> = vec!["cargo".into(), "test".into()];
-        assert_ne!(key(&build), key(&test));
+        assert_ne!(key(&dir(), &build), key(&dir(), &test));
 
         let store = store_with(&["cargo", "build"], vec![sample(1 << 30, 1.0, 1)]);
-        assert!(suggest(&store, &build, 1.5).is_some());
+        assert!(suggest(&store, &dir(), &build, 1.5).is_some());
         assert!(
-            suggest(&store, &test, 1.5).is_none(),
+            suggest(&store, &dir(), &test, 1.5).is_none(),
             "`cargo test` must not use the record of `cargo build`"
         );
     }
@@ -317,15 +345,42 @@ mod tests {
     fn the_key_separates_the_arguments() {
         let joined: Vec<String> = vec!["a b".into()];
         let split: Vec<String> = vec!["a".into(), "b".into()];
-        assert_ne!(key(&joined), key(&split));
+        assert_ne!(key(&dir(), &joined), key(&dir(), &split));
     }
 
-    /// The key must not hold the command. A command line can hold a token.
+    /// One command in two directories must have two records. `cargo test` in a
+    /// small library and the same command in a large program need very
+    /// different claims.
+    #[test]
+    fn one_command_in_two_directories_has_two_records() {
+        let cmd: Vec<String> = vec!["cargo".into(), "test".into()];
+        let small = std::path::PathBuf::from("/home/me/small-library");
+        let large = std::path::PathBuf::from("/home/me/large-program");
+        assert_ne!(key(&small, &cmd), key(&large, &cmd));
+
+        let mut store = Store::default();
+        store.commands.insert(
+            key(&small, &cmd),
+            Entry {
+                name: "test".into(),
+                samples: vec![sample(100 << 20, 1.0, 10)],
+            },
+        );
+        assert!(suggest(&store, &small, &cmd, 1.5).is_some());
+        assert!(
+            suggest(&store, &large, &cmd, 1.5).is_none(),
+            "a different directory must not use this record"
+        );
+    }
+
+    /// The key must not hold the command or the directory. A command line can
+    /// hold a token, and a directory names the work of a user.
     #[test]
     fn the_key_does_not_hold_the_command() {
         let secret: Vec<String> = vec!["deploy".into(), "--token=SECRET123".into()];
-        let k = key(&secret);
+        let k = key(&dir(), &secret);
         assert!(!k.contains("SECRET"), "the key holds the command: {k}");
+        assert!(!k.contains("project"), "the key holds the directory: {k}");
         assert_eq!(k.len(), 16, "the key is a hash of a fixed length");
     }
 }

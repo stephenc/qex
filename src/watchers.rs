@@ -360,12 +360,13 @@ mod tests {
             "the search reported itself"
         );
 
-        // It must not report anything of its own process group either. The
-        // test program and the shell that started it are in that group.
-        let group = unsafe { libc::getpgid(0) };
-        for w in &found {
-            let其 = unsafe { libc::getpgid(w.pid) };
-            assert_ne!(其, group, "the search reported a process of its own group");
+        // It must not report the processes that started it either. The shell
+        // that runs this test holds the words of the command in its own line.
+        for parent in ancestors_of(me) {
+            assert!(
+                !found.iter().any(|w| w.pid == parent),
+                "the search reported a process that started it"
+            );
         }
     }
 }
