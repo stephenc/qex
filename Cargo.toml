@@ -1,6 +1,6 @@
 [package]
 name = "qex"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Queued EXecutor — a resource-aware local job queue for long-running tasks"
 license = "Apache-2.0"
