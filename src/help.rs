@@ -698,6 +698,11 @@ that qex uses now.
     mem = \"2GB\"           # the default is the machine memory / the core count
     timeout = \"0\"         # the default is no limit
 
+    [hooks]
+    on_stop = []          # the command that qex runs when a job stops
+    on_stop_states = [\"completed\", \"failed\", \"killed\", \"timeout\", \"oom\"]
+    timeout = \"30s\"       # the time limit for that command
+
 Quotation marks around a number
 -------------------------------
 
@@ -710,6 +715,60 @@ The quotation marks do not change WHICH values a field takes. `[budget] cpu`
 takes a percentage, because it gives a part of the machine to all the jobs
 together. `[defaults] cpu` gives the cores for ONE job, so it takes a whole
 number only, and a percentage there gives an error.
+
+A command when a job stops
+--------------------------
+
+`[hooks] on_stop` names a command that qex runs each time a job reaches its
+final state. Use it for a notification: a message on the screen, a line in a
+file, or a message to a chat. A person who left the machine thus learns that
+the job of four hours stopped.
+
+    [hooks]
+    on_stop = [\"notify-send\", \"a qex job stopped\"]
+
+The hook is in the config file only. A job file has no hook field. The hook
+belongs to the machine and to the person at it, and not to the work: the same
+pipeline runs on a laptop with a screen and on a build machine with none.
+
+The value is a program and its arguments. qex starts no shell, in the same way
+as for a job. To use a shell feature, name the shell:
+
+    [hooks]
+    on_stop = [\"bash\", \"-lc\", \"echo \\\"$QEX_JOB_NAME $QEX_STATE\\\" >> ~/qex.log\"]
+
+The job supplies these variables. A variable with no value is empty text.
+
+    QEX_JOB_ID        the job id
+    QEX_JOB_NAME      the job name
+    QEX_STATE         the final state
+    QEX_EXIT_CODE     the exit code, if the job stopped without a signal
+    QEX_SIGNAL        the signal number, if a signal stopped the job
+    QEX_ELAPSED_SECS  the seconds that the job ran
+    QEX_CWD           the directory of the job
+    QEX_JOB_DIR       the directory of the record, which holds the logs
+    QEX_ATTEMPTS      the number of times that qex started the job
+    QEX_MAX_RSS       the maximum memory in bytes
+    QEX_TAGS          the tags, separated by a space
+
+The values arrive in the environment and never in a command line. A job name
+with a shell character is thus a name, and never a command.
+
+`on_stop_states` selects the jobs that give a message. The default list holds
+each state of a job that ran. `cancelled` and `skipped` are not in it: you
+cancelled the job yourself, and one failure in a pipeline of twenty stages
+would give twenty messages. Add those names to get them. For a message on a
+failure only:
+
+    [hooks]
+    on_stop_states = [\"failed\", \"timeout\", \"oom\"]
+
+The hook cannot damage the queue. qex runs it after the final state is on the
+disk, so the job has its result, the budget is free, and the next job starts
+before the hook does anything. qex runs the hook one time for each job. A hook
+that uses more than `[hooks] timeout` receives a signal and stops. A hook that
+fails does not change the job. The output of the hook goes to `hook.log` in the
+directory of the job.
 
 Default job size
 ----------------

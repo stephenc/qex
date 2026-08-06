@@ -268,6 +268,14 @@ impl Harness {
     fn write_config(&self, config: &str) {
         std::fs::write(self.root.join("cfg/qex.toml"), config).unwrap();
     }
+
+    /// Gives the lines that the stop hook of a test wrote.
+    fn hook_lines(&self) -> Vec<String> {
+        match std::fs::read_to_string(self.root.join("hook.txt")) {
+            Ok(text) => text.lines().map(|l| l.trim().to_string()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 impl Drop for Harness {
@@ -3142,6 +3150,148 @@ fn a_follower_that_starts_after_the_limit_still_learns_what_went() {
     assert!(
         notice.contains("from the middle of this stream"),
         "the follower must give the count of the output that went, and it said: {notice}"
+    );
+}
+
+/// A job that stops must run the stop hook one time, and the hook must receive
+/// the result of the job.
+///
+/// One run for each job is the point of this feature. A person who receives the
+/// same notification two times learns to ignore every notification, and the
+/// notification then has no value.
+#[test]
+fn a_job_that_stops_runs_the_stop_hook_one_time_with_its_result() {
+    let h = Harness::with_default_config("hookone");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop = [\"sh\", \"-c\", \
+         \"echo \\\"$QEX_JOB_ID $QEX_STATE $QEX_EXIT_CODE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let id = h.submit(&["submit", "--name", "report", "--", "sh", "-c", "exit 7"]);
+    let out = h.qex(&["wait", &id]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.state_of(&id), "failed");
+
+    // The hook starts after the record says that the job stopped, so `qex wait`
+    // can give its answer first. Wait for the hook itself.
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+
+    let lines = h.hook_lines();
+    assert_eq!(lines.len(), 1, "the hook must run one time: {lines:?}");
+    assert_eq!(
+        lines[0],
+        format!("{id} failed 7 report"),
+        "the hook must receive the id, the state and the exit code"
+    );
+
+    // The job directory holds the record of the run. A second process that
+    // makes this job terminal reads it and does nothing.
+    assert!(h.job_dir(&id).join("hook.ran").exists());
+
+    // Give a second process the time to run the hook again. The count must not
+    // change.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(h.hook_lines().len(), 1, "the hook ran more than one time");
+}
+
+/// A hook that hangs must not hold the job, the queue or the coordinator.
+///
+/// The hook is a command that a user wrote, so it can hang. qex runs it after
+/// the final state is on the disk. The job thus has its result, its claim
+/// leaves the budget, and the next job starts while the hook still hangs.
+#[test]
+fn a_stop_hook_that_hangs_holds_neither_the_job_nor_the_queue() {
+    let h = Harness::with_default_config("hookhang");
+    let mark = h.root.join("hook.txt");
+    // A budget of one core. The second job can start only after the first job
+    // gives its claim back.
+    h.write_config(&format!(
+        "[budget]\ncpu = \"1\"\nmem = \"512MB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\ntimeout = \"2s\"\n\
+         on_stop = [\"sh\", \"-c\", \"echo hanging >> {}; sleep 300\"]\n",
+        mark.display()
+    ));
+
+    let first = h.submit(&["submit", "--cpu", "1", "--mem", "128MB", "--", "true"]);
+    let out = h.qex(&["wait", &first, "--timeout", "30s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a hook that hangs must not hold the job in a state that is not final"
+    );
+    assert_eq!(h.state_of(&first), "completed");
+
+    // Wait until the hook hangs. The test measures nothing before that moment.
+    h.until("the stop hook started", Duration::from_secs(30), || {
+        !h.hook_lines().is_empty()
+    });
+
+    // The coordinator must still answer.
+    let info = h.ok(&["info", "--json"]);
+    assert!(
+        info.contains("\"pid\""),
+        "the coordinator must answer: {info}"
+    );
+
+    // The next job must start and stop while the hook of the first job hangs.
+    let second = h.submit(&["submit", "--cpu", "1", "--mem", "128MB", "--", "true"]);
+    let out = h.qex(&["wait", &second, "--timeout", "30s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a hook that hangs must not delay the next job"
+    );
+    assert_eq!(h.state_of(&second), "completed");
+}
+
+/// The states in the config file select the jobs that give a message, and a job
+/// that the coordinator stops runs the hook as well.
+///
+/// A queue with many jobs and a message for each job is a set of messages that
+/// a person turns off. A job that never ran has no supervisor, so the
+/// coordinator runs its hook.
+#[test]
+fn the_configured_states_select_the_jobs_that_run_the_stop_hook() {
+    let h = Harness::with_default_config("hookstates");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop_states = [\"skipped\"]\n\
+         on_stop = [\"sh\", \"-c\", \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let build = h.submit(&["submit", "--name", "build", "--", "false"]);
+    let test = h.submit(&["submit", "--name", "test", "--needs", &build, "--", "true"]);
+
+    h.qex(&["wait", &build]);
+    h.until("the second job is skipped", Duration::from_secs(30), || {
+        h.state_of(&test) == "skipped"
+    });
+
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+
+    let lines = h.hook_lines();
+    assert_eq!(
+        lines,
+        vec!["skipped test".to_string()],
+        "the filter must select the state `skipped` only"
     );
 }
 

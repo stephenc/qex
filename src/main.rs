@@ -49,6 +49,8 @@ mod help;
 #[cfg(unix)]
 mod history;
 #[cfg(unix)]
+mod hook;
+#[cfg(unix)]
 mod job;
 #[cfg(unix)]
 mod keys;
@@ -736,5 +738,17 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
             )
         }
     );
+    // Show the command itself. A hook that qex runs on each job, and that the
+    // reader forgot, is a program that starts and gives no sign of its cause.
+    match cfg.hooks.on_stop.first() {
+        Some(program) => println!(
+            "stop hook:    {} ({} argument(s)); states {}; limit {}",
+            program,
+            cfg.hooks.on_stop.len() - 1,
+            cfg.hooks.on_stop_states.join(", "),
+            units::format_duration(cfg.hook_timeout()?)
+        ),
+        None => println!("stop hook:    none"),
+    }
     Ok(())
 }

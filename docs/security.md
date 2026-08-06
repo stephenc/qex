@@ -15,6 +15,7 @@ description: What qex writes to the disk, who can read it, and where the trust b
 | `spec.json` | 0600 | the command, the directory, the claims and THE CAPTURED ENVIRONMENT |
 | `status.json` | 0600 | the state, the exit code, the times and the measured use |
 | `stdout.log`, `stderr.log` | 0600 | everything that the job wrote |
+| `hook.log` | 0600 | everything that the stop hook wrote |
 | `~/.config/qex.toml` | your mode | the configuration |
 | `/tmp/qex/u<uid>/` | 0755 | the claims of your coordinator, for the other users |
 
@@ -42,6 +43,24 @@ of `qex status --json` into a log must not write your token into that log.
 **The command line is not hidden.** `qex list` and `qex status` show the program
 and its arguments, and the directory. Put a secret in the environment or in a
 file, and never in an argument.
+
+## The command when a job stops
+
+`[hooks] on_stop` names a command that qex starts each time a job stops. The
+command is in your config file, so it is your command, and qex trusts it in the
+same way as it trusts a job that you submit.
+
+**The data of the job is not yours.** A job name comes from the person or the
+agent that submitted the job, and the output of a job comes from the program.
+qex therefore gives the values of the job to the hook IN THE ENVIRONMENT, and it
+builds no command line from them. A job with the name `; rm -rf ~` gives a hook
+the variable `QEX_JOB_NAME` with those letters in it, and never a command.
+
+qex starts no shell for the hook, in the same way as for a job. A shell that you
+name in `on_stop` reads the variables, and the quotation is then yours to write.
+
+The hook has a time limit, and its output goes to `hook.log` in the job
+directory with mode 0600. A hook that fails changes no job.
 
 ## The several-user accounting
 

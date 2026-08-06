@@ -123,6 +123,10 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
         Err(_) => return,
     };
 
+    // Read the configuration before the lock. The code below holds a borrow of
+    // one job, and it cannot also read the state.
+    let cfg = coord.state.lock().unwrap().cfg.clone();
+
     let mut state = coord.state.lock().unwrap();
     if let Some(job) = state.jobs.get_mut(&id) {
         job.supervisor_pid = None;
@@ -173,6 +177,11 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 let status = job.status.clone();
                 job::write_status(&dir, &status).ok();
                 log(&format!("the supervisor of the job {id} left no result"));
+
+                // The supervisor of this job stopped before it could run the
+                // hook, so the coordinator runs it. The claim file stops a
+                // second run if the supervisor already started one.
+                crate::hook::fire_detached(&cfg, &dir, &status);
             }
         }
     }
@@ -437,6 +446,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             status.error = Some(message);
             status.blocked_reason = None;
             job::write_status(&dir, &status)?;
+            crate::hook::fire(&cfg, &dir, &status);
             return Ok(1);
         }
     };
@@ -718,6 +728,21 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // Keep the measurement, so the next job of this command gets an accurate
     // claim with no effort from the agent.
     crate::usage::record(&spec, &status);
+
+    // Tell the person that the job stopped.
+    //
+    // THE SUPERVISOR RUNS THE HOOK, and it runs it here, at the end.
+    //
+    // The supervisor is the process that knows the result first, and it exists
+    // for each job that ran. The coordinator can stop and start again while a
+    // job runs, so a coordinator that ran the hook would miss the jobs of the
+    // period in which it did not operate.
+    //
+    // The record on the disk already says that the job stopped, so this process
+    // holds nothing now: `qex wait` gives its answer, the budget is free, and
+    // the next job starts. A hook that hangs thus makes this process live
+    // longer and does no other damage.
+    crate::hook::fire(&cfg, &dir, &status);
 
     Ok(code.unwrap_or(0))
 }

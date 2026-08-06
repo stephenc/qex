@@ -762,6 +762,59 @@ impl Default for LearnConfig {
     }
 }
 
+/// Controls the command that qex runs when a job stops.
+///
+/// This hook is in the config file and not on the job. It belongs to the
+/// machine and to the person at it: the same pipeline runs on a laptop with a
+/// desktop alert and on a build machine with no screen.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    /// The program and its arguments. An empty list gives no hook.
+    ///
+    /// This is not a shell command line. qex starts no shell for a job, and it
+    /// starts no shell here. To use a shell feature, name the shell:
+    /// `["bash", "-lc", "notify-send \"qex: $QEX_JOB_NAME\""]`. The values of
+    /// the job arrive in the environment, so a job name with a shell character
+    /// stays a name.
+    pub on_stop: Vec<String>,
+    /// The states that give a notification.
+    ///
+    /// The default is each state of a job that ran. `cancelled` and `skipped`
+    /// are not in the default set: the person cancelled the job, and one
+    /// failure in a pipeline of twenty stages would give twenty messages. Add
+    /// those names to this list to get them.
+    pub on_stop_states: Vec<String>,
+    /// The time limit for the hook.
+    ///
+    /// qex signals the process group of the hook at this limit. A hook with no
+    /// limit could hold a process of qex for ever.
+    pub timeout: String,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            on_stop: Vec::new(),
+            on_stop_states: ["completed", "failed", "killed", "timeout", "oom"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            timeout: "30s".into(),
+        }
+    }
+}
+
+impl HooksConfig {
+    /// Tests if a state gives a notification.
+    pub fn runs_on(&self, state: crate::job::JobState) -> bool {
+        self.on_stop_states
+            .iter()
+            .filter_map(|s| s.parse::<crate::job::JobState>().ok())
+            .any(|s| s == state)
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -778,6 +831,7 @@ pub struct Config {
     pub history: HistoryConfig,
     pub gc: GcConfig,
     pub logs: LogsConfig,
+    pub hooks: HooksConfig,
 }
 
 /// How much of the message about the config file the reader needs.
@@ -1198,6 +1252,15 @@ impl Config {
         Ok(())
     }
 
+    /// Gives the time limit for the stop hook.
+    pub fn hook_timeout(&self) -> Result<std::time::Duration> {
+        units::parse_duration(&self.hooks.timeout)
+            .map_err(|e| anyhow::anyhow!("config [hooks] timeout: {e}"))
+            // A hook with no limit can hold a process of qex for ever, so `0`
+            // gives the default limit and not "no limit".
+            .map(|d| d.unwrap_or(std::time::Duration::from_secs(30)))
+    }
+
     /// Reads each field that the config parser does not read immediately.
     ///
     /// Call this function at start. qex then reports an incorrect config file
@@ -1213,6 +1276,27 @@ impl Config {
         self.default_mem()?;
         self.default_timeout()?;
         self.log_max_bytes()?;
+        self.hook_timeout()?;
+
+        // A state name with a spelling error, or a state that is not final,
+        // would keep the hook silent for the jobs that the user wants. Refuse
+        // the file instead.
+        for name in &self.hooks.on_stop_states {
+            let state = name.parse::<crate::job::JobState>().map_err(|e| {
+                anyhow::anyhow!(
+                    "config [hooks] on_stop_states: {e}. Use the names of the states that a \
+                     job stops in."
+                )
+            })?;
+            if !state.is_terminal() {
+                anyhow::bail!(
+                    "config [hooks] on_stop_states names the state `{state}`. A job does not \
+                     stop in that state, so the hook would never run. Use the final states: \
+                     completed, failed, killed, timeout, oom, cancelled, skipped."
+                );
+            }
+        }
+
         if self.learn.margin < 1.0 {
             anyhow::bail!(
                 "config [learn] margin is {}. Use a value of 1.0 or more. A smaller value \
@@ -1480,7 +1564,12 @@ mod tests {
     #[test]
     fn a_field_that_qex_does_not_know_gives_the_order_of_the_steps() {
         let path = std::path::Path::new("/home/me/.config/qex.toml");
-        let error = toml::from_str::<Config>("[hooks]\non_stop = [\"true\"]\n").unwrap_err();
+        // The section must be one that NO qex knows. This test read `[hooks]`
+        // until qex gained a `[hooks]` section, and the test then failed on a
+        // file that parses. Choose a name that this build refuses, and change
+        // it again when qex takes that name.
+        let error = toml::from_str::<Config>("[telemetry]\nendpoint = \"https://example.invalid\"\n")
+            .unwrap_err();
         let text = config_error(path, error, Detail::Full).to_string();
 
         assert!(
@@ -1547,7 +1636,12 @@ mod tests {
     #[test]
     fn the_record_of_a_job_takes_the_short_message() {
         let path = std::path::Path::new("/home/me/.config/qex.toml");
-        let error = toml::from_str::<Config>("[hooks]\non_stop = [\"true\"]\n").unwrap_err();
+        // The section must be one that NO qex knows. This test read `[hooks]`
+        // until qex gained a `[hooks]` section, and the test then failed on a
+        // file that parses. Choose a name that this build refuses, and change
+        // it again when qex takes that name.
+        let error = toml::from_str::<Config>("[telemetry]\nendpoint = \"https://example.invalid\"\n")
+            .unwrap_err();
         let text = config_error(path, error, Detail::Short).to_string();
 
         assert!(
@@ -1750,6 +1844,11 @@ max_bytes = "64MB"
 cpu = 1
 mem = "1GB"
 timeout = "0"
+
+[hooks]
+on_stop = ["bash", "-lc", "notify-send \"qex $QEX_STATE\" \"$QEX_JOB_NAME\""]
+on_stop_states = ["completed", "failed", "killed", "timeout", "oom"]
+timeout = "30s"
 "#;
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();
@@ -1883,6 +1982,57 @@ timeout = "0"
     fn overcommit_below_one_is_rejected() {
         let c: Config = toml::from_str("[enforce]\nmem_overcommit = 0.5\n").unwrap();
         assert!(c.validate().is_err());
+    }
+
+    /// With no `[hooks]` section there is no hook, and no job starts a program
+    /// that the user did not ask for.
+    #[test]
+    fn there_is_no_stop_hook_by_default() {
+        let c = Config::default();
+        assert!(c.hooks.on_stop.is_empty());
+        assert_eq!(
+            c.hook_timeout().unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    /// The default filter covers the jobs that ran. A pipeline of twenty stages
+    /// that stops at stage one must not give twenty messages, so `skipped` and
+    /// `cancelled` need a word from the user.
+    #[test]
+    fn the_default_filter_covers_the_jobs_that_ran() {
+        use crate::job::JobState;
+        let c = Config::default();
+        for state in [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Killed,
+            JobState::Timeout,
+            JobState::Oom,
+        ] {
+            assert!(c.hooks.runs_on(state), "{state} must notify by default");
+        }
+        assert!(!c.hooks.runs_on(JobState::Skipped));
+        assert!(!c.hooks.runs_on(JobState::Cancelled));
+        assert!(!c.hooks.runs_on(JobState::Running));
+    }
+
+    /// A state name with a spelling error must give an error. Without this
+    /// test, the user waits for a notification that cannot arrive.
+    #[test]
+    fn a_hook_state_that_qex_does_not_know_is_rejected() {
+        let c: Config =
+            toml::from_str("[hooks]\non_stop = [\"true\"]\non_stop_states = [\"faild\"]\n")
+                .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("on_stop_states"), "got: {err}");
+
+        // `running` is not a final state, so a hook on it would never run.
+        let c: Config =
+            toml::from_str("[hooks]\non_stop = [\"true\"]\non_stop_states = [\"running\"]\n")
+                .unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("never run"), "got: {err}");
     }
 
     #[test]
