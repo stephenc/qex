@@ -5141,3 +5141,40 @@ fn check_the_bash_candidates(
         bait.display()
     );
 }
+
+/// A job must give way to the work of a person.
+///
+/// The queue controls how many cores a job uses. It does not control how rudely
+/// the job uses them, and a build inside its budget still makes an editor
+/// stutter. qex knows what the scheduler of the machine does not: this work sat
+/// in a queue, so nobody waits for the next second of it.
+#[test]
+fn a_job_gives_way_to_the_work_of_a_person() {
+    let h = Harness::with_default_config("polite");
+
+    // `ps` reports the nice value on Linux and on macOS alike.
+    let id = h.submit(&["submit", "--", "sh", "-c", "ps -o ni= -p $$"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "10",
+        "a job must be polite by default, and this one was not: {out}"
+    );
+
+    // A job that must not give way says so.
+    let id = h.submit(&["submit", "--nice", "0", "--", "sh", "-c", "ps -o ni= -p $$"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(out.trim(), "0", "`--nice 0` must reach the job: {out}");
+
+    // A machine that refuses the change must still run the job. A number below
+    // zero needs privilege, and qex does not ask for it.
+    let id = h.submit(&["submit", "--nice", "-5", "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    assert_eq!(
+        h.status_json(&id)["state"],
+        "completed",
+        "a nice value that the machine refuses must not stop the job"
+    );
+}

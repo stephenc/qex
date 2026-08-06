@@ -47,6 +47,11 @@ pub struct JobFile {
     pub locks: Vec<String>,
     /// The number of times to run this job again when it fails.
     pub retries: Option<u32>,
+    /// How politely this job uses the processor, from -20 to 19.
+    ///
+    /// A larger number gives way to everything else. The default comes from
+    /// `[politeness] nice` in the configuration.
+    pub nice: Option<i32>,
     pub resources: Resources,
     pub env: BTreeMap<String, String>,
 }
@@ -128,6 +133,8 @@ pub struct SubmitOptions {
     pub locks: Vec<String>,
     /// The number of times to run the job again when it fails.
     pub retries: Option<u32>,
+    /// How politely this job uses the processor.
+    pub nice: Option<i32>,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -185,6 +192,9 @@ pub struct JobSpec {
     /// The number of times to run the job again when it fails.
     #[serde(default)]
     pub retries: u32,
+    /// How politely this job uses the processor. See `[politeness] nice`.
+    #[serde(default)]
+    pub nice: Option<i32>,
     pub submitted_at: u64,
 }
 
@@ -412,6 +422,7 @@ impl JobSpec {
                     all
                 },
                 retries: opts.retries.or(file.retries).unwrap_or(0),
+                nice: opts.nice.or(file.nice),
                 // The CLI changes each name into an id after this function, because
                 // that step needs the coordinator.
                 needs: Vec::new(),

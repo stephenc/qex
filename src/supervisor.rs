@@ -322,16 +322,9 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         .env_clear()
         .envs(&spec.env);
 
-    unsafe {
-        cmd.pre_exec(|| {
-            // A new process group. `qex kill` then signals every process of the
-            // job with one call to `killpg`.
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // The new process group goes in the SAME `pre_exec` as the politeness of
+    // the job, below. That call needs the configuration, which this function
+    // reads above, so one closure does both and the job forks once.
 
     // Apply the memory limit before the job starts.
     //
@@ -381,6 +374,28 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         status.error = Some(fault.clone());
     }
     let _ = &cgroup_dir;
+
+    // How politely this job uses the machine. See `PolitenessConfig`.
+    let nice = spec.nice.unwrap_or(cfg.politeness.nice);
+    let io_class = cfg.politeness.io.clone();
+    let oom_adj = cfg.politeness.oom_score_adj;
+
+    unsafe {
+        cmd.pre_exec(move || {
+            // A new process group. `qex kill` then signals every process of the
+            // job with one call to `killpg`.
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // The steps below make the job give way. NOT ONE OF THEM CAN STOP
+            // THE JOB: a machine that refuses them gives a job that runs at the
+            // usual priority, which is what qex did before. A failure here must
+            // never take the work away from the user.
+            apply_politeness(nice, &io_class, oom_adj);
+            Ok(())
+        });
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -788,6 +803,108 @@ const RACE_JOB: u8 = 1;
 /// The timer fired first, so the job reached its time limit.
 const RACE_TIMER: u8 = 2;
 
+/// Makes a job give way to the work of a person.
+///
+/// This function operates in the child, between the fork and the exec. It must
+/// therefore call the system only: no allocation, and no lock. Each step gives
+/// up in silence, because a job that runs at the usual priority is the
+/// behaviour that qex had before, and it is far better than no job at all.
+fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
+    // The processor. A larger number gives way to everything else.
+    //
+    // A user cannot ask for a number below zero without privilege, and this
+    // code does not try: the call fails and the job continues.
+    if nice != 0 {
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+        }
+    }
+
+    // The disk, on Linux. A build that reads the whole source tree makes an
+    // editor wait for its own file without this.
+    #[cfg(target_os = "linux")]
+    {
+        // From <linux/ioprio.h>. The class is in the top three bits.
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+        const CLASS_BEST_EFFORT: libc::c_int = 2;
+        const CLASS_IDLE: libc::c_int = 3;
+
+        let value = match io_class {
+            // The middle level of the class, which is the level that a process
+            // receives by default.
+            "best-effort" => Some((CLASS_BEST_EFFORT << IOPRIO_CLASS_SHIFT) | 4),
+            "idle" => Some(CLASS_IDLE << IOPRIO_CLASS_SHIFT),
+            _ => None,
+        };
+        if let Some(value) = value {
+            unsafe {
+                libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, value);
+            }
+        }
+
+        // The out-of-memory score. A background job should lose that
+        // competition before an editor that holds an hour of work.
+        //
+        // This writes a file, and a write in a child between the fork and the
+        // exec must not allocate. `write` on a fixed buffer is safe here.
+        if oom_score_adj != 0 {
+            write_oom_score(oom_score_adj);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS has no equivalent of either, and `nice` above covers the
+        // processor. The values are read and ignored, which the configuration
+        // says.
+        let _ = (io_class, oom_score_adj);
+    }
+}
+
+/// Writes the out-of-memory score of this process.
+///
+/// This operates between the fork and the exec, so it uses the system calls
+/// only and it allocates nothing.
+#[cfg(target_os = "linux")]
+fn write_oom_score(value: i32) {
+    // The largest value is 1000 and the smallest is -1000, so five characters
+    // and a sign are sufficient.
+    let mut buf = [0u8; 8];
+    let mut n = 0;
+    let negative = value < 0;
+    let mut v = value.unsigned_abs();
+    if v == 0 {
+        buf[n] = b'0';
+        n += 1;
+    }
+    let start = n;
+    while v > 0 {
+        buf[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    buf[start..n].reverse();
+
+    let mut out = [0u8; 9];
+    let mut len = 0;
+    if negative {
+        out[0] = b'-';
+        len = 1;
+    }
+    out[len..len + n].copy_from_slice(&buf[..n]);
+    len += n;
+
+    unsafe {
+        let path = c"/proc/self/oom_score_adj";
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, out.as_ptr() as *const libc::c_void, len);
+            libc::close(fd);
+        }
+    }
+}
+
 /// Gives the last words of the supervisor of a job.
 ///
 /// The supervisor writes its faults to `supervisor.log`, and a supervisor that
@@ -1139,6 +1256,7 @@ mod tests {
             group_name: None,
             locks: vec![],
             retries: 0,
+            nice: None,
             needs: vec![],
             after: vec![],
             submitted_at: 0,

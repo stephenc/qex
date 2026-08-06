@@ -655,6 +655,11 @@ that qex uses now.
     oversized = \"run-when-idle\"   # run-when-idle, reject or queue
     settle = \"3s\"
 
+    [politeness]
+    nice = 10             # -20 to 19; a larger number gives way
+    io = \"none\"           # none, best-effort or idle (Linux)
+    oom_score_adj = 0     # a larger number offers the job to the OOM killer
+
     [submit]
     env_capture = \"all\"           # all, minimal or none
     minimal_env = [\"PATH\", \"HOME\", \"USER\", \"LOGNAME\", \"SHELL\", \"LANG\", \"TZ\"]

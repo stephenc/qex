@@ -50,6 +50,8 @@ pub struct Stage {
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<crate::config::EnvCapture>,
+    /// How politely this stage uses the processor. See the job file.
+    pub nice: Option<i32>,
     /// The stages that must succeed before this one.
     pub needs: Vec<String>,
     /// The stages that must stop before this one, whatever their result.
@@ -238,6 +240,7 @@ pub fn stage_spec(
         tags: stage.tags.clone(),
         priority: stage.priority,
         env_capture: stage.env_capture,
+        nice: stage.nice,
         // The caller resolves these names inside the file.
         needs: Vec::new(),
         after: Vec::new(),

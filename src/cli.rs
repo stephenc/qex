@@ -201,6 +201,17 @@ pub struct SubmitArgs {
     #[arg(long = "lock", value_name = "NAME")]
     pub locks: Vec<String>,
 
+    /// How politely this job uses the processor, from -20 to 19.
+    ///
+    /// A larger number gives the job less of the processor when something else
+    /// wants it, so an editor and a video call stay smooth while the queue
+    /// operates. The default comes from `[politeness] nice`, and it is 10.
+    ///
+    /// A number below zero needs privilege. qex does not ask for it: the job
+    /// then runs at the usual priority.
+    #[arg(long, allow_negative_numbers = true)]
+    pub nice: Option<i32>,
+
     /// Write the job id to this file as well as to stdout.
     ///
     /// A shell variable does not last, and an agent frequently needs the id in

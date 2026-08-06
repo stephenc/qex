@@ -288,6 +288,38 @@ takes a percentage, because it gives a part of the machine to all the jobs
 together. `[defaults] cpu` gives the cores for one job, so it takes a whole
 number only, and a percentage there gives an error.
 
+### A job gives way to a person
+
+The queue controls **how many** cores a job uses. It does not control **how
+rudely** it uses them: a build inside its budget still makes an editor stutter
+and a call break up, because the job and the person ask the scheduler for the
+same cores and the scheduler treats them alike.
+
+qex knows what that scheduler does not — this work sat in a queue, so nobody is
+waiting for the next second of it. Every job therefore starts at `nice 10`:
+
+```toml
+[politeness]
+nice = 10             # -20 to 19; a larger number gives way
+io = "none"           # none, best-effort or idle (Linux only)
+oom_score_adj = 0     # a larger number offers the job to the OOM killer first
+```
+
+`qex submit --nice 0` for one job that must not give way, and `nice = 0` in the
+configuration to return to the earlier behaviour for every job. A job file and a
+pipeline stage take `nice` as well.
+
+`io = "idle"` gives the disk to everything else first, which matters when a
+build reads a whole source tree while somebody saves a file.
+
+`oom_score_adj` decides who the kernel stops when the machine runs out of
+memory. A background build should lose that competition before an editor that
+holds an hour of work.
+
+**Not one of these can stop a job.** A machine that refuses the change runs the
+job at the usual priority, which is what qex did before. A number below zero
+needs privilege, and qex does not ask for it.
+
 ### The coordinator reads this file again when it changes
 
 A coordinator operates for hours. It reads the configuration file again when the

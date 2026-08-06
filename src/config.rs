@@ -415,6 +415,59 @@ impl Default for QueueConfig {
     }
 }
 
+/// How politely a job uses the machine.
+///
+/// # Why this exists
+///
+/// The queue controls HOW MANY cores a job uses. It does not control HOW RUDELY
+/// the job uses them. A build inside its budget still makes an editor stutter
+/// and a video call break up, because the job and the person ask the scheduler
+/// for the same cores and the scheduler treats them alike.
+///
+/// qex knows something that the scheduler does not: this work is in a queue, so
+/// nobody is waiting for the next second of it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolitenessConfig {
+    /// The `nice` value of a job, from -20 to 19.
+    ///
+    /// A larger number gives the job less of the processor when something else
+    /// wants it. 0 is the value of a command that you type.
+    ///
+    /// A user cannot give a number BELOW zero without privilege, and qex does
+    /// not try: a negative value gives a warning and no change.
+    pub nice: i32,
+    /// The class of the job for the disk, on Linux.
+    ///
+    /// `idle` gives the disk to everything else first. `best-effort` is the
+    /// usual class, and `none` leaves the class as it is.
+    ///
+    /// macOS has no equivalent, and qex ignores this value there.
+    pub io: String,
+    /// The value that qex adds to the out-of-memory score of a job, on Linux.
+    ///
+    /// The kernel chooses a victim when the machine has no memory left. A
+    /// larger number makes the job a more likely victim, and 0 leaves the
+    /// choice as it is.
+    ///
+    /// A background build should lose that competition before an editor with an
+    /// hour of unsaved work. A user cannot LOWER this value without privilege.
+    pub oom_score_adj: i32,
+}
+
+impl Default for PolitenessConfig {
+    fn default() -> Self {
+        Self {
+            // A background job gives way, and it still gets the whole machine
+            // when nothing else wants it. This is the value that `nice` itself
+            // gives with no argument.
+            nice: 10,
+            io: "none".into(),
+            oom_score_adj: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubmitConfig {
@@ -561,6 +614,7 @@ pub struct Config {
     pub peers: PeersConfig,
     pub queue: QueueConfig,
     pub submit: SubmitConfig,
+    pub politeness: PolitenessConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
     pub history: HistoryConfig,
