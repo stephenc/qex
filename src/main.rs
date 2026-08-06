@@ -33,6 +33,7 @@ mod schema;
 mod spec;
 mod supervisor;
 mod sys;
+mod top;
 #[cfg(test)]
 mod testutil;
 mod units;
@@ -46,6 +47,16 @@ use cli::{Cli, Command};
 const EXIT_USAGE: i32 = 2;
 
 fn main() {
+    // Let the system stop this process when a reader closes a pipe.
+    //
+    // Rust ignores SIGPIPE, so a write to a closed pipe gives an error, and the
+    // print macros panic on that error. A command such as `qex list | head`
+    // then writes a Rust panic and a note about a backtrace, which reads as a
+    // fault in qex. Every other tool in a pipe stops in silence.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let code = match run() {
         Ok(code) => code,
         Err(e) => {
@@ -82,6 +93,7 @@ fn run() -> Result<i32> {
         Command::Cancel(args) => commands::cancel(args),
         Command::Clean(args) => commands::clean(args),
         Command::Info(args) => commands::info(args),
+        Command::Top(args) => top::run(args),
         Command::Daemon(_) => {
             daemon::run()?;
             Ok(0)

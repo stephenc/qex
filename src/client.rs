@@ -135,7 +135,7 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
 fn spawn_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
 
-    let exe = std::env::current_exe().context("finding the qex program file")?;
+    let exe = paths::program_path()?;
     let log_path = paths::daemon_log_path()?;
     paths::ensure_dir(&paths::runtime_dir()?, 0o700)?;
 

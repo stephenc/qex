@@ -357,7 +357,7 @@ pub fn restart_with_systemd(cfg: &Config) -> bool {
         return false;
     }
 
-    let Ok(exe) = std::env::current_exe() else {
+    let Ok(exe) = crate::paths::program_path() else {
         return false;
     };
 

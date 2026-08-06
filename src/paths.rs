@@ -172,6 +172,57 @@ fn path_hash(path: &std::path::Path) -> String {
     format!("{hash:08x}")
 }
 
+/// Gives the path of the qex program file, in a form that qex can start again.
+///
+/// `current_exe` reads `/proc/self/exe`. When something replaces the program
+/// file, the kernel keeps the running program but adds ` (deleted)` to that
+/// name. A start of that name then fails with "No such file or directory".
+///
+/// This happens during development: a coordinator operates, `cargo install`
+/// replaces the file, and every job after that fails at once with a message
+/// that names no cause.
+///
+/// This function removes that mark and tests the true path. The program at that
+/// path is the new one, and its records have the same format, so a job starts
+/// correctly.
+pub fn program_path() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("finding the qex program file")?;
+
+    if exe.exists() {
+        return Ok(exe);
+    }
+
+    let text = exe.to_string_lossy();
+    if let Some(stripped) = text.strip_suffix(" (deleted)") {
+        let path = PathBuf::from(stripped);
+        if path.exists() {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "the qex program file {} no longer exists. Something replaced or deleted it \
+             while the coordinator was operating. Stop the coordinator and start it again: \
+             `qex info --no-start --json` gives its process id.",
+            stripped
+        );
+    }
+
+    anyhow::bail!(
+        "the qex program file {} no longer exists. Stop the coordinator and start it again.",
+        exe.display()
+    )
+}
+
+/// Tests if something replaced the program file of this process.
+///
+/// The coordinator uses this test to stop when it becomes idle, so the next
+/// command starts a coordinator with the new program.
+pub fn program_file_changed() -> bool {
+    match std::env::current_exe() {
+        Ok(exe) => !exe.exists(),
+        Err(_) => false,
+    }
+}
+
 pub fn spawn_lock_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("spawn.lock"))
 }

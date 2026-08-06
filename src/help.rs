@@ -161,20 +161,26 @@ Do not measure a task before you run it
 ---------------------------------------
 
 Do not run a small test job to find the size of a task. That method costs you
-time and gives a poor measurement. Give `--cpu guess --mem guess` and start the
-real task.
+time and gives a poor measurement, because a small job does different work.
 
-Do not read the use of every job. For one task, or for a task that you run one
-time, `guess` is sufficient and you need no other step.
+Give `--cpu guess --mem guess` and start the REAL task. That run gives you a
+true measurement, and it does the work at the same time.
 
-Read the use only when you run the same kind of task many times, and the queue
-is slow. qex measures each job, so the numbers are already there:
+qex then uses that measurement for you. The next job of the same command gets a
+claim from the earlier runs, so you give no claim at all:
 
-    qex status $ID --json
+    qex submit --cpu guess --mem guess -- ./task    # run 1
+    qex submit -- ./task                            # run 2: the claim is ready
 
-The `usage` field gives `max_rss` and `cpu_secs`. If a task always uses much
-less than `guess` gives it, put an exact claim in a job file. More jobs then
-operate together.
+`qex status` says where a claim came from.
+
+Read the numbers yourself when you want an exact claim:
+
+    qex status $ID --json      # the usage field gives max_rss and cpu_secs
+
+The first run with `guess` is thus not wasted effort: it produces both the
+result and the measurement that makes every later run cheap. What is wasted is
+a separate test job that produces no result.
 
 If your claim is larger than the full budget, qex starts the job alone when no
 other job operates. The job can then swap or stop with an out-of-memory error.

@@ -47,6 +47,8 @@ pub struct State {
     pub idle_since: Option<Instant>,
     /// The number for the next job, to keep the order of submission.
     pub next_sequence: u64,
+    /// The time when this coordinator started.
+    pub started_at: u64,
     pub stop: bool,
 }
 
@@ -155,6 +157,7 @@ impl Coordinator {
                 last_contact: Instant::now(),
                 idle_since: Some(Instant::now()),
                 next_sequence: 1,
+                started_at: crate::sys::now_secs(),
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -467,6 +470,8 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
     Response::Info {
         pid: std::process::id() as i32,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: state.started_at,
+        program_replaced: paths::program_file_changed(),
         jobs_running: state.count_state(|s| s.is_active()),
         jobs_queued: state.count_state(|s| s == JobState::Queued),
         cpu_budget: state.cfg.budget_cpu().unwrap_or(0),
@@ -678,15 +683,30 @@ fn idle_watch(coord: Arc<Coordinator>, socket: std::path::PathBuf) {
         // qex would accept that job, write its record, give the id to the user,
         // and then stop. The job would never start, and `qex wait` would block
         // with no end.
+        // Stop when something replaced the qex program file.
+        //
+        // A coordinator can operate for hours. During development, a new build
+        // replaces the program file, and this process then holds the old code.
+        // A stop when no job operates lets the next command start a coordinator
+        // with the new program. No job is lost: the next command starts a new
+        // coordinator, which reads the same job records.
+        let replaced = paths::program_file_changed();
+
         let should_stop = {
             let mut state = coord.state.lock().unwrap();
             let active = state.count_state(|s| !s.is_terminal());
-            let idle = active == 0 && state.last_contact.elapsed() >= idle_limit;
+            let idle = active == 0
+                && (replaced || state.last_contact.elapsed() >= idle_limit);
             if idle {
                 state.stop = true;
             }
             idle
         };
+
+        if should_stop && replaced {
+            log("the qex program file changed; this coordinator stops so that the next \
+                 command starts one with the new program");
+        }
 
         if should_stop {
             log("the coordinator is idle and stops");

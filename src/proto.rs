@@ -61,6 +61,16 @@ pub enum Response {
     Info {
         pid: i32,
         version: String,
+        /// The time when this coordinator started.
+        #[serde(default)]
+        started_at: u64,
+        /// True when something replaced the program file of the coordinator.
+        ///
+        /// The coordinator then holds code that is not the code of the program
+        /// on the disk. It stops when no job operates, and the next command
+        /// starts a coordinator with the new program.
+        #[serde(default)]
+        program_replaced: bool,
         jobs_running: usize,
         jobs_queued: usize,
         cpu_budget: u64,

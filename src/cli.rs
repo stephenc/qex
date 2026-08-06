@@ -49,6 +49,9 @@ pub enum Command {
     /// Delete the records of the jobs that stopped.
     Clean(CleanArgs),
 
+    /// Watch the queue. Shows the claim and the true use of each job.
+    Top(TopArgs),
+
     /// Show the coordinator: its process id, its budget and its load.
     Info(InfoArgs),
 
@@ -263,6 +266,17 @@ pub struct CleanArgs {
     /// Delete the records that are older than this time. Example: 7d.
     #[arg(long, value_name = "TIME")]
     pub older_than: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct TopArgs {
+    /// The time between two refreshes, in seconds.
+    #[arg(long, short = 'i', value_name = "SECONDS", default_value = "2")]
+    pub interval: f64,
+
+    /// Write the page one time and stop. Use this option in a script.
+    #[arg(long)]
+    pub once: bool,
 }
 
 #[derive(Debug, Args)]

@@ -1150,6 +1150,8 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
         Response::Info {
             pid,
             version,
+            started_at,
+            program_replaced,
             jobs_running,
             jobs_queued,
             cpu_budget,
@@ -1163,6 +1165,9 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "pid": pid,
                         "version": version,
+                        "started_at": started_at,
+                        "program_replaced": program_replaced,
+                        "cli_version": env!("CARGO_PKG_VERSION"),
                         "jobs_running": jobs_running,
                         "jobs_queued": jobs_queued,
                         "cpu_budget": cpu_budget,
@@ -1174,7 +1179,16 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 return Ok(0);
             }
             println!("coordinator pid: {pid}");
-            println!("version:         {version}");
+            println!("version:         {version} (this command: {})", env!("CARGO_PKG_VERSION"));
+            if program_replaced {
+                // Say this clearly. A user that replaces the program during
+                // development would otherwise meet a message with no cause.
+                println!(
+                    "program:        REPLACED. This coordinator holds the code of an \
+                     earlier build. It stops when no job operates, and the next command \
+                     starts a coordinator with the new program."
+                );
+            }
             println!("jobs running:    {jobs_running}");
             println!("jobs queued:     {jobs_queued}");
             println!(

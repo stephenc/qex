@@ -22,7 +22,7 @@ use std::time::Duration;
 /// The supervisor is a new `qex` process. It is not a copy of the coordinator,
 /// so the coordinator does not fork its threads and its memory.
 pub fn spawn(id: uuid::Uuid) -> Result<i32> {
-    let exe = std::env::current_exe().context("finding the qex program file")?;
+    let exe = paths::program_path()?;
     let dir = paths::job_dir(&id)?;
     let log_path = dir.join("supervisor.log");
 

@@ -412,6 +412,17 @@ mod tests {
 
     use crate::testutil::{env_lock, EnvVar};
 
+    /// Gives a config that does not read the measurements of earlier jobs.
+    ///
+    /// A test of the default claim must not read the state directory of the
+    /// user. That directory holds the measurements of the real jobs of this
+    /// machine, and a test would then give a different result on each machine.
+    fn cfg_without_learning() -> Config {
+        let mut cfg = Config::default();
+        cfg.learn.enabled = false;
+        cfg
+    }
+
     fn opts(command: &[&str]) -> SubmitOptions {
         SubmitOptions {
             command: command.iter().map(|s| s.to_string()).collect(),
@@ -602,10 +613,11 @@ mod tests {
     #[test]
     fn config_defaults_supply_the_job_size() {
         let _guard = env_lock();
-        let cfg: Config = toml::from_str(
+        let mut cfg: Config = toml::from_str(
             "[defaults]\ncpu = 4\nmem = \"6GB\"\ntimeout = \"30m\"\n",
         )
         .unwrap();
+        cfg.learn.enabled = false;
         let spec = JobSpec::resolve(&opts(&["true"]), &cfg).unwrap();
         assert_eq!(spec.cpu, 4);
         assert_eq!(spec.mem, 6 << 30);
@@ -651,7 +663,7 @@ mod tests {
     #[test]
     fn built_in_defaults_supply_a_size() {
         let _guard = env_lock();
-        let spec = JobSpec::resolve(&opts(&["true"]), &Config::default()).unwrap();
+        let spec = JobSpec::resolve(&opts(&["true"]), &cfg_without_learning()).unwrap();
         assert_eq!(spec.cpu, 1, "the default job must claim 1 core");
 
         let cores = crate::sys::cpu_count().max(1);

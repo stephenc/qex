@@ -1707,6 +1707,103 @@ fn a_job_that_did_not_complete_is_not_a_measurement() {
     h.qex(&["wait", &second, "--timeout", "45s"]);
 }
 
+/// A replacement of the qex program must not stop the jobs.
+///
+/// A coordinator can operate for hours. During development, a new build
+/// replaces the program file. The kernel then adds ` (deleted)` to the name in
+/// `/proc/self/exe`, and a start of that name fails. Every job after the
+/// replacement failed at once with "No such file or directory", and that
+/// message named no cause.
+#[test]
+fn a_replacement_of_the_program_does_not_stop_the_jobs() {
+    let h = Harness::with_default_config("skew");
+
+    // Start a coordinator with a copy of the program.
+    let copy = h.root.join("qex-copy");
+    std::fs::copy(env!("CARGO_BIN_EXE_qex"), &copy).unwrap();
+
+    let run = |args: &[&str], exe: &std::path::Path| -> Output {
+        Command::new(exe)
+            .args(args)
+            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+            .env("XDG_STATE_HOME", h.root.join("state"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .output()
+            .expect("qex did not start")
+    };
+
+    let first = run(&["submit", "--", "true"], &copy);
+    assert!(first.status.success());
+    let id = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    run(&["wait", &id, "--timeout", "45s"], &copy);
+
+    // Replace the program file while the coordinator operates.
+    std::fs::remove_file(&copy).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_qex"), &copy).unwrap();
+
+    // A job must still start. The coordinator holds the old code, and it starts
+    // the supervisor from the program that is on the disk now.
+    let after = run(&["submit", "--", "sh", "-c", "echo it-ran"], &copy);
+    assert!(
+        after.status.success(),
+        "the submission failed after the replacement: {}",
+        String::from_utf8_lossy(&after.stderr)
+    );
+    let id2 = String::from_utf8_lossy(&after.stdout).trim().to_string();
+
+    let waited = run(&["wait", &id2, "--timeout", "45s"], &copy);
+    assert_eq!(
+        waited.status.code(),
+        Some(0),
+        "the job did not run after the replacement: {}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    // `qex info` must report the replacement, so a reader learns the cause.
+    let info = run(&["info", "--no-start", "--json"], &copy);
+    let v: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(v["program_replaced"], true);
+
+    if let Some(pid) = v["pid"].as_i64() {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+/// A closed pipe must not give a Rust panic.
+///
+/// An agent writes `qex list | head` frequently. Rust ignores SIGPIPE, so a
+/// write to a closed pipe gives an error and the print macros panic on it. The
+/// output then holds a panic and a note about a backtrace, which reads as a
+/// fault in qex.
+#[test]
+fn a_closed_pipe_does_not_give_a_panic() {
+    let h = Harness::with_default_config("pipe");
+    for _ in 0..5 {
+        h.submit(&["submit", "--", "true"]);
+    }
+
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "{} list | head -2",
+            env!("CARGO_BIN_EXE_qex")
+        ))
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .output()
+        .unwrap();
+
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("panicked"),
+        "a closed pipe gave a panic: {err}"
+    );
+    assert!(!err.contains("Broken pipe"), "got: {err}");
+}
+
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,
 /// and a test harness gives a long path.
 #[test]

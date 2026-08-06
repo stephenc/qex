@@ -229,3 +229,107 @@ mod tests {
         assert!(!pid_alive(0));
     }
 }
+
+/// The resources that one process group uses now.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GroupUsage {
+    /// The memory of every process of the group, in bytes.
+    pub rss: u64,
+    /// The CPU time of every process of the group, in seconds.
+    pub cpu_secs: f64,
+    /// The number of processes in the group.
+    pub processes: usize,
+}
+
+/// Measures the processes of one process group.
+///
+/// This function compares the process group id, which is a number. It does not
+/// read a command line, so it cannot match a command that holds the word `qex`.
+/// That fault is the reason for this program.
+#[cfg(target_os = "linux")]
+pub fn group_usage(pgid: i32) -> GroupUsage {
+    let mut out = GroupUsage::default();
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.parse::<i32>().is_err() {
+            continue;
+        }
+
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // The command of a process can hold a space or a bracket, and it is
+        // inside brackets. Read the fields after the last bracket.
+        let Some(rest) = stat.rsplit_once(") ") else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.1.split_whitespace().collect();
+        // After the command, field 1 is the state and field 3 is the group.
+        if fields.len() < 22 {
+            continue;
+        }
+        let Ok(group) = fields[2].parse::<i32>() else {
+            continue;
+        };
+        if group != pgid {
+            continue;
+        }
+
+        let utime: f64 = fields[11].parse().unwrap_or(0.0);
+        let stime: f64 = fields[12].parse().unwrap_or(0.0);
+        let rss_pages: u64 = fields[21].parse().unwrap_or(0);
+
+        out.cpu_secs += (utime + stime) / ticks;
+        out.rss += rss_pages * page;
+        out.processes += 1;
+    }
+    out
+}
+
+/// Measures the processes of one process group.
+///
+/// macOS has no `/proc`, so this version reads the output of `ps`.
+#[cfg(not(target_os = "linux"))]
+pub fn group_usage(pgid: i32) -> GroupUsage {
+    let mut out = GroupUsage::default();
+    let Ok(result) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pgid=,rss=,time="])
+        .output()
+    else {
+        return out;
+    };
+
+    for line in String::from_utf8_lossy(&result.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        if fields[0].parse::<i32>() != Ok(pgid) {
+            continue;
+        }
+        // `ps` gives the memory in kilobytes.
+        out.rss += fields[1].parse::<u64>().unwrap_or(0) * 1024;
+        out.cpu_secs += parse_ps_time(fields[2]);
+        out.processes += 1;
+    }
+    out
+}
+
+/// Reads a time from `ps`, in the form `MM:SS.ss` or `HH:MM:SS`.
+#[cfg(not(target_os = "linux"))]
+fn parse_ps_time(text: &str) -> f64 {
+    let parts: Vec<&str> = text.split(':').collect();
+    let mut seconds = 0.0;
+    for part in &parts {
+        seconds = seconds * 60.0 + part.parse::<f64>().unwrap_or(0.0);
+    }
+    seconds
+}
