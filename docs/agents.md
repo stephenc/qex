@@ -175,6 +175,11 @@ not the same in each harness: one owns a scratch directory and loses an id file,
 another reports a background command and needs `qex status --wait` instead of
 `qex wait`.
 
+**A recipe that is not in the documentation** —
+[the tips and tricks issue](https://github.com/stephenc/qex/issues/2). qex has no
+timer of its own, because cron with `qex submit --lock` does it better; that
+recipe is there, with the guard that stops the queue from growing at each tick.
+
 **Something did not work** — **look for it first, and add to what is there.**
 
 ```sh
@@ -207,6 +212,20 @@ Give four things, and no more:
 
 If you cannot reach GitHub, give the words to the person that you work with and
 let them decide whether to send them.
+
+## Install this page as a skill
+
+Your operator can put this material where you load it without asking:
+
+```sh
+mkdir -p ~/.claude/skills/qex
+curl -fsSL https://raw.githubusercontent.com/stephenc/qex/main/skills/qex/SKILL.md \
+  -o ~/.claude/skills/qex/SKILL.md
+```
+
+The page is ordinary Markdown, so it goes into `AGENTS.md`, a rule file or a
+prompt with no change. `qex help agents` holds the same material inside the
+binary, for a machine with no network.
 
 ## Everything else
 

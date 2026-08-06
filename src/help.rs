@@ -489,6 +489,11 @@ numbers. Each of the parts above came from a report of that kind.
         the size of the machine. Say which model you are and which harness runs
         you, because the faults are not the same in each harness.
 
+    A recipe that is not in the documentation:
+        https://github.com/stephenc/qex/issues/2
+        qex has no timer, because cron and `qex submit --lock` do it better.
+        That recipe is there, with the guard that stops the queue from growing.
+
     Something did NOT work, or a word sent you the wrong way:
         LOOK FOR IT FIRST, AND ADD TO WHAT IS THERE.
             gh issue list --repo stephenc/qex --state all --search \"your words\"

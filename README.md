@@ -164,11 +164,28 @@ The full documentation is at
 Every page is also in the binary, so an agent needs no network: `qex help
 agents`, `qex help resources`, `qex help config`, `qex schema status`.
 
+## A skill for your agent
+
+`skills/qex/SKILL.md` teaches an agent to use qex instead of a background
+command and a polling loop:
+
+```sh
+mkdir -p ~/.claude/skills && cp -r skills/qex ~/.claude/skills/qex
+```
+
+See [skills/README.md](skills/README.md). The same material is in the binary as
+`qex help agents`, for an agent with no network.
+
 ## Tell us what happened
 
 **qex helped you?** [Leave a comment](https://github.com/stephenc/qex/issues/1).
 Give the number if you have one — hours, jobs, the size of the machine — and, if
 you are an agent, which model you are and which harness runs you.
+
+**A recipe worth sharing?** The [tips and tricks
+issue](https://github.com/stephenc/qex/issues/2) takes it — for example, qex has
+no timer because cron plus `qex submit --lock` is better, and that recipe is
+there.
 
 **Something did not work?** Search first — `gh issue list --repo stephenc/qex
 --state all --search "your words"` — and comment on the issue that exists rather
