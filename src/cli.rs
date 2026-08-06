@@ -62,6 +62,12 @@ pub enum Command {
     /// Delete the records of the jobs that stopped.
     Clean(CleanArgs),
 
+    /// Collect the old records of every directory.
+    Gc(GcArgs),
+
+    /// Show how much disk space qex holds.
+    Du(DuArgs),
+
     /// Watch the queue. Shows the claim and the true use of each job.
     Top(TopArgs),
 
@@ -227,6 +233,18 @@ pub struct ListArgs {
     #[arg(long, value_name = "GROUP")]
     pub group: Option<String>,
 
+    /// Show the jobs that ran in exactly this directory.
+    ///
+    /// Without a value, the option uses the current directory.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
+    pub cwd: Option<PathBuf>,
+
+    /// Show the jobs that ran in this directory or below it.
+    ///
+    /// Without a value, the option uses the current directory.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
+    pub under: Option<PathBuf>,
+
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
@@ -335,6 +353,35 @@ pub struct CancelArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct DuArgs {
+    /// Show the largest jobs, and how much each one holds.
+    #[arg(long, value_name = "N", default_value = "10")]
+    pub top: usize,
+
+    /// Write the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct GcArgs {
+    /// Delete a record that stopped before this time.
+    ///
+    /// The default comes from `[gc] keep` in the config file, and that default
+    /// is one day.
+    #[arg(long, value_name = "TIME")]
+    pub older_than: Option<String>,
+
+    /// Show what this command would delete, and delete nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Write the result as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct RerunArgs {
     /// The job to run again. Give its id or its name.
     pub id: String,
@@ -361,6 +408,27 @@ pub struct CleanArgs {
     /// Delete the records that are older than this time. Example: 7d.
     #[arg(long, value_name = "TIME")]
     pub older_than: Option<String>,
+
+    /// Delete the records of the jobs that ran in exactly this directory.
+    ///
+    /// Without a value, the option uses the current directory.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
+    pub cwd: Option<PathBuf>,
+
+    /// Delete the records of the jobs that ran in this directory or below it.
+    ///
+    /// Without a value, the option uses the current directory. Use it at the
+    /// top of a project to delete the records of every job of that project.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
+    pub under: Option<PathBuf>,
+
+    /// Delete every record of this directory tree that is safe to delete.
+    ///
+    /// This option is a short form of `--state done --older-than 1h`, on this
+    /// directory and below. A job that stopped in the last hour stays, because
+    /// it is frequently the job that you read now.
+    #[arg(long, conflicts_with_all = ["all", "state", "older_than"])]
+    pub auto: bool,
 }
 
 #[derive(Debug, Args)]
@@ -471,6 +539,7 @@ fn parse_mem_claim(s: &str) -> Result<crate::claim::Claim, String> {
 ///
 /// The name `done` selects each final state. An agent frequently wants "the
 /// jobs that stopped" and does not want to name each state.
+#[derive(Debug, Clone, Copy)]
 pub enum StateFilter {
     One(JobState),
     Done,

@@ -24,6 +24,12 @@ pub const EXIT_SKIPPED: i32 = 126;
 /// The exit code when there is no job with the given id.
 pub const EXIT_NO_SUCH_JOB: i32 = 127;
 
+/// The age of a record that `qex clean --auto` deletes.
+///
+/// A job that stopped in the last hour is frequently the job that a user reads
+/// now. A job that stopped before that is history.
+const AUTO_CLEAN_AGE: u64 = 3600;
+
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
@@ -105,6 +111,17 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     }
     if let Some(tag) = &args.tag {
         jobs.retain(|j| j.tags.iter().any(|t| t == tag));
+    }
+    let list_cwd = match &args.cwd {
+        Some(p) => Some(resolve_directory(p, "--cwd")?),
+        None => None,
+    };
+    let list_under = match &args.under {
+        Some(p) => Some(resolve_directory(p, "--under")?),
+        None => None,
+    };
+    if list_cwd.is_some() || list_under.is_some() {
+        jobs.retain(|j| matches_directory(&j.cwd, list_cwd.as_deref(), list_under.as_deref()));
     }
     if let Some(group) = &args.group {
         // A group takes its id or its name. A name is easier to type, and the
@@ -1022,27 +1039,65 @@ pub fn cancel(args: cli::CancelArgs) -> Result<i32> {
 }
 
 pub fn clean(args: cli::CleanArgs) -> Result<i32> {
-    if args.ids.is_empty() && !args.all && args.state.is_none() && args.older_than.is_none() {
+    if args.ids.is_empty()
+        && !args.all
+        && !args.auto
+        && args.state.is_none()
+        && args.older_than.is_none()
+        && args.cwd.is_none()
+        && args.under.is_none()
+    {
         bail!(
             "name the jobs to delete.\n\n\
              Examples:\n\
              \x20   qex clean <id>\n\
              \x20   qex clean completed        # or: qex clean --state completed\n\
              \x20   qex clean done             # every job that stopped\n\
+             \x20   qex clean --auto           # everything safe, here and below\n\
+             \x20   qex clean --cwd            # the jobs of this directory\n\
+             \x20   qex clean --under          # the jobs of this directory and below\n\
              \x20   qex clean --older-than 7d\n\
              \x20   qex clean --all"
         );
     }
 
-    let older_than = match &args.older_than {
-        Some(t) => parse_duration(t)
-            .map_err(|e| anyhow::anyhow!("--older-than: {e}"))?
-            .map(|d| d.as_secs()),
+    let clean_cwd = match &args.cwd {
+        Some(p) => Some(resolve_directory(p, "--cwd")?),
         None => None,
     };
-    let filter = match args.state.as_deref() {
-        Some(s) => Some(StateFilter::parse(s).map_err(|e| anyhow::anyhow!("--state: {e}"))?),
+    let mut clean_under = match &args.under {
+        Some(p) => Some(resolve_directory(p, "--under")?),
         None => None,
+    };
+    // `--auto` works on this directory and below, unless the user names one.
+    // A command that deletes must never reach the work of a different project.
+    if args.auto && clean_cwd.is_none() && clean_under.is_none() {
+        clean_under = Some(resolve_directory(std::path::Path::new("."), "--auto")?);
+    }
+    let by_directory = clean_cwd.is_some() || clean_under.is_some();
+
+    // `--auto` is a short form. It gives the two options below, and it works on
+    // this directory and below.
+    //
+    // The age is the safety. A job of the last hour can still be the job that a
+    // user reads now, and a job of yesterday is history.
+    let older_than = if args.auto {
+        Some(AUTO_CLEAN_AGE)
+    } else {
+        match &args.older_than {
+            Some(t) => parse_duration(t)
+                .map_err(|e| anyhow::anyhow!("--older-than: {e}"))?
+                .map(|d| d.as_secs()),
+            None => None,
+        }
+    };
+    let filter = if args.auto {
+        Some(StateFilter::Done)
+    } else {
+        match args.state.as_deref() {
+            Some(s) => Some(StateFilter::parse(s).map_err(|e| anyhow::anyhow!("--state: {e}"))?),
+            None => None,
+        }
     };
 
     let mut client = Client::connect()?;
@@ -1051,6 +1106,10 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     };
 
     let now = crate::sys::now_secs();
+    // A job that a job in the queue still needs is not finished for the purpose
+    // of a deletion, whatever its own state says.
+    let held = needed_by_unfinished(&jobs);
+    let mut held_back = 0usize;
     let mut targets: Vec<uuid::Uuid> = Vec::new();
     let mut word_filters: Vec<StateFilter> = Vec::new();
 
@@ -1077,12 +1136,46 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         if !j.state.is_terminal() {
             continue;
         }
+        if held.contains(&j.id) {
+            // A job that a job in the queue needs. It is not finished yet for
+            // this purpose.
+            held_back += 1;
+            continue;
+        }
+
+        // A directory is a filter and not a selector. A job outside the
+        // directory is never deleted, whatever the other options say.
+        if by_directory
+            && !matches_directory(&j.cwd, clean_cwd.as_deref(), clean_under.as_deref())
+        {
+            continue;
+        }
+
         let by_state = filter.as_ref().map(|f| f.matches(j.state)).unwrap_or(false)
             || word_filters.iter().any(|f| f.matches(j.state));
         let by_age = older_than
             .map(|limit| now.saturating_sub(j.finished_at.unwrap_or(j.submitted_at)) >= limit)
             .unwrap_or(false);
-        if args.all || by_state || by_age {
+
+        // `--auto` needs BOTH conditions. A job that stopped a minute ago is
+        // frequently the job that the user reads now.
+        if args.auto {
+            if by_state && by_age {
+                targets.push(j.id);
+            }
+            continue;
+        }
+
+        // A directory with no other option means every job that stopped in
+        // that directory. `qex clean --under` is then the whole answer for a
+        // user who wants the records of one project.
+        let by_directory_alone = by_directory
+            && !args.auto
+            && filter.is_none()
+            && word_filters.is_empty()
+            && older_than.is_none();
+
+        if args.all || by_state || by_age || by_directory_alone {
             targets.push(j.id);
         }
     }
@@ -1100,6 +1193,13 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     }
 
     println!("qex deleted the records of {deleted} job(s)");
+    if held_back > 0 {
+        println!(
+            "{held_back} record(s) stayed, because a job that has not stopped still needs \
+             them. They go when that job stops."
+        );
+    }
+
     Ok(worst)
 }
 
@@ -1933,4 +2033,321 @@ fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
     }
     let (have, version, pid) = coordinator_capabilities(client);
     crate::capabilities::check(&have, &version, pid, spec).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Tests one job against a directory.
+///
+/// `exact` gives the jobs of one directory. `under` gives the jobs of that
+/// directory and of every directory below it, so a user at the top of a project
+/// reaches every job of that project.
+fn matches_directory(job_cwd: &str, exact: Option<&std::path::Path>, under: Option<&std::path::Path>) -> bool {
+    if let Some(dir) = exact {
+        if std::path::Path::new(job_cwd) != dir {
+            return false;
+        }
+    }
+    if let Some(dir) = under {
+        let path = std::path::Path::new(job_cwd);
+        // `starts_with` compares whole parts, so `/a/b` does not match `/a/bc`.
+        if !path.starts_with(dir) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reads a directory from the command line, and makes it absolute.
+///
+/// A job records the directory that the CLI resolved at the submission, so this
+/// value must be resolved in the same way. Without that step, `.` and the full
+/// path would not match each other.
+fn resolve_directory(path: &std::path::Path, option: &str) -> Result<std::path::PathBuf> {
+    path.canonicalize()
+        .with_context(|| format!("{option}: the directory {} does not exist", path.display()))
+}
+
+
+/// Collects the old records of every directory.
+///
+/// `qex clean --auto` works on one directory tree and on one hour, for a user
+/// who finished a piece of work. This command works on every directory and on a
+/// longer time, for a machine that has run for days.
+///
+/// It also deletes a job directory that holds no record. A coordinator that
+/// stopped between the creation of the directory and the first write of the
+/// record leaves one, and nothing else removes it.
+pub fn gc(args: cli::GcArgs) -> Result<i32> {
+    let cfg = Config::load()?;
+    cfg.validate()?;
+
+    let keep = match &args.older_than {
+        Some(t) => parse_duration(t)
+            .map_err(|e| anyhow::anyhow!("--older-than: {e}"))?
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs(),
+        None => cfg.gc_keep()?.as_secs(),
+    };
+
+    let now = crate::sys::now_secs();
+    let mut client = Client::connect()?;
+    let Response::Jobs { jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+
+    let held = needed_by_unfinished(&jobs);
+    let mut held_back = 0usize;
+    let mut targets: Vec<(uuid::Uuid, String, u64)> = Vec::new();
+    for j in &jobs {
+        if !j.state.is_terminal() {
+            continue;
+        }
+        if held.contains(&j.id) {
+            // A job that a job in the queue needs is not finished for this
+            // purpose. Its record answers a question that the other job has
+            // not yet asked.
+            held_back += 1;
+            continue;
+        }
+        let stopped = j.finished_at.unwrap_or(j.submitted_at);
+        let age = now.saturating_sub(stopped);
+        if age >= keep {
+            targets.push((j.id, j.name.clone(), directory_size(&paths::job_dir(&j.id)?)));
+        }
+    }
+
+    // A directory with no record belongs to no job. It cannot be deleted by an
+    // id, because no id names it in the coordinator.
+    let mut orphans: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(paths::jobs_dir()?) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let known = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<uuid::Uuid>().ok())
+                .map(|id| jobs.iter().any(|j| j.id == id))
+                .unwrap_or(false);
+            if !known && crate::job::read_status(&path).is_err() {
+                orphans.push((path.clone(), directory_size(&path)));
+            }
+        }
+    }
+
+    let bytes: u64 = targets.iter().map(|(_, _, b)| b).sum::<u64>()
+        + orphans.iter().map(|(_, b)| b).sum::<u64>();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "older_than_secs": keep,
+                "dry_run": args.dry_run,
+                "jobs": targets.iter().map(|(id, name, _)| serde_json::json!({
+                    "id": id.to_string(), "name": name
+                })).collect::<Vec<_>>(),
+                "directories_with_no_record": orphans.len(),
+                "kept_because_a_job_needs_them": held_back,
+                "bytes": bytes,
+            }))?
+        );
+    }
+
+    if args.dry_run {
+        if !args.json {
+            println!(
+                "qex would delete {} record(s) and {} directory(s) with no record, and free {}.",
+                targets.len(),
+                orphans.len(),
+                format_size(bytes)
+            );
+            println!("Nothing changed. Run the command without `--dry-run` to delete them.");
+        }
+        return Ok(0);
+    }
+
+    let mut deleted = 0usize;
+    for (id, _, _) in &targets {
+        if let Response::Ok = client.call(&Request::Clean { id: *id })? {
+            deleted += 1;
+        }
+    }
+    for (path, _) in &orphans {
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    if !args.json {
+        println!(
+            "qex deleted {deleted} record(s) and {} directory(s) with no record, and freed {}.",
+            orphans.len(),
+            format_size(bytes)
+        );
+        if held_back > 0 {
+            println!(
+                "{held_back} record(s) stayed, because a job that has not stopped still \
+                 needs them. They go at the next run, after that job stops."
+            );
+        }
+        if deleted < targets.len() {
+            println!(
+                "{} record(s) that this command chose stayed. The coordinator refused them.",
+                targets.len() - deleted
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// Gives the number of bytes that one directory holds.
+fn directory_size(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| if m.is_dir() { 0 } else { m.len() })
+        .sum()
+}
+
+/// Gives the jobs that a job which has not stopped still needs.
+///
+/// Such a job is not finished for the purpose of a deletion, whatever its own
+/// state says. A job in the queue reads the record of the job that it waits
+/// for: it needs the state to decide whether to run, and it needs the name and
+/// the log to explain why it did not.
+///
+/// A deletion of that record would take the answer away from a job that has not
+/// yet asked the question.
+fn needed_by_unfinished(jobs: &[JobStatus]) -> std::collections::BTreeSet<uuid::Uuid> {
+    let mut held = std::collections::BTreeSet::new();
+    for job in jobs {
+        if job.state.is_terminal() {
+            continue;
+        }
+        for id in job.needs.iter().chain(job.after.iter()) {
+            held.insert(*id);
+        }
+    }
+    held
+}
+
+/// Shows how much disk space qex holds.
+///
+/// The output of a job has no limit, and a job that writes a large log holds
+/// that space until somebody deletes its record. This command says how much,
+/// and which jobs hold the most, so a user knows whether `qex gc` is worth the
+/// command.
+pub fn du(args: cli::DuArgs) -> Result<i32> {
+    let cfg = Config::load()?;
+    let state = paths::state_dir()?;
+    let jobs_dir = paths::jobs_dir()?;
+
+    // Read the records from the disk. This command must answer when no
+    // coordinator operates, in the same way as `qex top`.
+    let jobs = crate::job::read_all_from_disk();
+
+    let mut per_job: Vec<(uuid::Uuid, String, String, u64, bool)> = Vec::new();
+    let mut total_jobs = 0u64;
+    let mut orphans = 0u64;
+    let mut orphan_count = 0usize;
+
+    if let Ok(entries) = std::fs::read_dir(&jobs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let size = directory_size(&path);
+            total_jobs += size;
+
+            match crate::job::read_status(&path) {
+                Ok(status) => {
+                    let old = crate::sys::now_secs()
+                        .saturating_sub(status.finished_at.unwrap_or(status.submitted_at))
+                        >= cfg.gc_keep().map(|d| d.as_secs()).unwrap_or(86400);
+                    per_job.push((
+                        status.id,
+                        status.name.clone(),
+                        status.state.to_string(),
+                        size,
+                        status.state.is_terminal() && old,
+                    ));
+                }
+                Err(_) => {
+                    orphans += size;
+                    orphan_count += 1;
+                }
+            }
+        }
+    }
+
+    // The files beside the jobs: the record of the ids, the measurements, the
+    // log of the coordinator.
+    let other = directory_size(&state) + directory_size(&paths::runtime_dir()?);
+    let total = total_jobs + other;
+    let reclaimable: u64 = per_job
+        .iter()
+        .filter(|(_, _, _, _, old)| *old)
+        .map(|(_, _, _, size, _)| size)
+        .sum::<u64>()
+        + orphans;
+
+    per_job.sort_by_key(|(_, _, _, size, _)| std::cmp::Reverse(*size));
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "total_bytes": total,
+                "jobs_bytes": total_jobs,
+                "other_bytes": other,
+                "reclaimable_bytes": reclaimable,
+                "job_count": jobs.len(),
+                "directories_with_no_record": orphan_count,
+                "largest": per_job.iter().take(args.top).map(|(id, name, state, size, _)| {
+                    serde_json::json!({
+                        "id": id.to_string(), "name": name, "state": state, "bytes": size
+                    })
+                }).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(0);
+    }
+
+    println!("qex holds {} in {}", format_size(total), state.display());
+    println!("  {} in {} job record(s)", format_size(total_jobs), per_job.len());
+    if orphan_count > 0 {
+        println!(
+            "  {} in {orphan_count} directory(s) with no record",
+            format_size(orphans)
+        );
+    }
+    println!("  {} in the other files", format_size(other));
+
+    if reclaimable > 0 {
+        println!();
+        println!(
+            "{} can go now. Run `qex gc` to free it.",
+            format_size(reclaimable)
+        );
+    }
+
+    if !per_job.is_empty() && args.top > 0 {
+        println!();
+        println!("The largest job records:");
+        for (id, name, state, size, old) in per_job.iter().take(args.top) {
+            println!(
+                "  {:>9}  {}  {:<10} {:<16.16}{}",
+                format_size(*size),
+                &id.to_string()[..8],
+                state,
+                name,
+                if *old { "  (qex gc would free this)" } else { "" }
+            );
+        }
+    }
+    Ok(0)
 }

@@ -1873,6 +1873,163 @@ fn the_id_file_of_a_pipeline_holds_every_stage() {
     assert!(v["jobs"]["test"].as_str().is_some());
 }
 
+/// `--cwd` gives one directory, and `--under` gives a directory and the
+/// directories below it. Neither must reach the work of a different project.
+#[test]
+fn the_directory_filters_select_the_right_jobs() {
+    let h = Harness::with_default_config("dirs");
+    let project = h.root.join("project");
+    let inner = project.join("inner");
+    let other = h.root.join("other");
+    for d in [&project, &inner, &other] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let run_in = |dir: &std::path::Path, name: &str| -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_qex"))
+            .args(["submit", "--name", name, "--", "true"])
+            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+            .env("XDG_STATE_HOME", h.root.join("state"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let top = run_in(&project, "top");
+    let deep = run_in(&inner, "deep");
+    let away = run_in(&other, "away");
+    for id in [&top, &deep, &away] {
+        h.ok(&["wait", id, "--timeout", "45s"]);
+    }
+
+    let names = |args: &[&str], dir: &std::path::Path| -> Vec<String> {
+        let out = Command::new(env!("CARGO_BIN_EXE_qex"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+            .env("XDG_STATE_HOME", h.root.join("state"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        let jobs: Vec<serde_json::Value> =
+            serde_json::from_slice(&out.stdout).unwrap_or_default();
+        jobs.iter()
+            .map(|j| j["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    assert_eq!(names(&["list", "--json", "--cwd"], &project), vec!["top"]);
+    let under = names(&["list", "--json", "--under"], &project);
+    assert!(under.contains(&"top".to_string()) && under.contains(&"deep".to_string()));
+    assert!(
+        !under.contains(&"away".to_string()),
+        "a different directory must not appear"
+    );
+
+    // A deletion must respect the same limit.
+    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
+        .args(["clean", "--under"])
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let left: Vec<String> = h
+        .list_json()
+        .iter()
+        .map(|j| j["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(left, vec!["away"], "the other directory must stay");
+}
+
+/// `--auto` deletes a job that stopped long ago, and keeps a job that stopped
+/// a moment ago. The age is the safety: a job of the last hour is frequently
+/// the job that the user reads now.
+#[test]
+fn clean_auto_keeps_the_recent_jobs() {
+    let h = Harness::with_default_config("auto");
+    let id = h.submit(&["submit", "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+
+    let out = h.qex(&["clean", "--auto"]);
+    assert!(out.status.success());
+    assert_eq!(
+        h.list_json().len(),
+        1,
+        "a job that stopped a moment ago must stay: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A job that a job in the queue still needs must not be deleted, whatever its
+/// own state says.
+///
+/// The job in the queue reads that record to decide whether to run, and to
+/// explain why it did not run. A deletion would take the answer away from a job
+/// that has not yet asked the question.
+#[test]
+fn a_dependency_of_a_queued_job_is_not_finished() {
+    let h = Harness::new(
+        "depclean",
+        "[budget]\ncpu = \"1\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let first = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &first, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&first), "completed");
+
+    // Hold the budget, so the job below stays in the queue.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "20"]);
+    h.until("the blocker starts", Duration::from_secs(45), || {
+        h.state_of(&blocker) == "running"
+    });
+    let second = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", &first, "--", "true",
+    ]);
+    assert_eq!(h.state_of(&second), "queued");
+
+    // The first job completed, and a job in the queue needs it.
+    let out = h.ok(&["clean", "--all"]);
+    assert!(out.contains("0 job(s)"), "nothing must go: {out}");
+    assert!(
+        out.contains("still needs them"),
+        "the message must give the reason: {out}"
+    );
+    assert!(
+        h.list_json().iter().any(|j| j["id"] == first),
+        "the record of the first job must stay"
+    );
+
+    h.ok(&["kill", &blocker, "--grace", "1s"]);
+}
+
+/// `qex du` must say how much space qex holds.
+#[test]
+fn du_reports_the_space_that_qex_holds() {
+    let h = Harness::with_default_config("du");
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "i=0; while [ $i -lt 500 ]; do echo padding-line-$i; i=$((i+1)); done",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+
+    let text = h.ok(&["du", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(v["total_bytes"].as_u64().unwrap() > 0);
+    assert!(v["jobs_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(v["largest"][0]["id"].as_str(), Some(id.as_str()));
+}
+
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,
 /// and a test harness gives a long path.
 #[test]

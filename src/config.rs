@@ -245,6 +245,23 @@ pub struct DefaultsConfig {
     pub timeout: Option<String>,
 }
 
+/// Controls the command that collects the old records.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GcConfig {
+    /// The age of a record that `qex gc` deletes.
+    ///
+    /// `qex gc` works on every directory, so this value is larger than the one
+    /// hour of `qex clean --auto`, which works on one directory tree.
+    pub keep: String,
+}
+
+impl Default for GcConfig {
+    fn default() -> Self {
+        Self { keep: "1d".into() }
+    }
+}
+
 /// Controls the short record of the jobs that qex accepted.
 ///
 /// The record lets `qex status` tell "the record was deleted" from "this job
@@ -301,6 +318,7 @@ pub struct Config {
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
     pub history: HistoryConfig,
+    pub gc: GcConfig,
 }
 
 impl Config {
@@ -347,6 +365,13 @@ impl Config {
         units::parse_duration(&self.queue.settle)
             .map_err(|e| anyhow::anyhow!("config [queue] settle: {e}"))
             .map(|d| d.unwrap_or(std::time::Duration::ZERO))
+    }
+
+    /// Gives the age of a record that `qex gc` deletes.
+    pub fn gc_keep(&self) -> Result<std::time::Duration> {
+        units::parse_duration(&self.gc.keep)
+            .map_err(|e| anyhow::anyhow!("config [gc] keep: {e}"))
+            .map(|d| d.unwrap_or(std::time::Duration::from_secs(86400)))
     }
 
     /// Gives the time to keep the id of a job after its record is gone.
@@ -412,6 +437,7 @@ impl Config {
         self.settle()?;
         self.peer_stale_after()?;
         self.history_keep()?;
+        self.gc_keep()?;
         self.default_mem()?;
         self.default_timeout()?;
         if self.learn.margin < 1.0 {

@@ -101,6 +101,8 @@ fn run() -> Result<i32> {
         Command::Cancel(args) => commands::cancel(args),
         Command::Rerun(args) => commands::rerun(args),
         Command::Clean(args) => commands::clean(args),
+        Command::Gc(args) => commands::gc(args),
+        Command::Du(args) => commands::du(args),
         Command::Info(args) => commands::info(args),
         Command::Version(args) => commands::version(args),
         Command::Watchers(args) => watchers::report(args.json),

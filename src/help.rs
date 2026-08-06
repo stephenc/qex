@@ -535,6 +535,9 @@ that qex uses now.
     [history]
     keep = \"1d\"           # how long to keep the id of a job after its removal
 
+    [gc]
+    keep = \"1d\"           # the age of a record that `qex gc` deletes
+
     [defaults]
     cpu = 1               # the default is 1 core
     mem = \"2GB\"           # the default is the machine memory / the core count
@@ -765,6 +768,30 @@ Delete the records
     qex clean completed            each job that succeeded
     qex clean done                 each job that stopped
     qex clean --state failed       each job in one state
+    qex clean --cwd                the jobs of this directory
+    qex clean --under              the jobs of this directory and below
+    qex clean --under /path        the jobs of that directory and below
+    qex clean --auto               a short form of `--state done
+                                   --older-than 1h`, on this directory and
+                                   below. A job of the last hour stays,
+                                   because it is frequently the job that you
+                                   read now.
+    qex gc                         every record of every directory that
+                                   stopped more than one day ago. It also
+                                   deletes a job directory that holds no
+                                   record. Use `--dry-run` first, and
+                                   `[gc] keep` to change the time.
+
+    qex du                         how much disk space qex holds, and the
+                                   job records that hold the most
+
+`qex list` takes `--cwd` and `--under` as well, so you can see what a deletion
+would remove.
+
+A job that a job in the queue still needs is NOT finished for a deletion,
+whatever its own state says. The job in the queue reads that record to decide
+whether to run, and to explain why it did not. `qex clean` and `qex gc` keep
+such a record and say so, and it goes when the other job stops.
     qex clean --older-than 7d      each job older than 7 days
     qex clean --all                every job
 
