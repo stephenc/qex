@@ -21,11 +21,21 @@
 //! `systemd-run` makes a temporary unit. systemd holds that unit in memory and
 //! writes no file to the disk.
 
-use crate::config::{Config, EnforceMode};
+use crate::config::Config;
+// The mode selects which cgroup file qex writes, and cgroups are Linux only.
+// macOS therefore never reads this type, and an import of it there is an
+// unused import, which CI treats as an error.
+#[cfg(target_os = "linux")]
+use crate::config::EnforceMode;
 use std::path::{Path, PathBuf};
 
 /// The result of the test for the enforcement of limits.
+///
+/// macOS makes the `Unavailable` value only, because macOS has no cgroup. The
+/// type stays the same on both systems, so the code that reads it needs no
+/// condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum Availability {
     /// qex can apply a memory limit. The path is the cgroup of the coordinator.
     Available(PathBuf),
@@ -318,6 +328,9 @@ pub fn mark_oom(job_dir: &Path) {
 }
 
 /// The name of the variable that stops a second start with systemd.
+///
+/// systemd is on Linux only, and macOS thus never reads this name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const REEXEC_VAR: &str = "QEX_SYSTEMD_STARTED";
 
 /// Starts the coordinator again in a temporary systemd unit, if that step gives
@@ -445,7 +458,7 @@ mod tests {
     #[test]
     fn the_default_mode_gives_no_warning() {
         let cfg = Config::default();
-        assert_eq!(cfg.enforce.mode, EnforceMode::Off);
+        assert_eq!(cfg.enforce.mode, crate::config::EnforceMode::Off);
         assert!(startup_warning(&cfg).is_none());
     }
 

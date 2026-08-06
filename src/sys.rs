@@ -99,7 +99,6 @@ fn vm_available() -> Option<u64> {
     const HOST_VM_INFO64_COUNT: libc::mach_msg_type_number_t = 38;
 
     #[repr(C)]
-    #[derive(Default)]
     struct VmStatistics64 {
         free_count: u32,
         active_count: u32,
@@ -110,8 +109,17 @@ fn vm_available() -> Option<u64> {
         rest: [u32; 34],
     }
 
-    let mut stats = VmStatistics64::default();
+    // Zero, and not `Default`: the standard library gives `Default` for an
+    // array of 32 elements at the most, and this array holds 34. The kernel
+    // writes each field of this structure, so the value before the call has no
+    // effect.
+    let mut stats: VmStatistics64 = unsafe { std::mem::zeroed() };
     let mut count = HOST_VM_INFO64_COUNT;
+    // `libc` marks `mach_host_self` as deprecated and gives the `mach2` crate
+    // as the answer. qex reads one value from it, and a dependency for one
+    // value is a poor exchange. The function itself is not deprecated: it is
+    // the interface of the kernel, and it does not go away.
+    #[allow(deprecated)]
     let rc = unsafe {
         libc::host_statistics64(
             libc::mach_host_self(),

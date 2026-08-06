@@ -374,6 +374,11 @@ mod tests {
 
         // It must not report the processes that started it either. The shell
         // that runs this test holds the words of the command in its own line.
+        //
+        // The list of the ancestors comes from `/proc`, which is Linux only.
+        // The macOS code removes the process group instead, and the test above
+        // covers the part that both systems share.
+        #[cfg(target_os = "linux")]
         for parent in ancestors_of(me) {
             assert!(
                 !found.iter().any(|w| w.pid == parent),
