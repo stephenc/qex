@@ -256,7 +256,9 @@ fn render(
             "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}",
             &job.id.to_string()[..8],
             job.state.as_str(),
-            job.name,
+            // The SAFE name. A name that holds an ESC byte would move the
+            // cursor of the terminal and write over this page.
+            job.display_name(),
             job.cpu,
             cpu_text,
             mem_text,

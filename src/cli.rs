@@ -91,6 +91,30 @@ pub enum Command {
     /// Find the monitor scripts on this machine that wait for a proxy.
     Watchers(WatchersArgs),
 
+    /// Write the completions for your shell to stdout.
+    ///
+    /// This command is for a person. An agent gives the full command and needs
+    /// no completion.
+    ///
+    /// bash, zsh and fish also offer the jobs, by id and by name.
+    ///
+    /// qex SHOWS a safe form of each name, here and in every other output. It
+    /// holds letters, numbers, `-`, `_` and `.` only, it does not start with
+    /// `-`, and it stops at 128 characters. The record on the disk keeps the
+    /// name that you gave, and a command finds the job by either form.
+    Completions(CompletionsArgs),
+
+    /// Write the candidates that a shell offers after TAB.
+    ///
+    /// This command is for the completion scripts. IT NEVER STARTS A
+    /// COORDINATOR: it reads the records on the disk. A press of TAB must not
+    /// start a process.
+    ///
+    /// It gives the id of each job, and the SAFE form of the name of each job.
+    /// See `qex completions --help`.
+    #[command(name = "__complete", hide = true)]
+    Complete(CompleteArgs),
+
     /// Run the coordinator. qex starts this process for you.
     #[command(hide = true)]
     Daemon(DaemonArgs),
@@ -490,6 +514,18 @@ pub struct SchemaArgs {
     /// The schema to write: job or status.
     #[arg(value_name = "WHICH")]
     pub which: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CompleteArgs {
+    /// What to offer: `ids`, `active` or `queued`.
+    pub what: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// The shell: bash, zsh, fish, elvish or powershell.
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Debug, Args)]

@@ -145,7 +145,9 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     let (cause_name, cause_state) = {
         let state = coord.state.lock().unwrap();
         match state.jobs.get(&id) {
-            Some(job) => (job.status.name.clone(), job.status.state.to_string()),
+            // The SAFE name: this value goes into a sentence that a reader
+            // sees, through `status.error`. See `job::safe_name`.
+            Some(job) => (job.status.display_name(), job.status.state.to_string()),
             None => (String::from("unknown"), String::from("unknown")),
         }
     };
@@ -180,7 +182,13 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
             .values()
             .filter(|j| !j.status.state.is_terminal())
             .filter(|j| j.spec.needs.contains(&id) || j.spec.after.contains(&id))
-            .map(|j| format!("{} ({})", &j.status.id.to_string()[..8], j.status.name))
+            .map(|j| {
+                format!(
+                    "{} ({})",
+                    &j.status.id.to_string()[..8],
+                    j.status.display_name()
+                )
+            })
             .collect();
 
         if !waiting.is_empty() {

@@ -181,12 +181,12 @@ pub const STATUS: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/qex/schema/status.json",
   "title": "qex job status",
-  "description": "The output of `qex status --json`. The file status.json of each job has this format. `qex list --json` gives an array of these objects.",
+  "description": "The output of `qex status --json`. The file status.json of each job has this format, with one difference: the file holds the job name as the user gave it, and the output holds the safe form. `qex list --json` gives an array of these objects.",
   "type": "object",
   "required": ["id", "name", "state", "submitted_at", "cpu", "mem", "usage", "tags"],
   "properties": {
     "id": { "type": "string", "format": "uuid", "description": "The job id." },
-    "name": { "type": "string", "description": "The job name. Use it in place of the id in each command." },
+    "name": { "type": "string", "description": "The job name, in its SAFE form: letters, numbers, `-`, `_` and `.` only, never a first `-`, and 128 characters at most. qex replaces each other character with `_`, and a run of them with one `_`. Use this value in place of the id in each command; qex takes the name that the user gave as well." },
     "command": {
       "type": "array",
       "items": { "type": "string" },

@@ -3,7 +3,7 @@
 use crate::cli::{self, StateFilter};
 use crate::client::Client;
 use crate::config::{Config, EnvCapture};
-use crate::job::{JobState, JobStatus};
+use crate::job::{safe_name, JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
 use crate::spec::{JobSpec, SubmitOptions};
@@ -130,12 +130,20 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
             j.group
                 .map(|g| g.to_string().starts_with(group))
                 .unwrap_or(false)
+                // The name that the user gave, AND the name that qex shows.
+                // `qex list --json` gives the safe form, so a script that reads
+                // that value and gives it back here must find the jobs. See
+                // `job::safe_name`.
                 || j.group_name.as_deref() == Some(group.as_str())
+                || j.group_name.as_deref().map(safe_name).as_deref() == Some(group.as_str())
         });
     }
     // Show the jobs in the order of submission. A pipeline then reads from the
     // first stage to the last stage.
     jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+
+    // From here the records are for a READER. See `for_display`.
+    let jobs = all_for_display(jobs);
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -224,6 +232,8 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
 
     match client.call(&Request::Status { id })? {
         Response::Status { status } => {
+            // From here the record is for a READER. See `for_display`.
+            let status = Box::new(for_display(*status));
             // Read the output of the job in the same call.
             //
             // A reader of a job that failed always wants the last lines of its
@@ -504,7 +514,8 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         if code != 0 && worst == 0 {
             worst = code;
         }
-        results.push(*status);
+        // From here the records are for a READER. See `for_display`.
+        results.push(for_display(*status));
     }
 
     if args.json {
@@ -549,6 +560,8 @@ fn wait_for_any(args: &cli::WaitArgs, deadline: Option<Instant>) -> Result<i32> 
             };
 
             if status.state.is_terminal() {
+                // From here the record is for a READER. See `for_display`.
+                let status = for_display(status);
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(&vec![&status])?);
                 } else {
@@ -1159,9 +1172,9 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         //
         // A job can have the name of a state. Test the jobs first, and give an
         // error when the word gives both a job and a state.
-        let is_job = jobs
-            .iter()
-            .any(|j| j.id.to_string().starts_with(raw) || j.name == *raw);
+        let is_job = jobs.iter().any(|j| {
+            j.id.to_string().starts_with(raw) || j.name == *raw || safe_name(&j.name) == *raw
+        });
         match (is_job, StateFilter::parse(raw)) {
             (true, Ok(_)) => bail!(
                 "`{raw}` is the name of a job and the name of a state. \
@@ -1368,6 +1381,26 @@ fn short_id(id: &uuid::Uuid) -> String {
     id.to_string()[..8].to_string()
 }
 
+/// Gives the form of a record that qex SHOWS.
+///
+/// This is the one boundary between a record and a reader. Everything that a
+/// command prints — the table, the sentences and the JSON — comes from the
+/// value that this gives, so a name reaches a reader in its safe form and it
+/// reaches that reader once. See `job::safe_name`.
+///
+/// The record on the disk is not touched. `resolve_id` reads the stored name,
+/// so a user who knows the name that they gave still finds the job.
+fn for_display(mut s: JobStatus) -> JobStatus {
+    s.name = safe_name(&s.name);
+    s.group_name = s.group_name.as_deref().map(safe_name);
+    s
+}
+
+/// The same, for a list of records.
+fn all_for_display(jobs: Vec<JobStatus>) -> Vec<JobStatus> {
+    jobs.into_iter().map(for_display).collect()
+}
+
 /// Reads a job id from the text that the user wrote.
 ///
 /// The user can write the full id, or the start of the id. A short id is easier
@@ -1396,9 +1429,12 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
         };
     }
 
+    // The stored name AND the safe name of it. A shell offers the safe name,
+    // so a user who pressed TAB gives that word to the command; a user who
+    // knows the real name still gives that one. See `safe_name`.
     let matches: Vec<&JobStatus> = jobs
         .iter()
-        .filter(|j| j.id.to_string().starts_with(raw) || j.name == raw)
+        .filter(|j| j.id.to_string().starts_with(raw) || j.name == raw || safe_name(&j.name) == raw)
         .collect();
 
     match matches.len() {
@@ -1409,7 +1445,7 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
              the old jobs with `qex clean done` and start again.\n{}",
             matches
                 .iter()
-                .map(|j| format!("  {} {}", j.id, j.name))
+                .map(|j| format!("  {} {}", j.id, j.display_name()))
                 .collect::<Vec<_>>()
                 .join("\n")
         ),
@@ -1656,7 +1692,10 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "group": group.to_string(),
-                "group_name": group_name,
+                // The SAFE form, so that ONE field name carries ONE value.
+                // `qex list --json` gives this same value, and `qex list
+                // --group` takes it. See `job::safe_name`.
+                "group_name": crate::job::safe_name(&group_name),
                 "jobs": jobs,
             }))?
         );
@@ -1664,7 +1703,10 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
         // The group id goes on stdout alone, so `GROUP=$(qex pipeline f.toml)`
         // operates in the same way as `ID=$(qex submit ...)`.
         for (name, id) in &submitted {
-            eprintln!("{name}: {id}");
+            // The SAFE name: this line goes to a terminal. The JSON above and
+            // the id file keep the name of the stage as the file gives it,
+            // because a machine reads that name as a KEY.
+            eprintln!("{}: {id}", crate::job::safe_name(name));
         }
         println!("{group}");
     }
@@ -1745,6 +1787,55 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
             if replaced {
                 println!("the qex program changed after this coordinator started");
             }
+        }
+    }
+    Ok(0)
+}
+
+/// Writes the candidates that a shell offers after TAB.
+///
+/// # Three rules
+///
+/// 1. THIS COMMAND NEVER STARTS A COORDINATOR. It reads the records on the
+///    disk. A press of TAB must not start a process, and a user who presses TAB
+///    in a directory with no work must not leave a coordinator behind.
+/// 2. It never fails. A completion that writes an error puts that error in the
+///    line that the user is typing. An empty answer is the correct answer when
+///    something is wrong.
+/// 3. It gives the SAFE form of each name. See `job::safe_name`.
+pub fn complete(args: cli::CompleteArgs) -> Result<i32> {
+    let jobs = crate::job::read_all_from_disk();
+
+    let wanted: Vec<&crate::job::JobStatus> = match args.what.as_str() {
+        // `qex kill` takes a job that operates, and nothing else.
+        "active" => jobs.iter().filter(|j| j.state.is_active()).collect(),
+        // `qex cancel` takes a job that waits in the queue.
+        "queued" => jobs
+            .iter()
+            .filter(|j| j.state == crate::job::JobState::Queued)
+            .collect(),
+        _ => jobs.iter().collect(),
+    };
+
+    // The newest first. A user completes the work of this hour far more often
+    // than the work of last week, and a shell shows the first candidates.
+    let mut out: Vec<&crate::job::JobStatus> = wanted;
+    out.reverse();
+
+    // The id AND the name, for each set. A person types a name far more often
+    // than a uuid, and qex accepts either in the same place.
+    //
+    // A name repeats over time, because two runs of one command can share it.
+    // qex answers that with an error that lists the jobs, so an ambiguous name
+    // costs a second command and never the wrong job.
+    let mut seen = std::collections::BTreeSet::new();
+    for job in out {
+        println!("{}", job.id);
+        // The SAFE FORM of the name, and never the name itself. See
+        // `safe_name`.
+        let name = safe_name(&job.name);
+        if !name.is_empty() && seen.insert(name.clone()) {
+            println!("{name}");
         }
     }
     Ok(0)
@@ -1849,7 +1940,8 @@ fn pipeline_id_file(
             .collect();
         return Ok(serde_json::to_string_pretty(&serde_json::json!({
             "group": group.to_string(),
-            "group_name": group_name,
+            // The SAFE form. See the note in `pipeline`.
+            "group_name": crate::job::safe_name(group_name),
             "jobs": stages,
         }))?);
     }
@@ -2367,7 +2459,8 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
         if age >= keep {
             targets.push((
                 j.id,
-                j.name.clone(),
+                // For a READER. See `for_display`.
+                j.display_name(),
                 directory_size(&paths::job_dir(&j.id)?),
             ));
         }
@@ -2528,7 +2621,8 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
                         >= cfg.gc_keep().map(|d| d.as_secs()).unwrap_or(86400);
                     per_job.push((
                         status.id,
-                        status.name.clone(),
+                        // For a READER. See `for_display`.
+                        status.display_name(),
                         status.state.to_string(),
                         size,
                         status.state.is_terminal() && old,

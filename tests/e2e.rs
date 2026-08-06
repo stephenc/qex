@@ -3639,3 +3639,1157 @@ fn wait_for_child(mut child: std::process::Child, limit: Duration, what: &str) -
         }
     }
 }
+
+/// The completions must name the commands that qex has.
+///
+/// A completion file that a person installs and then finds to be wrong is worse
+/// than no completion: it teaches a command that does not exist.
+#[test]
+fn the_completions_hold_the_commands_of_qex() {
+    let h = Harness::with_default_config("completions");
+
+    for shell in ["bash", "zsh", "fish"] {
+        let out = h.ok(&["completions", shell]);
+        assert!(!out.is_empty(), "{shell} gave nothing");
+        for command in ["submit", "wait", "status", "logs", "kill", "watchers"] {
+            assert!(
+                out.contains(command),
+                "the {shell} completions must name `{command}`"
+            );
+        }
+    }
+
+    // A shell that qex does not know must give an error, and not an empty file.
+    let out = h.qex(&["completions", "not-a-shell"]);
+    assert!(!out.status.success(), "an unknown shell must give an error");
+
+    // A NAME MUST NOT RUN. `compgen -W` expands its word list again, so the
+    // first version of this code ran a job named `$(...)` when somebody pressed
+    // TAB. An agent chooses the names of the jobs and a person presses the TAB,
+    // so a name is not trusted text.
+    let bash = h.ok(&["completions", "bash"]);
+    let jobs_part = &bash[bash.find("_qex_jobs()").expect("bash needs `_qex_jobs`")..];
+    // The comment in that part NAMES `compgen`, and a comment is not code.
+    assert!(
+        !jobs_part
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains("compgen")),
+        "the bash completions must not expand the names again: {jobs_part}"
+    );
+    assert!(
+        jobs_part.contains("while IFS= read -r candidate"),
+        "the bash completions must read the names as lines"
+    );
+
+    // A NAME MUST STAY ONE WORD. bash writes a candidate to the line as it
+    // stands, so a name that holds `;` would put a command on the line beside
+    // `qex`, and the next press of ENTER would run it. `printf %q` puts a
+    // backslash before each character that the shell reads.
+    assert!(
+        jobs_part.contains("printf -v candidate '%q'"),
+        "the bash completions must make each name safe for the command line"
+    );
+    // A leading `~` as well. bash 5.1 escapes it with `%q` and bash 3.2 does
+    // NOT, so a name of `~/x` arrived as a home directory on macOS.
+    //
+    // `bash_keeps_a_hostile_candidate_in_one_word` measures the outcome, and it
+    // can only measure the bash of the machine that runs it. This assertion
+    // holds the rule on every machine.
+    assert!(
+        jobs_part.contains(r#"case "$candidate" in "~"*) candidate="\\$candidate" ;; esac"#),
+        "the bash completions must make a leading `~` safe as well"
+    );
+    // `compopt -o filenames` asks bash to do that work instead, and it treats
+    // each name as a FILE: a name that is also a directory got a `/`, and a
+    // name that starts with `~` was expanded. Do not go back to it.
+    assert!(
+        !jobs_part
+            .lines()
+            .any(|l| !l.trim_start().starts_with('#') && l.contains("compopt")),
+        "the bash completions must not treat a job name as a file name"
+    );
+
+    // BASH MUST CALL THE FUNCTION THAT ADDS THE JOBS.
+    //
+    // This is the fault that zsh had: the words were in the file and the shell
+    // never ran them. A test that calls `_qex_with_jobs` by name cannot see it,
+    // because the name is right and the registration is wrong.
+    assert!(
+        bash.contains("complete -F _qex_with_jobs "),
+        "bash must give `_qex_with_jobs` to the shell, and not `_qex`: {bash}"
+    );
+    // `-o nosort` came with bash 4.4, and `complete` refuses the WHOLE command
+    // when it meets an option name that it does not know. An earlier version
+    // wrote that option with no test of the version, so on the bash 3.2 of
+    // macOS the file bound NOTHING and it wrote an error at each shell start.
+    assert!(
+        bash.contains("BASH_VERSINFO[0]}\" -eq 4 && \"${BASH_VERSINFO[1]}\" -ge 4")
+            && bash.contains("complete -F _qex_with_jobs -o bashdefault -o default qex"),
+        "the registration must test the version of bash before it uses `-o nosort`: {bash}"
+    );
+    // `-o nosort` must stay for a bash that has it: it is what keeps the newest
+    // job first, and bash sorts the candidates again without it.
+    assert!(
+        bash.contains("complete -F _qex_with_jobs -o nosort -o bashdefault -o default qex"),
+        "a bash that has `-o nosort` must get it: {bash}"
+    );
+    assert!(
+        bash.contains("_qex_with_jobs() {") && bash.contains("    _qex_jobs\n}"),
+        "`_qex_with_jobs` must run `_qex` and then add the jobs"
+    );
+
+    // An option that takes a VALUE must be named, and a flag must not. The
+    // guard read every word that starts with a dash, so `qex status --json
+    // <TAB>` offered no job at all.
+    let guard = bash
+        .lines()
+        .find(|l| l.contains("in *\" $prev \"*)"))
+        .expect("bash needs the guard for an option value");
+    for valued in ["--signal", "--grace", "--timeout", "--tail", "-C"] {
+        assert!(
+            guard.contains(&format!(" {valued} ")),
+            "`{valued}` takes a value, so it must be in the guard: {guard}"
+        );
+    }
+    for flag in ["--json", "--show-env", "--no-logs", "--all"] {
+        assert!(
+            !guard.contains(&format!(" {flag} ")),
+            "`{flag}` takes no value, so the word after it is a job: {guard}"
+        );
+    }
+
+    // The zsh completions must ASK for the ids where a job goes.
+    //
+    // An earlier version put the function at the end of the file. zsh gives
+    // the completion to the shell in the lines above it, so that function
+    // never ran and zsh offered no job at all. It is not enough that the file
+    // holds the words; the job argument must name the function.
+    let zsh = h.ok(&["completions", "zsh"]);
+    for (line, what) in [
+        ("':id -- The job id, or the start of the id", "ids"),
+        ("'*::ids -- The job ids to wait for", "ids"),
+        ("'*::ids -- The job ids to stop", "active"),
+        ("'*::ids -- The job ids to remove from the queue", "queued"),
+        ("'*::ids -- The job ids to delete", "ids"),
+    ] {
+        assert!(
+            zsh.contains(&format!("{line}: _qex_jobs {what}' \\")),
+            "the zsh job argument must offer the jobs: {line}"
+        );
+    }
+    // The SPACE before `_qex_jobs` is not decoration: zsh runs an action as a
+    // command only when the action starts with a space.
+    assert!(
+        !zsh.contains(":_qex_jobs "),
+        "a zsh action needs a space before the name of the function"
+    );
+    // An option that takes a value is not a job. `qex kill --signal <TAB>`
+    // must offer a signal, and never a job.
+    assert!(
+        zsh.contains("]:SIGNAL:_default'"),
+        "the value of `--signal` must not become a job"
+    );
+    // The function must exist BEFORE the file gives the completion to the
+    // shell, and `#compdef` must stay on the first line.
+    let helper = zsh.find("_qex_jobs()").expect("zsh needs `_qex_jobs`");
+    let hand_over = zsh.find("compdef _qex qex").expect("zsh needs `compdef`");
+    assert!(
+        zsh.starts_with("#compdef qex"),
+        "zsh needs `#compdef` first"
+    );
+    assert!(
+        helper < hand_over,
+        "`_qex_jobs` must exist before zsh gets the completion"
+    );
+
+    // The commands that qex gives to itself must not be offered. A person who
+    // pressed TAB was invited to run `qex daemon`.
+    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
+        let out = h.ok(&["completions", shell]);
+        for hidden in ["daemon", "supervise", "__complete"] {
+            // Look in the lines that OFFER a command, and not in the whole
+            // file: the part that asks qex for the ids names `qex __complete`
+            // itself, and that line is code and not a candidate. The block that
+            // says what a hidden command accepts also stays, and it offers
+            // nothing.
+            for line in out.lines() {
+                let trimmed = line.trim_start();
+                let offers = trimmed.starts_with("opts=\"")
+                    || trimmed.starts_with(&format!("'{hidden}:"))
+                    || trimmed.starts_with("cand ")
+                    || trimmed.starts_with("[CompletionResult]::new(")
+                    || (trimmed.starts_with("complete -c qex")
+                        && trimmed.contains("__fish_use_subcommand"));
+                if !offers {
+                    continue;
+                }
+                assert!(
+                    !line
+                        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                        .any(|word| word == hidden),
+                    "the {shell} completions must not offer `{hidden}`: {line}"
+                );
+            }
+        }
+    }
+
+    // The shells that offer the ids must hold the command that asks for them.
+    for shell in ["bash", "zsh", "fish"] {
+        let out = h.ok(&["completions", shell]);
+        assert!(
+            out.contains("qex __complete"),
+            "the {shell} completions must ask qex for the ids"
+        );
+    }
+
+    // fish gets one line for each set, and each line names the commands that
+    // take that set.
+    let fish = h.ok(&["completions", "fish"]);
+    for (commands, what) in [
+        ("status wait logs rerun clean", "ids"),
+        ("kill", "active"),
+        ("cancel", "queued"),
+    ] {
+        assert!(
+            fish.contains(&format!(
+                "complete -c qex -n \"__fish_seen_subcommand_from {commands}\" \
+                 -f -a \"(qex __complete {what})\""
+            )),
+            "fish must offer `{what}` after `{commands}`: {fish}"
+        );
+    }
+}
+
+/// The candidates for a shell must come from the disk, and they must never
+/// start a coordinator.
+///
+/// A press of TAB is not a request to start a process. A user who presses TAB
+/// in a directory with no work must not leave a coordinator behind.
+#[test]
+fn the_completion_candidates_start_no_coordinator() {
+    let h = Harness::with_default_config("candidates");
+
+    // No coordinator, and no jobs.
+    let empty = h.ok(&["__complete", "ids"]);
+    assert!(empty.is_empty(), "an empty state must give no candidate");
+    let info = h.qex(&["info", "--no-start"]);
+    let text = String::from_utf8_lossy(&info.stdout);
+    assert!(
+        text.contains("no coordinator"),
+        "TAB must not start a coordinator: {text}"
+    );
+
+    // A job that operates, and a job that waits for it.
+    let running = h.submit(&[
+        "submit", "--name", "holder", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--",
+        "sleep", "300",
+    ]);
+    let queued = h.submit(&[
+        "submit", "--name", "waiter", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--", "true",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&running) == "running"
+    });
+
+    // Every job, with the id and the name of each.
+    let all = h.ok(&["__complete", "ids"]);
+    for want in [running.as_str(), queued.as_str(), "holder", "waiter"] {
+        assert!(all.lines().any(|l| l == want), "`ids` must hold {want}");
+    }
+
+    // `qex kill` takes a job that operates, so it must not offer one that
+    // waits. `qex cancel` is the opposite. A candidate that the command
+    // refuses teaches the wrong command.
+    let active = h.ok(&["__complete", "active"]);
+    assert!(active.lines().any(|l| l == running));
+    assert!(
+        !active.lines().any(|l| l == queued),
+        "`active` must not hold a job that waits: {active}"
+    );
+
+    let waiting = h.ok(&["__complete", "queued"]);
+    assert!(waiting.lines().any(|l| l == queued));
+    assert!(
+        !waiting.lines().any(|l| l == running),
+        "`queued` must not hold a job that operates: {waiting}"
+    );
+
+    // THE LIST HOLDS A SAFE FORM OF EACH NAME.
+    //
+    // Each character outside the set `A-Z a-z 0-9 - _ .` becomes `_`, a run of
+    // them becomes ONE `_`, a first character of `-` becomes `_`, and the
+    // result stops at 128 characters.
+    //
+    // A record on the disk is not a promise about its content: qex wrote
+    // records before this rule, and one of them can hold a name with a space, a
+    // `$` or a `;`. The safe form comes from the name that the record holds, so
+    // the rule reaches every record at once and `qex gc` is not the thing that
+    // applies it.
+    let pairs = [
+        ("deploy prod$(id)", "deploy_prod_id_"),
+        ("cost $HOME", "cost_HOME"),
+        ("a; touch", "a_touch"),
+        ("two\nlines", "two_lines"),
+        ("two\tparts", "two_parts"),
+        ("esc\u{1b}[2Jname", "esc_2Jname"),
+        ("src/main", "src_main"),
+        ("a:b", "a_b"),
+        ("build-*", "build-_"),
+        ("-version", "_version"),
+        ("caf\u{e9}", "caf_"),
+        ("plain-name_1.2", "plain-name_1.2"),
+    ];
+    for (name, safe) in pairs {
+        let id = h.submit(&["submit", &format!("--name={name}"), "--", "true"]);
+        // qex shows the safe form. `every_output_shows_the_safe_name` holds
+        // the other half: the record on the disk keeps the name that the user
+        // gave.
+        assert_eq!(
+            h.status_json(&id)["name"].as_str(),
+            Some(safe),
+            "qex must show {safe:?} for the name {name:?}"
+        );
+        // The list holds the SAFE form, and never the name itself.
+        let all = h.ok(&["__complete", "ids"]);
+        assert!(
+            all.lines().any(|l| l == safe),
+            "the list must offer {safe:?} for the name {name:?}: {all}"
+        );
+        if safe != name {
+            assert!(
+                !all.lines().any(|l| l == name),
+                "the list must not offer the name {name:?} itself: {all}"
+            );
+        }
+        // AND THE SAFE FORM FINDS THE JOB. Without this a press of TAB would
+        // give a word that no command takes.
+        assert_eq!(
+            h.status_json(safe)["id"].as_str(),
+            Some(id.as_str()),
+            "`qex status {safe}` must find the job named {name:?}"
+        );
+        // The stored name still finds it as well. A user who knows the real
+        // name must not lose it. A name that starts with `-` goes after `--`,
+        // which is how every command line takes a value of that form.
+        let found = if name.starts_with('-') {
+            h.qex(&["status", "--", name])
+        } else {
+            h.qex(&["status", name])
+        };
+        assert!(
+            found.status.success(),
+            "`qex status` must still find the job by its stored name {name:?}"
+        );
+    }
+
+    // A LONG NAME stops at 128 characters.
+    let long = "y".repeat(200);
+    h.submit(&["submit", &format!("--name={long}"), "--", "true"]);
+    let all = h.ok(&["__complete", "ids"]);
+    assert!(
+        all.lines().any(|l| l == "y".repeat(128)),
+        "a long name must stop at 128 characters"
+    );
+    assert!(
+        all.lines().all(|l| l.chars().count() <= 128),
+        "no candidate may be longer than 128 characters"
+    );
+
+    // TWO NAMES THAT GIVE ONE SAFE FORM fall into the answer that qex already
+    // has for a name that names more than one job. There is no second error.
+    //
+    // `a b` and `a_b` both give `a_b`. `a-b` does NOT collide with them,
+    // because `-` is inside the set and it is not replaced.
+    h.submit(&["submit", "--name=x y", "--", "true"]);
+    h.submit(&["submit", "--name=x_y", "--", "true"]);
+    let out = h.qex(&["status", "x_y"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an ambiguous name must give an error"
+    );
+    assert!(
+        err.contains("`x_y` names 2 jobs"),
+        "the error must say how many jobs the word names: {err}"
+    );
+    assert!(
+        err.contains("Give the id of the job that you want"),
+        "the error must say what the reader must do: {err}"
+    );
+    assert_eq!(
+        err.lines().filter(|l| l.starts_with("  ")).count(),
+        2,
+        "the error must list the two jobs: {err}"
+    );
+    // The list of the error shows the SAFE name of each job, so a reader can
+    // copy an id and see which job it is.
+    assert_eq!(
+        err.lines().filter(|l| l.ends_with(" x_y")).count(),
+        2,
+        "the error must name each job: {err}"
+    );
+
+    // One candidate only, for two jobs with one safe form.
+    let all = h.ok(&["__complete", "ids"]);
+    assert_eq!(
+        all.lines().filter(|l| *l == "x_y").count(),
+        1,
+        "one safe form gives one candidate: {all}"
+    );
+
+    h.ok(&["kill", &running, "--grace", "1s"]);
+}
+
+/// qex must SHOW the safe form of a name, and only that, in every output.
+///
+/// A job name is text that another agent chose. A name that holds an ESC byte,
+/// written to a terminal by `qex list`, moves the cursor and writes over the
+/// text around it: no shell and no TAB are needed. Sanitising at each output
+/// closes that whole class.
+///
+/// The record on the disk keeps the name that the user gave, and `qex status`
+/// still finds the job by it.
+#[test]
+fn every_output_shows_the_safe_name() {
+    let h = Harness::with_default_config("safename");
+
+    let stored = "deploy prod$(id)";
+    let safe = "deploy_prod_id_";
+    let id = h.submit(&["submit", &format!("--name={stored}"), "--", "true"]);
+    // A name that holds an ESC byte. This is the one that hurts a terminal.
+    let esc = "esc\u{1b}[2Jbad";
+    let esc_id = h.submit(&["submit", &format!("--name={esc}"), "--", "true"]);
+    h.until("both jobs stop", Duration::from_secs(45), || {
+        h.state_of(&id) == "completed" && h.state_of(&esc_id) == "completed"
+    });
+
+    // 1. THE RECORD KEEPS THE STORED NAME. This change rewrites no history.
+    let record = h.root.join("state/qex/jobs").join(&id).join("status.json");
+    let text = std::fs::read_to_string(&record).expect("the record must exist");
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        value["name"].as_str(),
+        Some(stored),
+        "the record on the disk must keep the name that the user gave"
+    );
+
+    // 2. EVERY OUTPUT SHOWS THE SAFE FORM.
+    let list = h.ok(&["list"]);
+    assert!(list.contains(safe), "`qex list` must show {safe}: {list}");
+    let status = h.ok(&["status", &id]);
+    assert!(
+        status.contains(&format!("name:      {safe}")),
+        "`qex status` must show {safe}: {status}"
+    );
+    assert_eq!(
+        h.status_json(&id)["name"].as_str(),
+        Some(safe),
+        "the JSON of `qex status` must hold the safe name"
+    );
+    let listed = h.list_json();
+    assert!(
+        listed
+            .iter()
+            .any(|j| j["name"].as_str() == Some(safe) && j["id"].as_str() == Some(id.as_str())),
+        "the JSON of `qex list` must hold the safe name: {listed:?}"
+    );
+    for out in [
+        h.ok(&["wait", &id]),
+        h.ok(&["wait", &id, "--json"]),
+        h.ok(&["du", "--json"]),
+        h.ok(&["gc", "--dry-run", "--older-than", "0s", "--json"]),
+        h.ok(&["__complete", "ids"]),
+    ] {
+        assert!(
+            !out.contains(stored),
+            "an output showed the stored name: {out}"
+        );
+    }
+
+    // 3. THE ESC BYTE REACHES NO OUTPUT. Test the BYTES, and not the text: a
+    // reader of a terminal never sees the byte, and that is the whole point.
+    for args in [
+        vec!["list"],
+        vec!["list", "--json"],
+        vec!["status", &esc_id],
+        vec!["status", &esc_id, "--json"],
+        vec!["wait", &esc_id],
+        vec!["wait", &esc_id, "--json"],
+        vec!["du", "--json"],
+        vec!["du"],
+        vec!["gc", "--dry-run", "--older-than", "0s", "--json"],
+        vec!["__complete", "ids"],
+        vec!["top", "--once"],
+    ] {
+        let out = h.qex(&args);
+        // `qex top` paints with its own escape codes, so look for the bytes of
+        // the NAME and not for an escape byte anywhere.
+        for stream in [&out.stdout, &out.stderr] {
+            assert!(
+                !stream.windows(6).any(|w| w == b"esc\x1b[2"),
+                "`qex {}` wrote the ESC byte of a job name",
+                args.join(" ")
+            );
+        }
+    }
+
+    // 5. A NAME THAT REACHES A READER INSIDE ANOTHER SENTENCE.
+    //
+    // The sentence that says why a job waits, the sentence that says which job
+    // failed, and the sentence that says that a record is gone each carry the
+    // name of a DIFFERENT job. Those sentences go to the reader in the same
+    // way, so they hold the safe name too.
+    let holder = h.submit(&[
+        "submit",
+        &format!("--name={esc}"),
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--lock",
+        "one",
+        "--",
+        "sleep",
+        "300",
+    ]);
+    let waiter = h.submit(&[
+        "submit", "--name", "waiter", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--", "true",
+    ]);
+    h.until(
+        "the second job waits for the lock",
+        Duration::from_secs(45),
+        || h.status_json(&waiter)["blocked_reason"].is_string(),
+    );
+
+    // A job that FAILED, and a job that needed it.
+    let broken = h.submit(&[
+        "submit",
+        &format!("--name={esc}"),
+        "--",
+        "sh",
+        "-c",
+        "exit 3",
+    ]);
+    let dependent = h.submit(&["submit", "--needs", &broken, "--", "true"]);
+    h.until(
+        "the dependent job is skipped",
+        Duration::from_secs(45),
+        || h.state_of(&dependent) == "skipped",
+    );
+
+    // And a record that something deleted.
+    let gone = h.submit(&["submit", &format!("--name={esc}"), "--", "true"]);
+    h.until("that job stops", Duration::from_secs(45), || {
+        h.state_of(&gone) == "completed"
+    });
+    h.ok(&["clean", &gone]);
+
+    for args in [
+        vec!["list"],
+        vec!["list", "--json"],
+        vec!["status", &waiter],
+        vec!["status", &waiter, "--json"],
+        vec!["status", &dependent],
+        vec!["status", &dependent, "--json"],
+        vec!["status", &gone],
+        vec!["top", "--once"],
+    ] {
+        let out = h.qex(&args);
+        for stream in [&out.stdout, &out.stderr] {
+            assert!(
+                !stream.windows(6).any(|w| w == b"esc\x1b[2"),
+                "`qex {}` wrote the ESC byte of a job name",
+                args.join(" ")
+            );
+        }
+    }
+    // The sentences must still NAME the other job, in its safe form. A test
+    // that only looks for the absence of a byte passes when the name is gone.
+    let reason = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("esc_2Jbad"),
+        "the sentence must name the job that holds the lock: {reason}"
+    );
+    let failed = h.status_json(&dependent)["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        failed.contains("esc_2Jbad"),
+        "the sentence must name the job that failed: {failed}"
+    );
+    let missing = String::from_utf8_lossy(&h.qex(&["status", &gone]).stderr).to_string();
+    assert!(
+        missing.contains("esc_2Jbad"),
+        "the sentence must name the job whose record is gone: {missing}"
+    );
+
+    // The sentence that names a job that a QUEUED job waits for.
+    let needs_holder = h.submit(&["submit", "--needs", &holder, "--", "true"]);
+    h.until("that job waits", Duration::from_secs(45), || {
+        h.status_json(&needs_holder)["blocked_reason"].is_string()
+    });
+    let reason = h.status_json(&needs_holder)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("esc_2Jbad") && !reason.contains('\u{1b}'),
+        "the sentence must name the job that this one waits for, safely: {reason}"
+    );
+
+    // The sentence that `qex clean` gives when a job in the queue needs the
+    // record. It names the job that WAITS.
+    let done = h.submit(&["submit", "--", "true"]);
+    h.until("a job to delete stops", Duration::from_secs(45), || {
+        h.state_of(&done) == "completed"
+    });
+    // The waiting job needs that record AND the lock, so it stays in the queue
+    // while the record it needs is already deletable.
+    let waiting_esc = h.submit(&[
+        "submit",
+        &format!("--name={esc}"),
+        "--needs",
+        &done,
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--lock",
+        "one",
+        "--",
+        "true",
+    ]);
+    h.until("that job waits too", Duration::from_secs(45), || {
+        h.state_of(&waiting_esc) == "queued"
+    });
+    let refused = h.qex(&["clean", &done]);
+    let text = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        text.contains("is needed by"),
+        "`qex clean` must refuse a record that a job in the queue needs: {text}"
+    );
+    assert!(
+        text.contains("esc_2Jbad") && !text.contains('\u{1b}'),
+        "that sentence must name the waiting job, safely: {text}"
+    );
+
+    // The sentence that `qex clean` writes into a job that did not run. It
+    // names the job whose record goes.
+    h.ok(&["clean", &broken]);
+    let after = h.status_json(&dependent)["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        after.contains("esc_2Jbad") && !after.contains('\u{1b}'),
+        "the sentence must name the deleted job, safely: {after}"
+    );
+
+    // A PIPELINE gives a group a name, and that name reaches a reader too.
+    //
+    // ONE FIELD NAME CARRIES ONE VALUE. `qex list --json`, `qex pipeline
+    // --json` and the id file all give the safe form, and `qex list --group`
+    // takes it. A script that reads the value out of one of them and gives it
+    // back to `--group` must find the jobs.
+    let file = h.root.join("p.toml");
+    std::fs::write(
+        &file,
+        "name = \"my grp\\u001B[2Jbad\"\n\n         [[jobs]]\nname = \"stg\\u001B[2Jbad\"\ncommand = [\"true\"]\n",
+    )
+    .unwrap();
+    let id_file = h.root.join("ids.json");
+    let made = h.qex(&[
+        "pipeline",
+        file.to_str().unwrap(),
+        "--json",
+        "--id-file",
+        id_file.to_str().unwrap(),
+    ]);
+    assert!(made.status.success(), "the pipeline must start");
+
+    // `qex pipeline --json` gives the SAME `group_name` as `qex list --json`.
+    let started: serde_json::Value = serde_json::from_slice(&made.stdout).unwrap();
+    assert_eq!(
+        started["group_name"].as_str(),
+        Some("my_grp_2Jbad"),
+        "`qex pipeline --json` must give the safe group name: {started}"
+    );
+
+    // The line that `qex pipeline` writes for a PERSON holds the safe name of
+    // each stage. The JSON above and the id file keep the name of the stage,
+    // because a machine reads it as a key.
+    let file2 = h.root.join("p2.toml");
+    std::fs::write(
+        &file2,
+        "name = \"two grp\"\n\n         [[jobs]]\nname = \"stg\\u001B[2Jbad\"\ncommand = [\"true\"]\n",
+    )
+    .unwrap();
+    let echo = h.qex(&["pipeline", file2.to_str().unwrap()]);
+    assert!(
+        !echo.stderr.windows(6).any(|w| w == b"stg\x1b[2"),
+        "`qex pipeline` wrote the ESC byte of a stage name: {}",
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&echo.stderr).contains("stg_2Jbad"),
+        "`qex pipeline` must still name each stage: {}",
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    let listed = h.list_json();
+    let group = listed
+        .iter()
+        .filter_map(|j| j["group_name"].as_str())
+        .find(|n| n.contains("grp"))
+        .expect("the pipeline must give the group a name")
+        .to_string();
+    assert_eq!(
+        group, "my_grp_2Jbad",
+        "the group name must reach a reader in its safe form"
+    );
+    let ids: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&id_file).unwrap()).unwrap();
+    assert_eq!(
+        ids["group_name"].as_str(),
+        Some(group.as_str()),
+        "the id file must give the same value as `qex list --json`: {ids}"
+    );
+
+    // `qex list --group` takes the value that qex showed, AND the name that
+    // the file gave.
+    for word in [group.as_str(), "my grp\u{1b}[2Jbad"] {
+        let out = h.ok(&["list", "--group", word, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "`qex list --group {word:?}` must find the job of the pipeline: {out}"
+        );
+        assert!(
+            !out.contains('\u{1b}'),
+            "no output holds an ESC byte: {out}"
+        );
+    }
+    // And the group id still works.
+    let gid = listed
+        .iter()
+        .find(|j| j["group_name"].as_str() == Some(group.as_str()))
+        .unwrap()["group"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = h.ok(&["list", "--group", &gid, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap();
+    assert_eq!(jobs.len(), 1, "`qex list --group <id>` must still work");
+
+    // The log of the coordinator is an output as well. A person reads it in a
+    // terminal after a fault, so a name in it holds no ESC byte either.
+    let log = std::fs::read(h.root.join("state/qex/run/daemon.log")).unwrap_or_default();
+    assert!(
+        !log.windows(6).any(|w| w == b"esc\x1b[2"),
+        "the log of the coordinator wrote the ESC byte of a job name"
+    );
+    assert!(
+        log.windows(9).any(|w| w == b"esc_2Jbad"),
+        "the log of the coordinator must still name the job"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+
+    // 4. THE ROUND TRIP, AND ITS LIMIT.
+    //
+    // The NAME column of the table stops at 16 characters, as it did before
+    // this rule, so a word copied out of that column is not always the whole
+    // name. `qex list --json` and `qex status` give the whole name, and the
+    // documentation names those two. This test holds the boundary, so that a
+    // later change to the column does not make the sentence false in silence.
+    let long_name = "a-very-long-name-for-one-job";
+    let long_id = h.submit(&["submit", "--name", long_name, "--", "true"]);
+    let table = h.ok(&["list"]);
+    assert!(
+        !table.contains(long_name),
+        "the table stops the name at 16 characters: {table}"
+    );
+    assert_eq!(
+        h.status_json(long_name)["id"].as_str(),
+        Some(long_id.as_str()),
+        "the whole name must find the job"
+    );
+    assert_eq!(
+        h.list_json()
+            .iter()
+            .find(|j| j["id"].as_str() == Some(long_id.as_str()))
+            .unwrap()["name"]
+            .as_str(),
+        Some(long_name),
+        "`qex list --json` must give the whole name"
+    );
+
+    // 4b. THE ROUND TRIP for a name that fits. A safe name that a reader copies out of `qex list`
+    // goes back into `qex status` as it stands.
+    let from_list = listed
+        .iter()
+        .find(|j| j["id"].as_str() == Some(id.as_str()))
+        .unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        h.status_json(&from_list)["id"].as_str(),
+        Some(id.as_str()),
+        "the name that `qex list` shows must find the job"
+    );
+
+    // And the name that the user gave still finds it as well.
+    assert_eq!(
+        h.status_json(stored)["id"].as_str(),
+        Some(id.as_str()),
+        "the stored name must still find the job"
+    );
+}
+
+/// bash must keep a hostile candidate in ONE word, whatever the answer holds.
+///
+/// `qex __complete` gives a SAFE form of each name now, so the real command no
+/// longer answers with a `;` or a `$(`. That is not a reason to stop making the
+/// word safe in the shell, and it is not a reason to stop testing it: **the
+/// answer is text that came off a disk, and it is not a guarantee.** A record
+/// that another program wrote, a record of a qex that is older or newer, and a
+/// fault in the sanitiser all reach this function in the same way.
+///
+/// The test puts a `qex` of its own in front of the real one on the PATH, and
+/// that one answers with the names that an attacker would choose.
+#[test]
+fn bash_keeps_a_hostile_candidate_in_one_word() {
+    let h = Harness::with_default_config("bashquote");
+    let script = h.root.join("qex.bash");
+    std::fs::write(&script, h.ok(&["completions", "bash"])).unwrap();
+
+    // The answer of the stand-in. Each line is one candidate.
+    let bait = h.root.join("BAIT");
+    let hostile = [
+        format!("bait$(touch {})", bait.display()),
+        format!("tick`touch {}`", bait.display()),
+        format!("semi; touch {}", bait.display()),
+        format!("pipe | touch {}", bait.display()),
+        format!("amp & touch {}", bait.display()),
+        "has space inside".to_string(),
+        "quote\"double".to_string(),
+        "quote'single".to_string(),
+        "glob-*".to_string(),
+        "[abc]".to_string(),
+        "back\\slash".to_string(),
+        "trailing\\".to_string(),
+        "${IFS}brace".to_string(),
+        "$HOME".to_string(),
+        "~/tilde".to_string(),
+        "!hist".to_string(),
+        "esc\u{1b}[2Jname".to_string(),
+        "caf\u{e9} \u{65e5}\u{672c}".to_string(),
+        "x".repeat(2002),
+    ];
+
+    // A `qex` that answers with those names, and gives every other command to
+    // the real one.
+    let bin = h.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stand_in = bin.join("qex");
+    std::fs::write(
+        &stand_in,
+        format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = __complete ]; then cat {answers}; exit 0; fi\n\
+             exec {real} \"$@\"\n",
+            answers = h.root.join("answers").display(),
+            real = env!("CARGO_BIN_EXE_qex"),
+        ),
+    )
+    .unwrap();
+    std::fs::write(h.root.join("answers"), format!("{}\n", hostile.join("\n"))).unwrap();
+    std::process::Command::new("chmod")
+        .args(["+x", stand_in.to_str().unwrap()])
+        .status()
+        .unwrap();
+
+    // `_qex_jobs` alone, and not `_qex_with_jobs`. The wrapper adds the
+    // options of clap first, and this test asks about the ONE candidate that
+    // the jobs part gives. The wrapper and the registration have their own test.
+    let ask = |prefix: &str, tail: &str| -> String {
+        let program = format!(
+            "source {script}\n\
+             COMP_WORDS=(qex status '{prefix}')\n\
+             COMP_CWORD=2\n\
+             COMP_LINE='qex status {prefix}'\n\
+             COMP_POINT=${{#COMP_LINE}}\n\
+             COMPREPLY=()\n\
+             _qex_jobs 2>/dev/null\n\
+             {tail}\n",
+            script = script.display(),
+        );
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&program)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .output()
+            .expect("bash did not start");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    for name in &hostile {
+        // One name in the answer, so `COMPREPLY[0]` is that name and no other.
+        // An empty word matches every candidate.
+        std::fs::write(h.root.join("answers"), format!("{name}\n")).unwrap();
+        let read = ask(
+            "",
+            "eval \"set -- ${COMPREPLY[0]}\" 2>/dev/null; printf '%s\\n' \"$#\"; printf '%s' \"$1\"",
+        );
+        let mut lines = read.splitn(2, '\n');
+        assert_eq!(
+            lines.next(),
+            Some("1"),
+            "the candidate for {name:?} must be ONE argument: {read:?}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some(name.as_str()),
+            "the argument must be the name itself, for {name:?}"
+        );
+    }
+
+    // AND NOTHING RAN, at the press of TAB or at the press of ENTER.
+    assert!(!bait.exists(), "a candidate RAN: {}", bait.display());
+
+    // A candidate that starts with `-` must not arrive where an option goes.
+    std::fs::write(h.root.join("answers"), "-version\n--json\n").unwrap();
+    let reply = ask("-", "printf '%s\\n' \"${COMPREPLY[@]}\"");
+    assert!(
+        !reply.lines().any(|l| l == "-version"),
+        "a candidate must not be offered where an option goes: {reply}"
+    );
+}
+
+/// The bash completions must offer the jobs when a REAL bash runs them.
+///
+/// A test that reads the generated text says only that the words are there. It
+/// cannot say that bash gives the right candidates, and this project has
+/// shipped a completion whose shell part never ran.
+///
+/// **A job name must not run when somebody presses TAB.** An agent chooses the
+/// names of the jobs and a person presses the TAB, so a name is text that an
+/// attacker writes. The test gives a job the name `bait$(touch FILE)` and
+/// requires that the file does not appear.
+#[test]
+fn a_real_bash_offers_the_jobs_and_runs_no_name() {
+    let h = Harness::with_default_config("bashcomp");
+
+    let running = h.submit(&[
+        "submit", "--name", "holder", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--",
+        "sleep", "300",
+    ]);
+    let queued = h.submit(&[
+        "submit", "--name", "waiter", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--", "true",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&running) == "running"
+    });
+
+    // The names that an attacker would choose.
+    let bait = h.root.join("BAIT");
+    h.submit(&[
+        "submit",
+        "--name",
+        &format!("bait$(touch {})", bait.display()),
+        "--",
+        "true",
+    ]);
+    h.submit(&["submit", "--name", "two words", "--", "true"]);
+
+    let script = h.root.join("qex.bash");
+    std::fs::write(&script, h.ok(&["completions", "bash"])).unwrap();
+
+    // Ask bash for the candidates the way that bash asks for them.
+    //
+    // The completion makes each word safe by itself, with `printf %q`. This
+    // test measures the bash that is on the PATH of the machine that runs it.
+    let ask_with = |prelude: &str, line: &[&str], tail: &str| -> String {
+        let words = line
+            .iter()
+            .map(|w| format!("'{}'", w.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let last = line.len() - 1;
+        let program = format!(
+            "{prelude}\n\
+             source {script}\n\
+             COMP_WORDS=({words})\n\
+             COMP_CWORD={last}\n\
+             COMP_LINE='{comp_line}'\n\
+             COMP_POINT=${{#COMP_LINE}}\n\
+             COMPREPLY=()\n\
+             _qex_with_jobs qex \"${{COMP_WORDS[{last}]}}\" 2>/dev/null\n\
+             {tail}\n",
+            script = script.display(),
+            comp_line = line.join(" ").replace('\'', "'\\''"),
+        );
+        let bin = Path::new(env!("CARGO_BIN_EXE_qex")).parent().unwrap();
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg(&program)
+            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+            .env("XDG_STATE_HOME", h.root.join("state"))
+            .env("XDG_RUNTIME_DIR", h.root.join("run"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .expect("bash did not start");
+        assert!(
+            out.status.success(),
+            "bash failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // THE REGISTRATION MUST RUN, AND IT MUST BIND OUR FUNCTION.
+    //
+    // Every other test here calls `_qex_with_jobs` by its name, so none of them
+    // can see a registration that failed. `-o nosort` came with bash 4.4, and
+    // `complete` refuses the whole command when it meets an option name that it
+    // does not know: on the bash 3.2 of macOS the file thus bound nothing, and
+    // it wrote an error at each shell start. This test reads what the shell
+    // holds after the file ran, and it requires a silent stderr.
+    let out = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "set -e\nsource {}\ncomplete -p qex\n",
+            script.display()
+        ))
+        .output()
+        .expect("bash did not start");
+    let bound = String::from_utf8_lossy(&out.stdout).to_string();
+    let noise = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        out.status.success(),
+        "sourcing the completions failed: {noise}"
+    );
+    assert_eq!(
+        noise, "",
+        "sourcing the completions must write nothing: {noise}"
+    );
+    assert!(
+        bound.contains("-F _qex_with_jobs"),
+        "the shell must call `_qex_with_jobs` after TAB, and it holds: {bound}"
+    );
+
+    let ask = |line: &[&str]| ask_with("", line, "printf '%s\\n' \"${COMPREPLY[@]}\"");
+    // What the shell reads when the user then presses ENTER. `set --` splits
+    // the completed word the way that the command line does, so the count says
+    // whether the name stayed ONE argument, and a name that holds `$(...)`
+    // runs here when the completion did not make it safe.
+    let read_back = |line: &[&str]| {
+        ask_with(
+            "",
+            line,
+            "eval \"set -- ${COMPREPLY[0]}\" 2>/dev/null; printf '%s\\n' \"$#\" \"$@\"",
+        )
+    };
+    check_the_bash_candidates(&ask, &read_back, &running, &queued, &bait);
+
+    h.ok(&["kill", &running, "--grace", "1s"]);
+}
+
+/// The candidates that bash gives, for one way of making a word safe.
+#[allow(clippy::type_complexity)]
+fn check_the_bash_candidates(
+    ask: &dyn Fn(&[&str]) -> String,
+    read_back: &dyn Fn(&[&str]) -> String,
+    running: &str,
+    queued: &str,
+    bait: &Path,
+) {
+    // A command that reads a record offers every job, by id and by name.
+    let reply = ask(&["qex", "status", ""]);
+    for want in [running, queued, "holder", "waiter"] {
+        assert!(
+            reply.lines().any(|l| l == want),
+            "bash must offer {want}: {reply}"
+        );
+    }
+
+    // The prefix chooses. `qex status hol<TAB>` gives one job.
+    let reply = ask(&["qex", "status", "hol"]);
+    assert_eq!(reply.trim(), "holder", "bash must complete the name");
+
+    // `qex kill` takes a job that operates, and `qex cancel` takes one that
+    // waits. A candidate that the command refuses teaches the wrong command.
+    let reply = ask(&["qex", "kill", ""]);
+    assert!(reply.lines().any(|l| l == running), "kill: {reply}");
+    assert!(!reply.lines().any(|l| l == queued), "kill: {reply}");
+    let reply = ask(&["qex", "cancel", ""]);
+    assert!(reply.lines().any(|l| l == queued), "cancel: {reply}");
+    assert!(!reply.lines().any(|l| l == running), "cancel: {reply}");
+
+    // The value of an option is not a job.
+    let reply = ask(&["qex", "kill", "--signal", ""]);
+    assert!(
+        !reply.lines().any(|l| l == running),
+        "`qex kill --signal <TAB>` must not offer a job: {reply}"
+    );
+
+    // A FLAG takes no value, so the word after it IS a job. The guard read
+    // every word that starts with a dash, and `qex status --json <TAB>` then
+    // offered nothing.
+    for flag in ["--json", "--show-env"] {
+        let reply = ask(&["qex", "status", flag, ""]);
+        assert!(
+            reply.lines().any(|l| l == "holder"),
+            "`qex status {flag} <TAB>` must still offer a job: {reply}"
+        );
+    }
+
+    // `qex clean` takes a job id or a job name, so it offers them. Without
+    // this it offered the files of the current directory.
+    let reply = ask(&["qex", "clean", ""]);
+    assert!(
+        reply.lines().any(|l| l == "holder"),
+        "`qex clean <TAB>` must offer a job: {reply}"
+    );
+
+    // THE LIST HOLDS THE SAFE FORM of a name that is not plain.
+    //
+    // `two words` arrives as `two_words`, and that word finds the job.
+    let reply = ask(&["qex", "status", "two"]);
+    assert_eq!(reply.trim(), "two_words", "the safe form only: {reply}");
+    let read = read_back(&["qex", "status", "two"]);
+    assert_eq!(
+        read.trim(),
+        "1\ntwo_words",
+        "the completed word must be ONE argument of qex: {read}"
+    );
+
+    // AND NOTHING RAN. The job named `bait$(touch FILE)` made no file, at the
+    // press of TAB and at the press of ENTER.
+    let reply = ask(&["qex", "status", "bait"]);
+    assert_eq!(reply.lines().count(), 1, "one candidate only: {reply}");
+    assert!(
+        !reply.contains("$("),
+        "the list must hold the safe form: {reply}"
+    );
+    let read = read_back(&["qex", "status", "bait"]);
+    assert_eq!(read.lines().next(), Some("1"), "one argument only: {read}");
+    assert!(
+        !bait.exists(),
+        "a job name RAN when bash asked for the candidates: {}",
+        bait.display()
+    );
+}

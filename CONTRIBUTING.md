@@ -1,5 +1,17 @@
 # How to make a change to qex
 
+## Work on a branch, and merge with a pull request
+
+**Do not push to `main`.** A branch ruleset refuses it. A change goes on a
+branch, and a pull request merges it:
+
+```sh
+git switch -c feat/the-thing
+# ... the work ...
+git push -u origin feat/the-thing
+gh pr create
+```
+
 ## The title of your pull request gives the version number
 
 qex has no manual release step. A merge to `main` reads the commit messages

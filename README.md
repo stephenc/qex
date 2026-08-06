@@ -174,6 +174,18 @@ The full documentation is at
 Every page is also in the binary, so an agent needs no network: `qex help
 agents`, `qex help resources`, `qex help config`, `qex schema status`.
 
+## Completions for your shell
+
+```sh
+qex completions bash > ~/.local/share/bash-completion/completions/qex
+qex completions zsh  > ~/.zfunc/_qex
+qex completions fish > ~/.config/fish/completions/qex.fish
+```
+
+The shell then offers each job by its id and by its name, and it offers the set
+that each command accepts: the jobs that operate after `qex kill`, and the jobs
+that wait after `qex cancel`.
+
 ## A skill for your agent
 
 `skills/qex/SKILL.md` teaches an agent to use qex instead of a background
