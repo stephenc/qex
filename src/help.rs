@@ -829,9 +829,9 @@ The lines
 Each line has the field `event`, which gives its type. Ignore a type that you do
 not know: a later version of qex can add one.
 
-    stream   the first line. It names the coordinator and the numbers that it
-             holds. Read `coordinator_started_at` to see that the coordinator
-             restarted.
+    stream   the first line. It gives `stream_id`, which is the name of this
+             stream, and the numbers that the coordinator holds. KEEP THE
+             NAME. See `--since`.
     job      the record of one job changed. See below.
     gap      you lost events, and this line counts them.
     bye      the coordinator stops now, and it says why.
@@ -854,20 +854,42 @@ A job that waits gives a line with `change` = `reason`. The field
 different job. The reason arrives a moment after the job enters the queue,
 because the scheduler writes it.
 
+The stream reports what the coordinator SAW
+-------------------------------------------
+
+The supervisor of a job writes the record, and the coordinator reads that record
+twice each second. A job that is shorter than that period thus gives `starting`
+and then `completed`, WITH NO `running` LINE. The field `previous` of that line
+says `starting`, so the sequence that you read is the true sequence.
+
+The stream gives no line for a state that the coordinator did not see. A line
+for such a state would be a statement that qex cannot support.
+
 Read the stream again after a stop
 ----------------------------------
 
-    qex events --json --since 348      # the events after the number 348
-    qex events --json --since start    # everything that the coordinator holds
-    qex events --json --since now      # the new events only
+    qex events --json --since <stream_id>:348   # the events after 348
+    qex events --json --since start             # everything that it holds
+    qex events --json --since now               # the new events only
 
-The default is `start`. Keep the largest `seq` that you read, and give it to
-`--since` when your program starts again. You then lose nothing.
+The default is `start`.
 
-The numbers belong to ONE coordinator. The coordinator stops when no job
-operates, and the next command starts a new one, which starts at 1 again. The
-first line of the stream gives `coordinator_started_at`, so you can see that
-this happened.
+KEEP TWO VALUES: the `stream_id` of the first line, and the largest `seq` that
+you read. Give both to `--since` when your program starts again, as
+`<stream_id>:<seq>`. You then lose nothing, and you read nothing a second time.
+
+THE NUMBERS BELONG TO ONE COORDINATOR. The coordinator stops when no job
+operates, and the next command starts a new one. That coordinator starts its
+numbers at 1 again, and it makes one event for each record that it reads. Your
+number 348 thus names a DIFFERENT event there.
+
+With the stream name, qex compares the two and gives you a `gap` line that says
+that the coordinator changed, then continues with the events that the new
+coordinator holds. Its job records are the same records.
+
+WITH A NUMBER ALONE, qex cannot make that comparison, and you can lose events
+with no message. Give the name. `qex events` writes a warning when you give a
+number with no name.
 
 What happens when you do not read fast enough
 ---------------------------------------------
@@ -880,6 +902,11 @@ reader reading.
 
 qex reports a gap. It does not hide one, because a reader that loses `failed`
 and hears nothing waits for a result that will never arrive.
+
+The field `missed` counts the events. It is `null` when qex cannot count them,
+which occurs when your number comes from a different stream: the two streams
+have no common measure, so a number there would say something that qex cannot
+support. The `reason` field says what happened.
 
 The end of the stream
 ---------------------
@@ -897,7 +924,7 @@ Options
 -------
 
     --json            one JSON object for each line. Use this option.
-    --since VALUE     `start`, `now`, or the last number that you read
+    --since VALUE     `start`, `now`, `<stream_id>:<seq>`, or a bare `seq`
     --count N         stop after N events
     --timeout TIME    stop after this time. The exit code is then 124.
 

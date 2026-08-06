@@ -19,7 +19,7 @@ qex logs   <id> [--follow] [--tail N] [--stdout|--stderr]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
 qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
-qex events [--json] [--since SEQ|start|now] [--count N] [--timeout TIME]
+qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
 qex config show             the values that qex uses now
 qex schema job|status|pipeline|event    the JSON Schema of each format
@@ -66,7 +66,7 @@ result happens.
 | Field | Meaning |
 | ----- | ------- |
 | `event` | `stream`, `job`, `gap` or `bye`. Ignore a value that you do not know. |
-| `seq` | The number of this event. Keep the largest number that you read. |
+| `seq` | The number of this event. Keep the largest number that you read, with the `stream_id` of the first line. |
 | `state`, `previous` | The state now, and the state before. `previous` is `null` for the first line of a job, which says that qex accepted it. |
 | `change` | `state`, or `reason` for a job that stays in the queue and whose reason to wait changed. |
 | `job` | The whole record, the same as `qex status --json`. |
@@ -76,24 +76,39 @@ result happens.
 The field `job` holds everything, so a reader needs no second command to learn
 the exit code, the measured use or the cause of a failure.
 
+The stream reports what the coordinator **saw**. The supervisor of a job writes
+the record, and the coordinator reads it twice each second, so a job that is
+shorter than that period gives `starting` and then `completed` with no `running`
+line. `previous` gives the true sequence, and qex writes no line for a state that
+it did not see.
+
 ### Read the stream again after a stop
 
 ```sh
-qex events --json --since 348      # the events after the number 348
-qex events --json --since start    # everything that the coordinator holds
-qex events --json --since now      # the new events only
+qex events --json --since "$STREAM_ID:348"   # the events after the number 348
+qex events --json --since start              # everything that it holds
+qex events --json --since now                # the new events only
 ```
 
-The default is `start`. A program that keeps the largest `seq` and gives it to
-`--since` loses nothing when it stops and starts again. **This is the reason for
-the numbers**: a stream that begins at "now" makes a reader that restarts lose
-the results that arrived while it was away.
+The default is `start`. A program that keeps two values — the `stream_id` of the
+first line and the largest `seq` — and gives both to `--since` loses nothing when
+it stops and starts again. **This is the reason for the numbers**: a stream that
+begins at "now" makes a reader that restarts lose the results that arrived while
+it was away.
 
-The numbers belong to one coordinator. The coordinator stops when no job
-operates, and the next command starts a new one, which begins at 1 again. The
-first line of the stream gives `coordinator_started_at`, so a reader can see
-that this happened, and a number from an earlier coordinator gives a `gap` line
-that says so.
+**The numbers belong to one stream.** The coordinator stops when no job operates,
+and the next command starts a new one. That coordinator starts its numbers at 1
+again, and it makes one event for each record that it reads, so the number 348
+names a different event there.
+
+With the stream name, qex compares the two, gives a `gap` line that says the
+coordinator changed, and continues with the events that the new coordinator
+holds. Its job records are the same records.
+
+With a **number alone**, qex cannot make that comparison: it sees a number that
+this stream also issued, and it continues from there. You then lose events with
+no message. Give the name. `qex events` writes a warning when you give a number
+with no name.
 
 ### A reader that is slow
 
@@ -107,6 +122,11 @@ line that COUNTS the events that it lost:
 
 qex reports a gap and never hides one. A reader that loses the line `failed` and
 hears nothing waits for a result that will never arrive.
+
+`missed` is `null` when qex cannot count the events, which happens when the
+number comes from a different stream: the two streams have no common measure, so
+a number there would say something that qex cannot support. `reason` says what
+happened.
 
 ### The end of the stream
 

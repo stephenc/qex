@@ -1376,11 +1376,6 @@ fn find_id_on_disk(raw: &str) -> Result<Option<uuid::Uuid>> {
     Ok(found)
 }
 
-/// Writes the state of the coordinator.
-///
-/// The process id here comes from the coordinator itself. Use this command to
-/// find the coordinator. Do not search the process list with `pgrep -f qex`,
-/// because that pattern also matches the command that contains it.
 /// Writes the event stream.
 ///
 /// # Why this command exists
@@ -1411,6 +1406,23 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
         crate::capabilities::check_floor(&version, pid).map_err(|e| anyhow::anyhow!("{e}"))?;
         crate::capabilities::check_command(&have, &version, pid, "events", "qex events")
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // Warn about a number with no stream name.
+    //
+    // The numbers of each coordinator start at 1, and a new coordinator makes
+    // an event for each record that it reads. A number alone thus points at a
+    // place in a stream that means something different, and the coordinator
+    // cannot see that. It gives no gap line, and the reader loses events with
+    // no message. The form with the name removes that condition, so name it
+    // here and give the remedy.
+    if let crate::events::Cursor::After { stream: None, .. } = since {
+        eprintln!(
+            "qex: you gave a number with no stream name. qex cannot then see that the \
+             coordinator restarted, and you can lose events with no message.\n\
+             Keep the `stream_id` of the first line of the stream, and use \
+             `--since <stream_id>:<seq>`."
+        );
     }
 
     client.send(&Request::Events { since })?;
@@ -1481,20 +1493,45 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
 }
 
 /// Reads the value of `--since`.
+///
+/// The form `<stream>:<seq>` carries the name of the stream that gave the
+/// number. The coordinator then compares the two, and it reports a gap when the
+/// stream is not the same one. A number alone cannot give that comparison,
+/// because the numbers of each coordinator start at 1.
 fn parse_since(text: &str) -> Result<crate::events::Cursor> {
     use crate::events::Cursor;
-    match text.trim().to_ascii_lowercase().as_str() {
-        "start" | "all" => Ok(Cursor::Start),
-        "now" | "live" => Ok(Cursor::Now),
-        other => match other.parse::<u64>() {
-            Ok(n) => Ok(Cursor::After(n)),
-            Err(_) => bail!(
-                "--since: qex cannot read `{text}`.\n\
-                 The stream would then start at a place that you did not choose, and you \
-                 would lose events or read events a second time.\n\
-                 Use `start`, `now`, or the `seq` number of the last event that you read."
-            ),
-        },
+    let value = text.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "start" | "all" => return Ok(Cursor::Start),
+        "now" | "live" => return Ok(Cursor::Now),
+        _ => {}
+    }
+
+    let (stream, number) = match value.rsplit_once(':') {
+        Some((name, number)) => {
+            let id = name.trim().parse::<uuid::Uuid>().map_err(|_| {
+                anyhow::anyhow!(
+                    "--since: `{name}` is not a stream name.\n\
+                     qex cannot then compare your number with this stream, and you would \
+                     lose events with no message.\n\
+                     Give the `stream_id` of the first line of the stream, as \
+                     `--since <stream_id>:<seq>`."
+                )
+            })?;
+            (Some(id), number)
+        }
+        None => (None, value),
+    };
+
+    match number.trim().parse::<u64>() {
+        Ok(seq) => Ok(Cursor::After { seq, stream }),
+        Err(_) => bail!(
+            "--since: qex cannot read `{text}`.\n\
+             The stream would then start at a place that you did not choose, and you \
+             would lose events or read events a second time.\n\
+             Use `start`, `now`, the `seq` number of the last event that you read, or \
+             `<stream_id>:<seq>`, which qex compares with this stream."
+        ),
     }
 }
 
@@ -1506,12 +1543,13 @@ fn event_text(event: &crate::events::Event) -> String {
             time,
             version,
             pid,
+            stream_id,
             first_seq,
             last_seq,
             ..
         } => format!(
-            "{}  the stream comes from the coordinator pid {pid}, version {version}; it holds \
-             the events {first_seq} to {last_seq}",
+            "{}  the stream {stream_id} comes from the coordinator pid {pid}, version \
+             {version}; it holds the events {first_seq} to {last_seq}",
             crate::sys::clock_text(*time)
         ),
         Event::Job {
@@ -1550,8 +1588,12 @@ fn event_text(event: &crate::events::Event) -> String {
             reason,
             ..
         } => format!(
-            "{}  GAP: qex lost {missed} event(s). {reason}",
-            crate::sys::clock_text(*time)
+            "{}  GAP: {}. {reason}",
+            crate::sys::clock_text(*time),
+            match missed {
+                Some(n) => format!("qex lost {n} event(s)"),
+                None => "qex cannot count the events that you lost".to_string(),
+            }
         ),
         Event::Bye { time, reason } => {
             format!(
@@ -1562,6 +1604,11 @@ fn event_text(event: &crate::events::Event) -> String {
     }
 }
 
+/// Writes the state of the coordinator.
+///
+/// The process id here comes from the coordinator itself. Use this command to
+/// find the coordinator. Do not search the process list with `pgrep -f qex`,
+/// because that pattern also matches the command that contains it.
 pub fn info(args: cli::InfoArgs) -> Result<i32> {
     let mut client = if args.no_start {
         match Client::connect_existing() {

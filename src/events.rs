@@ -41,6 +41,14 @@
 //! thus gives an event, and a new path gives one as well with no change here.
 //! The stream and `qex list` can never disagree, because they read one map.
 //!
+//! The stream reports what the coordinator OBSERVED, and it invents nothing.
+//! The supervisor of a job writes the record, and the coordinator reads that
+//! record twice each second. A job that is shorter than that period thus gives
+//! `starting` and then `completed`, with no `running` line. The field
+//! `previous` says `starting` in that line, so the reader sees the true
+//! sequence and no line is false. A `running` line for a state that the
+//! coordinator never saw would be the fault, not its absence.
+//!
 //! # The reader that does not read
 //!
 //! The coordinator holds the last `RETAINED` events in a ring. It never waits
@@ -111,7 +119,19 @@ pub enum Cursor {
     ///
     /// An agent that stops and starts again gives the last number that it read.
     /// It thus loses nothing, which is the reason for the numbers.
-    After(u64),
+    After {
+        seq: u64,
+        /// The stream that gave that number.
+        ///
+        /// GIVE THIS VALUE. A number belongs to one coordinator: the numbers
+        /// start at 1 again when a new coordinator starts, and a new
+        /// coordinator makes an event for each record that it reads. A number
+        /// alone thus points at a place in a stream that means something
+        /// different, and the coordinator cannot see the difference. With this
+        /// value the coordinator compares, and it gives a `gap` line when the
+        /// stream is not the same one.
+        stream: Option<uuid::Uuid>,
+    },
 }
 
 /// Says why one job event exists.
@@ -141,7 +161,14 @@ pub enum Event {
         time: u64,
         version: String,
         pid: i32,
-        /// The time when this coordinator started. It identifies the numbers.
+        /// The name of this stream. It identifies the numbers.
+        ///
+        /// A reader keeps this value with the last number that it read, and it
+        /// gives both to `--since`. Two coordinators can start in one second,
+        /// so the start time is not sufficient to separate them, and a pid
+        /// repeats. This name is unique.
+        stream_id: uuid::Uuid,
+        /// The time when this coordinator started.
         coordinator_started_at: u64,
         /// The oldest event that the coordinator still holds.
         first_seq: u64,
@@ -165,7 +192,12 @@ pub enum Event {
     Gap {
         time: u64,
         /// The number of events that the reader did not receive.
-        missed: u64,
+        ///
+        /// The value is `null` when qex cannot count them. That occurs when the
+        /// number of the reader comes from a different stream: the coordinator
+        /// then has no common measure between the two, and a number would be a
+        /// statement that qex cannot support. The reason says what happened.
+        missed: Option<u64>,
         /// The sequence number of the next event that the reader receives.
         next_seq: u64,
         reason: String,
@@ -188,6 +220,12 @@ pub struct EventLog {
     readers: usize,
     /// The number of events that the ring holds.
     capacity: usize,
+    /// The name of this stream.
+    ///
+    /// The numbers start at 1 in each coordinator, so a number alone does not
+    /// say which stream gave it. This name does, and a reader gives it back
+    /// with `--since`.
+    stream_id: uuid::Uuid,
 }
 
 impl Default for EventLog {
@@ -215,7 +253,12 @@ impl EventLog {
             reported: BTreeMap::new(),
             readers: 0,
             capacity,
+            stream_id: uuid::Uuid::new_v4(),
         }
+    }
+
+    pub fn stream_id(&self) -> uuid::Uuid {
+        self.stream_id
     }
 
     /// The number of the oldest event that the coordinator holds.
@@ -354,14 +397,37 @@ pub fn stream(
         let last = state.events.last_seq();
         let now = sys::now_secs();
 
+        let stream_id = state.events.stream_id();
         lead.push(Event::Stream {
             time: now,
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id() as i32,
+            stream_id,
             coordinator_started_at: state.started_at,
             first_seq: first,
             last_seq: last,
         });
+
+        // The gap for a number that belongs to a different stream.
+        //
+        // A new coordinator starts its numbers at 1, and it makes one event for
+        // each record that it reads. The number 348 of the earlier stream thus
+        // names a DIFFERENT event here, and the coordinator cannot see the
+        // difference from the number alone. Say so, and start with what this
+        // coordinator holds. qex cannot count what the reader lost, because the
+        // two streams have no common measure; `missed` is therefore null, and
+        // a number there would be a statement that qex cannot support.
+        let other_stream = |given: uuid::Uuid| Event::Gap {
+            time: now,
+            missed: None,
+            next_seq: first,
+            reason: format!(
+                "your number comes from the stream {given}, and this stream is {stream_id}. \
+                 The coordinator that gave you that number stopped, and the numbers of this \
+                 coordinator start again at 1. The stream continues with the events that this \
+                 coordinator holds ({first} to {last}). Its records are the same records."
+            ),
+        };
 
         next = match cursor {
             Cursor::Start => {
@@ -371,7 +437,7 @@ pub fn stream(
                 if state.events.dropped() > 0 {
                     lead.push(Event::Gap {
                         time: now,
-                        missed: state.events.dropped(),
+                        missed: Some(state.events.dropped()),
                         next_seq: first,
                         reason: "the coordinator keeps the last events only, and these events \
                                  left it before you connected"
@@ -381,27 +447,35 @@ pub fn stream(
                 first
             }
             Cursor::Now => last + 1,
-            Cursor::After(n) if n > last => {
-                // The number comes from a different coordinator. The records of
-                // the jobs continue over a restart; the events do not.
+            // The reader named its stream, and it is not this one.
+            Cursor::After {
+                stream: Some(given),
+                ..
+            } if given != stream_id => {
+                lead.push(other_stream(given));
+                first
+            }
+            // The reader named no stream, and its number is one that this
+            // coordinator never made. A restart is the usual cause.
+            Cursor::After { seq, stream: None } if seq > last => {
                 lead.push(Event::Gap {
                     time: now,
-                    missed: 0,
+                    missed: None,
                     next_seq: first,
                     reason: format!(
-                        "you asked for the events after {n}, and this coordinator (pid {}, \
-                         started at {}) holds {first} to {last}. It started after your number, \
-                         so the stream continues with what it holds.",
-                        std::process::id(),
-                        state.started_at
+                        "you asked for the events after {seq}, and this stream ({stream_id}) \
+                         holds {first} to {last}. It never made that number, so a different \
+                         coordinator gave it to you. Give the stream with the number, as \
+                         `--since <stream>:<seq>`, and qex compares them for you. The stream \
+                         continues with the events that this coordinator holds."
                     ),
                 });
                 first
             }
-            Cursor::After(n) if n + 1 < first => {
+            Cursor::After { seq, .. } if seq + 1 < first => {
                 lead.push(Event::Gap {
                     time: now,
-                    missed: first - (n + 1),
+                    missed: Some(first - (seq + 1)),
                     next_seq: first,
                     reason: "the coordinator keeps the last events only, and these events left \
                              it before you connected"
@@ -409,7 +483,7 @@ pub fn stream(
                 });
                 first
             }
-            Cursor::After(n) => n + 1,
+            Cursor::After { seq, .. } => seq + 1,
         };
     }
 
@@ -429,7 +503,7 @@ pub fn stream(
             let gap = if next < first {
                 Some(Event::Gap {
                     time: sys::now_secs(),
-                    missed: first - next,
+                    missed: Some(first - next),
                     next_seq: first,
                     reason: "you did not read the stream fast enough, and the coordinator \
                              dropped these events. Read the stream in a loop, and do the work \
@@ -468,11 +542,68 @@ pub fn stream(
             return Ok(());
         }
 
+        // Stop when the reader went away.
+        //
+        // A WRITE is not sufficient to find that condition. A reader that reads
+        // for one second and stops is the normal shape of an agent that comes
+        // back with `--since`, and on a quiet queue there is nothing to write
+        // to it. This thread would then wait for ever, and it would hold a
+        // thread and two file handles of the coordinator for each such reader.
+        // Fifteen of them left fifteen threads and thirty handles behind, for
+        // the hour of the idle time, and at the limit of the handles the
+        // coordinator accepts no connection at all.
+        if reader_is_gone(out) {
+            return Ok(());
+        }
+
         // Sleep until something changes. This thread uses no CPU time while it
         // waits, and the coordinator signals it at each change.
         let state = coord.state.lock().unwrap();
         let _ = coord.changed.wait_timeout(state, POLL).unwrap();
     }
+}
+
+/// Tests if the reader closed its end of the connection.
+///
+/// The CLI sends the request and then reads only. Data from that direction is
+/// thus the end of the connection, and this function asks the kernel for it
+/// with no wait. It never removes a byte from the socket: it looks at the
+/// socket with `MSG_PEEK`, so a later version of the CLI that sends something
+/// still finds its bytes.
+fn reader_is_gone(out: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = out.as_raw_fd();
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    // The timeout is zero, so this call gives control back immediately.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    if ready <= 0 {
+        return false;
+    }
+    if poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    if poll.revents & libc::POLLIN == 0 {
+        return false;
+    }
+
+    // There is something to read, or the reader closed. A read of zero bytes is
+    // the end of the connection.
+    let mut byte = 0u8;
+    let got = unsafe {
+        libc::recv(
+            fd,
+            &mut byte as *mut u8 as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    got == 0
 }
 
 /// Writes one line, and sends it now.
@@ -521,6 +652,18 @@ mod tests {
         }
     }
 
+    /// Each coordinator must give its stream a name of its own.
+    ///
+    /// The numbers start at 1 in each coordinator. Without a name that differs,
+    /// a reader that gives back a number cannot learn that the coordinator
+    /// changed, and it continues on a stream that means something else.
+    #[test]
+    fn each_stream_has_a_name_of_its_own() {
+        let a = EventLog::new();
+        let b = EventLog::new();
+        assert_ne!(a.stream_id(), b.stream_id());
+    }
+
     /// Every line must fit one line of JSON, and it must survive a round trip.
     /// A reader splits the stream on the newline character.
     #[test]
@@ -530,13 +673,14 @@ mod tests {
                 time: 1,
                 version: "0.8.0".into(),
                 pid: 7,
+                stream_id: uuid::Uuid::new_v4(),
                 coordinator_started_at: 1,
                 first_seq: 1,
                 last_seq: 3,
             },
             Event::Gap {
                 time: 2,
-                missed: 4,
+                missed: Some(4),
                 next_seq: 9,
                 reason: "a reason with \"quotation marks\"\nand a newline".into(),
             },
@@ -733,14 +877,23 @@ mod tests {
     /// The cursor must survive the wire. The coordinator reads it from JSON.
     #[test]
     fn each_cursor_form_survives_the_wire() {
-        for c in [Cursor::Start, Cursor::Now, Cursor::After(42)] {
+        let stream = uuid::Uuid::new_v4();
+        for c in [
+            Cursor::Start,
+            Cursor::Now,
+            Cursor::After {
+                seq: 42,
+                stream: None,
+            },
+            Cursor::After {
+                seq: 42,
+                stream: Some(stream),
+            },
+        ] {
             let text = serde_json::to_string(&c).unwrap();
+            assert!(!text.contains('\n'), "a request must fit one line: {text}");
             assert_eq!(serde_json::from_str::<Cursor>(&text).unwrap(), c);
         }
         assert_eq!(serde_json::to_string(&Cursor::Start).unwrap(), "\"start\"");
-        assert_eq!(
-            serde_json::to_string(&Cursor::After(3)).unwrap(),
-            "{\"after\":3}"
-        );
     }
 }
