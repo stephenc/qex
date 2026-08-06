@@ -123,7 +123,10 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
 
                 job.status.state = JobState::Failed;
                 job.status.finished_at = Some(sys::now_secs());
-                job.status.blocked_reason = Some(note);
+                // A job that failed waits for nothing, so this text belongs in
+                // the error field.
+                job.status.error = Some(note);
+                job.status.blocked_reason = None;
                 let status = job.status.clone();
                 job::write_status(&dir, &status).ok();
                 log(&format!("the supervisor of the job {id} left no result"));
@@ -211,6 +214,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // limit.
     let cfg = crate::config::Config::load().unwrap_or_default();
     let mut cgroup_dir: Option<std::path::PathBuf> = None;
+    let mut enforce_warning: Option<String> = None;
     if cfg.enforce.mode.is_on() {
         match crate::enforce::create_job_cgroup(&cfg, &id, spec.mem) {
             Ok(cgroup) => match crate::enforce::add_process(&cgroup, std::process::id() as i32) {
@@ -221,14 +225,27 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 Err(e) => {
                     // Report the fault. A limit that qex did not apply must
                     // never look like a limit that operates.
-                    eprintln!("qex: the memory limit is not active for this job: {e}");
+                    enforce_warning = Some(e);
                     crate::enforce::remove_cgroup(&cgroup);
                 }
             },
             Err(e) => {
-                eprintln!("qex: the memory limit is not active for this job: {e}");
+                enforce_warning = Some(e);
             }
         }
+    }
+
+    // Put the fault in the record of the job.
+    //
+    // Before this, the message went to stderr, which this process writes to
+    // `supervisor.log`. No command reads that file, so a user with
+    // `mode = "hard"` was told that the limit was active while it was not for
+    // this job.
+    if let Some(warning) = &enforce_warning {
+        eprintln!("qex: the memory limit is not active for this job: {warning}");
+        status.error = Some(format!(
+            "the memory limit is not active for this job: {warning}"
+        ));
     }
     let _ = &cgroup_dir;
 
@@ -252,6 +269,17 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             return Ok(1);
         }
     };
+
+    // Read the out-of-memory count before the job starts. An increase after
+    // the job stops shows that the kernel stopped a process for memory.
+    //
+    // This measurement needs no limit from qex, so the state `oom` is now
+    // available in the usual configuration.
+    let watch_cgroup = cgroup_dir.clone().or_else(crate::enforce::own_cgroup);
+    let oom_before = watch_cgroup
+        .as_ref()
+        .map(|c| crate::enforce::oom_count(c))
+        .unwrap_or(0);
 
     let pid = child.id() as i32;
     status.state = JobState::Running;
@@ -336,6 +364,14 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         crate::enforce::kill_cgroup(&cgroup);
     }
 
+    // Test the out-of-memory count again. An increase during this job, with a
+    // SIGKILL that no qex command sent, is the out-of-memory killer.
+    if let Some(cgroup) = &watch_cgroup {
+        if crate::enforce::oom_count(cgroup) > oom_before {
+            crate::enforce::mark_oom(&dir);
+        }
+    }
+
     // Release the process id. Each signal above is complete.
     let exit = child.wait().context("waiting for the job")?;
 
@@ -414,6 +450,18 @@ fn classify(
     timed_out: bool,
     dir: &std::path::Path,
 ) -> JobState {
+    // A job that stopped with the code 0 succeeded, whatever the timer did.
+    //
+    // The timer takes the result with one atomic operation, so it can win in
+    // the very short moment between the exit of the job and the same operation
+    // in the main thread. A record that says `timeout` with the exit code 0
+    // contradicts itself, and a reader cannot tell what happened.
+    //
+    // A job that the timer stopped receives a signal, so it has no exit code.
+    if code == Some(0) {
+        return JobState::Completed;
+    }
+
     if timed_out {
         return JobState::Timeout;
     }

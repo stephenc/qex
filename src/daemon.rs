@@ -183,6 +183,10 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Delete the short socket directories of the coordinators that stopped.
+    // Without this step, each unusual state directory leaves one in /tmp.
+    paths::reap_stale_socket_dirs();
+
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
@@ -474,6 +478,50 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
 
 fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
     let id = spec.id;
+
+    // Test each dependency here as well as in the CLI.
+    //
+    // The coordinator owns the job list, so this is the only test that cannot
+    // be wrong. A dependency that names no job would make the queue start a
+    // job in the wrong order, and the user would receive no warning.
+    {
+        let state = coord.state.lock().unwrap();
+        for dep in spec.needs.iter().chain(spec.after.iter()) {
+            if !state.jobs.contains_key(dep) {
+                return Response::error(
+                    ErrorKind::NoSuchJob,
+                    format!(
+                        "the job {dep} does not exist, so this job cannot wait for it.\n\
+                         Start that job first, and give the id that `qex submit` wrote."
+                    ),
+                );
+            }
+        }
+
+        // A dependency that already succeeded is an error. See the same test in
+        // the CLI for the reason: a name can give a job of an earlier run, and
+        // a job that succeeded satisfies the dependency in silence.
+        //
+        // A dependency in a different final state is accepted. It makes this
+        // job `skipped` with the correct cause, so a script that submits the
+        // stages one at a time can finish.
+        for dep in spec.needs.iter().chain(spec.after.iter()) {
+            if let Some(other) = state.jobs.get(dep) {
+                if other.status.state == JobState::Completed {
+                    return Response::error(
+                        ErrorKind::WrongState,
+                        format!(
+                            "the job {} ({}) already succeeded, so a wait for it does \
+                             nothing. If you named the job by its name, you can be naming \
+                             a job of an earlier run.",
+                            &dep.to_string()[..8],
+                            other.status.name
+                        ),
+                    );
+                }
+            }
+        }
+    }
     let dir = match paths::job_dir(&id) {
         Ok(d) => d,
         Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),

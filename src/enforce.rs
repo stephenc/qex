@@ -261,6 +261,50 @@ pub fn record_cgroup_path(job_dir: &Path, cgroup: &Path) {
     std::fs::write(job_dir.join("cgroup"), cgroup.to_string_lossy().as_bytes()).ok();
 }
 
+/// Gives the cgroup of this process, whatever made that cgroup.
+///
+/// This function does not need enforcement. Every process on a Linux system
+/// with cgroup v2 is in a cgroup, and the session of the user has one. qex can
+/// thus read the out-of-memory count for a job even when it sets no limit.
+#[cfg(target_os = "linux")]
+pub fn own_cgroup() -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let dir = PathBuf::from("/sys/fs/cgroup").join(rel.trim_start_matches('/'));
+    dir.exists().then_some(dir)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn own_cgroup() -> Option<PathBuf> {
+    None
+}
+
+/// Gives the number of processes that the out-of-memory killer stopped in a
+/// cgroup.
+///
+/// Read this value before the job starts and after it stops. An increase shows
+/// that the kernel stopped a process for memory.
+///
+/// This measurement needs no limit from qex. Without it, the state `oom` is not
+/// available in the usual configuration, and qex would report `killed` for a
+/// job that no command stopped.
+#[cfg(target_os = "linux")]
+pub fn oom_count(cgroup: &Path) -> u64 {
+    let Ok(text) = std::fs::read_to_string(cgroup.join("memory.events")) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix("oom_kill "))
+        .filter_map(|n| n.trim().parse::<u64>().ok())
+        .next()
+        .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn oom_count(_cgroup: &Path) -> u64 {
+    0
+}
+
 /// Tests if the out-of-memory killer stopped a job.
 ///
 /// The kernel stops a process with `SIGKILL` for an out-of-memory event. That

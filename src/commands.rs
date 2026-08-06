@@ -24,6 +24,12 @@ pub const EXIT_SKIPPED: i32 = 126;
 /// The exit code when there is no job with the given id.
 pub const EXIT_NO_SUCH_JOB: i32 = 127;
 
+/// The number of lines that `qex logs` shows without an option.
+///
+/// A job can write hundreds of megabytes, and the reader is frequently an agent
+/// with a limited context.
+const DEFAULT_LOG_LINES: usize = 500;
+
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
@@ -378,6 +384,38 @@ fn resolve_dependencies(
                  first job, keep its id, then give that id here."
             )
         })?;
+
+        // A dependency that already succeeded is an error.
+        //
+        // This test finds a frequent fault. An agent runs a script a second
+        // time and writes `--needs test`, but it forgot to start a new test
+        // job. The name gives the test job of the FIRST run, which already
+        // succeeded. The new stage then starts immediately, it waits for
+        // nothing, and the pipeline reports success although the order was
+        // wrong. A job that succeeded is the one state that hides this fault,
+        // because it satisfies the dependency in silence.
+        //
+        // A dependency in a different final state does NOT hide anything. It
+        // makes this job `skipped`, with the correct cause. qex accepts it, so
+        // that a script which submits the stages one at a time can finish even
+        // when an early stage already failed. Without that rule, the script
+        // would stop in the middle and leave a pipeline with no end stages.
+        if let Response::Status { status } = client.call(&Request::Status { id })? {
+            if status.state == JobState::Completed {
+                bail!(
+                    "{option}: the job {} ({}) already succeeded, so a wait for it does \
+                     nothing.\n\n\
+                     A name frequently gives a job of an earlier run. Did you forget to \
+                     start a new `{}` job? Use the id that `qex submit` wrote for this run, \
+                     or delete the old jobs with `qex clean done`.\n\n\
+                     If you want this job to start now, remove {option}.",
+                    &id.to_string()[..8],
+                    status.name,
+                    status.name
+                );
+            }
+        }
+
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -434,8 +472,16 @@ fn wait_on_file(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> 
 }
 
 pub fn logs(args: cli::LogsArgs) -> Result<i32> {
+    // Use the same code as `status` and `wait` for the same fault. A script
+    // must not need two codes for one condition.
     let id = match Client::connect_existing() {
-        Some(mut c) => resolve_id(&mut c, &args.id)?,
+        Some(mut c) => match resolve_id(&mut c, &args.id) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("qex: {e}");
+                return Ok(EXIT_NO_SUCH_JOB);
+            }
+        },
         None => match find_id_on_disk(&args.id)? {
             Some(id) => id,
             None => {
@@ -490,19 +536,38 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => String::new(),
         };
-        let text = match args.tail {
+        // Show the last lines only, unless the user asks for every line.
+        //
+        // A job can write hundreds of megabytes. The reader of this command is
+        // frequently an agent with a limited context, and the recipe in the
+        // help text is `qex logs $ID` with no other option. A full file would
+        // fill that context and hide the answer.
+        let limit = match (args.all, args.tail) {
+            (true, _) => None,
+            (false, Some(n)) => Some(n),
+            (false, None) => Some(DEFAULT_LOG_LINES),
+        };
+
+        let (text, hidden) = match limit {
             Some(n) => {
                 let lines: Vec<&str> = text.lines().collect();
                 let start = lines.len().saturating_sub(n);
-                lines[start..].join("\n")
+                (lines[start..].join("\n"), start)
             }
-            None => text,
+            None => (text, 0),
         };
         if text.is_empty() {
             continue;
         }
         if !label.is_empty() && files.len() > 1 {
             println!("==> {label} <==");
+        }
+        if hidden > 0 {
+            // Say what is missing. A reader must not believe that this is the
+            // whole output.
+            println!(
+                "... {hidden} earlier line(s) are not shown. Use `--all`, or `--tail N`."
+            );
         }
         println!("{}", text.trim_end_matches('\n'));
     }
@@ -564,7 +629,14 @@ pub fn kill(args: cli::KillArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     let mut worst = 0;
     for raw in &args.ids {
-        let id = resolve_id(&mut client, raw)?;
+        let id = match resolve_id(&mut client, raw) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("qex: {e}");
+                worst = EXIT_NO_SUCH_JOB;
+                continue;
+            }
+        };
         match client.call(&Request::Kill {
             id,
             signal,
@@ -581,7 +653,14 @@ pub fn cancel(args: cli::CancelArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     let mut worst = 0;
     for raw in &args.ids {
-        let id = resolve_id(&mut client, raw)?;
+        let id = match resolve_id(&mut client, raw) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("qex: {e}");
+                worst = EXIT_NO_SUCH_JOB;
+                continue;
+            }
+        };
         match client.call(&Request::Cancel { id })? {
             Response::Ok => println!("{id} left the queue"),
             other => worst = report(other)?,
@@ -675,6 +754,12 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
 /// Gives the exit code for a job result.
 fn exit_code_for(status: &JobStatus, passthrough: bool) -> i32 {
     if passthrough {
+        // A job that did not run has no exit code of its own. Give the code for
+        // the state instead, so the caller still learns that an earlier job is
+        // the cause and this job never ran.
+        if status.state == JobState::Skipped {
+            return EXIT_SKIPPED;
+        }
         return status.exit_code.unwrap_or(match status.state {
             JobState::Completed => 0,
             _ => 1,
@@ -746,13 +831,25 @@ fn short_id(id: &uuid::Uuid) -> String {
 /// The user can write the full id, or the start of the id. A short id is easier
 /// to copy from the output of `qex list`.
 fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
-    if let Ok(id) = raw.parse::<uuid::Uuid>() {
-        return Ok(id);
-    }
-
     let Response::Jobs { jobs } = client.call(&Request::List)? else {
         bail!("the coordinator did not give the job list");
     };
+
+    // Test each name in the same way, including a full id.
+    //
+    // An earlier version gave back each value with the form of a UUID without
+    // a test. A `--needs` value with one incorrect character was then accepted,
+    // the dependency did not exist, and the job started immediately with no
+    // warning. `qex logs` with such a value also wrote nothing and gave the
+    // code 0, so a reader could not separate "this job wrote nothing" from
+    // "this job does not exist".
+    if let Ok(id) = raw.parse::<uuid::Uuid>() {
+        return if jobs.iter().any(|j| j.id == id) {
+            Ok(id)
+        } else {
+            bail!("there is no job with the id {id}")
+        };
+    }
 
     let matches: Vec<&JobStatus> = jobs
         .iter()
@@ -763,7 +860,8 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
         1 => Ok(matches[0].id),
         0 => bail!("there is no job with the id or the name `{raw}`"),
         n => bail!(
-            "`{raw}` names {n} jobs. Write more characters of the id.\n{}",
+            "`{raw}` names {n} jobs. Give the id of the job that you want, or delete \
+             the old jobs with `qex clean done` and start again.\n{}",
             matches
                 .iter()
                 .map(|j| format!("  {} {}", j.id, j.name))

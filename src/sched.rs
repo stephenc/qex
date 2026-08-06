@@ -256,14 +256,21 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
                 .map(|j| j.status.state.to_string())
                 .unwrap_or_else(|| other.status.state.to_string());
 
+            // Name the log file only when the job wrote one. A cancelled job
+            // never started, so a reader who follows that instruction finds an
+            // empty file and learns nothing.
+            let advice = if root_state == "cancelled" {
+                String::new()
+            } else {
+                format!(" Read `qex logs {}` for the cause.", &root.to_string()[..8])
+            };
+
             return Depends::Broken {
                 reason: format!(
-                    "the job {} ({}) is {}, so this job did not run. \
-                     Read `qex logs {}` for the cause.",
+                    "the job {} ({}) is {}, so this job did not run.{advice}",
                     &root.to_string()[..8],
                     root_name,
-                    root_state,
-                    &root.to_string()[..8]
+                    root_state
                 ),
                 root,
             };
@@ -319,6 +326,18 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     let mut reasons: Vec<(uuid::Uuid, Option<String>)> = Vec::new();
     let mut to_skip: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
 
+    // Pass 1: test the dependencies of EVERY job in the queue.
+    //
+    // This pass is separate from the capacity pass below, and it must stay
+    // separate. The capacity pass stops at the first job that must wait, to
+    // keep capacity for that job. If the dependency test were in that loop, a
+    // job behind a job that waits for capacity would never be tested. A job
+    // whose dependency already failed would then stay in the queue for ever,
+    // and `qex wait` on it would never give an answer.
+    //
+    // A dependency decision does not use capacity, so qex can make it for every
+    // job at once.
+    let mut ready: Vec<uuid::Uuid> = Vec::new();
     for id in state.queue.iter().copied() {
         let Some(job) = state.jobs.get(&id) else {
             continue;
@@ -327,22 +346,18 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
             continue;
         }
 
-        // Test the dependencies before the capacity.
-        //
-        // A job that waits for a different job does not hold capacity. The loop
-        // thus continues to the next job. Without this rule, one long chain of
-        // jobs would stop each job behind it.
         match depends(state, id) {
-            Depends::Ready => {}
-            Depends::Waiting(reason) => {
-                reasons.push((id, Some(reason)));
-                continue;
-            }
-            Depends::Broken { reason, root } => {
-                to_skip.push((id, reason, root));
-                continue;
-            }
+            Depends::Ready => ready.push(id),
+            Depends::Waiting(reason) => reasons.push((id, Some(reason))),
+            Depends::Broken { reason, root } => to_skip.push((id, reason, root)),
         }
+    }
+
+    // Pass 2: choose one job from the jobs that have no dependency left.
+    for id in ready.iter().copied() {
+        let Some(job) = state.jobs.get(&id) else {
+            continue;
+        };
 
         match size_check(&cfg, &job.spec) {
             Size::Fits => match admit(&cfg, &job.spec, cpu_used, mem_used) {
@@ -359,14 +374,13 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
                     // Give a reason to each job behind this one. A user who
                     // asks "why does my job wait" must get an answer for every
                     // job, and not for the first job only.
-                    for later in state.queue.iter().copied() {
+                    //
+                    // Use the jobs that have no dependency left. A job that
+                    // waits for a different job already has its own reason, and
+                    // this text would replace it with a text that is not
+                    // correct.
+                    for later in ready.iter().copied() {
                         if later == id {
-                            continue;
-                        }
-                        let Some(other) = state.jobs.get(&later) else {
-                            continue;
-                        };
-                        if other.status.state != JobState::Queued {
                             continue;
                         }
                         if !reasons.iter().any(|(r, _)| *r == later) {

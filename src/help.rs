@@ -185,6 +185,14 @@ an earlier stage.
 A job can name the jobs that you started before it. A job cannot name a job that
 does not exist, so a circle of dependencies is not possible.
 
+A job that already succeeded is not a correct dependency, and qex refuses it.
+The wait would do nothing, and the usual cause is a name that gives a job of an
+earlier run: you write `--needs test` and you forgot to start a new test job.
+Use the id that `qex submit` wrote for this run, or run `qex clean done` first.
+
+A job that failed IS a correct dependency. Your job then becomes `skipped` with
+the correct cause, so a script that submits the stages one at a time can finish.
+
 Other commands
 --------------
 
@@ -516,7 +524,8 @@ reads this file directly if the coordinator does not operate.
 Logs
 ----
 
-    qex logs <id>              both streams
+    qex logs <id>              both streams, the last 500 lines
+    qex logs <id> --all        every line
     qex logs <id> --stdout     one stream
     qex logs <id> --follow     the output while the job operates
     qex logs <id> --tail 100   the last 100 lines

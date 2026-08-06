@@ -120,6 +120,44 @@ fn short_socket_dir(preferred: &std::path::Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Deletes the short socket directories that no coordinator uses.
+///
+/// Each test run and each unusual state directory can make one of these
+/// directories in `/tmp`. Without this step they stay for ever.
+///
+/// This function deletes a directory of this user only, and only when it holds
+/// no socket that answers.
+pub fn reap_stale_socket_dirs() {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::getuid() };
+    let prefix = format!("qex-{uid}-");
+
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != uid {
+            continue;
+        }
+
+        // Keep a directory with a socket that answers. A coordinator uses it.
+        let socket = entry.path().join("s");
+        if socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            continue;
+        }
+        std::fs::remove_dir_all(entry.path()).ok();
+    }
+}
+
 /// Gives a short name for a long path.
 ///
 /// This function uses the FNV-1a method. The result identifies the path. It is

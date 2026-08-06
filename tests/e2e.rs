@@ -1273,6 +1273,203 @@ fn a_job_file_accepts_dependencies() {
     assert_eq!(h.status_json(&second)["caused_by"].as_str(), Some(first.as_str()));
 }
 
+/// A dependency that names no job must be refused.
+///
+/// A value with the form of a UUID gave no error before, and qex dropped the
+/// dependency. The job then started with no wait and no warning, and a pipeline
+/// reported success although the order was wrong.
+#[test]
+fn a_dependency_with_an_unknown_uuid_is_refused() {
+    let h = Harness::with_default_config("depuuid");
+    let out = h.qex(&[
+        "submit",
+        "--needs",
+        "11111111-2222-3333-4444-555555555555",
+        "--",
+        "true",
+    ]);
+    assert!(!out.status.success(), "qex must refuse an unknown dependency");
+    assert!(h.list_json().is_empty(), "qex must not accept the job");
+}
+
+/// A dependency must not have stopped already.
+///
+/// An agent runs a script a second time and writes `--needs test`, but forgets
+/// to start a new test job. The name gives the test job of the first run, which
+/// already stopped. Without this test, the new job starts at once and waits for
+/// nothing.
+#[test]
+fn a_dependency_that_already_stopped_is_refused() {
+    let h = Harness::with_default_config("depdone");
+    let first = h.submit(&["submit", "--name", "build", "--", "true"]);
+    h.ok(&["wait", &first, "--timeout", "30s"]);
+
+    for option in ["--needs", "--after"] {
+        let out = h.qex(&["submit", option, "build", "--", "true"]);
+        assert!(
+            !out.status.success(),
+            "{option} on a job that succeeded must be refused"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("already succeeded"),
+            "the error must say that the job succeeded: {err}"
+        );
+        assert!(
+            err.contains("earlier run"),
+            "the error must name the usual cause: {err}"
+        );
+    }
+}
+
+/// A dependency that did NOT succeed is accepted, and it makes this job
+/// `skipped`.
+///
+/// A script that submits the stages one at a time must be able to finish when
+/// an early stage already failed. Without this rule, the script stops in the
+/// middle and leaves a pipeline with no end stages.
+#[test]
+fn a_dependency_that_failed_is_accepted_and_makes_the_job_skipped() {
+    let h = Harness::with_default_config("depfailed");
+    let first = h.submit(&["submit", "--name", "first", "--", "false"]);
+    h.qex(&["wait", &first, "--timeout", "30s"]);
+    assert_eq!(h.state_of(&first), "failed");
+
+    let second = h.submit(&["submit", "--needs", "first", "--", "true"]);
+    let out = h.qex(&["wait", &second, "--timeout", "45s"]);
+    assert_eq!(out.status.code(), Some(126));
+    assert_eq!(h.state_of(&second), "skipped");
+    assert_eq!(h.status_json(&second)["caused_by"].as_str(), Some(first.as_str()));
+}
+
+/// A job whose dependency fails must be marked at once, and not wait for the
+/// capacity of the jobs in front of it.
+///
+/// The dependency test and the capacity test are separate passes for this
+/// reason. In one pass, the walk stops at the first job that waits for
+/// capacity, and a job behind it is never tested. Such a job stays in the queue
+/// for ever and `qex wait` never gives an answer.
+#[test]
+fn a_failed_dependency_is_seen_behind_a_blocked_queue() {
+    let h = Harness::new(
+        "depblocked",
+        "[budget]\ncpu = \"2\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    // This job operates now, and it fails soon.
+    let failer = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--name", "failer", "--", "sh", "-c",
+        "sleep 2; exit 1",
+    ]);
+    // This job holds the rest of the budget.
+    let blocker = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--name", "blocker", "--", "sleep", "20",
+    ]);
+    h.until("both jobs operate", Duration::from_secs(45), || {
+        h.state_of(&failer) == "running" && h.state_of(&blocker) == "running"
+    });
+
+    // This job needs two cores, so it waits for capacity at the front.
+    h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--name", "mid", "--", "true"]);
+    // This job is behind the one above, and its dependency is about to fail.
+    let skipped = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", "failer", "--", "true",
+    ]);
+
+    // The job must reach `skipped` while `mid` still waits for capacity.
+    h.until("the job is skipped", Duration::from_secs(45), || {
+        h.state_of(&skipped) == "skipped"
+    });
+
+    let out = h.qex(&["wait", &skipped, "--timeout", "10s"]);
+    assert_eq!(out.status.code(), Some(126));
+
+    h.ok(&["kill", &blocker, "--grace", "1s"]);
+}
+
+/// `qex logs` with a job that does not exist must not give the code 0 with no
+/// output. A reader could not separate "this job wrote nothing" from "this job
+/// does not exist".
+#[test]
+fn every_command_gives_one_code_for_a_job_that_does_not_exist() {
+    let h = Harness::with_default_config("codes2");
+    let unknown = "11111111-2222-3333-4444-555555555555";
+
+    for command in ["status", "wait", "logs", "kill", "cancel"] {
+        let out = h.qex(&[command, unknown]);
+        assert_eq!(
+            out.status.code(),
+            Some(127),
+            "`qex {command}` must give the code 127 for a job that does not exist"
+        );
+    }
+}
+
+/// The record of a job that failed must not send the reader to a log file that
+/// no longer exists.
+#[test]
+fn clean_keeps_the_cause_readable_for_the_jobs_that_it_leaves() {
+    let h = Harness::with_default_config("cleancause");
+
+    let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "sleep 1; exit 1"]);
+    let second = h.submit(&["submit", "--name", "second", "--needs", "first", "--", "true"]);
+
+    h.until("the second job is skipped", Duration::from_secs(45), || {
+        h.state_of(&second) == "skipped"
+    });
+
+    // Delete the job that failed. The record of the second job must still
+    // answer the question "why did this job not run".
+    h.ok(&["clean", &first]);
+
+    let s = h.status_json(&second);
+    let error = s["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("first"),
+        "the record must still name the job that failed: {error}"
+    );
+    assert!(
+        !error.contains("qex logs"),
+        "the record must not send the reader to a log that is deleted: {error}"
+    );
+    assert!(s["caused_by"].is_null(), "the id points at nothing now");
+}
+
+/// `qex logs` must not write a very large file to the terminal by default.
+/// The reader is frequently an agent with a limited context.
+#[test]
+fn logs_shows_the_last_lines_by_default() {
+    let h = Harness::with_default_config("logcap");
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "i=0; while [ $i -lt 2000 ]; do echo line-$i; i=$((i+1)); done",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert!(
+        out.lines().count() < 600,
+        "the default output must be short, and it had {} lines",
+        out.lines().count()
+    );
+    assert!(out.contains("line-1999"), "the last line must be there");
+    assert!(
+        out.contains("not shown"),
+        "qex must say that it hid the earlier lines: {}",
+        out.lines().next().unwrap_or("")
+    );
+
+    // The option `--all` must give every line.
+    let full = h.ok(&["logs", &id, "--stdout", "--all"]);
+    assert!(full.contains("line-0"), "--all must give the first line");
+    assert!(full.lines().count() >= 2000);
+}
+
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,
 /// and a test harness gives a long path.
 #[test]

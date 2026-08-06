@@ -208,6 +208,10 @@ pub struct LogsArgs {
     /// Write the output as JSON, with one field for each stream.
     #[arg(long, conflicts_with = "follow")]
     pub json: bool,
+
+    /// Show every line. Without this option, qex shows the last 500 lines.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]

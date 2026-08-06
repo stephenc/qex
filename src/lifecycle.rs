@@ -5,7 +5,7 @@
 //! holds memory that qex counted.
 
 use crate::daemon::{log, Coordinator};
-use crate::job::JobState;
+use crate::job::{self, JobState};
 use crate::paths;
 use crate::proto::{ErrorKind, Response};
 use std::sync::Arc;
@@ -140,6 +140,16 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
 ///
 /// This command does not stop a job. A job that operates keeps its record.
 pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
+    // Keep the name and the state of this job. The dependents need them after
+    // this job leaves the list.
+    let (cause_name, cause_state) = {
+        let state = coord.state.lock().unwrap();
+        match state.jobs.get(&id) {
+            Some(job) => (job.status.name.clone(), job.status.state.to_string()),
+            None => (String::from("unknown"), String::from("unknown")),
+        }
+    };
+
     {
         let state = coord.state.lock().unwrap();
         match state.jobs.get(&id) {
@@ -203,6 +213,37 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     let mut state = coord.state.lock().unwrap();
     state.jobs.remove(&id);
     state.queue.retain(|q| *q != id);
+
+    // Make each job that names this job as its cause self-contained.
+    //
+    // A skipped job holds `caused_by` and a text that says "Read `qex logs X`
+    // for the cause". After the deletion of X, that text sends the reader to a
+    // job that does not exist. The one thing that `caused_by` exists to give
+    // would then be lost.
+    //
+    // Write the name and the state of the deleted job into the text of each
+    // dependent, so the record still answers the question.
+    let dependents: Vec<uuid::Uuid> = state
+        .jobs
+        .values()
+        .filter(|j| j.status.caused_by == Some(id))
+        .map(|j| j.status.id)
+        .collect();
+
+    for dep in dependents {
+        if let Some(job) = state.jobs.get_mut(&dep) {
+            job.status.error = Some(format!(
+                "the job `{}` ({}) did not succeed, so this job did not run. \
+                 Its record is deleted, so there is no log to read.",
+                cause_name, cause_state
+            ));
+            job.status.caused_by = None;
+            let status = job.status.clone();
+            if let Ok(dir) = paths::job_dir(&dep) {
+                job::write_status(&dir, &status).ok();
+            }
+        }
+    }
     drop(state);
 
     coord.notify();
