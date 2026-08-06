@@ -97,6 +97,11 @@ impl std::str::FromStr for JobState {
             "oom" => Ok(Self::Oom),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             "skipped" => Ok(Self::Skipped),
+            // `skipped` AND `expired` belong in this list. A reader who took
+            // the list as complete, and then wrote one of them, met "unknown
+            // job state" for a state that qex uses and shows. A rebase dropped
+            // `skipped` here in silence, because the two changes wrote the same
+            // line; the list and the arms above it must always agree.
             other => Err(format!(
                 "unknown job state `{other}`. Use one of these states: queued, starting, \
                  running, completed, failed, killed, timeout, expired, oom, cancelled, \

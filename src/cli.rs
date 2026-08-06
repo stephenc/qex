@@ -405,6 +405,13 @@ pub struct LogsArgs {
     #[arg(long, conflicts_with = "follow")]
     pub json: bool,
 
+    /// Show the output of the stop hook, and the verdict of qex on it.
+    ///
+    /// Use this option when a notification did not arrive. See `[hooks]` in
+    /// `qex help config`.
+    #[arg(long, conflicts_with = "follow")]
+    pub hook: bool,
+
     #[command(flatten)]
     pub select: crate::logsel::LogSelect,
 }

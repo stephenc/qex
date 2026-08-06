@@ -5,7 +5,7 @@
 //! hook field: the same pipeline runs on a laptop with a desktop alert and on a
 //! build machine with no screen, and the job must not know the difference.
 //!
-//! # One run for each job
+//! # One run for each job, and never two
 //!
 //! A person who receives the same notification two times learns to ignore it.
 //! The hook must thus run one time for each job, and no more.
@@ -21,6 +21,13 @@
 //! machine and after a restart, because the file is beside the record of the
 //! job and it lives as long as the record. The caller that loses does nothing.
 //!
+//! THE ORDER IS DELIBERATE, AND IT IS NOT SYMMETRICAL. qex makes the file and
+//! then runs the hook, so a process that stops between those two steps loses
+//! that one message. The other order would run the hook and then record it, and
+//! a process that stopped between THOSE two steps would notify a second time
+//! later. qex chooses the message that is lost, because a notification that
+//! arrives two times teaches a person to ignore every notification.
+//!
 //! # A hook must not damage the queue
 //!
 //! The command comes from a user, so it can hang, fail, write a lot of output,
@@ -30,10 +37,15 @@
 //!   in its final state before the hook runs. `qex wait` gives its answer, the
 //!   budget is free, and the next job starts, whatever the hook does.
 //! - The hook has a time limit. qex signals the process group of the hook at
-//!   the limit, and it sends `KILL` a short time after that. The output of the
-//!   hook thus also has a limit.
+//!   the limit, and it sends `KILL` a short time after that.
+//! - The hook has a size limit. The time limit is NOT a limit on the output: a
+//!   hook of three seconds that writes with no stop made a file of 3.7GB. qex
+//!   stops a hook that goes above `OUTPUT_LIMIT`, and it cuts the file.
 //! - A hook that fails changes no job. The result of the job is the result of
 //!   the job, and a notification that did not arrive does not change it.
+//! - The verdict of qex goes into `hook.log`, which `qex logs --hook` reads. A
+//!   user whose notification did not arrive can thus learn the reason with a
+//!   qex command, and does not read the log of a supervisor.
 
 use crate::config::Config;
 use crate::daemon::log;
@@ -49,6 +61,14 @@ const LOG_FILE: &str = "hook.log";
 
 /// The time that a hook gets after `TERM` and before `KILL`.
 const GRACE: Duration = Duration::from_secs(2);
+
+/// The maximum size of the log of the hook.
+///
+/// The time limit is not a limit on the output. A hook of three seconds that
+/// writes with no stop made a file of 3.7GB in the state directory, for one
+/// job. qex stops a hook that goes above this size, and it cuts the file to it.
+/// A hook that writes a megabyte is not a hook that notifies a person.
+const OUTPUT_LIMIT: u64 = 1 << 20;
 
 /// Runs the stop hook for one job, and gives control back when it stops.
 ///
@@ -71,25 +91,55 @@ pub fn fire(cfg: &Config, dir: &Path, status: &JobStatus) {
     }
 
     let limit = cfg.hook_timeout().unwrap_or(Duration::from_secs(30));
-    match run(cfg, dir, status, limit) {
-        Ok(text) => log(&format!("the stop hook of the job {} {text}", status.id)),
-        // A hook that qex could not start is a fault of the config file, and
-        // the user must hear the name that failed. The job keeps its result.
-        Err(e) => log(&format!(
-            "the stop hook of the job {} did not start: {e}. The job keeps its result. \
-             Correct `[hooks] on_stop` in the config file.",
-            status.id
-        )),
+    let verdict = match run(cfg, dir, status, limit) {
+        Ok(text) => text,
+        // A hook that qex could not start is a fault of the config file. Name
+        // the program that failed, and say which file holds it. The job keeps
+        // its result.
+        Err(e) => format!(
+            "did not start: {e}. Test the program `{}` in `[hooks] on_stop` of the config \
+             file. The job keeps its result.",
+            cfg.hooks.on_stop[0]
+        ),
+    };
+
+    // Write the verdict of qex where a qex command can read it.
+    //
+    // Before this, the verdict went to the log of the supervisor or of the
+    // coordinator, AND NO COMMAND READS THOSE FILES. A user whose notification
+    // did not arrive had no way to learn the reason. `qex logs <id> --hook`
+    // gives this file.
+    note(dir, &format!("qex: the stop hook {verdict}"));
+    log(&format!("the stop hook of the job {} {verdict}", status.id));
+}
+
+/// Adds one line to the log of the hook.
+fn note(dir: &Path, text: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(dir.join(LOG_FILE))
+    {
+        writeln!(f, "{text}").ok();
     }
 }
 
 /// Runs the stop hook in a thread of its own.
 ///
 /// The coordinator uses this form. It makes a job terminal while it holds the
-/// lock of the queue, and a hook that hangs must never hold that lock. The
-/// thread stops with the hook. A coordinator that stops first leaves the hook
-/// to the init process, which is correct: the notification is more useful late
-/// than never.
+/// lock of the queue, and a hook that hangs must never hold that lock.
+///
+/// THE TIME LIMIT STOPS WITH THE COORDINATOR. This thread applies the limit,
+/// and a thread dies with its process. A coordinator that stops while the hook
+/// operates thus leaves the hook to the init process with no limit, and a hook
+/// that hangs then stays on the machine. The coordinator uses this form for the
+/// jobs that have no supervisor only: `cancelled`, `skipped`, and a job whose
+/// supervisor left no result. The supervisor path keeps its limit at all times,
+/// because the supervisor waits for the hook itself.
 pub fn fire_detached(cfg: &Config, dir: &Path, status: &JobStatus) {
     if cfg.hooks.on_stop.is_empty() || !status.state.is_terminal() {
         return;
@@ -201,9 +251,12 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
     let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
 
-    // Wait for the hook, and stop it at the limit.
+    // Wait for the hook. Stop it at the time limit, and stop it also when its
+    // output goes above the size limit.
     let deadline = start + limit;
-    let mut expired = false;
+    let log_path = dir.join(LOG_FILE);
+    let mut too_slow = false;
+    let mut too_large = false;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -219,28 +272,34 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
         }
 
         if Instant::now() >= deadline {
-            expired = true;
+            too_slow = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        if std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0) > OUTPUT_LIMIT {
+            too_large = true;
+            break;
+        }
+        // A short interval, because a hook can write a large quantity between
+        // two tests of the size.
+        std::thread::sleep(Duration::from_millis(20));
     }
 
-    if expired {
-        unsafe {
-            libc::killpg(pid, libc::SIGTERM);
-        }
-        let grace = Instant::now() + GRACE;
-        while Instant::now() < grace {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                break;
+    if too_slow || too_large {
+        stop(pid, &mut child);
+
+        if too_large {
+            // Cut the file. The state directory must not hold gigabytes because
+            // one hook wrote with no stop.
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&log_path) {
+                f.set_len(OUTPUT_LIMIT).ok();
             }
-            std::thread::sleep(Duration::from_millis(50));
+            return Ok(format!(
+                "wrote more than {} and qex stopped it. qex cut {}. Write less in the hook.",
+                crate::units::format_size(OUTPUT_LIMIT),
+                log_path.display()
+            ));
         }
-        // A hook cannot avoid this signal.
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
-        }
-        child.wait().ok();
+
         return Ok(format!(
             "used more than its time limit of {} and qex stopped it. \
              Make the hook faster, or increase `[hooks] timeout`.",
@@ -261,6 +320,27 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
     ))
 }
 
+/// Stops each process of the hook, and waits for it.
+///
+/// The signal goes to the process group, so a hook that started children stops
+/// completely. `KILL` follows `TERM`, and a process cannot avoid `KILL`.
+fn stop(pid: i32, child: &mut std::process::Child) {
+    unsafe {
+        libc::killpg(pid, libc::SIGTERM);
+    }
+    let grace = Instant::now() + GRACE;
+    while Instant::now() < grace {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+    child.wait().ok();
+}
+
 /// Gives the variables that the hook receives.
 ///
 /// The set answers the questions that a person asks when the notification
@@ -273,7 +353,7 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
 /// author of the hook writes no test for a variable that does not exist.
 fn variables(dir: &Path, status: &JobStatus) -> Vec<(String, String)> {
     let text = |v: Option<i32>| v.map(|n| n.to_string()).unwrap_or_default();
-    vec![
+    let mut set = vec![
         ("QEX_JOB_ID".into(), status.id.to_string()),
         ("QEX_JOB_NAME".into(), status.name.clone()),
         ("QEX_STATE".into(), status.state.to_string()),
@@ -291,7 +371,29 @@ fn variables(dir: &Path, status: &JobStatus) -> Vec<(String, String)> {
         ("QEX_ATTEMPTS".into(), status.attempts.to_string()),
         ("QEX_MAX_RSS".into(), status.usage.max_rss.to_string()),
         ("QEX_TAGS".into(), status.tags.join(" ")),
-    ]
+    ];
+    for (_, value) in set.iter_mut() {
+        *value = printable(value);
+    }
+    set
+}
+
+/// Replaces each control character with a space.
+///
+/// A NUL byte in a value stops the start of the hook: the system cannot receive
+/// a variable with a NUL in it, and `spawn` gives "nul byte found in provided
+/// data". A job NAME can hold that byte, because the name comes from the person
+/// or the agent that submitted the job and not from the config file. The
+/// notification of that job was then lost for ever, and the message named the
+/// config file, which was correct.
+///
+/// The other control characters go for the same reason in a smaller degree: a
+/// notification on a screen must not receive an escape sequence from a job name.
+fn printable(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -469,6 +571,83 @@ mod tests {
 
         fire(&cfg, &dir, &status(JobState::Failed));
         assert!(mark.exists(), "the filter must permit this state");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A job name that holds a NUL byte must not stop the notification.
+    ///
+    /// A job file can give the name `a\0b`. qex accepts that name, and
+    /// `Command::env` then refuses the value: `spawn` gives "nul byte found in
+    /// provided data". The hook never started, the claim was already taken, and
+    /// the message of that job was lost for ever — while the log named the
+    /// config file, which was correct. The name comes from the person who
+    /// submitted the job, so job data decided that a notification did not
+    /// arrive.
+    #[test]
+    fn a_job_name_with_a_control_byte_still_runs_the_hook() {
+        let dir = temp("nul");
+        let out = dir.join("name.txt");
+        let cfg = cfg_with(&format!(
+            "[hooks]\non_stop = [\"sh\", \"-c\", \"printf %s \\\"$QEX_JOB_NAME\\\" > {}\"]\n",
+            out.display()
+        ));
+        let mut status = status(JobState::Completed);
+        status.name = "a\0b\u{1b}[31mc\nd".to_string();
+        status.tags = vec!["x\0y".to_string()];
+        fire(&cfg, &dir, &status);
+
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        assert_eq!(text, "a b [31mc d", "each control byte must become a space");
+
+        // The verdict of qex must not say that the hook did not start.
+        let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert!(!log.contains("did not start"), "got: {log}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The verdict of qex must reach a file that a qex command reads.
+    ///
+    /// Before this, the verdict went to the log of the supervisor or of the
+    /// coordinator, and no command reads those files. A user whose notification
+    /// did not arrive had no way to learn the reason.
+    #[test]
+    fn the_verdict_of_qex_goes_into_the_log_of_the_hook() {
+        let dir = temp("verdict");
+        let cfg = cfg_with("[hooks]\non_stop = [\"qex-no-such-program\"]\n");
+        fire(&cfg, &dir, &status(JobState::Completed));
+
+        let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains("qex: the stop hook"), "got: {log}");
+        assert!(log.contains("qex-no-such-program"), "got: {log}");
+        assert!(
+            log.contains("on_stop"),
+            "the remedy must name the field: {log}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A hook that writes with no stop must not fill the disk.
+    ///
+    /// The time limit is not a limit on the output: a hook of three seconds
+    /// wrote 3.7GB into the state directory, for one job.
+    #[test]
+    fn a_hook_that_writes_without_a_stop_is_stopped_and_its_log_is_cut() {
+        let dir = temp("flood");
+        let cfg =
+            cfg_with("[hooks]\non_stop = [\"yes\", \"aaaaaaaaaaaaaaaa\"]\ntimeout = \"60s\"\n");
+        let start = Instant::now();
+        fire(&cfg, &dir, &status(JobState::Completed));
+
+        // The size limit, and not the time limit, stopped this hook.
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the size limit must stop the hook before the time limit"
+        );
+        let size = std::fs::metadata(dir.join(LOG_FILE)).unwrap().len();
+        assert!(
+            size <= OUTPUT_LIMIT + 4096,
+            "the log of the hook is {size} bytes and the limit is {OUTPUT_LIMIT}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

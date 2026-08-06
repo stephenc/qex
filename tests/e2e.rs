@@ -4924,6 +4924,63 @@ fn the_configured_states_select_the_jobs_that_run_the_stop_hook() {
     );
 }
 
+/// A job whose supervisor stopped must still notify, one time.
+///
+/// The supervisor runs the hook. A supervisor that a signal stops runs nothing,
+/// and the person then waits for a message that cannot arrive. The coordinator
+/// makes that job `failed`, so the coordinator runs the hook. The claim file
+/// stops a second message.
+///
+/// This test also reads `qex logs --hook`. The verdict of qex must reach a file
+/// that a qex command shows: a user whose notification did not arrive had no
+/// command that gave the reason.
+#[test]
+fn a_job_whose_supervisor_stopped_still_runs_the_stop_hook_one_time() {
+    let h = Harness::with_default_config("hookdead");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop = [\"sh\", \"-c\", \"echo \\\"$QEX_STATE\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let id = h.submit(&["submit", "--name", "long", "--", "sleep", "60"]);
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.status_json(&id)["supervisor_pid"].as_i64().is_some() && h.state_of(&id) == "running"
+    });
+
+    // Stop the supervisor of this job. This test started that process.
+    let supervisor = h.status_json(&id)["supervisor_pid"].as_i64().unwrap() as i32;
+    unsafe {
+        libc::kill(supervisor, libc::SIGKILL);
+    }
+
+    h.until("the job is failed", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+
+    // Give a second process the time to notify again.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        h.hook_lines(),
+        vec!["failed".to_string()],
+        "the hook must run one time for a job that lost its supervisor"
+    );
+
+    // The verdict of qex must reach a qex command.
+    let text = h.ok(&["logs", &id, "--hook"]);
+    assert!(
+        text.contains("qex: the stop hook"),
+        "`qex logs --hook` must give the verdict of qex: {text}"
+    );
+}
+
 fn _unused(_: &Path) {}
 
 /// Waits until a `qex run` that a test started stops, and gives its output.
