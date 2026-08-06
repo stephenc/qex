@@ -309,6 +309,20 @@ oom_score_adj = 0     # a larger number offers the job to the OOM killer first
 configuration to return to the earlier behaviour for every job. A job file and a
 pipeline stage take `nice` as well.
 
+The value comes from three places, and the last one wins:
+
+```text
+[politeness] nice   ->   job file or pipeline stage `nice`   ->   --nice N
+```
+
+`0` is a value and not an absence: `--nice 0` sets 0 against a configuration
+that says 10.
+
+qex refuses a `nice` outside -20 to 19, an `io` that is not one of the three
+names, and an `oom_score_adj` outside -1000 to 1000. It applies each of these
+between the fork and the exec of the job, where it cannot report a fault, so a
+value that the system refuses would do nothing and say nothing.
+
 `io = "idle"` gives the disk to everything else first, which matters when a
 build reads a whole source tree while somebody saves a file.
 
@@ -318,7 +332,8 @@ holds an hour of work.
 
 **Not one of these can stop a job.** A machine that refuses the change runs the
 job at the usual priority, which is what qex did before. A number below zero
-needs privilege, and qex does not ask for it.
+needs privilege that qex usually does not have; qex still makes the call, the
+system refuses it, and the job continues.
 
 ### The coordinator reads this file again when it changes
 

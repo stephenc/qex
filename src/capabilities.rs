@@ -186,6 +186,7 @@ pub const ALL: &[&str] = &[
     "history",
     "learn",
     "locks",
+    "politeness",
     "retries",
 ];
 
@@ -224,6 +225,15 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
     if spec.group.is_some() {
         out.push("groups");
     }
+    // A coordinator that does not know `nice` keeps the field, gives back a job
+    // id, and runs the job at the usual priority. The user asked for a job that
+    // gives way, and the job does not give way, and nothing said so.
+    //
+    // The support floor is 0.6.0, so such a coordinator passes the floor test.
+    // The name is therefore the only thing that separates the two builds.
+    if spec.nice.is_some() {
+        out.push("politeness");
+    }
     out
 }
 
@@ -254,6 +264,7 @@ pub fn check(
             "retries" => "--retries",
             "dependencies" => "--needs and --after",
             "groups" => "qex pipeline",
+            "politeness" => "--nice",
             other => other,
         })
         .collect();
@@ -458,6 +469,45 @@ mod tests {
     fn a_job_that_needs_nothing_passes_every_coordinator() {
         assert!(required_by(&spec()).is_empty());
         assert!(check(&[], "0.1.0", 1, &spec()).is_ok());
+    }
+
+    /// A job with `--nice` must be refused by a coordinator that cannot obey
+    /// it.
+    ///
+    /// The support floor is 0.6.0, so a 0.6.x coordinator passes the floor
+    /// test. It keeps the field, gives back a job id, and runs the job at the
+    /// usual priority. The user asked for a job that gives way, the job does
+    /// not give way, and nothing says so.
+    ///
+    /// The default from `[politeness] nice` is NOT this case: the supervisor
+    /// reads that value, so a job that the user did not give a value stays
+    /// without one and works with every coordinator.
+    #[test]
+    fn nice_is_refused_by_a_coordinator_that_cannot_obey_it() {
+        let mut s = spec();
+        s.nice = Some(19);
+
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "politeness")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check(&old, "0.6.0", 4321, &s).unwrap_err();
+        assert!(
+            err.contains("--nice"),
+            "the message must name the option: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+
+        // A coordinator of this build obeys it.
+        let now: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check(&now, env!("CARGO_PKG_VERSION"), 1, &s).is_ok());
+
+        // A job with no value of its own needs nothing.
+        assert!(required_by(&spec()).is_empty());
     }
 
     /// A job with a lock must be refused by a coordinator that has no locks.

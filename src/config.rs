@@ -415,6 +415,13 @@ impl Default for QueueConfig {
     }
 }
 
+/// The names that `[politeness] io` accepts.
+///
+/// `none` leaves the class of the job as it is. The supervisor holds the same
+/// three names, because it reads them between the fork and the exec, where a
+/// comparison against this list would allocate.
+pub const IO_CLASSES: [&str; 3] = ["none", "best-effort", "idle"];
+
 /// How politely a job uses the machine.
 ///
 /// # Why this exists
@@ -434,8 +441,10 @@ pub struct PolitenessConfig {
     /// A larger number gives the job less of the processor when something else
     /// wants it. 0 is the value of a command that you type.
     ///
-    /// A user cannot give a number BELOW zero without privilege, and qex does
-    /// not try: a negative value gives a warning and no change.
+    /// A user cannot give a number BELOW zero without privilege. qex still
+    /// makes the call; the system refuses it; and the job then runs at the
+    /// priority that it already had. A negative value on a machine where qex
+    /// has no privilege thus costs nothing and gives nothing.
     pub nice: i32,
     /// The class of the job for the disk, on Linux.
     ///
@@ -991,6 +1000,47 @@ impl Config {
         Ok(Some(bytes))
     }
 
+    /// Reads the `[politeness]` values, and refuses one that the system cannot
+    /// obey.
+    ///
+    /// Each of these values goes to the system between the fork and the exec of
+    /// a job. That code cannot report a fault: it has no lock and no allocation
+    /// available, so it gives up in silence. A value with a fault would then do
+    /// nothing, for every job, and say nothing. `io = "iddle"` would read as
+    /// `io = "none"`, and the user would look for the cause in the kernel.
+    ///
+    /// The test therefore belongs here, where qex can still name the file, the
+    /// value and the remedy.
+    pub fn politeness_values(&self) -> Result<()> {
+        let p = &self.politeness;
+        if !(-20..=19).contains(&p.nice) {
+            anyhow::bail!(
+                "config [politeness] nice is {}. Use a number from -20 to 19. The system \
+                 accepts no other number, so this value gives the job the priority that it \
+                 already had, and qex cannot tell you at the moment that it happens.",
+                p.nice
+            );
+        }
+        if !IO_CLASSES.contains(&p.io.as_str()) {
+            anyhow::bail!(
+                "config [politeness] io is `{}`. Use one of: {}. qex sets the class of a job \
+                 between the fork and the exec, where it cannot report a fault, so a name \
+                 with a fault would leave every job in the usual class in silence.",
+                p.io,
+                IO_CLASSES.join(", ")
+            );
+        }
+        if !(-1000..=1000).contains(&p.oom_score_adj) {
+            anyhow::bail!(
+                "config [politeness] oom_score_adj is {}. Use a number from -1000 to 1000. \
+                 The kernel refuses every other number, so this value changes nothing, and \
+                 the job stays as likely a victim as an editor of the user.",
+                p.oom_score_adj
+            );
+        }
+        Ok(())
+    }
+
     /// Reads each field that the config parser does not read immediately.
     ///
     /// Call this function at start. qex then reports an incorrect config file
@@ -1013,6 +1063,7 @@ impl Config {
                 self.learn.margin
             );
         }
+        self.politeness_values()?;
         if self.enforce.mem_overcommit < 1.0 {
             anyhow::bail!(
                 "config [enforce] mem_overcommit is {}. Use a value of 1.0 or more. \
@@ -1354,6 +1405,43 @@ mod tests {
             text.lines().count() <= 6,
             "the short message must fit in a record: {text}"
         );
+    }
+
+    /// A politeness value that the system cannot obey must be refused here.
+    ///
+    /// qex applies these values between the fork and the exec of a job, where
+    /// it cannot report a fault and gives up in silence. A value with a fault
+    /// would thus do nothing, for every job, and say nothing. `io = "iddle"`
+    /// would read as `io = "none"`, and a user would look for the cause in the
+    /// kernel.
+    #[test]
+    fn a_politeness_value_that_the_system_refuses_is_refused_at_the_start() {
+        for (text, word) in [
+            ("[politeness]\nnice = 100\n", "-20 to 19"),
+            ("[politeness]\nnice = -21\n", "-20 to 19"),
+            ("[politeness]\nio = \"banana\"\n", "best-effort"),
+            ("[politeness]\noom_score_adj = 5000\n", "-1000 to 1000"),
+            ("[politeness]\noom_score_adj = 100000000\n", "-1000 to 1000"),
+        ] {
+            let c: Config = toml::from_str(text).unwrap();
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(word),
+                "the message for `{text}` must give the remedy `{word}`, and it said: {err}"
+            );
+        }
+
+        // Every value that the system accepts must pass.
+        for class in IO_CLASSES {
+            let c: Config = toml::from_str(&format!(
+                "[politeness]\nnice = 19\nio = \"{class}\"\noom_score_adj = 1000\n"
+            ))
+            .unwrap();
+            c.validate().unwrap();
+        }
+        let c: Config =
+            toml::from_str("[politeness]\nnice = -20\noom_score_adj = -1000\n").unwrap();
+        c.validate().unwrap();
     }
 
     #[test]

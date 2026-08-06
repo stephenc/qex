@@ -812,12 +812,17 @@ const RACE_TIMER: u8 = 2;
 fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
     // The processor. A larger number gives way to everything else.
     //
-    // A user cannot ask for a number below zero without privilege, and this
-    // code does not try: the call fails and the job continues.
-    if nice != 0 {
-        unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
-        }
+    // A user cannot ask for a number below zero without privilege. qex still
+    // makes the call: it fails with EPERM, the job continues at the priority
+    // that it had, and no other step is lost.
+    //
+    // The call happens for 0 as well. `--nice 0` says "this job must not give
+    // way", and it must therefore SET 0, and not leave the priority that the
+    // job received from the supervisor. The supervisor runs at the priority of
+    // the command that started the coordinator, so a coordinator that a user
+    // started under `nice` would otherwise make `--nice 0` mean nothing.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, nice);
     }
 
     // The disk, on Linux. A build that reads the whole source tree makes an
@@ -868,9 +873,18 @@ fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
 /// only and it allocates nothing.
 #[cfg(target_os = "linux")]
 fn write_oom_score(value: i32) {
-    // The largest value is 1000 and the smallest is -1000, so five characters
-    // and a sign are sufficient.
-    let mut buf = [0u8; 8];
+    // The buffer holds ANY `i32`, and not the -1000 to 1000 that the kernel
+    // accepts.
+    //
+    // `Config::validate` refuses a value outside that range, so a larger number
+    // does not arrive here. The buffer still holds one, because this code runs
+    // in the child between the fork and the exec. An index outside the buffer
+    // is a panic; a panic formats a message; and that allocates and takes two
+    // locks in a process where no lock is safe. The job would then die, and
+    // this function must never be able to stop a job.
+    //
+    // 10 characters hold 2147483647, and the sign takes one more.
+    let mut buf = [0u8; 10];
     let mut n = 0;
     let negative = value < 0;
     let mut v = value.unsigned_abs();
@@ -886,7 +900,7 @@ fn write_oom_score(value: i32) {
     }
     buf[start..n].reverse();
 
-    let mut out = [0u8; 9];
+    let mut out = [0u8; 11];
     let mut len = 0;
     if negative {
         out[0] = b'-';

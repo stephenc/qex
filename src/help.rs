@@ -423,6 +423,11 @@ Other useful options
                        every attempt. Use it for a fault outside the task,
                        such as a network that is not ready.
 
+    --nice N           how much the job gives way to the work of a person.
+                       -20 to 19, and a larger number gives way. The default
+                       comes from `[politeness] nice`, and it is 10. Use
+                       `--nice 0` for a job that must not give way.
+
     --lock NAME        two jobs with one lock name never operate together.
                        Use it for work that shares something that a claim
                        cannot express: a build directory, a port, a database.
@@ -579,6 +584,7 @@ A full file
     needs = [\"build\"]             # stop if these jobs do not succeed
     after = [\"cleanup\"]           # wait for these jobs, whatever the result
     env_capture = \"all\"           # all, minimal or none
+    nice = 10                     # -20 to 19; a larger number gives way
 
     [resources]
     cpu = 3
@@ -1125,7 +1131,7 @@ so `GROUP=$(qex pipeline ci.toml)` operates.
     after = [\"ship\"]
 
 Each job in the file takes every field of a job file: `cwd`, `env`, `timeout`, `tags`,
-`priority`, `env_capture` and `[resources]`.
+`priority`, `env_capture`, `nice` and `[resources]`.
 
 Why a pipeline file, and not several submissions
 ------------------------------------------------
