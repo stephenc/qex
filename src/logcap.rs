@@ -58,13 +58,16 @@ pub struct Dropped {
     pub lines: u64,
 }
 
-/// The three parts of the limit.
+/// The parts of the limit.
 #[derive(Debug, Clone, Copy)]
 struct Parts {
-    /// The bytes that the file keeps from the start of the output.
+    /// The bytes that the file keeps from the start of the output, after the
+    /// output passes the limit.
     head: u64,
     /// The bytes that the circular file keeps from the end of the output.
     tail: u64,
+    /// The bytes that go into the file itself before qex removes anything.
+    fill: u64,
     /// The limit itself, for the notes that qex writes.
     max: u64,
 }
@@ -78,12 +81,22 @@ struct Parts {
 /// The tail is three times the head. The head needs the start of the output
 /// only: a banner, the configuration and the first commands. The failure is at
 /// the end, and the reader usually needs more of it.
+///
+/// # Why `fill` is not the same as `head`
+///
+/// qex removes nothing until the output passes the limit. A job that writes
+/// less than `max_bytes` thus keeps every byte, in one piece, with no note.
+/// This rule also holds for a second attempt, which adds to the same file: a
+/// retry of a job that wrote 349KB against a limit of 1MB must not lose that
+/// output, and an earlier version cut it at `head` and wrote a note that said
+/// something untrue.
 fn parts(max: u64) -> Parts {
     let room = NOTE_ROOM.min(max / 8);
     let head = max / 4;
     Parts {
         head,
         tail: max.saturating_sub(head + room).max(1),
+        fill: max.saturating_sub(room).max(head),
         max,
     }
 }
@@ -101,6 +114,14 @@ pub struct CapWriter {
     overflow_lines: u64,
     dropped: Dropped,
     tail: Option<Ring>,
+    /// True after the output passed the limit one time.
+    ///
+    /// This flag is not the same test as `tail.is_some()`. A machine that
+    /// refuses the circular file leaves no ring, and a test of the ring then
+    /// starts the same operation again for each part of the output: the file
+    /// received one note for each 64KB, and it grew with the output that the
+    /// limit had to stop.
+    overflowing: bool,
     tail_path: PathBuf,
     /// The first write fault, for the log of the supervisor.
     ///
@@ -123,10 +144,8 @@ impl CapWriter {
             overflow_lines: 0,
             dropped: Dropped::default(),
             tail: None,
-            // A name beside the log file. `qex clean` deletes the directory of
-            // the job, so a supervisor that a signal stops leaves no file that
-            // nothing removes.
-            tail_path: path.with_extension("log.tail"),
+            overflowing: false,
+            tail_path: tail_path(path),
             fault: None,
         }
     }
@@ -139,8 +158,16 @@ impl CapWriter {
         };
 
         let mut rest = buf;
-        if self.head_len < parts.head {
-            let room = (parts.head - self.head_len) as usize;
+        // The bytes go into the file itself until the output passes the limit.
+        // qex removes nothing before that moment, so output that fits in the
+        // limit stays complete and in one piece.
+        //
+        // After that moment the head is closed for ever. Without the test of
+        // `overflowing`, the cut to the head budget would make room, the next
+        // bytes would fill the file a second time, and the file would hold the
+        // middle of the output in place of its end.
+        if !self.overflowing && self.head_len < parts.fill {
+            let room = (parts.fill - self.head_len) as usize;
             let take = room.min(rest.len());
             self.push_head(&rest[..take]);
             rest = &rest[take..];
@@ -162,9 +189,9 @@ impl CapWriter {
         }
     }
 
-    /// Puts the bytes above the head in the circular file.
+    /// Puts the bytes above the limit in the circular file.
     fn push_overflow(&mut self, data: &[u8]) {
-        if self.tail.is_none() {
+        if !self.overflowing {
             self.start_overflow();
         }
         self.overflow_bytes += data.len() as u64;
@@ -186,6 +213,8 @@ impl CapWriter {
     /// wrote no more, and `qex logs --follow` gives this line as it arrives.
     fn start_overflow(&mut self) {
         let Some(parts) = self.parts else { return };
+        // This operation happens one time for each stream, whatever follows.
+        self.overflowing = true;
 
         // An earlier attempt of this job can have left more than the head in
         // the file. The limit belongs to the stream and not to the attempt, so
@@ -229,23 +258,38 @@ impl CapWriter {
     /// tail. A reader thus finds the start of the output, one line that names
     /// the loss, and the end of the output, in that order.
     pub fn finish(mut self) -> Dropped {
-        let Some(ring) = self.tail.take() else {
+        let (Some(ring), Some(parts)) = (self.tail.take(), self.parts) else {
+            // The output passed the limit, and there is no circular file. The
+            // machine refused that file, so those bytes reached no disk at all.
+            // The count must say so: a record that says that nothing went, for
+            // a file that is not complete, is worse than no record.
+            self.dropped.bytes += self.overflow_bytes;
+            self.dropped.lines += self.overflow_lines;
             self.file.flush().ok();
-            return self.dropped;
-        };
-        let Some(parts) = self.parts else {
             return self.dropped;
         };
         let mut ring = ring;
 
+        // The tail starts in the middle of a line, and a reader must not read
+        // that fragment as a whole line. qex therefore removes the bytes before
+        // the first line end — BUT ONLY IF THERE IS ONE.
+        //
+        // A stream can hold no line end at all in the tail: one JSON document
+        // of 30MB, a base64 block, or a progress display that uses `\r` (dd,
+        // curl, docker, apt). An earlier version removed the whole tail in that
+        // case, and the file then held the head only. That defeats the reason
+        // for this module, so qex keeps the fragment and says that it is one.
+        let cut_line = ring.wrapped && !ring.has_line_end().unwrap_or(false);
+        let trim = ring.wrapped && !cut_line;
+
         // The first pass measures. The line that says how much went must be
         // before the tail, so qex needs the numbers before it writes anything.
         // Neither pass holds the tail in the memory.
-        let (kept_bytes, kept_lines) = ring.walk(None).unwrap_or((0, 0));
+        let (kept_bytes, kept_lines) = ring.walk(None, trim).unwrap_or((0, 0));
         self.dropped.bytes += self.overflow_bytes.saturating_sub(kept_bytes);
         self.dropped.lines += self.overflow_lines.saturating_sub(kept_lines);
 
-        let note = format!(
+        let mut note = format!(
             "{MARK} ---- {} and {} line(s) of the output are not in this file ----\n\
              {MARK} The limit is `[logs] max_bytes` = {}. qex kept the first {} and the last {}. \
              To keep more, make max_bytes larger in the configuration file.\n",
@@ -255,11 +299,17 @@ impl CapWriter {
             crate::units::format_size(parts.head),
             crate::units::format_size(kept_bytes),
         );
+        if cut_line {
+            note.push_str(&format!(
+                "{MARK} The last part has no line end in it. The text that follows starts in \
+                 the middle of a line.\n"
+            ));
+        }
         if let Err(e) = self.file.write_all(note.as_bytes()) {
             self.record_fault(&format!("writing the line about the removed output: {e}"));
         }
 
-        if let Err(e) = ring.walk(Some(&mut self.file)) {
+        if let Err(e) = ring.walk(Some(&mut self.file), trim) {
             self.record_fault(&format!("writing the last part of the output: {e}"));
         }
         self.file.flush().ok();
@@ -336,23 +386,56 @@ impl Ring {
         Ok(())
     }
 
+    /// Gives the order of the two parts of the file.
+    fn segments(&self) -> [(u64, u64); 2] {
+        if self.wrapped {
+            [(self.pos, self.size - self.pos), (0, self.pos)]
+        } else {
+            [(0, self.pos), (0, 0)]
+        }
+    }
+
+    /// Tests if the contents hold a line end.
+    ///
+    /// The caller removes the incomplete first line, and it must not do that
+    /// when the whole tail is one incomplete line. This function stops at the
+    /// first line end, so the usual stream costs one read.
+    fn has_line_end(&mut self) -> std::io::Result<bool> {
+        let mut buf = vec![0u8; CHUNK];
+        for (start, len) in self.segments() {
+            if len == 0 {
+                continue;
+            }
+            self.file.seek(SeekFrom::Start(start))?;
+            let mut left = len;
+            while left > 0 {
+                let want = (left as usize).min(buf.len());
+                let n = self.file.read(&mut buf[..want])?;
+                if n == 0 {
+                    break;
+                }
+                left -= n as u64;
+                if buf[..n].contains(&b'\n') {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Reads the contents in the order that the job wrote them.
     ///
     /// With `out`, this function also writes the contents there. It gives the
     /// number of bytes and the number of lines that it read. The caller calls
-    /// it two times: one time to measure, and one time to write.
+    /// it two times: one time to measure, and one time to write, and it gives
+    /// the same `trim` value both times.
     ///
-    /// The first line is incomplete when the writer returned to the start, so
-    /// this function removes the bytes before the first line end. A reader must
-    /// not meet one half of a line as if it were a whole line.
-    fn walk(&mut self, mut out: Option<&mut File>) -> std::io::Result<(u64, u64)> {
-        let segments: [(u64, u64); 2] = if self.wrapped {
-            [(self.pos, self.size - self.pos), (0, self.pos)]
-        } else {
-            [(0, self.pos), (0, 0)]
-        };
-
-        let mut trim = self.wrapped;
+    /// With `trim`, this function removes the bytes before the first line end.
+    /// The first line is incomplete when the writer returned to the start, and
+    /// a reader must not meet one half of a line as if it were a whole line.
+    fn walk(&mut self, mut out: Option<&mut File>, trim: bool) -> std::io::Result<(u64, u64)> {
+        let segments = self.segments();
+        let mut trim = trim;
         let mut bytes = 0u64;
         let mut lines = 0u64;
         let mut buf = vec![0u8; CHUNK];
@@ -395,6 +478,15 @@ impl Ring {
     }
 }
 
+/// Gives the name of the file that holds the tail of one stream.
+///
+/// The name is beside the log file, so `qex clean` deletes it with the record
+/// of the job. The supervisor uses this function as well, to remove the file
+/// when a copy did not complete.
+pub fn tail_path(log: &Path) -> PathBuf {
+    log.with_extension("log.tail")
+}
+
 fn count_lines(data: &[u8]) -> u64 {
     data.iter().filter(|b| **b == b'\n').count() as u64
 }
@@ -417,12 +509,28 @@ fn count_lines_in(file: &mut File, start: u64, len: u64) -> std::io::Result<u64>
     Ok(lines)
 }
 
+/// What one copy of one stream reports to the supervisor.
+#[derive(Debug, Clone, Copy)]
+pub enum Report {
+    /// The job closed this stream. No more output can arrive.
+    Eof,
+    /// The copy is complete. This is what qex removed.
+    Done(Dropped),
+}
+
 /// Reads one stream of the job and writes it through the limit.
 ///
 /// This function operates in a thread of its own, one thread for each stream.
 /// It reads until the job closes the stream. A read fault stops the copy, and
 /// it does not stop the job.
-pub fn pump(mut source: impl Read, mut writer: CapWriter) -> Dropped {
+///
+/// `on_eof` reports the end of the output, BEFORE the tail goes into the log
+/// file. The two events are separate because the supervisor gives them
+/// different times: the wait for the end of the output has a short limit,
+/// because a process that left the process group can hold the pipe open for
+/// ever, but the copy of the tail that follows is local work, and a limit on it
+/// would cut the log file of a job that did nothing wrong.
+pub fn pump(mut source: impl Read, mut writer: CapWriter, on_eof: impl FnOnce()) -> Dropped {
     let mut buf = vec![0u8; CHUNK];
     loop {
         match source.read(&mut buf) {
@@ -432,6 +540,7 @@ pub fn pump(mut source: impl Read, mut writer: CapWriter) -> Dropped {
             Err(_) => break,
         }
     }
+    on_eof();
     writer.finish()
 }
 
@@ -665,6 +774,131 @@ mod tests {
         assert!(text.contains("first"), "the head went");
         assert!(text.contains("THE-END"), "the end of the write went");
         assert!(std::fs::metadata(&path).unwrap().len() <= MIN_LIMIT);
+    }
+
+    /// Output with no line end must keep its last part.
+    ///
+    /// qex removes the incomplete first line of the tail, so that a reader
+    /// never meets one half of a line. An earlier version applied that rule
+    /// when the tail held NO line end at all, and it then removed the whole
+    /// tail: a 4GB stream of one line left the head only. One JSON document,
+    /// one base64 block, or a progress display that uses `\r` (dd, curl,
+    /// docker, apt) all give a stream of that form.
+    #[test]
+    fn output_with_no_line_end_keeps_its_last_part() {
+        let dir = Dir::new("no-line-end");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+
+        w.write(b"the start of the output, and then one very long line: ");
+        for _ in 0..40 {
+            w.write(&vec![b'x'; 8 * 1024]);
+        }
+        w.write(b"THE-VERY-END");
+        let dropped = w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("the start of the output"), "the head went");
+        assert!(
+            text.ends_with("THE-VERY-END"),
+            "the end of the output went, and the file holds the head only"
+        );
+        // The tail must be a true tail, and not one line of the note.
+        let kept = text.rfind(MARK).map(|i| text[i..].len()).unwrap_or(0);
+        assert!(kept > 1000, "the tail holds {kept} bytes only");
+        assert!(dropped.bytes > 0);
+        assert!(
+            text.contains("middle of a line"),
+            "the file must say that the last part starts in the middle of a line"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= MIN_LIMIT);
+    }
+
+    /// A second attempt must not remove output that fits in the limit.
+    ///
+    /// The limit belongs to the whole stream, but qex removes nothing before
+    /// the stream passes the limit. An earlier version cut the file back to one
+    /// quarter of the limit at the first byte of the second attempt: a retry of
+    /// a job that wrote 349KB against a limit of 1MB lost 87KB, and the file
+    /// said that the output had reached the limit, which was not true.
+    #[test]
+    fn a_second_attempt_that_fits_the_limit_loses_nothing() {
+        let dir = Dir::new("retry-fits");
+        let path = dir.log();
+        let limit = 1 << 20;
+
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(limit));
+        write_lines(&mut w, 1, 30000);
+        let first = w.finish();
+        assert_eq!(first, Dropped::default(), "the first attempt fits");
+        let existing = std::fs::metadata(&path).unwrap().len();
+        assert!(existing < limit, "the test needs an attempt that fits");
+
+        // The supervisor writes this mark between two attempts.
+        let mut again = std::fs::OpenOptions::new()
+            .append(true)
+            .read(true)
+            .open(&path)
+            .unwrap();
+        again.write_all(b"\n--- attempt 2 ---\n").unwrap();
+        let existing = std::fs::metadata(&path).unwrap().len();
+
+        let mut w = CapWriter::new(&path, again, existing, Some(limit));
+        w.write(b"the second attempt\n");
+        let second = w.finish();
+
+        assert_eq!(
+            second,
+            Dropped::default(),
+            "the second attempt removed data"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains(MARK), "qex wrote a note with no reason");
+        assert!(
+            text.contains("line-1\n"),
+            "the first attempt lost its start"
+        );
+        assert!(
+            text.contains("line-30000\n"),
+            "the first attempt lost its end"
+        );
+        assert!(
+            text.contains("--- attempt 2 ---"),
+            "the mark between the attempts went"
+        );
+        assert!(text.contains("the second attempt"));
+    }
+
+    /// A machine that refuses the file for the tail must still stop the output,
+    /// and the count must say that the output is not complete.
+    ///
+    /// An earlier version tested the ring and not the state, so it wrote the
+    /// note one time for each 64KB and the file grew with the output that the
+    /// limit had to stop. It also reported that nothing went.
+    #[test]
+    fn a_tail_file_that_the_machine_refuses_still_stops_the_output() {
+        let dir = Dir::new("no-ring");
+        let path = dir.log();
+        // A directory with the name of the file. The machine then refuses the
+        // file, in the same way as a disk that is full or a mode that stops it.
+        std::fs::create_dir_all(tail_path(&path)).unwrap();
+
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+        write_lines(&mut w, 1, 20000);
+        let dropped = w.finish();
+
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size <= MIN_LIMIT, "the file holds {size} bytes");
+        assert!(
+            dropped.bytes > 0 && dropped.lines > 0,
+            "the record must say that the output is not complete: {dropped:?}"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.matches("reached the limit").count(),
+            1,
+            "the note must appear one time"
+        );
     }
 
     /// The parts of the limit must never be larger than the limit itself. The

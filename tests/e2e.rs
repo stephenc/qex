@@ -2883,6 +2883,94 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
     assert!(value["stdout_dropped_lines"].as_u64().unwrap() > 1000);
 }
 
+/// Output with no line end must keep its last part.
+///
+/// qex removes the incomplete first line of the tail, so that a reader never
+/// meets one half of a line. An earlier version applied that rule when the tail
+/// held no line end at all, and it then removed the whole tail: a job that
+/// wrote one enormous line left the head only. One JSON document, one base64
+/// block, and a progress display that uses `\r` all give output of that form.
+#[test]
+fn a_job_that_writes_one_enormous_line_keeps_its_end() {
+    let h = Harness::new(
+        "logcap-line",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // 8MB with no line end at all, and a mark at the very end.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "dd if=/dev/zero bs=1M count=8 2>/dev/null | tr '\\0' 'A'; printf THE-VERY-END",
+    ]);
+    let wait = h.qex(&["wait", &id, "--timeout", "60s"]);
+    assert_eq!(wait.status.code(), Some(0));
+
+    let path = h.job_dir(&id).join("stdout.log");
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(size <= 64 * 1024, "the file holds {size} bytes");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.ends_with("THE-VERY-END"),
+        "the end of the output went, and the file holds the head only"
+    );
+    assert!(
+        text.contains("middle of a line"),
+        "the file must say that the last part is not a whole line"
+    );
+}
+
+/// A second attempt must not remove output that fits in the limit.
+///
+/// qex removes nothing before the output passes the limit. An earlier version
+/// cut the file back at the first byte of the second attempt: a retry of a job
+/// that wrote a third of the limit lost 87KB, and the file said that the output
+/// had reached the limit, which was not true.
+#[test]
+fn a_retry_that_fits_the_limit_keeps_the_output_of_both_attempts() {
+    let h = Harness::new(
+        "logcap-retry",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"1MB\"\n",
+    );
+    // Each attempt writes about 110KB, and the two together fit in the limit.
+    let id = h.submit(&[
+        "submit",
+        "--retries",
+        "1",
+        "--",
+        "sh",
+        "-c",
+        "seq 1 20000; echo THE-LAST-LINE; exit 1",
+    ]);
+    h.qex(&["wait", &id, "--timeout", "60s"]);
+
+    let text = std::fs::read_to_string(h.job_dir(&id).join("stdout.log")).unwrap();
+    assert!(
+        !text.contains("[qex]"),
+        "qex wrote a note about the limit, and the output fits in the limit"
+    );
+    assert_eq!(
+        text.lines().filter(|l| *l == "THE-LAST-LINE").count(),
+        2,
+        "each attempt must keep its output"
+    );
+    assert!(
+        text.contains("--- attempt 2 ---"),
+        "the mark between the attempts went"
+    );
+    assert_eq!(
+        h.status_json(&id)["logs_dropped"],
+        serde_json::Value::Null,
+        "the record says that qex removed output, and it removed nothing"
+    );
+}
+
 fn _unused(_: &Path) {}
 
 /// Waits until a `qex run` that a test started stops, and gives its output.

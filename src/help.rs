@@ -968,8 +968,30 @@ Those lines are NOT on the disk. `--all` does not give them back, because
 nothing holds them. `qex status` and `qex logs` say how much went, and
 `qex status --json` gives the numbers in the field `logs_dropped`.
 
+qex removes nothing until the output passes the limit. A job that writes less
+than the limit keeps every byte in one piece, and a second attempt of a job
+that failed keeps the output of the first attempt.
+
 Make `[logs] max_bytes` larger for a job that must keep everything, or write
 the output of the job to a file of your own.
+
+The output of a job is a pipe
+-----------------------------
+
+The supervisor reads the output through a pipe and writes the file itself. The
+standard output and the standard error of a job are thus a pipe, and not a
+regular file. Almost every program sees no difference. Three things change:
+
+    lseek gives ESPIPE, and stat gives a FIFO in place of a regular file. A
+        program that asks for its position in its own output meets an error.
+    Two children of one job that write more than 4096 bytes in one operation
+        can mix in the middle of a line. A regular file kept each write
+        together.
+    isatty gives false, as it did before.
+
+If a program needs a regular file, give it one:
+
+    qex submit -- sh -c 'my-program > out.txt'
 
 Use `--follow --grep` in place of a pipe to `grep`. A pipe holds the lines in a
 buffer and shows nothing until the buffer fills, because `grep` needs the option

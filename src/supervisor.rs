@@ -409,17 +409,29 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // that left the process group can hold the pipe open, and a `join` would
     // then wait for ever. The supervisor must write the result of a job that
     // stopped, whatever a process of that job still holds.
-    let (tx, rx) = std::sync::mpsc::channel::<(bool, crate::logcap::Dropped)>();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, crate::logcap::Report)>();
+    let mut copies = 0;
     if let Some(pipe) = child.stdout.take() {
-        let tx = tx.clone();
+        let done = tx.clone();
+        let eof = tx.clone();
+        copies += 1;
         std::thread::spawn(move || {
-            tx.send((false, crate::logcap::pump(pipe, out_cap))).ok();
+            let dropped = crate::logcap::pump(pipe, out_cap, || {
+                eof.send((false, crate::logcap::Report::Eof)).ok();
+            });
+            done.send((false, crate::logcap::Report::Done(dropped)))
+                .ok();
         });
     }
     if let Some(pipe) = child.stderr.take() {
-        let tx = tx.clone();
+        let done = tx.clone();
+        let eof = tx.clone();
+        copies += 1;
         std::thread::spawn(move || {
-            tx.send((true, crate::logcap::pump(pipe, err_cap))).ok();
+            let dropped = crate::logcap::pump(pipe, err_cap, || {
+                eof.send((true, crate::logcap::Report::Eof)).ok();
+            });
+            done.send((true, crate::logcap::Report::Done(dropped))).ok();
         });
     }
     drop(tx);
@@ -544,33 +556,72 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // Release the process id. Each signal above is complete.
     let exit = child.wait().context("waiting for the job")?;
 
-    // Complete the two copies. Each process of the job stopped, so the pipes
-    // are closed and each thread writes the last part of its file.
+    // Complete the copy of each stream. Each process of the job stopped, so
+    // the pipes close and each thread writes the last part of its file.
+    //
+    // The two events have different times, and that difference is deliberate:
+    //
+    // 1. The END OF THE OUTPUT has a limit of 30 seconds. A process that left
+    //    the process group can hold the pipe open for ever, and the record of
+    //    a job that stopped must not wait for it.
+    // 2. The COPY OF THE TAIL that follows has a long limit. That work is
+    //    local, and its time grows with `max_bytes`. A short limit here would
+    //    cut the log file of a job that did nothing wrong, on a machine where
+    //    the disk is slow or the limit is some gigabytes.
     let mut drops = crate::job::LogsDropped {
         limit: log_limit.unwrap_or(0),
         ..earlier_drops
     };
-    for _ in 0..2 {
-        match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok((false, d)) => {
-                drops.stdout_bytes += d.bytes;
-                drops.stdout_lines += d.lines;
-            }
-            Ok((true, d)) => {
-                drops.stderr_bytes += d.bytes;
-                drops.stderr_lines += d.lines;
+    let mut open = copies;
+    let mut waiting_for_eof = copies;
+    let mut incomplete = false;
+    let eof_limit = std::time::Instant::now() + Duration::from_secs(30);
+    while open > 0 {
+        let wait = if waiting_for_eof > 0 {
+            eof_limit.saturating_duration_since(std::time::Instant::now())
+        } else {
+            Duration::from_secs(600)
+        };
+        match rx.recv_timeout(wait) {
+            Ok((_, crate::logcap::Report::Eof)) => waiting_for_eof -= 1,
+            Ok((is_err, crate::logcap::Report::Done(d))) => {
+                open -= 1;
+                if is_err {
+                    drops.stderr_bytes += d.bytes;
+                    drops.stderr_lines += d.lines;
+                } else {
+                    drops.stdout_bytes += d.bytes;
+                    drops.stdout_lines += d.lines;
+                }
             }
             Err(_) => {
-                // Something still holds a pipe of this job. Say so, and write
-                // the result. A record that arrives is worth more than a wait
-                // that has no end.
-                log(&format!(
-                    "the output of the job {id} did not close; qex writes the result now, \
-                     and the last part of one log file can be missing"
-                ));
+                incomplete = true;
                 break;
             }
         }
+    }
+
+    if incomplete {
+        // Something still holds a pipe of this job, or the copy did not
+        // complete. Write the result, and say that a log file is not complete.
+        // A record that arrives is worth more than a wait that has no end.
+        log(&format!(
+            "the output of the job {id} did not close; qex writes the result now, and the \
+             last part of a log file can be missing"
+        ));
+        // The file that holds the tail must not stay. Nothing reads it, and it
+        // holds disk space that `qex du` cannot explain. A copy that continues
+        // keeps its open file, so this operation stops no work.
+        for log_file in [&out_path, &err_path] {
+            std::fs::remove_file(crate::logcap::tail_path(log_file)).ok();
+        }
+        let note = "the output of this job did not close, so a log file can be missing its \
+                    last part. A process of the job kept the pipe open. Read the log file, \
+                    and start the job again if you need the full output.";
+        status.error = Some(match status.error.take() {
+            Some(first) => format!("{first}; {note}"),
+            None => note.to_string(),
+        });
     }
 
     // Read the resources that the job used. The values include each child of

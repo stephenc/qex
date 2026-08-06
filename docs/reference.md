@@ -537,6 +537,10 @@ Error: the build failed         <- the tail: the failure
 The head holds the reason that the job started. The tail holds the reason that
 it stopped. A reader needs both.
 
+qex removes nothing until the output passes the limit. A job that writes less
+than `max_bytes` thus keeps every byte in one piece, with no note, and a second
+attempt of a job that failed keeps the output of the first attempt.
+
 A job never fails because of this limit. Reaching the limit is normal.
 
 `qex status` and `qex logs` say how much went, so a reader never takes a part of
@@ -553,7 +557,32 @@ the log file (`stdout.log.tail`). It writes that part into the log file and
 deletes it when the job stops. `qex logs --follow` shows the head, then a line
 that says that the limit is reached, and then the last part when the job stops.
 
+If the last part holds no line end, qex keeps it and says that the text starts
+in the middle of a line. One JSON document, one base64 block and a progress
+display that uses `\r` all give output of that form.
+
 Use `max_bytes = "0"` for no limit. A job can then fill the disk.
+
+### What the job sees
+
+The standard output and the standard error of a job are a **pipe**, and not a
+regular file. The supervisor reads that pipe and writes the file. Almost every
+program sees no difference, but three things change:
+
+* `lseek` on the output gives `ESPIPE`, and `stat` gives a FIFO in place of a
+  regular file. A program that asks for its position in its own output, or that
+  reads back what it wrote, meets an error.
+* Two children of one job that write more than 4096 bytes in one operation can
+  now mix in the middle of a line. With a regular file, each write stayed
+  together.
+* `isatty` gives false, as it did before. A program that tests for a terminal
+  behaves in the same way.
+
+If a program needs a regular file, give it one:
+
+```sh
+qex submit -- sh -c 'my-program > out.txt'
+```
 
 ## More help inside the tool
 
