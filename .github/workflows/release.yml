@@ -166,7 +166,15 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): v${{ needs.version.outputs.version }}"
+          # A person can put the number in Cargo.toml before the merge, and the
+          # release then agrees with the file already. There is nothing to
+          # commit in that case, and that is a correct state and not a fault.
+          if git diff --cached --quiet; then
+            echo "Cargo.toml holds this number already, so there is no commit to make."
+          else
+            git commit -m "chore(release): v${{ needs.version.outputs.version }}"
+          fi
+          # The tag goes on the commit that the build tested, either way.
           git tag -a "v${{ needs.version.outputs.version }}" \
             -m "qex ${{ needs.version.outputs.version }}"
 
