@@ -34,7 +34,7 @@ pub fn total_memory() -> u64 {
 /// On macOS this value is the total of the free pages and the inactive pages.
 #[cfg(target_os = "linux")]
 pub fn available_memory() -> u64 {
-    meminfo_field("MemAvailable:").unwrap_or_else(|| total_memory())
+    meminfo_field("MemAvailable:").unwrap_or_else(total_memory)
 }
 
 #[cfg(target_os = "macos")]
@@ -336,7 +336,9 @@ fn parse_ps_time(text: &str) -> f64 {
 
 /// Gives the time of day as `HH:MM:SS`, in the time zone of the machine.
 pub fn clock_text(epoch_secs: u64) -> String {
-    let t = epoch_secs as libc::time_t;
+    // The type comes from `localtime_r`. Do not name it: on musl the name
+    // `libc::time_t` is deprecated, because that type becomes 64 bits.
+    let t = epoch_secs as _;
     let mut parts: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         libc::localtime_r(&t, &mut parts);

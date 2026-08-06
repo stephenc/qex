@@ -45,7 +45,9 @@ pub fn classify(command: &str) -> Option<(&'static str, &'static str)> {
         return None;
     }
 
-    if lower.contains("pgrep") || lower.contains("pidof") || lower.contains("ps -ef")
+    if lower.contains("pgrep")
+        || lower.contains("pidof")
+        || lower.contains("ps -ef")
         || lower.contains("ps aux")
     {
         return Some((
@@ -121,7 +123,10 @@ pub fn find() -> Vec<Watcher> {
             continue;
         }
         // The parts of a command line are separated by a zero byte.
-        let command = String::from_utf8_lossy(&raw).replace('\0', " ").trim().to_string();
+        let command = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .trim()
+            .to_string();
 
         // A command that runs qex itself is not a monitor.
         if command.contains("qex watchers") {
@@ -169,7 +174,9 @@ pub fn find() -> Vec<Watcher> {
         else {
             continue;
         };
-        let Ok(pid) = pid.parse::<i32>() else { continue };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
         if pid == me || group.parse::<i32>() == Ok(my_group) {
             continue;
         }
@@ -212,7 +219,9 @@ fn ancestors_of(mut pid: i32) -> Vec<i32> {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             break;
         };
-        let Some(rest) = stat.rsplit_once(") ") else { break };
+        let Some(rest) = stat.rsplit_once(") ") else {
+            break;
+        };
         let fields: Vec<&str> = rest.1.split_whitespace().collect();
         if fields.len() < 2 {
             break;
@@ -325,7 +334,10 @@ mod tests {
     #[test]
     fn ordinary_commands_are_not_monitors() {
         assert!(classify("cargo test --release").is_none());
-        assert!(classify("grep -r pattern src/").is_none(), "a search is not a loop");
+        assert!(
+            classify("grep -r pattern src/").is_none(),
+            "a search is not a loop"
+        );
         assert!(classify("sleep 60").is_none(), "one sleep is not a loop");
         assert!(
             classify("pgrep -f something").is_none(),

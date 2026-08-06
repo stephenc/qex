@@ -1,0 +1,9 @@
+# The site at https://stephenc.github.io/qex
+title: qex
+description: Queued EXecutor — a resource-aware job queue for the long tasks that coding agents start.
+theme: jekyll-theme-cayman
+show_downloads: false
+# The repository holds no other page. Jekyll must not try to make one from the
+# files of the project.
+exclude:
+  - Cargo.toml

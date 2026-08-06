@@ -168,10 +168,7 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
     entry.samples.push(Sample {
         max_rss: status.usage.max_rss,
         cpu_secs: status.usage.cpu_secs,
-        elapsed_secs: status
-            .elapsed()
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        elapsed_secs: status.elapsed().map(|d| d.as_secs()).unwrap_or(0),
         at: crate::sys::now_secs(),
     });
 

@@ -77,8 +77,9 @@ impl JobFile {
             .to_ascii_lowercase();
 
         let parsed: Self = match ext.as_str() {
-            "yaml" | "yml" => serde_yaml_ng::from_str(&text)
-                .map_err(|e| job_file_error(path, &e.to_string()))?,
+            "yaml" | "yml" => {
+                serde_yaml_ng::from_str(&text).map_err(|e| job_file_error(path, &e.to_string()))?
+            }
             "json" => {
                 serde_json::from_str(&text).map_err(|e| job_file_error(path, &e.to_string()))?
             }
@@ -234,7 +235,6 @@ impl JobSpec {
         cfg: &Config,
         file: JobFile,
     ) -> Result<(Self, DependencyNames)> {
-
         let command = if !opts.command.is_empty() {
             opts.command.clone()
         } else {
@@ -289,7 +289,10 @@ impl JobSpec {
             )
         })?;
         if !cwd.is_dir() {
-            bail!("the job directory {} is a file, not a directory", cwd.display());
+            bail!(
+                "the job directory {} is a file, not a directory",
+                cwd.display()
+            );
         }
 
         // A claim can be a number, or a word such as `half` or `full`. qex
@@ -343,8 +346,9 @@ impl JobSpec {
         };
 
         let timeout = match opts.timeout.as_ref().or(file.timeout.as_ref()) {
-            Some(s) => crate::units::parse_duration(s)
-                .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?,
+            Some(s) => {
+                crate::units::parse_duration(s).map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
+            }
             None => cfg.default_timeout()?,
         };
 
@@ -384,35 +388,38 @@ impl JobSpec {
         deps.needs.extend(opts.needs.iter().cloned());
         deps.after.extend(opts.after.iter().cloned());
 
-        Ok((Self {
-            id: uuid::Uuid::new_v4(),
-            name,
-            cwd,
-            command,
-            env,
-            cpu,
-            mem,
-            timeout: timeout.map(|d| d.as_secs()),
-            tags,
-            priority: opts.priority.or(file.priority).unwrap_or(0),
-            env_capture: capture,
-            claim_source: source.to_string(),
-            group: None,
-            group_name: None,
-            locks: {
-                let mut all = file.locks.clone();
-                all.extend(opts.locks.iter().cloned());
-                all.sort();
-                all.dedup();
-                all
+        Ok((
+            Self {
+                id: uuid::Uuid::new_v4(),
+                name,
+                cwd,
+                command,
+                env,
+                cpu,
+                mem,
+                timeout: timeout.map(|d| d.as_secs()),
+                tags,
+                priority: opts.priority.or(file.priority).unwrap_or(0),
+                env_capture: capture,
+                claim_source: source.to_string(),
+                group: None,
+                group_name: None,
+                locks: {
+                    let mut all = file.locks.clone();
+                    all.extend(opts.locks.iter().cloned());
+                    all.sort();
+                    all.dedup();
+                    all
+                },
+                retries: opts.retries.or(file.retries).unwrap_or(0),
+                // The CLI changes each name into an id after this function, because
+                // that step needs the coordinator.
+                needs: Vec::new(),
+                after: Vec::new(),
+                submitted_at: crate::sys::now_secs(),
             },
-            retries: opts.retries.or(file.retries).unwrap_or(0),
-            // The CLI changes each name into an id after this function, because
-            // that step needs the coordinator.
-            needs: Vec::new(),
-            after: Vec::new(),
-            submitted_at: crate::sys::now_secs(),
-        }, deps))
+            deps,
+        ))
     }
 }
 
@@ -525,7 +532,10 @@ mod tests {
         let mut o = opts(&["true"]);
         o.env_capture = Some(EnvCapture::Minimal);
         let spec = JobSpec::resolve(&o, &Config::default()).unwrap();
-        assert_eq!(spec.env.get("HOME").map(String::as_str), Some("/home/example"));
+        assert_eq!(
+            spec.env.get("HOME").map(String::as_str),
+            Some("/home/example")
+        );
         assert!(
             !spec.env.contains_key("QEX_TEST_MARKER"),
             "minimal capture leaked a non-allowlisted variable"
@@ -651,7 +661,11 @@ mod tests {
         let dir = tmpdir("unknown");
         // A field name with a spelling error must give an error. If qex ignores
         // the field, the job operates without the limit that the author set.
-        let p = job_file(&dir, "typo.toml", "command = [\"true\"]\ntimeoutt = \"5m\"\n");
+        let p = job_file(
+            &dir,
+            "typo.toml",
+            "command = [\"true\"]\ntimeoutt = \"5m\"\n",
+        );
         let err = JobFile::load(&p).unwrap_err().to_string();
         assert!(err.contains("timeoutt"), "got: {err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -662,10 +676,8 @@ mod tests {
     #[test]
     fn config_defaults_supply_the_job_size() {
         let _guard = env_lock();
-        let mut cfg: Config = toml::from_str(
-            "[defaults]\ncpu = 4\nmem = \"6GB\"\ntimeout = \"30m\"\n",
-        )
-        .unwrap();
+        let mut cfg: Config =
+            toml::from_str("[defaults]\ncpu = 4\nmem = \"6GB\"\ntimeout = \"30m\"\n").unwrap();
         cfg.learn.enabled = false;
         let spec = JobSpec::resolve(&opts(&["true"]), &cfg).unwrap();
         assert_eq!(spec.cpu, 4);
@@ -721,7 +733,10 @@ mod tests {
             spec.mem, expected,
             "the default memory must be the machine memory divided by the cores"
         );
-        assert_eq!(spec.timeout, None, "a job must have no time limit by default");
+        assert_eq!(
+            spec.timeout, None,
+            "a job must have no time limit by default"
+        );
     }
 
     #[test]
@@ -730,9 +745,17 @@ mod tests {
         let p = job_file(&dir, "j.toml", "command = [\"from-file\"]\n");
         let mut o = opts(&["from-cli"]);
         o.job_file = Some(p);
-        let err = JobSpec::resolve(&o, &Config::default()).unwrap_err().to_string();
-        assert!(err.contains("job file"), "the error must name both sources: {err}");
-        assert!(err.contains("--"), "the error must name both sources: {err}");
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("job file"),
+            "the error must name both sources: {err}"
+        );
+        assert!(
+            err.contains("--"),
+            "the error must name both sources: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -748,14 +771,19 @@ mod tests {
     fn cwd_is_captured_and_made_absolute() {
         let spec = JobSpec::resolve(&opts(&["true"]), &Config::default()).unwrap();
         assert!(spec.cwd.is_absolute());
-        assert_eq!(spec.cwd, std::env::current_dir().unwrap().canonicalize().unwrap());
+        assert_eq!(
+            spec.cwd,
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
     }
 
     #[test]
     fn missing_cwd_is_rejected_at_submit_time_not_at_run_time() {
         let mut o = opts(&["true"]);
         o.cwd = Some(PathBuf::from("/nonexistent/qex/dir"));
-        let err = JobSpec::resolve(&o, &Config::default()).unwrap_err().to_string();
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not exist"), "got: {err}");
     }
 
@@ -765,7 +793,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("qex submit"), "error should show usage: {err}");
-        assert!(err.contains("--job"), "error should mention job files: {err}");
+        assert!(
+            err.contains("--job"),
+            "error should mention job files: {err}"
+        );
     }
 
     /// A name must not have the form of an id.
@@ -778,7 +809,9 @@ mod tests {
         let _guard = env_lock();
         let mut o = opts(&["true"]);
         o.name = Some("550e8400-e29b-41d4-a716-446655440000".into());
-        let err = JobSpec::resolve(&o, &Config::default()).unwrap_err().to_string();
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("form of a job id"), "got: {err}");
 
         // A name that a person can read is accepted.
@@ -788,7 +821,8 @@ mod tests {
 
     #[test]
     fn name_defaults_to_the_program_basename() {
-        let spec = JobSpec::resolve(&opts(&["/usr/bin/python3", "x.py"]), &Config::default()).unwrap();
+        let spec =
+            JobSpec::resolve(&opts(&["/usr/bin/python3", "x.py"]), &Config::default()).unwrap();
         assert_eq!(spec.name, "python3");
     }
 

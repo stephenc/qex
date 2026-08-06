@@ -94,11 +94,7 @@ pub fn availability() -> Availability {
 /// Every step reports its fault. A limit that qex could not apply must never
 /// look like a limit that operates.
 #[cfg(target_os = "linux")]
-pub fn create_job_cgroup(
-    cfg: &Config,
-    id: &uuid::Uuid,
-    mem_claim: u64,
-) -> Result<PathBuf, String> {
+pub fn create_job_cgroup(cfg: &Config, id: &uuid::Uuid, mem_claim: u64) -> Result<PathBuf, String> {
     if !cfg.enforce.mode.is_on() {
         return Err("the config file sets [enforce] mode = \"off\"".into());
     }
@@ -184,11 +180,7 @@ fn move_processes(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn create_job_cgroup(
-    _cfg: &Config,
-    _id: &uuid::Uuid,
-    _mem: u64,
-) -> Result<PathBuf, String> {
+pub fn create_job_cgroup(_cfg: &Config, _id: &uuid::Uuid, _mem: u64) -> Result<PathBuf, String> {
     Err("this system cannot limit the memory of a job".into())
 }
 
@@ -386,7 +378,9 @@ pub fn restart_with_systemd(cfg: &Config) -> bool {
             false
         }
         Err(e) => {
-            eprintln!("qex: qex could not run systemd-run ({e}), so it continues without a memory limit");
+            eprintln!(
+                "qex: qex could not run systemd-run ({e}), so it continues without a memory limit"
+            );
             false
         }
     }
@@ -437,7 +431,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qex-oom-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        assert!(!was_oom_killed(&dir), "a new job has no out-of-memory record");
+        assert!(
+            !was_oom_killed(&dir),
+            "a new job has no out-of-memory record"
+        );
         mark_oom(&dir);
         assert!(was_oom_killed(&dir));
 
@@ -462,7 +459,8 @@ mod tests {
                 assert!(startup_warning(&cfg).is_none());
             }
             Availability::Unavailable(_) => {
-                let warning = startup_warning(&cfg).expect("qex must warn about a limit it cannot apply");
+                let warning =
+                    startup_warning(&cfg).expect("qex must warn about a limit it cannot apply");
                 assert!(warning.contains("mode"), "got: {warning}");
                 assert!(
                     warning.contains("queue only"),
@@ -477,7 +475,11 @@ mod tests {
     fn the_availability_test_gives_an_answer() {
         match availability() {
             Availability::Available(path) => {
-                assert!(path.exists(), "the cgroup path must exist: {}", path.display());
+                assert!(
+                    path.exists(),
+                    "the cgroup path must exist: {}",
+                    path.display()
+                );
             }
             Availability::Unavailable(reason) => {
                 assert!(!reason.is_empty(), "the reason must not be empty");

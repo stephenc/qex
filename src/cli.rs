@@ -612,9 +612,10 @@ mod tests {
         assert_eq!(a.cpu, Some(Claim::Half));
         assert_eq!(a.mem, Some(Claim::Half));
 
-        let cli =
-            Cli::try_parse_from(["qex", "submit", "--cpu", "max", "--mem", "full", "--", "true"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "qex", "submit", "--cpu", "max", "--mem", "full", "--", "true",
+        ])
+        .unwrap();
         let Some(Command::Submit(a)) = cli.command else {
             panic!("expected a submit command")
         };
@@ -679,8 +680,7 @@ mod tests {
 
     #[test]
     fn a_negative_priority_parses() {
-        let cli =
-            Cli::try_parse_from(["qex", "submit", "--priority", "-5", "--", "true"]).unwrap();
+        let cli = Cli::try_parse_from(["qex", "submit", "--priority", "-5", "--", "true"]).unwrap();
         let Some(Command::Submit(a)) = cli.command else {
             panic!("expected a submit command")
         };
@@ -723,8 +723,14 @@ mod tests {
     #[test]
     fn the_agents_topic_warns_about_monitor_scripts() {
         let text = crate::help::AGENTS;
-        assert!(text.contains("pgrep"), "the topic must name the pgrep fault");
-        assert!(text.contains("qex wait"), "the topic must give the solution");
+        assert!(
+            text.contains("pgrep"),
+            "the topic must name the pgrep fault"
+        );
+        assert!(
+            text.contains("qex wait"),
+            "the topic must give the solution"
+        );
     }
 
     /// The topic must name the general fault, and not the pgrep fault only.
@@ -803,7 +809,9 @@ mod tests {
         assert!(!StateFilter::parse("running")
             .unwrap()
             .matches(JobState::Queued));
-        assert!(StateFilter::parse("done").unwrap().matches(JobState::Failed));
+        assert!(StateFilter::parse("done")
+            .unwrap()
+            .matches(JobState::Failed));
         assert!(!StateFilter::parse("done")
             .unwrap()
             .matches(JobState::Running));

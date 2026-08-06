@@ -74,7 +74,9 @@ impl PipelineFile {
             .to_ascii_lowercase();
 
         let parsed: Self = match ext.as_str() {
-            "yaml" | "yml" => serde_yaml_ng::from_str(&text).map_err(|e| error(path, &e.to_string()))?,
+            "yaml" | "yml" => {
+                serde_yaml_ng::from_str(&text).map_err(|e| error(path, &e.to_string()))?
+            }
             "json" => serde_json::from_str(&text).map_err(|e| error(path, &e.to_string()))?,
             _ => toml::from_str(&text).map_err(|e| error(path, &e.to_string()))?,
         };
@@ -335,7 +337,10 @@ needs = ["a"]
         .to_string();
 
         assert!(err.contains("circle"), "got: {err}");
-        assert!(err.contains("a") && err.contains("b"), "the error must name the stages: {err}");
+        assert!(
+            err.contains("a") && err.contains("b"),
+            "the error must name the stages: {err}"
+        );
     }
 
     #[test]
@@ -368,7 +373,10 @@ needs = ["build"]
         .unwrap_err()
         .to_string();
         assert!(err.contains("no job with that name"), "got: {err}");
-        assert!(err.contains("test"), "the error must list the stages: {err}");
+        assert!(
+            err.contains("test"),
+            "the error must list the stages: {err}"
+        );
     }
 
     #[test]
@@ -399,10 +407,7 @@ command = ["false"]
             .unwrap_err()
             .to_string()
             .contains("no command"));
-        assert!(file("")
-            .unwrap_err()
-            .to_string()
-            .contains("no job"));
+        assert!(file("").unwrap_err().to_string().contains("no job"));
     }
 
     /// A stage name with the form of an id would break the rule that qex uses

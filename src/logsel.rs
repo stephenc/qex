@@ -108,8 +108,7 @@ impl Selected {
             (Some(found), _) if found > self.matches_shown => Some(format!(
                 "... {} line(s) match, and qex shows the first {}. \
                  Use `--max-matches N`, `--all`, or a narrower pattern.",
-                found,
-                self.matches_shown
+                found, self.matches_shown
             )),
             (Some(found), _) => Some(format!("... {found} line(s) match.")),
             (None, true) => Some(format!(
@@ -189,7 +188,7 @@ impl LogSelect {
             // A person counts from 1.
             let kept: Vec<usize> = chosen
                 .into_iter()
-                .filter(|i| *i + 1 >= from && *i + 1 <= to)
+                .filter(|i| *i >= from.saturating_sub(1) && *i < to)
                 .collect();
             let hidden = available.saturating_sub(kept.len());
             (kept, hidden)
@@ -407,11 +406,9 @@ fn parse_tokens(pattern: &str) -> Result<Vec<Token>, String> {
                 Token::Char(chars[i])
             }
             '[' => {
-                let close = chars[i..]
-                    .iter()
-                    .position(|c| *c == ']')
-                    .ok_or_else(|| format!("the group that starts at `[` has no `]` in `{pattern}`"))?
-                    + i;
+                let close = chars[i..].iter().position(|c| *c == ']').ok_or_else(|| {
+                    format!("the group that starts at `[` has no `]` in `{pattern}`")
+                })? + i;
                 let mut set: Vec<char> = chars[i + 1..close].to_vec();
                 let negated = set.first() == Some(&'^');
                 if negated {
@@ -438,9 +435,9 @@ fn parse_tokens(pattern: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '*' | '+' | '?' => {
-                let previous = tokens
-                    .pop()
-                    .ok_or_else(|| format!("`{}` has nothing before it in `{pattern}`", chars[i]))?;
+                let previous = tokens.pop().ok_or_else(|| {
+                    format!("`{}` has nothing before it in `{pattern}`", chars[i])
+                })?;
                 let wrapped = match chars[i] {
                     '*' => Token::Star(Box::new(previous)),
                     '+' => Token::Plus(Box::new(previous)),
@@ -524,7 +521,10 @@ fn match_one(token: &Token, chars: &[char], position: usize) -> Option<usize> {
     let ok = match token {
         Token::Char(want) => c == *want,
         Token::Any => true,
-        Token::Class { chars: set, negated } => set.contains(&c) != *negated,
+        Token::Class {
+            chars: set,
+            negated,
+        } => set.contains(&c) != *negated,
         // A repeat inside a repeat is not necessary here.
         _ => return None,
     };
@@ -551,7 +551,10 @@ mod tests {
         let out = sel().apply(&text(), 500).unwrap();
         assert_eq!(out.text.lines().count(), 500);
         assert!(out.text.contains("line-1000"));
-        assert!(!out.text.contains("line-1\n"), "the first line must be hidden");
+        assert!(
+            !out.text.contains("line-1\n"),
+            "the first line must be hidden"
+        );
         assert!(out.truncated);
         assert_eq!(out.hidden, 500);
     }
@@ -730,7 +733,10 @@ mod tests {
         assert_eq!(out.matches, Some(100));
         assert_eq!(out.matches_shown, 5);
         // Five matches, and one line before and after each one.
-        assert_eq!(out.text.lines().filter(|l| l.starts_with("FAIL")).count(), 5);
+        assert_eq!(
+            out.text.lines().filter(|l| l.starts_with("FAIL")).count(),
+            5
+        );
     }
 
     /// The option `--all` removes the match limit as well.

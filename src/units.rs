@@ -200,7 +200,11 @@ mod tests {
     fn sizes_round_trip_through_formatting() {
         for bytes in [1024u64, 8 << 30, 512 << 20, 1u64 << 40] {
             let rendered = format_size(bytes);
-            assert_eq!(parse_size(&rendered).unwrap(), bytes, "round trip {rendered}");
+            assert_eq!(
+                parse_size(&rendered).unwrap(),
+                bytes,
+                "round trip {rendered}"
+            );
         }
         assert_eq!(format_size(8 << 30), "8GB");
         assert_eq!(format_size(1536 << 20), "1.5GB");
@@ -210,10 +214,22 @@ mod tests {
     #[test]
     fn durations_parse_and_zero_means_unlimited() {
         use std::time::Duration;
-        assert_eq!(parse_duration("30s").unwrap(), Some(Duration::from_secs(30)));
-        assert_eq!(parse_duration("5m").unwrap(), Some(Duration::from_secs(300)));
-        assert_eq!(parse_duration("4h").unwrap(), Some(Duration::from_secs(14400)));
-        assert_eq!(parse_duration("2d").unwrap(), Some(Duration::from_secs(172800)));
+        assert_eq!(
+            parse_duration("30s").unwrap(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_duration("5m").unwrap(),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(
+            parse_duration("4h").unwrap(),
+            Some(Duration::from_secs(14400))
+        );
+        assert_eq!(
+            parse_duration("2d").unwrap(),
+            Some(Duration::from_secs(172800))
+        );
         assert_eq!(parse_duration("90").unwrap(), Some(Duration::from_secs(90)));
         assert_eq!(parse_duration("0").unwrap(), None);
         assert_eq!(parse_duration("none").unwrap(), None);

@@ -133,7 +133,10 @@ mod tests {
     fn a_number_gives_an_exact_claim() {
         assert_eq!(Claim::parse("4", false).unwrap(), Claim::Exact(4));
         assert_eq!(Claim::parse("8GB", true).unwrap(), Claim::Exact(8 << 30));
-        assert_eq!(Claim::parse("512MB", true).unwrap(), Claim::Exact(512 << 20));
+        assert_eq!(
+            Claim::parse("512MB", true).unwrap(),
+            Claim::Exact(512 << 20)
+        );
     }
 
     /// The words `half` and `guess` give one half of the budget. An agent uses
@@ -207,8 +210,14 @@ mod tests {
     #[test]
     fn an_unknown_word_gives_a_message_with_the_permitted_words() {
         let err = Claim::parse("lots", false).unwrap_err();
-        assert!(err.contains("half"), "the message must name the words: {err}");
-        assert!(err.contains("guess"), "the message must name the words: {err}");
+        assert!(
+            err.contains("half"),
+            "the message must name the words: {err}"
+        );
+        assert!(
+            err.contains("guess"),
+            "the message must name the words: {err}"
+        );
     }
 
     /// A job file must accept a number and a word in the same field.

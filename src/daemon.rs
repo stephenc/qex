@@ -190,7 +190,6 @@ pub fn run() -> Result<()> {
     // Without this step, each unusual state directory leaves one in /tmp.
     paths::reap_stale_socket_dirs();
 
-
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
@@ -266,7 +265,9 @@ pub fn run() -> Result<()> {
             Err(e) => {
                 // A failure to accept one connection must not stop the
                 // coordinator. The jobs continue.
-                log(&format!("the coordinator could not accept a connection: {e}"));
+                log(&format!(
+                    "the coordinator could not accept a connection: {e}"
+                ));
             }
         }
 
@@ -433,7 +434,10 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
         Request::Ping => Response::Ok,
         Request::Info => handle_info(coord),
         Request::Capabilities => Response::Capabilities {
-            names: crate::capabilities::ALL.iter().map(|s| s.to_string()).collect(),
+            names: crate::capabilities::ALL
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         },
         Request::Submit { spec } => handle_submit(coord, *spec),
         Request::List => {
@@ -709,8 +713,7 @@ fn idle_watch(coord: Arc<Coordinator>, socket: std::path::PathBuf) {
         let should_stop = {
             let mut state = coord.state.lock().unwrap();
             let active = state.count_state(|s| !s.is_terminal());
-            let idle = active == 0
-                && (replaced || state.last_contact.elapsed() >= idle_limit);
+            let idle = active == 0 && (replaced || state.last_contact.elapsed() >= idle_limit);
             if idle {
                 state.stop = true;
             }
@@ -718,8 +721,10 @@ fn idle_watch(coord: Arc<Coordinator>, socket: std::path::PathBuf) {
         };
 
         if should_stop && replaced {
-            log("the qex program file changed; this coordinator stops so that the next \
-                 command starts one with the new program");
+            log(
+                "the qex program file changed; this coordinator stops so that the next \
+                 command starts one with the new program",
+            );
         }
 
         if should_stop {

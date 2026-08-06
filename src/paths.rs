@@ -371,7 +371,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         ensure_dir(&dir, 0o700).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "the group and other users must not read job directories");
+        assert_eq!(
+            mode, 0o700,
+            "the group and other users must not read job directories"
+        );
         // On an existing directory, the function must set the mode again.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         ensure_dir(&dir, 0o700).unwrap();

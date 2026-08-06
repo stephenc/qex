@@ -1,9 +1,22 @@
 [package]
 name = "qex"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "Queued EXecutor — a resource-aware local job queue for long-running tasks"
 license = "Apache-2.0"
+repository = "https://github.com/stephenc/qex"
+homepage = "https://stephenc.github.io/qex"
+documentation = "https://stephenc.github.io/qex"
+readme = "README.md"
+keywords = ["queue", "scheduler", "jobs", "agents", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# The version of Rust that qex needs. The lock file has the format 4, which
+# needs 1.78, and one dependency uses the 2024 edition, which needs 1.85. The
+# number below is that floor, and CI proves it on each change.
+rust-version = "1.85"
+# The files that a person needs to build and use qex. The state of a build is
+# large, and it belongs to no other machine.
+exclude = ["/.github", "/target", "/docs"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -38,12 +38,12 @@ mod spec;
 mod style;
 mod supervisor;
 mod sys;
-mod top;
 #[cfg(test)]
 mod testutil;
+mod top;
 mod units;
-mod watchers;
 mod usage;
+mod watchers;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -220,10 +220,18 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     println!(
         "config file: {} ({})",
         path.display(),
-        if path.exists() { "read" } else { "absent; qex uses the default values" }
+        if path.exists() {
+            "read"
+        } else {
+            "absent; qex uses the default values"
+        }
     );
     println!();
-    println!("machine:      {} cores, {}", sys::cpu_count(), units::format_size(sys::total_memory()));
+    println!(
+        "machine:      {} cores, {}",
+        sys::cpu_count(),
+        units::format_size(sys::total_memory())
+    );
     println!(
         "budget:       {} cores, {}",
         cfg.budget_cpu()?,

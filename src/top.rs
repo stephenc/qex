@@ -174,7 +174,14 @@ fn render(
 
     out.push_str(&crate::style::heading(&format!(
         "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}",
-        "ID", "STATE", "NAME", "CPU CLAIM", "CPU NOW", "MEMORY CLAIM/NOW", "RUNTIME", "SINCE",
+        "ID",
+        "STATE",
+        "NAME",
+        "CPU CLAIM",
+        "CPU NOW",
+        "MEMORY CLAIM/NOW",
+        "RUNTIME",
+        "SINCE",
         "NOTE"
     )));
     out.push('\n');
@@ -226,7 +233,11 @@ fn render(
         let mem_text = match mem_now {
             Some(rss) => format!("{} / {}", format_size(job.mem), format_size(rss)),
             None if job.usage.max_rss > 0 => {
-                format!("{} / {}", format_size(job.mem), format_size(job.usage.max_rss))
+                format!(
+                    "{} / {}",
+                    format_size(job.mem),
+                    format_size(job.usage.max_rss)
+                )
             }
             None => format!("{} / -", format_size(job.mem)),
         };
@@ -388,6 +399,7 @@ mod tests {
             cwd: "/".into(),
             state,
             pid: Some(std::process::id() as i32),
+            last_pid: None,
             supervisor_pid: None,
             exit_code: None,
             signal: None,
@@ -547,17 +559,29 @@ mod tests {
         let mut queued = job(JobState::Queued, 1, 1 << 20);
         queued.submitted_at = now - 120;
         queued.started_at = None;
-        assert_eq!(since_text(&queued), "2m", "a job in the queue: since it arrived");
+        assert_eq!(
+            since_text(&queued),
+            "2m",
+            "a job in the queue: since it arrived"
+        );
 
         let mut running = job(JobState::Running, 1, 1 << 20);
         running.submitted_at = now - 600;
         running.started_at = Some(now - 60);
-        assert_eq!(since_text(&running), "1m", "a job that operates: since it started");
+        assert_eq!(
+            since_text(&running),
+            "1m",
+            "a job that operates: since it started"
+        );
 
         let mut done = job(JobState::Completed, 1, 1 << 20);
         done.started_at = Some(now - 600);
         done.finished_at = Some(now - 30);
-        assert_eq!(since_text(&done), "30s", "a job that stopped: since it stopped");
+        assert_eq!(
+            since_text(&done),
+            "30s",
+            "a job that stopped: since it stopped"
+        );
     }
 
     /// The page must give the time, so a reader sees that a screen is old.

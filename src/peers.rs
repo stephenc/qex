@@ -235,7 +235,9 @@ pub fn claims(cfg: &Config) -> Claims {
 
         for file in files.flatten() {
             let fname = file.file_name();
-            let Some(fname) = fname.to_str() else { continue };
+            let Some(fname) = fname.to_str() else {
+                continue;
+            };
             if !fname.starts_with("peer-") || !fname.ends_with(".json") {
                 continue;
             }

@@ -277,7 +277,10 @@ mod tests {
 
         let text = describe_missing(uuid::Uuid::new_v4());
         assert!(text.contains("no record"), "got: {text}");
-        assert!(text.contains("submit"), "the message must say what to do: {text}");
+        assert!(
+            text.contains("submit"),
+            "the message must say what to do: {text}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -363,7 +366,10 @@ mod tests {
         record_submit(&s);
 
         let text = std::fs::read_to_string(dir.join("qex/history.jsonl")).unwrap();
-        assert!(!text.contains("SECRET123"), "the file holds the command: {text}");
+        assert!(
+            !text.contains("SECRET123"),
+            "the file holds the command: {text}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

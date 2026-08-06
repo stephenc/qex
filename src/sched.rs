@@ -336,7 +336,9 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
     if let Ok(dir) = paths::job_dir(&id) {
         job::write_status(&dir, &status).ok();
     }
-    log(&format!("job {id} did not run, because a job that it needed did not succeed"));
+    log(&format!(
+        "job {id} did not run, because a job that it needed did not succeed"
+    ));
 }
 
 /// Chooses the next job to start.
@@ -437,8 +439,8 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
                 // This job can never fit. Start it alone when the machine is
                 // quiet, so the agent gets a result and not an endless wait.
                 let settle = cfg.settle().unwrap_or(Duration::from_secs(3));
-                let quiet = active == 0
-                    && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
+                let quiet =
+                    active == 0 && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
 
                 if cfg.queue.oversized == OversizedPolicy::RunWhenIdle && quiet {
                     chosen = Some(id);
@@ -547,7 +549,9 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
     }
 
     if let Some(reason) = &forced_reason {
-        log(&format!("job {id} ({name}) starts although it is too large: {reason}"));
+        log(&format!(
+            "job {id} ({name}) starts although it is too large: {reason}"
+        ));
     }
 
     match crate::supervisor::spawn(id) {
@@ -569,7 +573,9 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
                 write_started(&id, &status).ok();
             }
 
-            log(&format!("job {id} ({name}) started; the supervisor pid is {pid}"));
+            log(&format!(
+                "job {id} ({name}) started; the supervisor pid is {pid}"
+            ));
 
             // One thread reads the result of each supervisor. The number of
             // jobs is small, so a thread for each job is not expensive.
@@ -653,19 +659,28 @@ mod tests {
         let Size::TooBig(reason) = size_check(&cfg, &spec_with(64, 1 << 30)) else {
             panic!("a job of 64 cores must not fit a budget of 4 cores");
         };
-        assert!(reason.contains("cores"), "the reason must name the cores: {reason}");
+        assert!(
+            reason.contains("cores"),
+            "the reason must name the cores: {reason}"
+        );
 
         let Size::TooBig(reason) = size_check(&cfg, &spec_with(1, 64 << 30)) else {
             panic!("a job of 64GB must not fit a budget of 8GB");
         };
-        assert!(reason.contains("memory"), "the reason must name the memory: {reason}");
+        assert!(
+            reason.contains("memory"),
+            "the reason must name the memory: {reason}"
+        );
 
         // A job that is too large in both values must give both reasons. The
         // agent then corrects the claim one time only.
         let Size::TooBig(reason) = size_check(&cfg, &spec_with(64, 64 << 30)) else {
             panic!("this job must not fit");
         };
-        assert!(reason.contains("cores") && reason.contains("memory"), "got: {reason}");
+        assert!(
+            reason.contains("cores") && reason.contains("memory"),
+            "got: {reason}"
+        );
     }
 
     #[test]
@@ -694,7 +709,10 @@ mod tests {
     #[test]
     fn a_job_that_fills_the_budget_exactly_starts() {
         let cfg = cfg_with("4", "8GB");
-        assert!(matches!(admit(&cfg, &spec_with(4, 8 << 30), 0, 0), Admit::Yes));
+        assert!(matches!(
+            admit(&cfg, &spec_with(4, 8 << 30), 0, 0),
+            Admit::Yes
+        ));
         assert_eq!(size_check(&cfg, &spec_with(4, 8 << 30)), Size::Fits);
     }
 

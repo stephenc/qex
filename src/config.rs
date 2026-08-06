@@ -8,13 +8,14 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Selects the quantity of the environment that a job receives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EnvCapture {
     /// Copy all the variables of the process that submits the job.
     ///
     /// This is the default. The job then operates in the same way as a command
     /// that you type in that shell.
+    #[default]
     All,
     /// Copy the variables in the `minimal_env` list only.
     ///
@@ -24,12 +25,6 @@ pub enum EnvCapture {
     ///
     /// The job receives the values from `[env]` and from `--env` only.
     None,
-}
-
-impl Default for EnvCapture {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl std::str::FromStr for EnvCapture {
@@ -47,7 +42,7 @@ impl std::str::FromStr for EnvCapture {
 }
 
 /// Selects the operation for a job that is larger than the full budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum OversizedPolicy {
     /// Start the job alone when no other job operates.
@@ -55,6 +50,7 @@ pub enum OversizedPolicy {
     /// The job can then cause swap operations, use all the cores, or stop
     /// because of the out-of-memory killer. Each of these results is data that
     /// the agent needs. A job that stays in the queue supplies no data.
+    #[default]
     RunWhenIdle,
     /// Refuse the job at submission. Use this mode on a strict shared machine.
     Reject,
@@ -62,19 +58,14 @@ pub enum OversizedPolicy {
     Queue,
 }
 
-impl Default for OversizedPolicy {
-    fn default() -> Self {
-        Self::RunWhenIdle
-    }
-}
-
 /// Selects if qex applies the claimed limits to the job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EnforceMode {
     /// Use the claims for the queue only. Do not set a limit on the job.
     ///
     /// This is the default mode. It is the only mode on macOS.
+    #[default]
     Off,
     /// Set `memory.high` to the claim. The kernel then slows the job and
     /// reclaims memory. Set `memory.max` to `claim * mem_overcommit` as a
@@ -82,12 +73,6 @@ pub enum EnforceMode {
     Soft,
     /// Set `memory.max` to the claim. The kernel stops a job that goes above it.
     Hard,
-}
-
-impl Default for EnforceMode {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 impl EnforceMode {
@@ -278,9 +263,7 @@ pub struct HistoryConfig {
 
 impl Default for HistoryConfig {
     fn default() -> Self {
-        Self {
-            keep: "1d".into(),
-        }
+        Self { keep: "1d".into() }
     }
 }
 
@@ -578,7 +561,10 @@ timeout = "0"
     fn env_capture_parses_from_cli_strings() {
         use std::str::FromStr;
         assert_eq!(EnvCapture::from_str("all").unwrap(), EnvCapture::All);
-        assert_eq!(EnvCapture::from_str("MINIMAL").unwrap(), EnvCapture::Minimal);
+        assert_eq!(
+            EnvCapture::from_str("MINIMAL").unwrap(),
+            EnvCapture::Minimal
+        );
         assert_eq!(EnvCapture::from_str(" none ").unwrap(), EnvCapture::None);
         assert!(EnvCapture::from_str("some").is_err());
     }

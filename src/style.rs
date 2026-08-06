@@ -37,8 +37,7 @@ pub fn enabled() -> bool {
 }
 
 /// A user can turn the colour off for one command.
-static FORCED_OFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static FORCED_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn turn_off() {
     FORCED_OFF.store(true, std::sync::atomic::Ordering::SeqCst);

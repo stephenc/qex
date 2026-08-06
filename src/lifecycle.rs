@@ -189,7 +189,11 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
                 format!(
                     "the job {id} is needed by {}. Wait for {}, or cancel {}.",
                     waiting.join(", "),
-                    if waiting.len() == 1 { "that job" } else { "those jobs" },
+                    if waiting.len() == 1 {
+                        "that job"
+                    } else {
+                        "those jobs"
+                    },
                     if waiting.len() == 1 { "it" } else { "them" }
                 ),
             );
@@ -279,7 +283,10 @@ mod tests {
     fn an_unknown_signal_gives_a_message_with_the_permitted_names() {
         let err = parse_signal("BANANA").unwrap_err();
         assert!(err.contains("TERM"), "the error must list the names: {err}");
-        assert!(parse_signal("0").is_err(), "the signal 0 tests a process only");
+        assert!(
+            parse_signal("0").is_err(),
+            "the signal 0 tests a process only"
+        );
         assert!(parse_signal("99").is_err());
     }
 }
