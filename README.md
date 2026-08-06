@@ -129,11 +129,13 @@ and you must find the cause yourself.
 Give each stage its own job:
 
 ```sh
-qex submit --name build -- make
-qex submit --name test  --needs build -- make test
-SHIP=$(qex submit --name ship --needs test -- ./deploy.sh)
+BUILD=$(qex submit --name build -- make)
+TEST=$(qex submit --name test --needs $BUILD -- make test)
+SHIP=$(qex submit --name ship --needs $TEST -- ./deploy.sh)
 qex wait $SHIP
 ```
+
+Keep the id of each stage and give it to the next stage.
 
 Each stage has its own log file, its own exit code and its own claim. If `build`
 fails, `test` and `ship` do not start:
@@ -162,9 +164,21 @@ Use `--after` for a cleanup step that must run also when the build fails.
 `qex wait` gives 126 for a skipped job and 1 for a job that failed, so a script
 can separate a failure of its own stage from a failure of an earlier stage.
 
-Each option accepts a job name, so `--needs build` operates after
-`qex submit --name build`. A job can name the jobs that you started before it,
-so a circle of dependencies is not possible.
+Each option accepts an id or a name, and the two have different rules.
+
+An **id** must exist. That is the only rule, so a script can submit its last
+stage even when the first stage already failed; the last stage then becomes
+`skipped` with the correct cause.
+
+A **name** must give a job that is in the queue or operates. A name can give a
+job of an earlier run — you write `--needs test`, you forgot to start a new test
+job, and the name gives yesterday's test job, which already succeeded. Your
+stage would then start immediately and wait for nothing. qex refuses that.
+
+Use an id in a script. Use a name when you type a command yourself.
+
+A job can name only the jobs that you started before it, so a circle of
+dependencies is not possible.
 
 ## Job files
 

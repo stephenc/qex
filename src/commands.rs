@@ -385,34 +385,39 @@ fn resolve_dependencies(
             )
         })?;
 
-        // A dependency that already succeeded is an error.
+        // A dependency given by NAME must still be in the queue or operate.
         //
-        // This test finds a frequent fault. An agent runs a script a second
-        // time and writes `--needs test`, but it forgot to start a new test
-        // job. The name gives the test job of the FIRST run, which already
-        // succeeded. The new stage then starts immediately, it waits for
-        // nothing, and the pipeline reports success although the order was
-        // wrong. A job that succeeded is the one state that hides this fault,
-        // because it satisfies the dependency in silence.
+        // A name is the value that can be wrong in silence. An agent runs a
+        // script a second time and writes `--needs test`, but it forgot to
+        // start a new test job. The name gives the test job of the FIRST run,
+        // which already stopped. The new stage then waits for nothing, and the
+        // pipeline reports success although the order was wrong.
         //
-        // A dependency in a different final state does NOT hide anything. It
-        // makes this job `skipped`, with the correct cause. qex accepts it, so
-        // that a script which submits the stages one at a time can finish even
-        // when an early stage already failed. Without that rule, the script
-        // would stop in the middle and leave a pipeline with no end stages.
-        if let Response::Status { status } = client.call(&Request::Status { id })? {
-            if status.state == JobState::Completed {
-                bail!(
-                    "{option}: the job {} ({}) already succeeded, so a wait for it does \
-                     nothing.\n\n\
-                     A name frequently gives a job of an earlier run. Did you forget to \
-                     start a new `{}` job? Use the id that `qex submit` wrote for this run, \
-                     or delete the old jobs with `qex clean done`.\n\n\
-                     If you want this job to start now, remove {option}.",
-                    &id.to_string()[..8],
-                    status.name,
-                    status.name
-                );
+        // An id does not have that risk. An id names one job for ever, and the
+        // agent read it from the `qex submit` of this run. An id thus needs the
+        // existence test only, which `resolve_id` already made.
+        //
+        // This difference also keeps a pipeline script correct. A script that
+        // keeps each id can submit its last stage even when the first stage
+        // already failed, and that stage then becomes `skipped` with the
+        // correct cause.
+        let by_name = name.parse::<uuid::Uuid>().is_err();
+        if by_name {
+            if let Response::Status { status } = client.call(&Request::Status { id })? {
+                if status.state.is_terminal() {
+                    bail!(
+                        "{option}: the name `{name}` gives the job {}, which already stopped. \
+                         Its state is `{}`.\n\n\
+                         A name can give a job of an earlier run. Did you forget to start a \
+                         new `{name}` job?\n\n\
+                         Use the id that `qex submit` wrote for this run:\n\
+                         \x20   ID=$(qex submit --name {name} -- ...)\n\
+                         \x20   qex submit {option} $ID -- ...\n\n\
+                         An id always names one job, so qex accepts an id whatever its state.",
+                        &id.to_string()[..8],
+                        status.state
+                    );
+                }
             }
         }
 

@@ -498,29 +498,13 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
             }
         }
 
-        // A dependency that already succeeded is an error. See the same test in
-        // the CLI for the reason: a name can give a job of an earlier run, and
-        // a job that succeeded satisfies the dependency in silence.
+        // The coordinator receives ids only, so the test above is the test that
+        // it can make. An id names one job for ever, so its existence is
+        // sufficient.
         //
-        // A dependency in a different final state is accepted. It makes this
-        // job `skipped` with the correct cause, so a script that submits the
-        // stages one at a time can finish.
-        for dep in spec.needs.iter().chain(spec.after.iter()) {
-            if let Some(other) = state.jobs.get(dep) {
-                if other.status.state == JobState::Completed {
-                    return Response::error(
-                        ErrorKind::WrongState,
-                        format!(
-                            "the job {} ({}) already succeeded, so a wait for it does \
-                             nothing. If you named the job by its name, you can be naming \
-                             a job of an earlier run.",
-                            &dep.to_string()[..8],
-                            other.status.name
-                        ),
-                    );
-                }
-            }
-        }
+        // A dependency given by name has one more rule, because a name can give
+        // a job of an earlier run. The CLI is the only part that sees a name,
+        // so that rule is in `resolve_dependencies`.
     }
     let dir = match paths::job_dir(&id) {
         Ok(d) => d,

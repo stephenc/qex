@@ -1078,8 +1078,10 @@ fn a_failed_stage_stops_the_stages_after_it() {
         "-c",
         "echo compiling; echo 'error: undefined symbol' >&2; exit 2",
     ]);
-    let test = h.submit(&["submit", "--name", "test", "--needs", "build", "--", "true"]);
-    let ship = h.submit(&["submit", "--name", "ship", "--needs", "test", "--", "true"]);
+    // Use the ids. The build can fail before the next submit, and a name must
+    // give a job that has not stopped.
+    let test = h.submit(&["submit", "--name", "test", "--needs", &build, "--", "true"]);
+    let ship = h.submit(&["submit", "--name", "ship", "--needs", &test, "--", "true"]);
 
     // The last stage must give the code 126: it did not run.
     let out = h.qex(&["wait", &ship, "--timeout", "60s"]);
@@ -1122,10 +1124,10 @@ fn a_pipeline_that_succeeds_runs_each_stage_in_order() {
 
     let build = h.submit(&["submit", "--name", "build", "--", "sh", "-c", "echo one"]);
     let test = h.submit(&[
-        "submit", "--name", "test", "--needs", "build", "--", "sh", "-c", "echo two",
+        "submit", "--name", "test", "--needs", &build, "--", "sh", "-c", "echo two",
     ]);
     let ship = h.submit(&[
-        "submit", "--name", "ship", "--needs", "test", "--", "sh", "-c", "echo three",
+        "submit", "--name", "ship", "--needs", &test, "--", "sh", "-c", "echo three",
     ]);
 
     let out = h.qex(&["wait", &ship, "--timeout", "60s"]);
@@ -1160,7 +1162,7 @@ fn an_after_job_runs_when_the_job_before_it_fails() {
 
     let build = h.submit(&["submit", "--name", "build", "--", "sh", "-c", "exit 3"]);
     let cleanup = h.submit(&[
-        "submit", "--name", "cleanup", "--after", "build", "--", "sh", "-c", "echo cleaned",
+        "submit", "--name", "cleanup", "--after", &build, "--", "sh", "-c", "echo cleaned",
     ]);
 
     let out = h.qex(&["wait", &cleanup, "--timeout", "60s"]);
@@ -1185,7 +1187,7 @@ fn a_job_that_waits_for_another_job_does_not_hold_capacity() {
     // A long job, and a job that waits for it.
     let slow = h.submit(&["submit", "--name", "slow", "--cpu", "1", "--mem", "64MB", "--", "sleep", "4"]);
     let waiter = h.submit(&[
-        "submit", "--cpu", "1", "--mem", "64MB", "--needs", "slow", "--", "true",
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", &slow, "--", "true",
     ]);
 
     // A job with no dependency must not wait for the job above it.
@@ -1221,7 +1223,7 @@ fn clean_keeps_a_job_that_another_job_needs() {
     let h = Harness::with_default_config("cleandep");
 
     let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "sleep 2; exit 1"]);
-    let second = h.submit(&["submit", "--needs", "first", "--", "true"]);
+    let second = h.submit(&["submit", "--needs", &first, "--", "true"]);
 
     let out = h.qex(&["clean", &first]);
     assert!(!out.status.success(), "qex must keep this job");
@@ -1262,7 +1264,7 @@ fn a_job_file_accepts_dependencies() {
     let file = h.root.join("second.toml");
     std::fs::write(
         &file,
-        "command = [\"true\"]\nname = \"second\"\nneeds = [\"first\"]\n",
+        &format!("command = [\"true\"]\nname = \"second\"\nneeds = [\"{first}\"]\n"),
     )
     .unwrap();
 
@@ -1292,32 +1294,45 @@ fn a_dependency_with_an_unknown_uuid_is_refused() {
     assert!(h.list_json().is_empty(), "qex must not accept the job");
 }
 
-/// A dependency must not have stopped already.
+/// An id and a name have different rules.
 ///
-/// An agent runs a script a second time and writes `--needs test`, but forgets
-/// to start a new test job. The name gives the test job of the first run, which
-/// already stopped. Without this test, the new job starts at once and waits for
-/// nothing.
+/// An id names one job for ever, so its existence is enough. A name can give a
+/// job of an earlier run, so it must give a job that has not stopped.
+///
+/// This difference is what keeps a pipeline script correct. A script that keeps
+/// each id can submit its last stage even when the first stage already failed.
 #[test]
-fn a_dependency_that_already_stopped_is_refused() {
-    let h = Harness::with_default_config("depdone");
+fn a_name_must_be_live_but_an_id_need_only_exist() {
+    let h = Harness::with_default_config("depnameid");
     let first = h.submit(&["submit", "--name", "build", "--", "true"]);
-    h.ok(&["wait", &first, "--timeout", "30s"]);
+    h.ok(&["wait", &first, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&first), "completed");
 
+    // By NAME: refused, because the name can give a job of an earlier run.
     for option in ["--needs", "--after"] {
         let out = h.qex(&["submit", option, "build", "--", "true"]);
         assert!(
             !out.status.success(),
-            "{option} on a job that succeeded must be refused"
+            "{option} with a name that gives a job which stopped must be refused"
         );
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("already succeeded"),
-            "the error must say that the job succeeded: {err}"
+            err.contains("already stopped"),
+            "the error must say that the job stopped: {err}"
         );
         assert!(
             err.contains("earlier run"),
             "the error must name the usual cause: {err}"
+        );
+    }
+
+    // By ID: accepted, because an id names one job for ever.
+    for option in ["--needs", "--after"] {
+        let out = h.qex(&["submit", option, &first, "--", "true"]);
+        assert!(
+            out.status.success(),
+            "{option} with an id must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 }
@@ -1335,7 +1350,8 @@ fn a_dependency_that_failed_is_accepted_and_makes_the_job_skipped() {
     h.qex(&["wait", &first, "--timeout", "30s"]);
     assert_eq!(h.state_of(&first), "failed");
 
-    let second = h.submit(&["submit", "--needs", "first", "--", "true"]);
+    // Use the id. A name would be refused, because the job already stopped.
+    let second = h.submit(&["submit", "--needs", &first, "--", "true"]);
     let out = h.qex(&["wait", &second, "--timeout", "45s"]);
     assert_eq!(out.status.code(), Some(126));
     assert_eq!(h.state_of(&second), "skipped");
@@ -1375,7 +1391,7 @@ fn a_failed_dependency_is_seen_behind_a_blocked_queue() {
     h.submit(&["submit", "--cpu", "2", "--mem", "64MB", "--name", "mid", "--", "true"]);
     // This job is behind the one above, and its dependency is about to fail.
     let skipped = h.submit(&[
-        "submit", "--cpu", "1", "--mem", "64MB", "--needs", "failer", "--", "true",
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", &failer, "--", "true",
     ]);
 
     // The job must reach `skipped` while `mid` still waits for capacity.
@@ -1414,7 +1430,7 @@ fn clean_keeps_the_cause_readable_for_the_jobs_that_it_leaves() {
     let h = Harness::with_default_config("cleancause");
 
     let first = h.submit(&["submit", "--name", "first", "--", "sh", "-c", "sleep 1; exit 1"]);
-    let second = h.submit(&["submit", "--name", "second", "--needs", "first", "--", "true"]);
+    let second = h.submit(&["submit", "--name", "second", "--needs", &first, "--", "true"]);
 
     h.until("the second job is skipped", Duration::from_secs(45), || {
         h.state_of(&second) == "skipped"

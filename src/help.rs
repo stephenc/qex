@@ -152,9 +152,12 @@ mixed together, and you must find the cause.
 Give each stage its own job, and name the jobs that must succeed first:
 
     BUILD=$(qex submit --name build -- make)
-    TEST=$(qex submit --name test  --needs build  -- make test)
-    SHIP=$(qex submit --name ship  --needs test   -- ./deploy.sh)
+    TEST=$(qex submit --name test  --needs $BUILD -- make test)
+    SHIP=$(qex submit --name ship  --needs $TEST  -- ./deploy.sh)
     qex wait $SHIP
+
+Keep the id of each stage and give the id to the next stage. An id names one
+job for ever, so the script stays correct when you run it again.
 
 Each stage has its own log file, its own exit code and its own claim. If `build`
 fails, `test` and `ship` do not start. Their state becomes `skipped`, and their
@@ -185,13 +188,20 @@ an earlier stage.
 A job can name the jobs that you started before it. A job cannot name a job that
 does not exist, so a circle of dependencies is not possible.
 
-A job that already succeeded is not a correct dependency, and qex refuses it.
-The wait would do nothing, and the usual cause is a name that gives a job of an
-earlier run: you write `--needs test` and you forgot to start a new test job.
-Use the id that `qex submit` wrote for this run, or run `qex clean done` first.
+An id and a name have different rules
+-------------------------------------
 
-A job that failed IS a correct dependency. Your job then becomes `skipped` with
-the correct cause, so a script that submits the stages one at a time can finish.
+An ID must exist. That is the only rule. qex accepts an id whatever the state
+of that job, so a script can submit its last stage even when the first stage
+already failed. The last stage then becomes `skipped` with the correct cause.
+
+A NAME must give a job that is in the queue or operates. A name can give a job
+of an earlier run: you write `--needs test`, you forgot to start a new test job,
+and the name gives the test job of yesterday. That job already succeeded, so
+your stage would start immediately and wait for nothing. qex refuses a name in
+that case and tells you what happened.
+
+Use an id in a script. Use a name when you type a command yourself.
 
 Other commands
 --------------

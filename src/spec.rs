@@ -278,6 +278,22 @@ impl JobSpec {
             // and the user does not need to remember the `--name` option.
             .unwrap_or_else(|| default_name(&command));
 
+        // A name must not have the form of an id.
+        //
+        // qex uses the form of a dependency value to choose a rule: an id must
+        // exist, and a name must give a job that has not stopped. A name with
+        // the form of an id would take the rule for an id, and the test that
+        // protects against a job of an earlier run would not happen.
+        if name.parse::<uuid::Uuid>().is_ok() {
+            bail!(
+                "the name `{name}` has the form of a job id, and qex does not accept it.\n\n\
+                 qex reads a dependency value as an id when it has this form, and an id \
+                 follows a different rule from a name. A name with this form would avoid \
+                 that rule.\n\n\
+                 Use a name that a person can read, such as `build` or `test`."
+            );
+        }
+
         let mut tags = file.tags;
         tags.extend(opts.tags.iter().cloned());
         tags.sort();
@@ -649,6 +665,24 @@ mod tests {
             .to_string();
         assert!(err.contains("qex submit"), "error should show usage: {err}");
         assert!(err.contains("--job"), "error should mention job files: {err}");
+    }
+
+    /// A name must not have the form of an id.
+    ///
+    /// qex chooses the rule for a dependency from the form of the value. A name
+    /// with the form of an id would take the rule for an id, and it would avoid
+    /// the test that protects against a job of an earlier run.
+    #[test]
+    fn a_name_with_the_form_of_an_id_is_refused() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.name = Some("550e8400-e29b-41d4-a716-446655440000".into());
+        let err = JobSpec::resolve(&o, &Config::default()).unwrap_err().to_string();
+        assert!(err.contains("form of a job id"), "got: {err}");
+
+        // A name that a person can read is accepted.
+        o.name = Some("build".into());
+        assert!(JobSpec::resolve(&o, &Config::default()).is_ok());
     }
 
     #[test]
