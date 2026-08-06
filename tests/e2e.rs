@@ -8201,10 +8201,20 @@ fn a_reader_continues_from_the_number_that_it_read() {
     let jobs: Vec<&serde_json::Value> = all.iter().filter(|l| l["event"] == "job").collect();
     assert!(jobs.len() >= 2, "the stream must hold the events: {all:?}");
 
+    // The reader keeps the name of the stream with the number. The name is what
+    // lets the coordinator see that it is not the coordinator that gave that
+    // number.
+    let stream_id = all[0]["stream_id"].as_str().unwrap().to_string();
     let first = jobs[0]["seq"].as_u64().unwrap();
     let after = events_lines(events_reader(
         &h,
-        &["--json", "--since", &first.to_string(), "--timeout", "3s"],
+        &[
+            "--json",
+            "--since",
+            &format!("{stream_id}:{first}"),
+            "--timeout",
+            "3s",
+        ],
     ));
     let got: Vec<u64> = after
         .iter()
@@ -8396,5 +8406,123 @@ fn a_coordinator_that_has_no_event_stream_refuses_the_command() {
     assert!(
         stdout.is_empty(),
         "a refused command must give no stream: {stdout}"
+    );
+}
+
+/// A number from a coordinator that stopped must give a gap, and never a
+/// silent continuation.
+///
+/// The numbers start at 1 in each coordinator, and a new coordinator makes one
+/// event for each record that it reads. The number 2 of the earlier stream thus
+/// names a DIFFERENT event in the new stream. Without the name of the stream,
+/// the coordinator continues from that number, and the reader loses the events
+/// before it with no message — which is the class of fault that qex exists to
+/// remove.
+#[test]
+fn a_number_from_a_coordinator_that_stopped_gives_a_gap() {
+    let h = Harness::with_default_config("eventsrestart");
+    for i in 0..3 {
+        let id = h.submit(&["submit", "--name", &format!("old{i}"), "--", "true"]);
+        h.ok(&["wait", &id]);
+    }
+
+    let before = events_lines(events_reader(
+        &h,
+        &["--json", "--since", "now", "--timeout", "2s"],
+    ));
+    let old_stream = before[0]["stream_id"].as_str().unwrap().to_string();
+
+    // Stop the coordinator of THIS test. The next command starts a new one,
+    // which reads the same records and makes its own numbers.
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator goes away", Duration::from_secs(20), || {
+        (unsafe { libc::kill(pid, 0) }) != 0
+    });
+
+    let lines = events_lines(events_reader(
+        &h,
+        &[
+            "--json",
+            "--since",
+            &format!("{old_stream}:2"),
+            "--timeout",
+            "3s",
+        ],
+    ));
+
+    assert_ne!(
+        lines[0]["stream_id"].as_str().unwrap(),
+        old_stream,
+        "the new coordinator must have a stream of its own"
+    );
+    let gap = lines
+        .iter()
+        .find(|l| l["event"] == "gap")
+        .unwrap_or_else(|| {
+            panic!("a number from a stream that stopped must give a gap: {lines:?}")
+        });
+    assert!(
+        gap["missed"].is_null(),
+        "qex cannot count across two streams, and it must not invent a number: {gap:?}"
+    );
+    assert!(
+        gap["reason"].as_str().unwrap().contains(&old_stream),
+        "the reason must name the stream that gave the number: {gap:?}"
+    );
+
+    // The stream must continue with everything that the new coordinator holds,
+    // and not from the number of the stream that stopped.
+    let seqs: Vec<u64> = lines
+        .iter()
+        .filter(|l| l["event"] == "job")
+        .map(|l| l["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        seqs.first(),
+        Some(&1),
+        "the stream must continue from the first event that the new coordinator holds: {seqs:?}"
+    );
+}
+
+/// A reader that goes away must not leave a thread and two file handles behind.
+///
+/// A bounded read is the shape that `--since`, `--count` and `--timeout` exist
+/// for: an agent reads for a few seconds, does its work, and comes back. On a
+/// quiet queue there is nothing to write to such a reader, so a write cannot
+/// find that it went away. Without a test of the connection itself, each of
+/// those readers held a thread and two handles for the hour of the idle time,
+/// and at the limit of the handles the coordinator accepts no connection.
+///
+/// This test reads `/proc`, so it runs on Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reader_that_goes_away_leaves_no_thread_behind() {
+    let h = Harness::with_default_config("eventsfds");
+    let pid = h.coordinator_pid();
+    let count = |what: &str| {
+        std::fs::read_dir(format!("/proc/{pid}/{what}"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+
+    let threads = count("task");
+    let handles = count("fd");
+    assert!(threads > 0, "this test needs /proc");
+
+    // Each reader stops by itself. See `events_reader`.
+    for _ in 0..8 {
+        let reader = events_reader(&h, &["--json", "--since", "now", "--timeout", "1s"]);
+        reader.wait_with_output().expect("the reader did not stop");
+    }
+
+    // The coordinator finds a reader that went away at its next test of the
+    // connection, so give it a moment.
+    h.until(
+        "the coordinator releases the threads of the readers that stopped",
+        Duration::from_secs(20),
+        || count("task") <= threads + 1 && count("fd") <= handles + 2,
     );
 }

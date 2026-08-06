@@ -166,7 +166,10 @@ mod tests {
             Request::Info,
             Request::Capabilities,
             Request::Events {
-                since: crate::events::Cursor::After(7),
+                since: crate::events::Cursor::After {
+                    seq: 7,
+                    stream: Some(id),
+                },
             },
         ];
         for r in requests {

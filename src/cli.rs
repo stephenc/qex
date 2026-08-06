@@ -548,12 +548,14 @@ pub struct EventsArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// Where to start: `start`, `now`, or a sequence number.
+    /// Where to start: `start`, `now`, or `<stream_id>:<seq>`.
     ///
     /// The default is `start`: every event that the coordinator still holds,
-    /// and then the new events. Give the last number that you read to continue
-    /// with no loss after a restart of your program.
-    #[arg(long, value_name = "SEQ|start|now", default_value = "start")]
+    /// and then the new events. To continue after a stop of your program, give
+    /// the `stream_id` of the first line and the last number that you read.
+    /// qex compares the name with this stream, and it reports a gap when the
+    /// coordinator changed. A number with no name cannot give that comparison.
+    #[arg(long, value_name = "STREAM:SEQ|start|now", default_value = "start")]
     pub since: String,
 
     /// Stop after this number of events.

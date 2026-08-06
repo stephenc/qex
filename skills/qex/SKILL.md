@@ -161,17 +161,24 @@ qex events --json      # one JSON object on one line for each change of state
 ```
 
 Each `job` line holds the whole record, the same as `qex status --json`, so you
-need no second command for the exit code or the cause of a failure. Keep the
-`seq` of the last line that you read and give it to `--since` when you start
-again, and you lose nothing:
+need no second command for the exit code or the cause of a failure.
+
+Keep **two** values: the `stream_id` of the first line and the largest `seq` you
+read. Give both when you start again:
 
 ```sh
-qex events --json --since 348
+qex events --json --since "$STREAM_ID:348"
 ```
+
+The numbers belong to one coordinator, and the next coordinator starts them at 1
+again. With the name, qex sees that and gives you a `gap` line; **with a number
+alone it cannot**, and you can lose events with no message.
 
 The coordinator keeps the last 512 events and never waits for a reader. If you
 fall behind you receive a `gap` line that counts what you lost; qex never hides
-a gap. Run `qex help events` for the detail.
+a gap. The stream reports what the coordinator saw: a job shorter than half a
+second can go from `starting` to `completed` with no `running` line, and
+`previous` gives the true sequence. Run `qex help events` for the detail.
 
 ## Claims
 

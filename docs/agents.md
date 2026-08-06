@@ -54,12 +54,19 @@ That command writes one JSON object on one line for each change of state, as it
 happens. Read it in place of a loop that asks about each job. Twenty jobs give
 one stream, and you learn of each result at the moment of the result.
 
-Keep the `seq` number of the last line that you read, and give it to `--since`
-when your program starts again. You then lose nothing:
+Keep **two** values: the `stream_id` of the first line, and the largest `seq`
+that you read. Give both to `--since` when your program starts again:
 
 ```sh
-qex events --json --since 348
+qex events --json --since "$STREAM_ID:348"
 ```
+
+You then lose nothing and you read nothing twice. The numbers belong to one
+coordinator: the coordinator stops when no job operates, and the next one starts
+its numbers at 1 again, so your number 348 names a different event there. With
+the name, qex compares the two and gives you a `gap` line that says the
+coordinator changed. **With a number alone it cannot**, and you can lose events
+with no message.
 
 Each `job` line carries the whole record, the same as `qex status --json`, so
 you need no second command to learn the exit code, the measured use or the
@@ -69,6 +76,10 @@ The coordinator keeps the last 512 events and never waits for a reader. If you
 fall behind, you receive a `gap` line that counts what you lost — qex never
 hides a gap. Do the work of an event in a different thread or process, and keep
 the reader reading.
+
+The stream reports what the coordinator **saw**. It reads the record of a job
+twice each second, so a job shorter than that goes from `starting` to
+`completed` with no `running` line. `previous` gives the true sequence.
 
 Run `qex help events` for the lines and the numbers, and `qex schema event` for
 the schema.

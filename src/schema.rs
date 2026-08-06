@@ -325,13 +325,18 @@ pub const EVENT: &str = r##"{
     "time": { "type": "integer", "description": "The time of the line, in seconds after the Unix epoch." },
     "seq": {
       "type": "integer",
-      "description": "The number of this event, on a `job` line. KEEP THE LARGEST NUMBER THAT YOU READ. Give it to `qex events --since N` when your program starts again, and you lose nothing. The numbers belong to one coordinator: they start at 1 again after the coordinator stops."
+      "description": "The number of this event, on a `job` line. KEEP THE LARGEST NUMBER THAT YOU READ, WITH THE `stream_id` OF THE FIRST LINE. Give both to `qex events --since <stream_id>:<seq>` when your program starts again, and you lose nothing. The numbers belong to one stream: a new coordinator starts them at 1 again, so a number alone names a different event there and qex cannot see the difference."
+    },
+    "stream_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "On a `stream` line: the name of this stream. Keep it with the largest `seq` that you read, and give both to `--since`. qex then compares them, and it gives a `gap` line when the coordinator changed. Two coordinators can start in one second, so the start time does not separate them; this name does."
     },
     "version": { "type": "string", "description": "On a `stream` line: the version of the coordinator." },
     "pid": { "type": "integer", "description": "On a `stream` line: the process id of the coordinator." },
     "coordinator_started_at": {
       "type": "integer",
-      "description": "On a `stream` line: the time when this coordinator started. A value that differs from the value of your last stream says that the coordinator restarted, so your sequence numbers belong to a coordinator that is gone."
+      "description": "On a `stream` line: the time when this coordinator started. Use `stream_id` to compare two streams: two coordinators can start in one second."
     },
     "first_seq": { "type": "integer", "description": "On a `stream` line: the oldest event that the coordinator still holds." },
     "last_seq": { "type": "integer", "description": "On a `stream` line: the newest event that the coordinator holds." },
@@ -340,7 +345,7 @@ pub const EVENT: &str = r##"{
     "state": {
       "type": "string",
       "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled", "skipped"],
-      "description": "On a `job` line: the state of the job now. Run `qex help states` for each state."
+      "description": "On a `job` line: the state of the job now. Run `qex help states` for each state. The stream gives one line for each state THAT THE COORDINATOR SAW: it reads the record of a job twice each second, so a job that is shorter than that period goes from `starting` to `completed` with no `running` line. The field `previous` then says `starting`, so the sequence that you read is the true sequence."
     },
     "previous": {
       "type": ["string", "null"],
@@ -356,8 +361,8 @@ pub const EVENT: &str = r##"{
       "description": "On a `job` line: the whole record of the job, in the form that `qex status --json` gives. See `qex schema status`. You thus need no second command to learn the exit code, the measured use or the cause of a failure."
     },
     "missed": {
-      "type": "integer",
-      "description": "On a `gap` line: the number of events that you did not receive. The coordinator keeps the last events only, and it never waits for a reader. Read the stream in a loop, and do the work of an event in a different thread or process."
+      "type": ["integer", "null"],
+      "description": "On a `gap` line: the number of events that you did not receive, or null when qex cannot count them. The value is null when your number comes from a different stream, because the two streams have no common measure; the field `reason` then says what happened. The coordinator keeps the last events only, and it never waits for a reader. Read the stream in a loop, and do the work of an event in a different thread or process."
     },
     "next_seq": { "type": "integer", "description": "On a `gap` line: the number of the next event that you receive." },
     "reason": { "type": "string", "description": "On a `gap` or `bye` line: the reason, in words for a person to read." }
