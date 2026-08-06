@@ -24,12 +24,6 @@ pub const EXIT_SKIPPED: i32 = 126;
 /// The exit code when there is no job with the given id.
 pub const EXIT_NO_SUCH_JOB: i32 = 127;
 
-/// The number of lines that `qex logs` shows without an option.
-///
-/// A job can write hundreds of megabytes, and the reader is frequently an agent
-/// with a limited context.
-const DEFAULT_LOG_LINES: usize = 500;
-
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
@@ -166,6 +160,14 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
 
     match client.call(&Request::Status { id })? {
         Response::Status { status } => {
+            // Read the output of the job in the same call.
+            //
+            // A reader of a job that failed always wants the last lines of its
+            // standard error. Without this, every failure costs two commands
+            // and two answers, and the reader is frequently an agent with a
+            // limited context.
+            let excerpt = job_excerpt(&status, &args)?;
+
             if args.json {
                 let mut value = serde_json::to_value(&*status)?;
                 if args.show_env {
@@ -175,14 +177,87 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                         value["env"] = serde_json::to_value(&spec.env)?;
                     }
                 }
+                if let Some((name, selected)) = &excerpt {
+                    let mut logs = serde_json::Map::new();
+                    logs.insert("stream".into(), serde_json::Value::from(name.as_str()));
+                    logs.insert("text".into(), serde_json::Value::from(selected.text.clone()));
+                    if let Some(found) = selected.matches {
+                        logs.insert("matches".into(), serde_json::Value::from(found));
+                    }
+                    if selected.truncated {
+                        logs.insert(
+                            "hidden_lines".into(),
+                            serde_json::Value::from(selected.hidden),
+                        );
+                    }
+                    value["logs"] = serde_json::Value::Object(logs);
+                }
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 print_status(&status, args.show_env)?;
+                if let Some((name, selected)) = &excerpt {
+                    if !selected.text.is_empty() {
+                        println!();
+                        println!("--- {name} ---");
+                        if let Some(notice) = selected.notice() {
+                            println!("{notice}");
+                        }
+                        print!("{}", selected.text);
+                    }
+                }
             }
             Ok(0)
         }
         other => report(other),
     }
+}
+
+/// Chooses the part of the output of a job to show with its status.
+///
+/// With no option, a job that did not succeed gives the last lines of its
+/// standard error, or of its standard output when the standard error is empty.
+/// A job that succeeded gives nothing, because the reader did not ask for it.
+///
+/// With any option of the log selection, the reader asked for output, so this
+/// function gives it whatever the state of the job.
+fn job_excerpt(
+    status: &JobStatus,
+    args: &cli::StatusArgs,
+) -> Result<Option<(String, crate::logsel::Selected)>> {
+    if args.no_logs {
+        return Ok(None);
+    }
+
+    let explicit = args.select.is_explicit() || args.select.stdout || args.select.stderr;
+    let failed = status.state.is_terminal() && status.state != JobState::Completed;
+    if !explicit && !failed {
+        return Ok(None);
+    }
+
+    let dir = paths::job_dir(&status.id)?;
+    let limit = if explicit {
+        crate::logsel::DEFAULT_LINES
+    } else {
+        crate::logsel::STATUS_LINES
+    };
+
+    // Choose the stream. The standard error holds the cause of a failure, and a
+    // program that writes its fault to the standard output is also frequent.
+    let order: Vec<(&str, &str)> = if args.select.stdout {
+        vec![("stdout", "stdout.log")]
+    } else if args.select.stderr {
+        vec![("stderr", "stderr.log")]
+    } else {
+        vec![("stderr", "stderr.log"), ("stdout", "stdout.log")]
+    };
+
+    for (name, file) in order {
+        let selected = select_log(&dir, file, &args.select, limit)?;
+        if !selected.text.trim().is_empty() {
+            return Ok(Some((name.to_string(), selected)));
+        }
+    }
+    Ok(None)
 }
 
 fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
@@ -497,113 +572,172 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
     };
 
     let dir = paths::job_dir(&id)?;
-    let files: Vec<(&str, std::path::PathBuf)> = if args.stdout {
-        vec![("", dir.join("stdout.log"))]
-    } else if args.stderr {
-        vec![("", dir.join("stderr.log"))]
-    } else {
-        vec![
-            ("stdout", dir.join("stdout.log")),
-            ("stderr", dir.join("stderr.log")),
-        ]
-    };
 
     if args.follow {
-        return follow(&dir, &files);
+        // A stream has no total, so the options that count a total have no
+        // meaning here.
+        if let Err(e) = args.select.check_with_follow() {
+            bail!("{e}");
+        }
+        return follow(&dir, &args.select);
     }
 
+    let streams = chosen_streams(&args.select);
+
     if args.json {
-        let read = |name: &str| -> String {
-            std::fs::read(dir.join(name))
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default()
-        };
         let mut out = serde_json::Map::new();
         out.insert("id".into(), serde_json::Value::String(id.to_string()));
-        if !args.stderr {
-            out.insert("stdout".into(), serde_json::Value::String(read("stdout.log")));
-        }
-        if !args.stdout {
-            out.insert("stderr".into(), serde_json::Value::String(read("stderr.log")));
+        for (name, file) in &streams {
+            let selected = select_log(&dir, file, &args.select, crate::logsel::DEFAULT_LINES)?;
+            out.insert((*name).into(), serde_json::Value::String(selected.text));
+            if let Some(found) = selected.matches {
+                out.insert(
+                    format!("{name}_matches"),
+                    serde_json::Value::from(found),
+                );
+            }
+            if selected.truncated {
+                out.insert(
+                    format!("{name}_hidden_lines"),
+                    serde_json::Value::from(selected.hidden),
+                );
+            }
         }
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(0);
     }
 
-    for (label, path) in &files {
-        // Read the bytes, then convert them. A job writes any byte, and one
-        // byte that is not UTF-8 must not hide the whole file.
-        //
-        // A strict read gives an error for such a file, and an empty result
-        // looks the same as a job that wrote nothing. A reader then believes
-        // that the build printed nothing.
-        let text = match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(_) => String::new(),
-        };
-        // Show the last lines only, unless the user asks for every line.
-        //
-        // A job can write hundreds of megabytes. The reader of this command is
-        // frequently an agent with a limited context, and the recipe in the
-        // help text is `qex logs $ID` with no other option. A full file would
-        // fill that context and hide the answer.
-        let limit = match (args.all, args.tail) {
-            (true, _) => None,
-            (false, Some(n)) => Some(n),
-            (false, None) => Some(DEFAULT_LOG_LINES),
-        };
-
-        let (text, hidden) = match limit {
-            Some(n) => {
-                let lines: Vec<&str> = text.lines().collect();
-                let start = lines.len().saturating_sub(n);
-                (lines[start..].join("\n"), start)
-            }
-            None => (text, 0),
-        };
-        if text.is_empty() {
+    for (name, file) in &streams {
+        let selected = select_log(&dir, file, &args.select, crate::logsel::DEFAULT_LINES)?;
+        if selected.text.is_empty() && selected.matches.unwrap_or(1) > 0 {
             continue;
         }
-        if !label.is_empty() && files.len() > 1 {
-            println!("==> {label} <==");
+        if streams.len() > 1 {
+            println!("==> {name} <==");
         }
-        if hidden > 0 {
-            // Say what is missing. A reader must not believe that this is the
-            // whole output.
-            println!(
-                "... {hidden} earlier line(s) are not shown. Use `--all`, or `--tail N`."
-            );
+        // The notice goes to stderr, so stdout holds the log lines only.
+        // A command such as `qex logs $ID > file` must give a clean file, and a
+        // reader that parses the output must not meet a sentence in it.
+        if let Some(notice) = selected.notice() {
+            eprintln!("{notice}");
         }
-        println!("{}", text.trim_end_matches('\n'));
+        print!("{}", selected.text);
     }
     Ok(0)
 }
 
+/// Gives the streams that the options select.
+fn chosen_streams(select: &crate::logsel::LogSelect) -> Vec<(&'static str, &'static str)> {
+    if select.stdout {
+        vec![("stdout", "stdout.log")]
+    } else if select.stderr {
+        vec![("stderr", "stderr.log")]
+    } else {
+        vec![("stdout", "stdout.log"), ("stderr", "stderr.log")]
+    }
+}
+
+/// Reads one log file and selects the part to show.
+///
+/// The read is lossy on purpose. A job writes any byte, and one byte that is
+/// not UTF-8 must not hide the whole file.
+fn select_log(
+    dir: &std::path::Path,
+    file: &str,
+    select: &crate::logsel::LogSelect,
+    default_limit: usize,
+) -> Result<crate::logsel::Selected> {
+    let text = match std::fs::read(dir.join(file)) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    };
+    select
+        .apply(&text, default_limit)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 /// Writes the output of a job while the job operates.
-fn follow(dir: &std::path::Path, files: &[(&str, std::path::PathBuf)]) -> Result<i32> {
+///
+/// The command first writes the last lines that the job already wrote, then it
+/// writes each new line. `--tail N` sets the number of first lines, in the same
+/// way as `tail -f -n N`. Without that option the command writes a few lines,
+/// because a job can already have written a very large file.
+///
+/// With `--grep`, this function writes the lines that match as they arrive.
+/// That combination is the reason for the option: a pipe to `grep` holds the
+/// lines in a buffer and shows nothing until the buffer fills, because `grep`
+/// needs `--line-buffered`. This code writes each line as it reads it.
+fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
+    let streams = chosen_streams(select);
+    let lead = select.tail.unwrap_or(crate::logsel::FOLLOW_LEAD_LINES);
+    let stdout = std::io::stdout();
     let mut handles = Vec::new();
-    for (label, path) in files {
-        let mut f = std::fs::File::open(path)
-            .or_else(|_| std::fs::File::create(path).and_then(|_| std::fs::File::open(path)))?;
-        f.seek(SeekFrom::Start(0))?;
-        handles.push((label.to_string(), f));
+
+    for (name, file) in &streams {
+        let path = dir.join(file);
+        // The supervisor can make this file after the command starts.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .create(true)
+            .write(true)
+            .open(&path)?;
+
+        // Read what the job already wrote, and show the last lines of it.
+        let mut existing = Vec::new();
+        f.read_to_end(&mut existing).ok();
+        let text = String::from_utf8_lossy(&existing).into_owned();
+
+        if lead > 0 {
+            let keep: Vec<&str> = text
+                .lines()
+                .filter(|line| keep_line(select, line))
+                .collect();
+            let from = keep.len().saturating_sub(lead);
+            for line in &keep[from..] {
+                let mut out = stdout.lock();
+                if streams.len() > 1 {
+                    write!(out, "[{name}] ")?;
+                }
+                writeln!(out, "{line}")?;
+            }
+            stdout.lock().flush()?;
+        }
+
+        // Continue after the text that this code already read. A partial last
+        // line stays in the buffer, so a filter never tests half of a line.
+        let partial = match text.rfind('\n') {
+            Some(end) => text[end + 1..].to_string(),
+            None => text,
+        };
+        f.seek(SeekFrom::End(0))?;
+        handles.push((name.to_string(), f, partial));
     }
 
-    let stdout = std::io::stdout();
     loop {
         let mut moved = false;
-        for (_label, f) in handles.iter_mut() {
+        for (name, file, partial) in handles.iter_mut() {
             let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                stdout.lock().write_all(&buf)?;
-                stdout.lock().flush()?;
+            if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
                 moved = true;
+                partial.push_str(&String::from_utf8_lossy(&buf));
+
+                while let Some(end) = partial.find('\n') {
+                    let line: String = partial.drain(..=end).collect();
+                    let line = line.trim_end_matches('\n');
+                    if keep_line(select, line) {
+                        let mut out = stdout.lock();
+                        if streams.len() > 1 {
+                            write!(out, "[{name}] ")?;
+                        }
+                        writeln!(out, "{line}")?;
+                        out.flush()?;
+                    }
+                }
             }
         }
 
-        // Stop when the job stops and the files hold no more data.
         match crate::job::read_status(dir) {
             Ok(status) => {
                 if status.state.is_terminal() && !moved {
@@ -611,8 +745,7 @@ fn follow(dir: &std::path::Path, files: &[(&str, std::path::PathBuf)]) -> Result
                 }
             }
             Err(_) => {
-                // The record is gone, so `qex clean` deleted the job. Stop, and
-                // do not wait for a file that will never change again.
+                // The record is gone, so `qex clean` deleted the job.
                 if !moved {
                     return Ok(0);
                 }
@@ -621,6 +754,22 @@ fn follow(dir: &std::path::Path, files: &[(&str, std::path::PathBuf)]) -> Result
 
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Tests one line against the filter of a stream.
+///
+/// Without `--grep`, every line passes.
+fn keep_line(select: &crate::logsel::LogSelect, line: &str) -> bool {
+    if select.grep.is_none() {
+        return true;
+    }
+    // An incorrect pattern gives an error before this point, so a fault here
+    // can only be unexpected. Show the line in that case; a lost line is worse
+    // than an extra line.
+    select
+        .apply(line, 1)
+        .map(|s| s.matches_shown > 0)
+        .unwrap_or(true)
 }
 
 pub fn kill(args: cli::KillArgs) -> Result<i32> {

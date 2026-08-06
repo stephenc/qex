@@ -75,6 +75,17 @@ The three commands you need
 `qex submit` writes the job UUID to stdout and writes nothing else. You can
 thus put the UUID in a shell variable.
 
+One command gives the result and the cause
+------------------------------------------
+
+`qex status` of a job that did not succeed also writes the last lines of its
+standard error. You thus need no second command for the usual question.
+
+    qex status $ID                  the state, the exit code and the last lines
+    qex status $ID --tail 50        more lines
+    qex status $ID --grep ERROR     the lines that match
+    qex status $ID --no-logs        the state only
+
 `qex wait` stops until the job stops. Its exit code tells you the result:
 
     0    the job succeeded
@@ -207,7 +218,7 @@ Other commands
 --------------
 
     qex list --json            all the jobs and their states
-    qex status <id> --json     one job in detail
+    qex status <id> --json     one job in detail, with the last error lines
     qex logs <id> --follow     the output while the job operates
     qex kill <id>              stop a job that operates
     qex cancel <id>            remove a job from the queue
@@ -534,11 +545,29 @@ reads this file directly if the coordinator does not operate.
 Logs
 ----
 
-    qex logs <id>              both streams, the last 500 lines
-    qex logs <id> --all        every line
-    qex logs <id> --stdout     one stream
-    qex logs <id> --follow     the output while the job operates
-    qex logs <id> --tail 100   the last 100 lines
+`qex logs` and `qex status` accept the same options to select lines.
+
+    qex logs <id>                 both streams, the last 500 lines
+    qex logs <id> --all           every line
+    qex logs <id> --stdout        one stream
+    qex logs <id> --tail 100      the last 100 lines
+    qex logs <id> --head 20       the first 20 lines; a fault at the start
+    qex logs <id> --lines 400:430 the lines from 400 to 430
+    qex logs <id> --number        write the line number before each line
+    qex logs <id> --grep ERROR    the lines that match
+    qex logs <id> --grep E -C 3   with 3 lines before and after each match
+    qex logs <id> --grep x --fixed  read the value as plain text
+    qex logs <id> --max-matches 20  show 20 matches, and count the others
+    qex logs <id> --follow        the output while the job operates
+    qex logs <id> --follow --tail 50   the last 50 lines, then the new lines
+    qex logs <id> --follow --grep ERROR  the matches as they arrive
+
+Every path has a limit. A search reports the number of lines that match, so a
+pattern that matches 3000 lines tells you that the pattern is too wide.
+
+Use `--follow --grep` in place of a pipe to `grep`. A pipe holds the lines in a
+buffer and shows nothing until the buffer fills, because `grep` needs the option
+`--line-buffered`. qex writes each line as it reads it.
 
 Delete the records
 ------------------

@@ -1467,23 +1467,125 @@ fn logs_shows_the_last_lines_by_default() {
     ]);
     h.ok(&["wait", &id, "--timeout", "45s"]);
 
-    let out = h.ok(&["logs", &id, "--stdout"]);
+    let result = h.qex(&["logs", &id, "--stdout"]);
+    let out = String::from_utf8_lossy(&result.stdout);
+    let notice = String::from_utf8_lossy(&result.stderr);
     assert!(
         out.lines().count() < 600,
         "the default output must be short, and it had {} lines",
         out.lines().count()
     );
     assert!(out.contains("line-1999"), "the last line must be there");
+    // The notice goes to stderr, so stdout holds the log lines only.
     assert!(
-        out.contains("not shown"),
-        "qex must say that it hid the earlier lines: {}",
-        out.lines().next().unwrap_or("")
+        notice.contains("not shown"),
+        "qex must say that it hid the earlier lines: {notice}"
     );
 
     // The option `--all` must give every line.
     let full = h.ok(&["logs", &id, "--stdout", "--all"]);
     assert!(full.contains("line-0"), "--all must give the first line");
     assert!(full.lines().count() >= 2000);
+}
+
+/// `qex status` of a job that failed must also give the last lines of its
+/// standard error, with no option at all.
+///
+/// A reader of a failure always wants those lines. Without them, every failure
+/// costs two commands and two answers.
+#[test]
+fn the_status_of_a_job_that_failed_holds_its_error_output() {
+    let h = Harness::with_default_config("statuslogs");
+    let id = h.submit(&[
+        "submit", "--", "sh", "-c", "echo normal; echo 'BOOM: it broke' >&2; exit 3",
+    ]);
+    h.qex(&["wait", &id, "--timeout", "45s"]);
+
+    // No option at all.
+    let text = h.ok(&["status", &id]);
+    assert!(
+        text.contains("BOOM: it broke"),
+        "the status must hold the error output: {text}"
+    );
+
+    // The JSON output must hold the same text in a field.
+    let v = h.status_json(&id);
+    assert_eq!(v["logs"]["stream"], "stderr");
+    assert!(v["logs"]["text"].as_str().unwrap().contains("BOOM"));
+
+    // A job that succeeded gives no output, because the reader did not ask.
+    let good = h.submit(&["submit", "--", "sh", "-c", "echo quiet"]);
+    h.ok(&["wait", &good, "--timeout", "45s"]);
+    assert!(h.status_json(&good)["logs"].is_null());
+
+    // The option --no-logs removes the output.
+    let text = h.ok(&["status", &id, "--no-logs"]);
+    assert!(!text.contains("BOOM"), "--no-logs must remove the output");
+}
+
+/// The options that select lines must operate on both commands.
+#[test]
+fn the_log_options_select_the_lines() {
+    let h = Harness::with_default_config("logopts");
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "i=1; while [ $i -le 300 ]; do echo line-$i; i=$((i+1)); done",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+
+    let head = h.ok(&["logs", &id, "--stdout", "--head", "3"]);
+    assert_eq!(head.lines().next().unwrap(), "line-1");
+    assert_eq!(head.lines().count(), 3);
+
+    let range = h.ok(&["logs", &id, "--stdout", "--lines", "100:102"]);
+    assert_eq!(range, "line-100\nline-101\nline-102");
+
+    let numbered = h.ok(&["logs", &id, "--stdout", "--head", "1", "--number"]);
+    assert!(numbered.contains("1  line-1"), "got: {numbered}");
+
+    // A search reports the number of matches, so a wide pattern is visible.
+    // The report goes to stderr, and the lines go to stdout.
+    let out = h.qex(&["logs", &id, "--stdout", "--grep", "line-1[0-9]$", "--max-matches", "3"]);
+    let found = String::from_utf8_lossy(&out.stdout);
+    let notice = String::from_utf8_lossy(&out.stderr);
+    assert!(notice.contains("10 line(s) match"), "got: {notice}");
+    assert!(found.contains("line-10") && found.contains("line-12"));
+    assert!(!found.contains("line-13"), "the limit must hold");
+    // The standard output holds the log lines only, so a file or a parser gets
+    // clean data.
+    for line in found.lines() {
+        assert!(line.starts_with("line-"), "stdout must hold log lines only: {line}");
+    }
+
+    // The same options operate on `status`.
+    let s = h.ok(&["status", &id, "--stdout", "--head", "2"]);
+    assert!(s.contains("line-1") && s.contains("line-2"));
+    assert!(!s.contains("line-3"), "the head limit must hold in status");
+}
+
+/// `--tail N --follow` must give the last N lines and then the new lines, in
+/// the same way as `tail -f -n N`. It must not write the whole file first.
+#[test]
+fn follow_leads_with_the_last_lines_only() {
+    let h = Harness::with_default_config("followtail");
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "i=1; while [ $i -le 200 ]; do echo old-$i; i=$((i+1)); done; sleep 2; echo NEW-A",
+    ]);
+    h.until("the job writes its first lines", Duration::from_secs(45), || {
+        h.job_dir(&id).join("stdout.log").metadata().map(|m| m.len() > 100).unwrap_or(false)
+    });
+
+    let out = h.ok(&["logs", &id, "--stdout", "--tail", "3", "--follow"]);
+    assert!(out.contains("NEW-A"), "follow must give the new lines: {out}");
+    assert!(!out.contains("old-1\n"), "follow must not write the whole file");
+    assert!(out.lines().count() <= 6, "got {} lines", out.lines().count());
 }
 
 /// A deep directory must not stop qex. The socket path must fit in `sun_path`,

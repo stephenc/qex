@@ -163,6 +163,16 @@ pub struct StatusArgs {
     /// Show the environment of the job. It can contain secrets.
     #[arg(long)]
     pub show_env: bool,
+
+    /// Do not show any output of the job.
+    ///
+    /// Without this option, the status of a job that did not succeed holds the
+    /// last lines of its standard error.
+    #[arg(long)]
+    pub no_logs: bool,
+
+    #[command(flatten)]
+    pub select: crate::logsel::LogSelect,
 }
 
 #[derive(Debug, Args)]
@@ -189,29 +199,18 @@ pub struct LogsArgs {
     /// The job id.
     pub id: String,
 
-    /// Show the standard output only.
-    #[arg(long, conflicts_with = "stderr")]
-    pub stdout: bool,
-
-    /// Show the standard error only.
-    #[arg(long)]
-    pub stderr: bool,
-
     /// Show the output while the job operates.
+    ///
+    /// Use --grep with this option to see the lines that matter as they arrive.
     #[arg(long, short)]
     pub follow: bool,
-
-    /// Show the last N lines only.
-    #[arg(long, value_name = "N")]
-    pub tail: Option<usize>,
 
     /// Write the output as JSON, with one field for each stream.
     #[arg(long, conflicts_with = "follow")]
     pub json: bool,
 
-    /// Show every line. Without this option, qex shows the last 500 lines.
-    #[arg(long)]
-    pub all: bool,
+    #[command(flatten)]
+    pub select: crate::logsel::LogSelect,
 }
 
 #[derive(Debug, Args)]

@@ -24,6 +24,7 @@ mod enforce;
 mod help;
 mod job;
 mod lifecycle;
+mod logsel;
 mod paths;
 mod peers;
 mod proto;
