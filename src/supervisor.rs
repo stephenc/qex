@@ -123,10 +123,6 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
         Err(_) => return,
     };
 
-    // Read the configuration before the lock. The code below holds a borrow of
-    // one job, and it cannot also read the state.
-    let cfg = coord.state.lock().unwrap().cfg.clone();
-
     let mut state = coord.state.lock().unwrap();
     if let Some(job) = state.jobs.get_mut(&id) {
         job.supervisor_pid = None;
@@ -142,7 +138,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // job with a correct result and no notification. This call
                 // closes that moment. It costs nothing when the supervisor did
                 // its work: the claim file stops the second run.
-                crate::hook::fire_detached(&cfg, &dir, &status);
+                crate::hook::fire_detached(&dir, &status);
             }
             other => {
                 // The supervisor stopped before it wrote a result. Something
@@ -190,7 +186,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // The supervisor of this job stopped before it could run the
                 // hook, so the coordinator runs it. The claim file stops a
                 // second run if the supervisor already started one.
-                crate::hook::fire_detached(&cfg, &dir, &status);
+                crate::hook::fire_detached(&dir, &status);
             }
         }
     }
@@ -467,7 +463,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 crate::enforce::remove_cgroup(&cgroup);
             }
 
-            crate::hook::fire(&cfg, &dir, &status);
+            crate::hook::fire(&dir, &status);
             return Ok(1);
         }
     };
@@ -763,7 +759,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // holds nothing now: `qex wait` gives its answer, the budget is free, and
     // the next job starts. A hook that hangs thus makes this process live
     // longer and does no other damage.
-    crate::hook::fire(&cfg, &dir, &status);
+    crate::hook::fire(&dir, &status);
 
     Ok(code.unwrap_or(0))
 }

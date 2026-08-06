@@ -1134,12 +1134,18 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
         // Say that there is no file. An empty answer would look like a hook
         // that ran and wrote nothing, and the reader would test the wrong
         // thing.
+        //
+        // The message goes to stderr, and `--json` continues to the document
+        // below. A reader that asks for JSON must always receive JSON: an empty
+        // answer gives that reader an error from its parser, and not an answer.
         if !dir.join("hook.log").exists() {
             eprintln!(
                 "qex: qex ran no stop hook for this job, so there is no log. \
                  Read `qex config show` to see the hook and the states that it runs on."
             );
-            return Ok(0);
+            if !args.json {
+                return Ok(0);
+            }
         }
         vec![("hook", "hook.log")]
     } else {

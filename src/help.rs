@@ -891,9 +891,13 @@ and it does not try again. A message that arrives two times is worse than a
 message that is lost.
 
 A hook that uses more than `[hooks] timeout` receives TERM and then KILL, in a
-process group of its own. A hook that writes more than 1MB stops in the same
-way, and qex cuts the file to that size. A hook that fails does not change the
-job.
+process group of its own. qex stops a hook that goes above 1MB of output while
+it runs, and it cuts the log of each hook to that size. A hook that fails does
+not change the job.
+
+qex reads the config file at each job that stops. A hook that you delete thus
+runs no more, and a hook that you add runs at once. You do not restart the
+coordinator.
 
 The output goes to `hook.log` in the directory of the job. Read it with
 `qex logs <id> --hook`, which also gives the verdict of qex: a hook that did not

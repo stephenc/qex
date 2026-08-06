@@ -4981,6 +4981,80 @@ fn a_job_whose_supervisor_stopped_still_runs_the_stop_hook_one_time() {
     );
 }
 
+/// A hook that a user deletes from the config file must not run again, and a
+/// hook that a user adds must run at once.
+///
+/// The coordinator reads its configuration one time, at its start, and it
+/// operates for hours. With that configuration, a hook that the user deleted
+/// still ran on each job, and a hook that the user added never ran on the paths
+/// of the coordinator — while `qex config show` gave the new value. A stale
+/// configuration that makes qex do nothing is a fault; a stale configuration
+/// that makes qex RUN A COMMAND THAT THE USER DELETED is a different thing.
+#[test]
+fn a_stop_hook_that_the_user_deletes_does_not_run_again() {
+    let h = Harness::with_default_config("hookstale");
+    let mark = h.root.join("hook.txt");
+    let base = "[peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n";
+    h.write_config(&format!(
+        "{base}[hooks]\non_stop = [\"sh\", \"-c\", \"echo \\\"$QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let first = h.submit(&["submit", "--name", "first", "--", "true"]);
+    h.ok(&["wait", &first]);
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+    assert_eq!(h.hook_lines(), vec!["first".to_string()]);
+
+    // Delete the hook. The same coordinator continues to operate.
+    h.write_config(base);
+
+    let second = h.submit(&["submit", "--name", "second", "--", "true"]);
+    h.ok(&["wait", &second]);
+    std::thread::sleep(Duration::from_secs(2));
+
+    assert_eq!(
+        h.hook_lines(),
+        vec!["first".to_string()],
+        "a hook that the user deleted must not run"
+    );
+    assert!(
+        !h.job_dir(&second).join("hook.ran").exists(),
+        "qex must not record a run of a hook that does not exist"
+    );
+
+    // The other direction: a hook that the user adds must run at once, also on
+    // a path of the coordinator. A skipped job has no supervisor.
+    h.write_config(&format!(
+        "{base}[hooks]\non_stop_states = [\"skipped\"]\n\
+         on_stop = [\"sh\", \"-c\", \"echo \\\"$QEX_STATE\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let build = h.submit(&["submit", "--name", "build", "--", "false"]);
+    let dependent = h.submit(&["submit", "--name", "dep", "--needs", &build, "--", "true"]);
+    h.qex(&["wait", &build]);
+    h.until(
+        "the dependent job is skipped",
+        Duration::from_secs(30),
+        || h.state_of(&dependent) == "skipped",
+    );
+    h.until(
+        "the new hook wrote its line",
+        Duration::from_secs(30),
+        || h.hook_lines().len() > 1,
+    );
+    assert_eq!(
+        h.hook_lines(),
+        vec!["first".to_string(), "skipped".to_string()],
+        "a hook that the user adds must run on the next job that stops"
+    );
+}
+
 fn _unused(_: &Path) {}
 
 /// Waits until a `qex run` that a test started stops, and gives its output.
