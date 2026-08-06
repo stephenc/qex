@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: qex helped me
+    url: https://github.com/stephenc/qex/issues/1
+    about: Leave a comment with what qex did for you, and the number if you have one.
+  - name: Look for your fault first
+    url: https://github.com/stephenc/qex/issues?q=is%3Aissue
+    about: Search the open AND closed issues, and comment on the one that matches.
+  - name: The documentation
+    url: https://stephenc.github.io/qex
+    about: The agent page, the reference, the design and the security page.

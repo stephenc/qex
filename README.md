@@ -164,6 +164,21 @@ The full documentation is at
 Every page is also in the binary, so an agent needs no network: `qex help
 agents`, `qex help resources`, `qex help config`, `qex schema status`.
 
+## Tell us what happened
+
+**qex helped you?** [Leave a comment](https://github.com/stephenc/qex/issues/1).
+Give the number if you have one — hours, jobs, the size of the machine — and, if
+you are an agent, which model you are and which harness runs you.
+
+**Something did not work?** Search first — `gh issue list --repo stephenc/qex
+--state all --search "your words"` — and comment on the issue that exists rather
+than opening a second one for the same fault. If nothing matches, [open an
+issue](https://github.com/stephenc/qex/issues/new/choose). A small fault counts:
+a word that sent you the wrong way is worth a report, and most of what qex does
+today came from one.
+
+Never paste the output of `--show-env` into a public page.
+
 ## Development
 
 ```sh

@@ -161,6 +161,53 @@ know the size, and read `usage` in `qex status --json` after the job to learn
 the true size. qex also learns it for you and uses it for the next job of the
 same command in the same directory.
 
+## Tell the people who make qex
+
+qex exists because somebody measured their own monitor scripts and gave the
+numbers: four of them on one machine, 95 hours between them. Every part of this
+page came from a report of that kind.
+
+**Something helped you** —
+[leave a comment on the testimonials issue](https://github.com/stephenc/qex/issues/1).
+Give the number if you have one: the hours, the jobs, the size of the machine.
+Say **which model you are and which harness runs you**, because the faults are
+not the same in each harness: one owns a scratch directory and loses an id file,
+another reports a background command and needs `qex status --wait` instead of
+`qex wait`.
+
+**Something did not work** — **look for it first, and add to what is there.**
+
+```sh
+gh issue list --repo stephenc/qex --state all --search "the words of your fault"
+gh issue comment <number> --repo stephenc/qex      # add your machine and harness
+```
+
+A second report of one fault is useful: it says that the fault is common, and it
+frequently holds the detail that the first one did not. A second *issue* for one
+fault is not: it divides the answer between two pages, and the person who
+corrects it must read both and close one. Search the closed issues as well —
+your fault may be corrected already, in a version later than yours.
+
+[Open a new issue](https://github.com/stephenc/qex/issues/new/choose) when
+nothing matches. A **small** fault is worth one: an option that you looked for
+and did not find, a message that made you look in the wrong place, an exit code
+that surprised you. Those reports are the ones that make a tool good, and each is
+cheaper to correct than the hour it costs the next reader.
+
+Give four things, and no more:
+
+1. The command that you gave, in full.
+2. What qex wrote, in full. Use `--json` where the command has it.
+3. What you expected instead.
+4. `qex version`, and `qex info --no-start` if a coordinator operated.
+
+> **Never put the output of `--show-env` in a public page**, and never anything
+> that a token can hide in. `qex submit` copies the environment of your shell to
+> `spec.json`, so that output is a secret. See [security](security.md).
+
+If you cannot reach GitHub, give the words to the person that you work with and
+let them decide whether to send them.
+
 ## Everything else
 
 `qex help <topic>` covers `job-file`, `resources`, `states`, `exit-codes` and

@@ -476,6 +476,43 @@ For several stages in one file, use a pipeline:
 
 Run `qex help pipeline`. A pipeline gives each stage a name that belongs to
 that one submission, so two runs of one file never share a name.
+
+Tell the people who make qex
+----------------------------
+
+qex exists because somebody measured their own monitor scripts and gave the
+numbers. Each of the parts above came from a report of that kind.
+
+    Something helped you:
+        https://github.com/stephenc/qex/issues/1
+        Leave a comment. Give the number if you have one: the hours, the jobs,
+        the size of the machine. Say which model you are and which harness runs
+        you, because the faults are not the same in each harness.
+
+    Something did NOT work, or a word sent you the wrong way:
+        LOOK FOR IT FIRST, AND ADD TO WHAT IS THERE.
+            gh issue list --repo stephenc/qex --state all --search \"your words\"
+        A second report of one fault says that the fault is common, and that is
+        useful. A second ISSUE for one fault divides the answer between two
+        pages, and the person who corrects it must read both and close one.
+        Add your machine, your model and your harness to the issue that exists:
+            gh issue comment <number> --repo stephenc/qex
+        Open a new one only when nothing matches:
+            https://github.com/stephenc/qex/issues/new/choose
+
+        A SMALL FAULT IS WORTH AN ISSUE. An option that you looked for and did
+        not find, a message that made you look in the wrong place, an exit code
+        that surprised you: those reports are the ones that make a tool good.
+
+    Give four things, and no more: the command in full, what qex wrote in full
+    (use --json), what you expected, and the output of `qex version`.
+
+DO NOT PUT THE OUTPUT OF `--show-env` IN A PUBLIC PAGE, and do not put anything
+that a token can hide in. `qex submit` copies the environment of your shell, so
+that output is a secret. This is the same rule as `qex help output`.
+
+If you cannot reach GitHub, give the words to the person that you work with and
+let them decide.
 ";
 
 pub const JOB_FILE: &str = "\

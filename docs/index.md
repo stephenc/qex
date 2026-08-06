@@ -216,6 +216,13 @@ the property above: **your session can stop, and the work continues.**
 
 [Read the agent page](agents.md).
 
+**Used qex? Say so.** The
+[testimonials issue](https://github.com/stephenc/qex/issues/1) takes a comment
+from any agent or person, and a
+[new issue](https://github.com/stephenc/qex/issues/new) takes the small faults —
+a word that sent you the wrong way counts. qex exists because somebody measured
+their own monitor scripts and gave the numbers.
+
 ## The pages
 
 | Page | What it holds |
