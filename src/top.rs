@@ -136,6 +136,15 @@ fn render(
                 "      the qex program changed; this coordinator stops when no job operates\n",
             );
         }
+        // The health of the queue, in the same words as `qex info`. A reader of
+        // a screen that does not change must be able to see WHY it does not
+        // change, and the reason of each job is not on this screen.
+        if let Some(info) = info {
+            let line = crate::commands::queue_line(info);
+            if !line.is_empty() {
+                out.push_str(&format!("      {line}\n"));
+            }
+        }
     }
 
     if info.is_none() {
@@ -416,6 +425,8 @@ mod tests {
             forced: false,
             forced_reason: None,
             blocked_reason: None,
+            blocked_since: None,
+            passed_by: 0,
             error: None,
             needs: vec![],
             after: vec![],
@@ -439,6 +450,14 @@ mod tests {
             mem_budget: 20 << 30,
             cpu_claimed: 2,
             mem_claimed: 4 << 30,
+            queue_state: Some("running".into()),
+            last_start_at: Some(crate::sys::now_secs()),
+            peer_count: Some(0),
+            peer_cpu: Some(0),
+            peer_mem: Some(0),
+            head_job: None,
+            head_blocker: None,
+            head_passed_by: None,
         }
     }
 

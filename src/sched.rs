@@ -58,11 +58,124 @@ pub fn size_check(cfg: &Config, spec: &JobSpec) -> Size {
     }
 }
 
+/// Who holds the capacity that a job waits for.
+///
+/// The class decides one thing: does the queue keep the capacity for the job,
+/// or does it start the jobs behind it?
+///
+/// qex controls the release of the capacity that its own jobs hold, and it
+/// controls nothing else. A queue that keeps capacity for a job which waits for
+/// another user therefore holds the machine empty for a time that qex cannot
+/// measure. That was the measured fault: one job that a peer blocked kept two
+/// small jobs in the queue for ever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Blocker {
+    /// The jobs of this queue hold the capacity. qex schedules the release.
+    Sibling,
+    /// The coordinator of another user holds the capacity. qex does not
+    /// schedule that release, and it can be hours.
+    Peer { count: usize },
+    /// A program outside qex holds the memory, or the machine has pressure.
+    Machine,
+    /// The job is larger than the budget, and it waits for a quiet machine.
+    OversizedWaitsForIdle,
+    /// The job is larger than the budget, and the config keeps it in the queue.
+    /// Such a job never starts, so capacity that qex keeps for it buys nothing.
+    OversizedParked,
+}
+
+impl Blocker {
+    /// Tells if the queue may keep capacity for a job with this class.
+    ///
+    /// A `Peer` or a `Machine` holds capacity that qex does not schedule. An
+    /// empty machine gives such a job nothing, and it stops every other job.
+    fn may_reserve(&self) -> bool {
+        matches!(self, Blocker::Sibling | Blocker::OversizedWaitsForIdle)
+    }
+
+    /// The word that `qex info` gives for a program to read.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Blocker::Sibling => "waits-for-capacity",
+            Blocker::Peer { .. } => "waits-for-peer",
+            Blocker::Machine => "waits-for-machine",
+            Blocker::OversizedWaitsForIdle => "waits-for-idle",
+            Blocker::OversizedParked => "parked",
+        }
+    }
+}
+
 /// The result of the test of a job against the machine now.
 enum Admit {
     Yes,
-    /// The job waits. The text gives the reason.
-    No(String),
+    No {
+        blocker: Blocker,
+        /// The text for a job that other jobs may pass.
+        reason: String,
+        /// The text for a job at the front of the queue that no job may pass.
+        ///
+        /// `None` means that the class never keeps capacity, so a reader never
+        /// sees this text.
+        held_reason: Option<String>,
+    },
+}
+
+/// The measurements of the machine for one pass of the scheduler.
+///
+/// The scheduler tests EVERY job that is ready in each pass, so each job gets a
+/// reason of its own. Without this record, each test reads `/proc` and the
+/// files of the other users again: that is one storm of system calls for each
+/// cycle of 500ms, and two jobs in one pass can also get answers from two
+/// different moments. One measurement for each pass removes both faults.
+struct Machine {
+    available: u64,
+    pressure: Option<f64>,
+    peers: crate::peers::Claims,
+}
+
+impl Machine {
+    fn read(cfg: &Config) -> Self {
+        Self {
+            available: sys::available_memory(),
+            pressure: sys::memory_pressure(),
+            // This function gives an empty total when the config turns the
+            // peers off, so there is no test here.
+            peers: crate::peers::claims(cfg),
+        }
+    }
+}
+
+/// Writes a number of cores with the correct word: `1 core`, `4 cores`.
+fn cores(n: u64) -> String {
+    if n == 1 {
+        "1 core".to_string()
+    } else {
+        format!("{n} cores")
+    }
+}
+
+/// Writes the other users with the correct verb: `1 other user holds`.
+fn other_users(n: usize) -> String {
+    if n == 1 {
+        "1 other user holds".to_string()
+    } else {
+        format!("{n} other users hold")
+    }
+}
+
+/// Builds the two texts for a job that the jobs of this queue hold back.
+fn sibling_wait(fact: String, resource: &str) -> Admit {
+    Admit::No {
+        blocker: Blocker::Sibling,
+        reason: format!(
+            "{fact} Those jobs release the {resource} when they stop. qex can start a smaller job \
+             before this one."
+        ),
+        held_reason: Some(format!(
+            "{fact} qex starts no other job before this one. Read `qex list` to see the jobs that \
+             hold the {resource}."
+        )),
+    }
 }
 
 /// Tests if a lock of this job is held by a job that operates.
@@ -92,51 +205,86 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
 }
 
 /// Tests if a job can start now.
-fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
+fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64, machine: &Machine) -> Admit {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
     let mem_budget = cfg.budget_mem().unwrap_or(0);
 
     // Test 1: the budget of this user.
     if cpu_used + spec.cpu > cpu_budget {
-        return Admit::No(format!(
-            "waits for cores: {} of {} are in use and the job needs {}",
-            cpu_used, cpu_budget, spec.cpu
-        ));
+        return sibling_wait(
+            format!(
+                "waits for cores: this job needs {}, and the jobs of this queue hold {} of the {} \
+                 in the budget.",
+                cores(spec.cpu),
+                cpu_used,
+                cores(cpu_budget)
+            ),
+            "cores",
+        );
     }
     if mem_used + spec.mem > mem_budget {
-        return Admit::No(format!(
-            "waits for memory: {} of {} is in use and the job needs {}",
-            format_size(mem_used),
-            format_size(mem_budget),
-            format_size(spec.mem)
-        ));
+        return sibling_wait(
+            format!(
+                "waits for memory: this job needs {}, and the jobs of this queue hold {} of the {} \
+                 budget.",
+                format_size(spec.mem),
+                format_size(mem_used),
+                format_size(mem_budget)
+            ),
+            "memory",
+        );
     }
 
     // Test 2: the other users. This test reads the files of the other
     // coordinators. It finds a load that this coordinator did not start.
-    if cfg.peers.enabled {
-        let peers = crate::peers::claims(cfg);
-        if peers.cpu > 0 || peers.mem > 0 {
-            if cpu_used + peers.cpu + spec.cpu > cpu_budget {
-                return Admit::No(format!(
-                    "waits for cores: {} user(s) claim {} cores",
-                    peers.count, peers.cpu
-                ));
-            }
-            if mem_used + peers.mem + spec.mem > mem_budget {
-                return Admit::No(format!(
-                    "waits for memory: {} user(s) claim {}",
-                    peers.count,
+    //
+    // The words must name the cause. The user of the fault saw "waits for the
+    // job at the front of the queue" and had no way to learn that a colleague
+    // held the machine.
+    let peers = &machine.peers;
+    if peers.cpu > 0 || peers.mem > 0 {
+        if cpu_used + peers.cpu + spec.cpu > cpu_budget {
+            return Admit::No {
+                blocker: Blocker::Peer { count: peers.count },
+                reason: format!(
+                    "this job cannot fit while another user holds capacity: the job needs {}, \
+                     this queue holds {} of the {} in the budget, and {} {}. \
+                     qex does not control that user, so this wait has no known end. qex starts \
+                     the jobs behind this one while the capacity is not free. Read `qex info` for \
+                     the load of the machine.",
+                    cores(spec.cpu),
+                    cpu_used,
+                    cores(cpu_budget),
+                    other_users(peers.count),
+                    cores(peers.cpu)
+                ),
+                held_reason: None,
+            };
+        }
+        if mem_used + peers.mem + spec.mem > mem_budget {
+            return Admit::No {
+                blocker: Blocker::Peer { count: peers.count },
+                reason: format!(
+                    "this job cannot fit while another user holds capacity: the job needs {}, this \
+                     queue holds {} of the {} budget, and {} {}. qex does not \
+                     control that user, so this wait has no known end. qex starts the jobs behind \
+                     this one while the capacity is not free. Read `qex info` for the load of the \
+                     machine.",
+                    format_size(spec.mem),
+                    format_size(mem_used),
+                    format_size(mem_budget),
+                    other_users(peers.count),
                     format_size(peers.mem)
-                ));
-            }
+                ),
+                held_reason: None,
+            };
         }
     }
 
     // Test 3: the machine. This test finds every load, and not the load of qex
     // only. It is the test that a program outside qex cannot avoid.
     let reserve = cfg.reserve_mem().unwrap_or(0);
-    let available = sys::available_memory();
+    let available = machine.available;
     if available < reserve + spec.mem {
         // Say what this number is, and what it is not.
         //
@@ -156,7 +304,7 @@ fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
             format_size(spec.mem),
             format_size(reserve)
         );
-        match sys::memory_pressure() {
+        match machine.pressure {
             Some(p) if p < 1.0 => reason.push_str(&format!(
                 ". The memory pressure is {p:.1}, so the machine is NOT short of memory now: \
                  this number counts the memory that a program can use with no operation to the \
@@ -169,19 +317,111 @@ fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
                  holds the memory",
             ),
         }
-        return Admit::No(reason);
+        // Say that this wait has no known end, and that the queue continues.
+        // The memory belongs to a program that qex never saw, so an empty
+        // queue does not give it back.
+        reason.push_str(
+            ". qex does not control the programs outside this queue, so this wait has no known \
+             end. qex starts the jobs behind this one while the memory is not free.",
+        );
+        return Admit::No {
+            blocker: Blocker::Machine,
+            reason,
+            held_reason: None,
+        };
     }
 
-    if let Some(pressure) = sys::memory_pressure() {
+    if let Some(pressure) = machine.pressure {
         if pressure > cfg.system.max_pressure {
-            return Admit::No(format!(
-                "waits for the machine: the memory pressure is {:.1} and the limit is {:.1}",
-                pressure, cfg.system.max_pressure
-            ));
+            return Admit::No {
+                blocker: Blocker::Machine,
+                reason: format!(
+                    "waits for the machine: the memory pressure is {:.1} and the limit is {:.1}. \
+                     qex does not control the programs outside this queue, so this wait has no \
+                     known end. qex starts the jobs behind this one while the pressure is high.",
+                    pressure, cfg.system.max_pressure
+                ),
+                held_reason: None,
+            };
         }
     }
 
     Admit::Yes
+}
+
+/// The decision for one job that has no dependency left.
+enum Verdict {
+    /// The job can start now.
+    Start,
+    /// The job waits. See [`Blocker`] for the meaning of the class.
+    Wait {
+        blocker: Blocker,
+        reason: String,
+        held_reason: Option<String>,
+    },
+}
+
+/// Tests one job against the budget, the other users, the machine and its size.
+///
+/// `quiet` says that no job operates and the settle time passed.
+fn verdict(
+    cfg: &Config,
+    spec: &JobSpec,
+    cpu_used: u64,
+    mem_used: u64,
+    machine: &Machine,
+    quiet: bool,
+) -> Verdict {
+    match size_check(cfg, spec) {
+        Size::Fits => match admit(cfg, spec, cpu_used, mem_used, machine) {
+            Admit::Yes => Verdict::Start,
+            Admit::No {
+                blocker,
+                reason,
+                held_reason,
+            } => Verdict::Wait {
+                blocker,
+                reason,
+                held_reason,
+            },
+        },
+        Size::TooBig(reason) => {
+            // This job can never fit. Start it alone when the machine is quiet,
+            // so the agent gets a result and not an endless wait.
+            if cfg.queue.oversized == OversizedPolicy::RunWhenIdle {
+                if quiet {
+                    return Verdict::Start;
+                }
+                return Verdict::Wait {
+                    blocker: Blocker::OversizedWaitsForIdle,
+                    reason: format!(
+                        "{reason}; qex starts this job when no other job operates. qex starts the \
+                         jobs behind this one until then."
+                    ),
+                    held_reason: Some(format!(
+                        "{reason}; qex starts this job when no other job operates. qex starts no \
+                         other job before this one, so the queue becomes empty."
+                    )),
+                };
+            }
+
+            let text = match cfg.queue.oversized {
+                // The config keeps this job in the queue, so it never starts.
+                // Capacity that qex keeps for it thus gives it nothing and
+                // stops every other job. Say that the queue continues.
+                OversizedPolicy::Queue => format!(
+                    "{reason}; the config file keeps this job in the queue. This job never starts, \
+                     so qex starts the jobs behind it."
+                ),
+                _ => reason.clone(),
+            };
+            Verdict::Wait {
+                blocker: Blocker::OversizedParked,
+                reason: text,
+                held_reason: None,
+            }
+        }
+    }
 }
 
 /// Runs the scheduler. This function does not give control back.
@@ -367,12 +607,49 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
     ));
 }
 
+/// The job at the front of the queue that cannot start now.
+struct Head {
+    id: uuid::Uuid,
+    name: String,
+    mem: u64,
+    blocker: Blocker,
+    /// True when no other job may pass this one.
+    reserved: bool,
+    /// The number of jobs that started after this job reached the front.
+    passed_by: u32,
+}
+
 /// Chooses the next job to start.
+///
+/// # The rule
+///
+/// The scheduler walks the jobs that have no dependency left, in queue order.
+/// The FIRST job that cannot start is the head. Its class ([`Blocker`]) says
+/// who holds the capacity:
+///
+/// * The jobs of this queue hold it, or the job waits for a quiet machine. qex
+///   schedules that release, so it is correct to wait. qex lets `max_bypass`
+///   jobs pass the head, and then it keeps the capacity: no job starts at all.
+/// * Another user, or a program outside qex, holds it. qex does not schedule
+///   that release, so the head never keeps capacity and the queue continues.
+///
+/// The count of the jobs that passed the head is NOT reset when the class
+/// changes. A job that another user held for an hour collects bypasses freely,
+/// and in the cycle in which that user releases the capacity the count is
+/// already at the limit. The job is then unpassable at once, and it collects
+/// capacity as the jobs of this queue stop. A wait behind another user thus
+/// costs one scheduler cycle, and not the life of the other user's job.
 fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     let (cpu_used, mem_used) = state.claimed();
     let cfg = state.cfg.clone();
     let active = state.count_state(|s| s.is_active());
     let idle_since = state.idle_since;
+    let max_bypass = cfg.queue.max_bypass;
+    let settle = cfg.settle().unwrap_or(Duration::from_secs(3));
+    let quiet = active == 0 && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
+
+    // Measure the machine one time for this pass. See [`Machine`].
+    let machine = Machine::read(&cfg);
 
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
@@ -411,6 +688,14 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     //
     // The scheduler starts one job for each call, so a lock that this pass gives
     // away cannot be given again: the next call sees the job as active.
+    //
+    // This pass tests EVERY ready job while the head does not keep capacity, so
+    // each job gets a reason of its own. The earlier code stopped at the head,
+    // and each job behind it read a sentence about queue position that named no
+    // cause. A job that the other user also held back was told the wrong thing.
+    let mut head: Option<Head> = None;
+    let mut started_now: Option<uuid::Uuid> = None;
+
     for id in ready.iter().copied() {
         let Some(job) = state.jobs.get(&id) else {
             continue;
@@ -419,71 +704,90 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
         // A lock comes before the capacity. A job that waits for a lock does
         // not hold capacity, in the same way as a job that waits for a
         // different job, so the loop continues to the next job.
+        //
+        // A lock is all or nothing, so there is no part of it to protect. Such
+        // a job therefore never becomes the head, and it never keeps capacity:
+        // one long build with a lock would otherwise stop the whole machine.
         if let Some(reason) = lock_conflict(state, &job.spec) {
             reasons.push((id, Some(reason)));
             continue;
         }
 
-        match size_check(&cfg, &job.spec) {
-            Size::Fits => match admit(&cfg, &job.spec, cpu_used, mem_used) {
-                Admit::Yes if chosen.is_none() => {
-                    chosen = Some(id);
-                    break;
-                }
-                Admit::Yes => break,
-                Admit::No(reason) => {
-                    reasons.push((id, Some(reason)));
-                    // Keep the capacity for this job. A smaller job must not
-                    // pass it again and again, or the large job never starts.
-                    //
-                    // Give a reason to each job behind this one. A user who
-                    // asks "why does my job wait" must get an answer for every
-                    // job, and not for the first job only.
-                    //
-                    // Use the jobs that have no dependency left. A job that
-                    // waits for a different job already has its own reason, and
-                    // this text would replace it with a text that is not
-                    // correct.
-                    for later in ready.iter().copied() {
-                        if later == id {
-                            continue;
-                        }
-                        if !reasons.iter().any(|(r, _)| *r == later) {
-                            reasons.push((
-                                later,
-                                Some(format!(
-                                    "waits for the job {} at the front of the queue",
-                                    &id.to_string()[..8]
-                                )),
-                            ));
-                        }
-                    }
-                    break;
-                }
-            },
-            Size::TooBig(reason) => {
-                // This job can never fit. Start it alone when the machine is
-                // quiet, so the agent gets a result and not an endless wait.
-                let settle = cfg.settle().unwrap_or(Duration::from_secs(3));
-                let quiet =
-                    active == 0 && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
+        let Some(job) = state.jobs.get(&id) else {
+            continue;
+        };
 
-                if cfg.queue.oversized == OversizedPolicy::RunWhenIdle && quiet {
-                    chosen = Some(id);
-                    break;
-                }
-
-                let text = match cfg.queue.oversized {
-                    OversizedPolicy::RunWhenIdle => {
-                        format!("{reason}; qex starts this job when no other job operates")
-                    }
-                    OversizedPolicy::Queue => {
-                        format!("{reason}; the config file keeps this job in the queue")
-                    }
-                    OversizedPolicy::Reject => reason.clone(),
-                };
-                reasons.push((id, Some(text)));
+        match verdict(&cfg, &job.spec, cpu_used, mem_used, &machine, quiet) {
+            Verdict::Start => {
+                chosen = Some(id);
+                started_now = Some(id);
                 break;
+            }
+            Verdict::Wait {
+                blocker,
+                reason,
+                held_reason,
+            } => {
+                if head.is_some() {
+                    // A job behind a head that does not keep capacity. It gets
+                    // its own reason, because no job holds it back.
+                    reasons.push((id, Some(reason)));
+                    continue;
+                }
+
+                let passed_by = job.status.passed_by;
+                let reserved = blocker.may_reserve() && passed_by >= max_bypass;
+                reasons.push((
+                    id,
+                    Some(if reserved {
+                        held_reason.unwrap_or(reason)
+                    } else {
+                        reason
+                    }),
+                ));
+                head = Some(Head {
+                    id,
+                    name: job.status.name.clone(),
+                    mem: job.status.mem,
+                    blocker,
+                    reserved,
+                    passed_by,
+                });
+                if reserved {
+                    break;
+                }
+            }
+        }
+    }
+
+    // The head keeps the capacity. Tell each job behind it WHY, and not its
+    // position only.
+    //
+    // The count in this sentence does not change while a reader sees it: no job
+    // starts while the head keeps the capacity, so the count cannot move. A
+    // number that moves would rewrite the record of every queued job at each
+    // start, with two operations to the disk for each record.
+    if let Some(h) = &head {
+        if h.reserved {
+            for later in ready.iter().copied() {
+                if later == h.id {
+                    continue;
+                }
+                if reasons.iter().any(|(r, _)| *r == later) {
+                    continue;
+                }
+                reasons.push((
+                    later,
+                    Some(format!(
+                        "waits for the job {} ({}), which is at the front of the queue and needs \
+                         {}. qex keeps the capacity for that job, because {} job(s) already \
+                         started before it.",
+                        &h.id.to_string()[..8],
+                        h.name,
+                        format_size(h.mem),
+                        h.passed_by
+                    )),
+                ));
             }
         }
     }
@@ -494,6 +798,9 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
         skip(state, id, reason, root);
     }
 
+    // Collect the jobs whose record changed, and write each record one time.
+    let mut dirty: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+
     for (id, reason) in reasons {
         if let Some(job) = state.jobs.get_mut(&id) {
             if job.status.state != JobState::Queued {
@@ -501,13 +808,60 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
             }
             if job.status.blocked_reason != reason {
                 job.status.blocked_reason = reason;
-                let status = job.status.clone();
-                if let Ok(dir) = paths::job_dir(&id) {
-                    job::write_status(&dir, &status).ok();
-                }
+                dirty.insert(id);
             }
         }
     }
+
+    // Count the jobs that pass the head.
+    //
+    // The count belongs to the head only. A count on every queued job would
+    // rewrite every record at each start, and the rule needs the count of the
+    // front-most job only.
+    if let Some(h) = &head {
+        if let Some(job) = state.jobs.get_mut(&h.id) {
+            if job.status.blocked_since.is_none() {
+                job.status.blocked_since = Some(sys::now_secs());
+                dirty.insert(h.id);
+            }
+            if started_now.is_some() {
+                job.status.passed_by = job.status.passed_by.saturating_add(1);
+                dirty.insert(h.id);
+            }
+        }
+    }
+
+    // A job that can start waited for nothing. Its count starts again.
+    if let Some(id) = started_now {
+        if let Some(job) = state.jobs.get_mut(&id) {
+            if job.status.blocked_since.is_some() || job.status.passed_by > 0 {
+                job.status.blocked_since = None;
+                job.status.passed_by = 0;
+                dirty.insert(id);
+            }
+        }
+    }
+
+    for id in dirty {
+        let Some(job) = state.jobs.get(&id) else {
+            continue;
+        };
+        let status = job.status.clone();
+        if let Ok(dir) = paths::job_dir(&id) {
+            job::write_status(&dir, &status).ok();
+        }
+    }
+
+    // Record what this pass found, so `qex info` and `qex top` can say in one
+    // line whether the queue is healthy.
+    state.head = head.map(|h| crate::daemon::HeadInfo {
+        id: h.id,
+        name: h.name,
+        blocker: h.blocker.word().to_string(),
+        reserved: h.reserved,
+        passed_by: h.passed_by,
+    });
+    state.peer_claims = machine.peers;
 
     chosen
 }
@@ -548,11 +902,16 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         job.status.state = JobState::Starting;
         job.status.started_at = Some(sys::now_secs());
         job.status.blocked_reason = None;
+        job.status.blocked_since = None;
+        job.status.passed_by = 0;
         job.status.forced = forced.is_some();
         job.status.forced_reason = forced.clone();
         let status = job.status.clone();
         let name = job.spec.name.clone();
         state.queue.retain(|q| *q != id);
+        // `qex info` reads this time to say if the queue moves. A queue that
+        // started nothing for a long time is the fault that a reader looks for.
+        state.last_start_at = Some(sys::now_secs());
         (forced, name, status)
     };
 
@@ -651,6 +1010,7 @@ fn write_started(id: &uuid::Uuid, status: &crate::job::JobStatus) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn cfg_with(cpu: &str, mem: &str) -> Config {
         toml::from_str(&format!(
@@ -742,20 +1102,30 @@ mod tests {
         let cfg = cfg_with("4", "256MB");
         let job = spec_with(2, 64 << 20);
 
+        let m = Machine::read(&cfg);
+
         // Two cores are in use. A job of two cores fits.
-        assert!(matches!(admit(&cfg, &job, 2, 64 << 20), Admit::Yes));
+        assert!(matches!(admit(&cfg, &job, 2, 64 << 20, &m), Admit::Yes));
 
         // Four cores are in use. The same job must wait.
-        let Admit::No(reason) = admit(&cfg, &job, 4, 64 << 20) else {
+        let Admit::No {
+            reason, blocker, ..
+        } = admit(&cfg, &job, 4, 64 << 20, &m)
+        else {
             panic!("a job must not start when the cores are in use");
         };
         assert!(reason.contains("cores"), "got: {reason}");
+        assert_eq!(blocker, Blocker::Sibling);
 
         // The memory is in use. The job must wait.
-        let Admit::No(reason) = admit(&cfg, &job, 0, 224 << 20) else {
+        let Admit::No {
+            reason, blocker, ..
+        } = admit(&cfg, &job, 0, 224 << 20, &m)
+        else {
             panic!("a job must not start when the memory is in use");
         };
         assert!(reason.contains("memory"), "got: {reason}");
+        assert_eq!(blocker, Blocker::Sibling);
     }
 
     /// A job that fills the budget exactly must start. An error in the compare
@@ -768,7 +1138,7 @@ mod tests {
     fn a_job_that_fills_the_budget_exactly_starts() {
         let cfg = cfg_with("4", "256MB");
         assert!(matches!(
-            admit(&cfg, &spec_with(4, 256 << 20), 0, 0),
+            admit(&cfg, &spec_with(4, 256 << 20), 0, 0, &Machine::read(&cfg)),
             Admit::Yes
         ));
         assert_eq!(size_check(&cfg, &spec_with(4, 256 << 20)), Size::Fits);
@@ -780,10 +1150,14 @@ mod tests {
         let mut cfg = cfg_with("4", "8GB");
         // Ask for a reserve that is larger than the machine. Each job must wait.
         cfg.system.reserve_mem = "1000GB".into();
-        let Admit::No(reason) = admit(&cfg, &spec_with(1, 1 << 20), 0, 0) else {
+        let Admit::No {
+            reason, blocker, ..
+        } = admit(&cfg, &spec_with(1, 1 << 20), 0, 0, &Machine::read(&cfg))
+        else {
             panic!("the reserve must stop this job");
         };
         assert!(reason.contains("reserve"), "got: {reason}");
+        assert_eq!(blocker, Blocker::Machine);
     }
 
     /// The pressure limit stops a job while the machine reclaims memory.
@@ -792,10 +1166,189 @@ mod tests {
         let mut cfg = cfg_with("4", "8GB");
         cfg.system.max_pressure = -1.0;
         if sys::memory_pressure().is_some() {
-            let Admit::No(reason) = admit(&cfg, &spec_with(1, 1 << 20), 0, 0) else {
+            let Admit::No {
+                reason, blocker, ..
+            } = admit(&cfg, &spec_with(1, 1 << 20), 0, 0, &Machine::read(&cfg))
+            else {
                 panic!("the pressure limit must stop this job");
             };
             assert!(reason.contains("pressure"), "got: {reason}");
+            assert_eq!(blocker, Blocker::Machine);
         }
+    }
+
+    /// Makes a config with a peer that holds capacity.
+    ///
+    /// The record goes in the directory of THIS user with a pid that is not
+    /// this process. `peers::claims` skips the record of this coordinator only,
+    /// because one user can have more than one coordinator. A record with a
+    /// different user id is not possible here: the reader tests the owner of
+    /// the file, and this process owns each file that it writes.
+    fn cfg_with_peer(cpu: &str, mem: &str, peer_cpu: u64, peer_mem: u64) -> (Config, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "qex-sched-peer-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let uid = crate::peers::current_uid();
+        let mine = dir.join(format!("u{uid}"));
+        std::fs::create_dir_all(&mine).unwrap();
+        // Pid 1 always exists. `pid_alive` also accepts the answer "you may not
+        // signal this process", so the test needs no process of its own.
+        let peer = serde_json::json!({
+            "uid": uid,
+            "pid": 1,
+            "boot_id": sys::boot_id(),
+            "cpu": peer_cpu,
+            "mem": peer_mem,
+            "updated_at": sys::now_secs(),
+        });
+        std::fs::write(mine.join("peer-1.json"), serde_json::to_vec(&peer).unwrap()).unwrap();
+
+        let cfg: Config = toml::from_str(&format!(
+            "[budget]\ncpu = \"{cpu}\"\nmem = \"{mem}\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = true\ndir = \"{}\"\nstale_after = \"1h\"\n",
+            dir.display()
+        ))
+        .unwrap();
+        (cfg, dir)
+    }
+
+    /// The measured fault: a job that another user holds back read a sentence
+    /// about queue position, and the user had no way to learn the cause.
+    ///
+    /// The words must name the other user, and the class must be `Peer`, so the
+    /// queue starts the jobs behind this one.
+    #[test]
+    fn a_job_that_another_user_holds_back_says_so_and_never_keeps_capacity() {
+        let (cfg, dir) = cfg_with_peer("4", "256MB", 3, 0);
+        let machine = Machine::read(&cfg);
+        assert_eq!(machine.peers.count, 1, "the test peer must count");
+
+        let Admit::No {
+            blocker,
+            reason,
+            held_reason,
+        } = admit(&cfg, &spec_with(4, 64 << 20), 0, 0, &machine)
+        else {
+            panic!("a job of 4 cores must not start while another user holds 3");
+        };
+        assert_eq!(blocker, Blocker::Peer { count: 1 });
+        assert!(
+            reason.contains("another user holds capacity"),
+            "the reason must name the other user: {reason}"
+        );
+        assert!(
+            reason.contains("no known end"),
+            "the reason must say that qex cannot schedule the release: {reason}"
+        );
+        assert!(
+            held_reason.is_none() && !blocker.may_reserve(),
+            "a job that another user holds back must never keep the capacity"
+        );
+
+        // A smaller job still fits, so the queue continues.
+        assert!(matches!(
+            admit(&cfg, &spec_with(1, 64 << 20), 0, 0, &machine),
+            Admit::Yes
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// qex keeps capacity only for a holder whose release it schedules.
+    ///
+    /// A queue that keeps capacity against another user, or against a program
+    /// outside qex, holds the machine empty for a time that qex cannot measure.
+    /// That is the measured fault.
+    #[test]
+    fn the_queue_keeps_capacity_only_for_a_holder_that_it_schedules() {
+        assert!(Blocker::Sibling.may_reserve());
+        assert!(Blocker::OversizedWaitsForIdle.may_reserve());
+        assert!(!Blocker::Peer { count: 1 }.may_reserve());
+        assert!(!Blocker::Machine.may_reserve());
+        assert!(!Blocker::OversizedParked.may_reserve());
+    }
+
+    /// A job that the config keeps in the queue never starts, so capacity that
+    /// qex keeps for it gives it nothing and stops every other job.
+    #[test]
+    fn a_job_that_the_config_parks_does_not_stop_the_jobs_behind_it() {
+        let mut cfg = cfg_with("2", "256MB");
+        cfg.queue.oversized = OversizedPolicy::Queue;
+        let machine = Machine::read(&cfg);
+
+        let Verdict::Wait {
+            blocker, reason, ..
+        } = verdict(&cfg, &spec_with(64, 64 << 20), 0, 0, &machine, false)
+        else {
+            panic!("a job of 64 cores must not start with a budget of 2");
+        };
+        assert_eq!(blocker, Blocker::OversizedParked);
+        assert!(
+            reason.contains("starts the jobs behind it"),
+            "the reason must say that the queue continues: {reason}"
+        );
+    }
+
+    /// A job that is larger than the budget waits for a quiet machine. qex
+    /// schedules that release, because the queue becomes empty, so this class
+    /// keeps the capacity after the permitted bypasses.
+    #[test]
+    fn a_job_that_waits_for_a_quiet_machine_keeps_the_capacity() {
+        let cfg = cfg_with("2", "256MB");
+        let machine = Machine::read(&cfg);
+
+        let Verdict::Wait {
+            blocker,
+            held_reason,
+            ..
+        } = verdict(&cfg, &spec_with(64, 64 << 20), 0, 0, &machine, false)
+        else {
+            panic!("a job of 64 cores must not start on a busy machine");
+        };
+        assert_eq!(blocker, Blocker::OversizedWaitsForIdle);
+        assert!(held_reason.is_some());
+
+        // The same job starts alone on a quiet machine.
+        assert!(matches!(
+            verdict(&cfg, &spec_with(64, 64 << 20), 0, 0, &machine, true),
+            Verdict::Start
+        ));
+    }
+
+    /// The two texts of a sibling wait must give different instructions. The
+    /// first says that a smaller job can pass; the second says that no job can.
+    #[test]
+    fn a_sibling_wait_says_if_another_job_can_pass_it() {
+        let cfg = cfg_with("4", "256MB");
+        let machine = Machine::read(&cfg);
+        let Admit::No {
+            blocker,
+            reason,
+            held_reason,
+        } = admit(&cfg, &spec_with(4, 64 << 20), 2, 0, &machine)
+        else {
+            panic!("a job of 4 cores must not start while 2 are in use");
+        };
+        assert_eq!(blocker, Blocker::Sibling);
+        assert!(
+            reason.contains("qex can start a smaller job before this one"),
+            "got: {reason}"
+        );
+        let held = held_reason.expect("a sibling wait has a text for a job that keeps capacity");
+        assert!(
+            held.contains("qex starts no other job before this one"),
+            "got: {held}"
+        );
+        // The count of the jobs that passed is NOT in the text. A number that
+        // changes at each start would rewrite the record of the job, with two
+        // operations to the disk, at each start.
+        assert!(!held.contains("time(s)"), "got: {held}");
     }
 }

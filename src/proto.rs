@@ -82,6 +82,50 @@ pub enum Response {
         mem_budget: u64,
         cpu_claimed: u64,
         mem_claimed: u64,
+        /// The health of the queue, in one word for a program to read.
+        ///
+        /// The words are `running`, `held`, `waits-for-peer`,
+        /// `waits-for-machine`, `waits-for-capacity`, `waits-for-idle` and
+        /// `parked`.
+        ///
+        /// EACH FIELD BELOW IS AN OPTION, AND THAT IS DELIBERATE.
+        ///
+        /// A newer CLI can talk to an older coordinator, which sends none of
+        /// these fields. A defaulted `0` in `peer_cpu` would then say "no other
+        /// user holds anything", which is a lie in the place where the true
+        /// answer is the most valuable. `None` says "unknown", and the CLI
+        /// prints that word.
+        ///
+        /// This field is also the mark of an older coordinator: it is `None`
+        /// only when the coordinator did not send it. A reader tests this one
+        /// field, and then it knows that each field below is unknown and not
+        /// empty.
+        #[serde(default)]
+        queue_state: Option<String>,
+        /// The time when a job last started. `None` means that no job started
+        /// since this coordinator started.
+        #[serde(default)]
+        last_start_at: Option<u64>,
+        /// The number of other coordinators that hold capacity.
+        #[serde(default)]
+        peer_count: Option<usize>,
+        /// The cores that the other users hold.
+        #[serde(default)]
+        peer_cpu: Option<u64>,
+        /// The memory that the other users hold.
+        #[serde(default)]
+        peer_mem: Option<u64>,
+        /// The job at the front of the queue that cannot start, as
+        /// `a1b2c3d4 (train)`. `None` means that no job waits.
+        #[serde(default)]
+        head_job: Option<String>,
+        /// Who holds the capacity that the job at the front needs.
+        #[serde(default)]
+        head_blocker: Option<String>,
+        /// The number of jobs that started after the job at the front reached
+        /// the front.
+        #[serde(default)]
+        head_passed_by: Option<u32>,
     },
     /// The things that the coordinator can do.
     Capabilities { names: Vec<String> },
