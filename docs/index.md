@@ -214,6 +214,13 @@ one queue and one budget.
 network for it. It covers the submit, wait and logs loop, the exit codes, and
 the property above: **your session can stop, and the work continues.**
 
+An agent that drives many jobs reads one stream in place of a loop that asks
+about each job:
+
+```sh
+qex events --json      # one JSON object on one line for each change of state
+```
+
 [Read the agent page](agents.md).
 
 **Used qex? Say so.** The

@@ -47,6 +47,7 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
         // Read the status file first. The supervisor writes the process id
         // there, and this command needs that value to signal the job.
         state.refresh_active();
+        state.publish_changes();
         let Some(job) = state.jobs.get(&id) else {
             return Response::error(
                 ErrorKind::NoSuchJob,
@@ -259,6 +260,7 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
             }
         }
     }
+    state.publish_changes();
     drop(state);
 
     coord.notify();

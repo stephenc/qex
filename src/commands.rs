@@ -1376,6 +1376,234 @@ fn find_id_on_disk(raw: &str) -> Result<Option<uuid::Uuid>> {
     Ok(found)
 }
 
+/// Writes the event stream.
+///
+/// # Why this command exists
+///
+/// An agent that drives twenty jobs asked about each job in a loop. It learned
+/// of a result late, it used the machine to ask, and it wrote the timer that
+/// qex exists to remove. This command gives one stream instead: the reader
+/// connects one time, and it receives one line for each change.
+pub fn events(args: cli::EventsArgs) -> Result<i32> {
+    let since = parse_since(&args.since)?;
+    let deadline = match &args.timeout {
+        Some(t) => parse_duration(t)
+            .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
+            .map(|d| Instant::now() + d),
+        None => None,
+    };
+
+    let mut client = Client::connect()?;
+    warn_if_version_differs(&mut client);
+
+    // Refuse a coordinator that cannot obey, BEFORE the request.
+    //
+    // Such a coordinator answers the request with an error, so a wait with no
+    // end is not possible. This test gives the words that name the remedy, in
+    // place of the words of a parser.
+    {
+        let (have, version, pid) = coordinator_capabilities(&mut client);
+        crate::capabilities::check_floor(&version, pid).map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::capabilities::check_command(&have, &version, pid, "events", "qex events")
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
+    // Warn about a number with no stream name.
+    //
+    // The numbers of each coordinator start at 1, and a new coordinator makes
+    // an event for each record that it reads. A number alone thus points at a
+    // place in a stream that means something different, and the coordinator
+    // cannot see that. It gives no gap line, and the reader loses events with
+    // no message. The form with the name removes that condition, so name it
+    // here and give the remedy.
+    if let crate::events::Cursor::After { stream: None, .. } = since {
+        eprintln!(
+            "qex: you gave a number with no stream name. qex cannot then see that the \
+             coordinator restarted, and you can lose events with no message.\n\
+             Keep the `stream_id` of the first line of the stream, and use \
+             `--since <stream_id>:<seq>`."
+        );
+    }
+
+    client.send(&Request::Events { since })?;
+
+    let mut written = 0u64;
+    let out = std::io::stdout();
+    loop {
+        // Give the socket the time that is left. A stream with no time limit
+        // blocks here, and it uses no CPU time.
+        if let Some(end) = deadline {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(EXIT_TIMEOUT);
+            }
+            client.set_read_timeout(Some(left))?;
+        }
+
+        let response = match client.recv_opt() {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                // The stream ended and gave no goodbye. Something stopped the
+                // coordinator: a signal, or a failure of the machine. Say so. A
+                // reader that takes this for an orderly end waits for a change
+                // that will never arrive.
+                eprintln!(
+                    "qex: the coordinator closed the event stream and gave no reason. \
+                     Something stopped it.\n\
+                     The records of the jobs are on the disk, and they are correct. \
+                     Run `qex events` again to read the stream of the next coordinator."
+                );
+                return Ok(1);
+            }
+            Err(e) if is_read_timeout(&e) => return Ok(EXIT_TIMEOUT),
+            Err(e) => return Err(e),
+        };
+
+        let Response::Event { event } = response else {
+            return report(response);
+        };
+
+        use crate::events::Event;
+        let counts = matches!(*event, Event::Job { .. } | Event::Gap { .. });
+
+        {
+            // Write the line and send it now. A line that stays in a buffer is
+            // a line that did not arrive, and the reader then waits for a
+            // change that already happened.
+            use std::io::Write as _;
+            let mut handle = out.lock();
+            if args.json {
+                writeln!(handle, "{}", serde_json::to_string(&*event)?)?;
+            } else {
+                writeln!(handle, "{}", event_text(&event))?;
+            }
+            handle.flush()?;
+        }
+
+        if let Event::Bye { .. } = *event {
+            return Ok(0);
+        }
+        if counts {
+            written += 1;
+            if Some(written) == args.count {
+                return Ok(0);
+            }
+        }
+    }
+}
+
+/// Reads the value of `--since`.
+///
+/// The form `<stream>:<seq>` carries the name of the stream that gave the
+/// number. The coordinator then compares the two, and it reports a gap when the
+/// stream is not the same one. A number alone cannot give that comparison,
+/// because the numbers of each coordinator start at 1.
+fn parse_since(text: &str) -> Result<crate::events::Cursor> {
+    use crate::events::Cursor;
+    let value = text.trim();
+    match value.to_ascii_lowercase().as_str() {
+        "start" | "all" => return Ok(Cursor::Start),
+        "now" | "live" => return Ok(Cursor::Now),
+        _ => {}
+    }
+
+    let (stream, number) = match value.rsplit_once(':') {
+        Some((name, number)) => {
+            let id = name.trim().parse::<uuid::Uuid>().map_err(|_| {
+                anyhow::anyhow!(
+                    "--since: `{name}` is not a stream name.\n\
+                     qex cannot then compare your number with this stream, and you would \
+                     lose events with no message.\n\
+                     Give the `stream_id` of the first line of the stream, as \
+                     `--since <stream_id>:<seq>`."
+                )
+            })?;
+            (Some(id), number)
+        }
+        None => (None, value),
+    };
+
+    match number.trim().parse::<u64>() {
+        Ok(seq) => Ok(Cursor::After { seq, stream }),
+        Err(_) => bail!(
+            "--since: qex cannot read `{text}`.\n\
+             The stream would then start at a place that you did not choose, and you \
+             would lose events or read events a second time.\n\
+             Use `start`, `now`, the `seq` number of the last event that you read, or \
+             `<stream_id>:<seq>`, which qex compares with this stream."
+        ),
+    }
+}
+
+/// Gives one line of text for one event, for a person to read.
+fn event_text(event: &crate::events::Event) -> String {
+    use crate::events::{Change, Event};
+    match event {
+        Event::Stream {
+            time,
+            version,
+            pid,
+            stream_id,
+            first_seq,
+            last_seq,
+            ..
+        } => format!(
+            "{}  the stream {stream_id} comes from the coordinator pid {pid}, version \
+             {version}; it holds the events {first_seq} to {last_seq}",
+            crate::sys::clock_text(*time)
+        ),
+        Event::Job {
+            seq,
+            time,
+            id,
+            name,
+            state,
+            change,
+            job,
+            ..
+        } => {
+            let note = match change {
+                Change::Reason => job.blocked_reason.clone().unwrap_or_default(),
+                Change::State => match (job.exit_code, &job.error) {
+                    (_, Some(text)) => text.clone(),
+                    (Some(code), _) if code != 0 => format!("the exit code is {code}"),
+                    _ => String::new(),
+                },
+            };
+            format!(
+                "{}  {seq:>6}  {}  {:<10}  {name}{}",
+                crate::sys::clock_text(*time),
+                &id.to_string()[..8],
+                state.as_str(),
+                if note.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {note}")
+                }
+            )
+        }
+        Event::Gap {
+            time,
+            missed,
+            reason,
+            ..
+        } => format!(
+            "{}  GAP: {}. {reason}",
+            crate::sys::clock_text(*time),
+            match missed {
+                Some(n) => format!("qex lost {n} event(s)"),
+                None => "qex cannot count the events that you lost".to_string(),
+            }
+        ),
+        Event::Bye { time, reason } => {
+            format!(
+                "{}  the stream ends. {reason}",
+                crate::sys::clock_text(*time)
+            )
+        }
+    }
+}
+
 /// Writes the state of the coordinator.
 ///
 /// The process id here comes from the coordinator itself. Use this command to

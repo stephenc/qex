@@ -193,13 +193,25 @@ pub fn run(coord: Arc<Coordinator>) {
 
         // Read the status file of each job that operates. The supervisors write
         // those files, so this is how the coordinator learns that a job started.
-        let changed = coord.state.lock().unwrap().refresh_active();
+        let changed = {
+            let mut state = coord.state.lock().unwrap();
+            let changed = state.refresh_active();
+            // The supervisors write the records, so this read is how the
+            // coordinator learns that a job started or stopped. Report each of
+            // those changes to the readers of the event stream.
+            state.publish_changes();
+            changed
+        };
 
         match step(&coord) {
             Ok(started) if started > 0 || changed => coord.notify(),
             Ok(_) => {}
             Err(e) => log(&format!("the scheduler failed: {e:#}")),
         }
+
+        // The step above can start a job, skip a job, or change the reason that
+        // a job waits. Report those changes as well.
+        coord.state.lock().unwrap().publish_changes();
 
         // Publish the claims of this coordinator, so the coordinators of the
         // other users see them.
@@ -362,6 +374,7 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
     if let Ok(dir) = paths::job_dir(&id) {
         job::write_status(&dir, &status).ok();
     }
+    state.publish_changes();
     log(&format!(
         "job {id} did not run, because a job that it needed did not succeed"
     ));
@@ -509,6 +522,11 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
         }
     }
 
+    // A job that waits keeps the state `queued`, so the reason is the only
+    // change. Report it: a reader of the stream that sees `queued` and no
+    // reason cannot learn what the job waits for.
+    state.publish_changes();
+
     chosen
 }
 
@@ -553,6 +571,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         let status = job.status.clone();
         let name = job.spec.name.clone();
         state.queue.retain(|q| *q != id);
+        state.publish_changes();
         (forced, name, status)
     };
 
@@ -568,6 +587,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             job.status.finished_at = Some(sys::now_secs());
             job.status.error = Some(format!("qex could not write the job record: {e:#}"));
         }
+        state.publish_changes();
         drop(state);
         coord.notify();
         log(&format!("job {id} could not start: {e:#}"));
@@ -630,6 +650,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
                 job.status.finished_at = Some(sys::now_secs());
                 job.status.error = Some(format!("qex could not start the job: {e:#}"));
                 let status = job.status.clone();
+                state.publish_changes();
                 drop(state);
                 if let Ok(dir) = paths::job_dir(&id) {
                     job::write_status(&dir, &status).ok();

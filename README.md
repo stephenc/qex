@@ -95,6 +95,13 @@ Put `qex run -- make test` in front of a command instead when you wait for it
 now: the output arrives as it happens, and the exit code is the exit code of the
 job.
 
+Driving many jobs at one time? Read one stream in place of a loop that asks
+about each job:
+
+```sh
+qex events --json     # one JSON object on one line for each change of state
+```
+
 A pipeline gives each stage its own log, its own exit code and its own claim:
 
 ```sh
@@ -162,7 +169,8 @@ The full documentation is at
 | [Security](docs/security.md) | What qex writes, and who can read it. |
 
 Every page is also in the binary, so an agent needs no network: `qex help
-agents`, `qex help resources`, `qex help config`, `qex schema status`.
+agents`, `qex help resources`, `qex help config`, `qex help events`,
+`qex schema status`.
 
 ## A skill for your agent
 
