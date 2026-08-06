@@ -378,7 +378,11 @@ pub struct LogsArgs {
     ///
     /// Use this option when a notification did not arrive. See `[hooks]` in
     /// `qex help config`.
-    #[arg(long, conflicts_with = "follow")]
+    ///
+    /// This file is not a stream of the job, so `--stdout` and `--stderr` have
+    /// no meaning with it. An option that qex ignores in silence gives the
+    /// reader an answer to a question that the reader did not ask.
+    #[arg(long, conflicts_with_all = ["follow", "stdout", "stderr"])]
     pub hook: bool,
 
     #[command(flatten)]

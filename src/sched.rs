@@ -388,7 +388,6 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
 
 /// Marks a job as skipped, because a job that it needed did not succeed.
 fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: uuid::Uuid) {
-    let cfg = state.cfg.clone();
     let Some(job) = state.jobs.get_mut(&id) else {
         return;
     };
@@ -404,7 +403,7 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
         job::write_status(&dir, &status).ok();
         // This code holds the lock of the queue, so the hook runs in a thread
         // of its own. A hook that hangs must never hold the queue.
-        crate::hook::fire_detached(&cfg, &dir, &status);
+        crate::hook::fire_detached(&dir, &status);
     }
     log(&format!(
         "job {id} did not run, because a job that it needed did not succeed"
@@ -670,7 +669,6 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         }
         Err(e) => {
             let mut state = coord.state.lock().unwrap();
-            let cfg = state.cfg.clone();
             if let Some(job) = state.jobs.get_mut(&id) {
                 job.status.state = JobState::Failed;
                 job.status.finished_at = Some(sys::now_secs());
@@ -681,7 +679,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
                     job::write_status(&dir, &status).ok();
                     // This job has no supervisor, so the coordinator tells the
                     // person that it stopped.
-                    crate::hook::fire_detached(&cfg, &dir, &status);
+                    crate::hook::fire_detached(&dir, &status);
                 }
             }
             coord.notify();

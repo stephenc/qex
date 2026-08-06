@@ -884,8 +884,13 @@ qex gives these guarantees:
   starts before the hook does anything.
 - **A hook has a time limit and a size limit.** A hook that uses more than
   `[hooks] timeout` receives TERM and then KILL, in a process group of its own.
-  A hook that writes more than 1MB stops in the same way, and qex cuts the file
-  to that size.
+  qex stops a hook that goes above 1MB of output while it runs, and it cuts the
+  log of each hook to that size. A hook that writes 20MB and stops at once thus
+  also leaves 1MB.
+- **A change to `[hooks]` acts on the next job that stops.** qex reads the
+  config file at each job, and not one time at the start. A hook that you delete
+  runs no more, and a hook that you add runs at once. You do not restart the
+  coordinator.
 - **A hook that fails does not change the job.**
 
 The output of the hook goes to `hook.log` in the directory of the job. Read it

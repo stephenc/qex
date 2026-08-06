@@ -603,7 +603,7 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                 ));
                 // This coordinator made the job terminal, so this coordinator
                 // tells the person. The supervisor is gone and cannot.
-                crate::hook::fire_detached(&state.cfg, &path, &status);
+                crate::hook::fire_detached(&path, &status);
             }
         }
 
@@ -896,7 +896,6 @@ fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
 fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     let mut state = coord.state.lock().unwrap();
 
-    let cfg = state.cfg.clone();
     let Some(job) = state.jobs.get_mut(&id) else {
         return no_such_job(id);
     };
@@ -914,7 +913,7 @@ fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
                 job::write_status(&dir, &status).ok();
                 // A cancelled job is not in the default filter. A user who asks
                 // for `cancelled` gets it here.
-                crate::hook::fire_detached(&cfg, &dir, &status);
+                crate::hook::fire_detached(&dir, &status);
             }
             coord.notify();
             Response::Ok
