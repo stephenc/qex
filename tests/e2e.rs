@@ -11662,3 +11662,569 @@ fn a_job_that_the_config_parks_does_not_park_the_jobs_behind_it() {
         "the reason must say that the queue continues: {reason}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pools: GPUs, VRAM and counted locks
+// ---------------------------------------------------------------------------
+
+/// The config that these tests use.
+///
+/// THE MACHINE THAT RUNS THIS TEST HAS NO GPU. That is the point of the
+/// feature: a pool is a promise from the configuration, and not a probe of a
+/// driver, so every test below must pass with no card in the machine.
+fn pool_config(devices: &str, extra: &str) -> String {
+    format!(
+        "[budget]\ncpu = \"8\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [{devices}]\n\
+         env = \"CUDA_VISIBLE_DEVICES\"\n{extra}"
+    )
+}
+
+/// A machine with no GPU must schedule a GPU claim from the configuration, and
+/// it must give the job the index and the environment variable.
+///
+/// Without this, qex would need a driver library to schedule a promise, and a
+/// build machine could not run the test at all.
+#[test]
+fn a_machine_with_no_gpu_schedules_a_gpu_claim_from_the_configuration() {
+    let h = Harness::new("gpupromise", &pool_config("\"24GB\", \"24GB\"", ""));
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--gpu",
+        "1",
+        "--",
+        "sh",
+        "-c",
+        "echo cuda=$CUDA_VISIBLE_DEVICES; echo qex=$QEX_GPU_DEVICES; echo vram=$QEX_GPU_VRAM",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&id), "completed");
+
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert!(
+        out.contains("cuda=0"),
+        "the pool must write its variable: {out}"
+    );
+    assert!(
+        out.contains("qex=0"),
+        "every indexed pool gets QEX_..._DEVICES: {out}"
+    );
+    assert!(
+        out.contains(&format!("vram={}", 24u64 << 30)),
+        "a whole device gives its capacity: {out}"
+    );
+
+    // The record holds the same answer, and the record stays after the job.
+    let status = h.status_json(&id);
+    assert_eq!(status["assigned"]["gpu"]["devices"][0], 0);
+    assert_eq!(status["assigned"]["gpu"]["units"], 1);
+}
+
+/// Two jobs that claim one GPU each must operate together on a pool of two,
+/// and they must get DIFFERENT devices. A third job must wait.
+///
+/// A fault here gives two jobs one card, and both jobs then meet a memory
+/// error on the device that qex said was free.
+#[test]
+fn two_gpu_jobs_get_different_devices_and_a_third_waits() {
+    let h = Harness::new("gpushare", &pool_config("\"24GB\", \"24GB\"", ""));
+
+    let ids: Vec<String> = (0..3)
+        .map(|i| {
+            h.submit(&[
+                "submit",
+                "--cpu",
+                "1",
+                "--mem",
+                "64MB",
+                "--gpu",
+                "1",
+                "--name",
+                &format!("g{i}"),
+                "--",
+                "sleep",
+                "60",
+            ])
+        })
+        .collect();
+
+    h.until("two GPU jobs operate", Duration::from_secs(45), || {
+        ids.iter().filter(|id| h.state_of(id) == "running").count() == 2
+    });
+
+    let running: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| h.status_json(id))
+        .filter(|s| s["state"] == "running")
+        .collect();
+    let mut devices: Vec<i64> = running
+        .iter()
+        .map(|s| s["assigned"]["gpu"]["devices"][0].as_i64().unwrap())
+        .collect();
+    devices.sort_unstable();
+    assert_eq!(
+        devices,
+        vec![0, 1],
+        "two jobs must hold two different devices"
+    );
+
+    // The third job waits, and its reason names the pool.
+    let waiting = ids
+        .iter()
+        .find(|id| h.state_of(id) == "queued")
+        .expect("one job must wait");
+    let reason = h.status_json(waiting)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("gpu"),
+        "the reason must name the pool: {reason}"
+    );
+
+    for id in &ids {
+        h.qex(&["kill", id, "--grace", "1s"]);
+    }
+}
+
+/// qex must never add the memory of the devices together.
+///
+/// Four devices of 24GB are not 96GB for one job. An arithmetic that says they
+/// are admits a job that cannot run, and the job then fails on the card with a
+/// message that names no cause.
+#[test]
+fn a_vram_claim_above_the_largest_device_is_refused_at_the_submission() {
+    let h = Harness::new(
+        "vramsum",
+        &pool_config("\"24GB\", \"24GB\", \"24GB\", \"24GB\"", ""),
+    );
+
+    let out = h.qex(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--gpu", "2", "--vram", "40GB", "--", "true",
+    ]);
+    assert!(!out.status.success(), "qex must refuse this job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("never start"),
+        "the message must say that the job can never start: {err}"
+    );
+    assert!(
+        err.contains("24GB"),
+        "the message must name the largest device: {err}"
+    );
+
+    // No record must exist. A refusal at the submission gives no job id.
+    assert!(
+        h.list_json().is_empty(),
+        "a refused job must leave no record"
+    );
+}
+
+/// A claim above the pool total is a refusal, whatever `[queue] oversized`
+/// says. An empty machine does not make a fifth device, so `run-when-idle`
+/// cannot help this job.
+#[test]
+fn a_gpu_claim_above_the_pool_total_is_refused_whatever_the_oversized_policy() {
+    let h = Harness::new(
+        "gputoobig",
+        &pool_config(
+            "\"24GB\", \"24GB\"",
+            "[queue]\noversized = \"run-when-idle\"\n",
+        ),
+    );
+
+    let out = h.qex(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--gpu", "8", "--", "true",
+    ]);
+    assert!(!out.status.success(), "qex must refuse this job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("never start"), "got: {err}");
+}
+
+/// The assignment must survive a coordinator that stops and starts while the
+/// job still operates.
+///
+/// The assignment is in `status.json`, which the supervisor carries forward. A
+/// new coordinator reads it and rebuilds the occupancy of the pool. Without
+/// this, the new coordinator gives the same device to a second job.
+#[test]
+fn a_gpu_assignment_survives_a_coordinator_that_stops_and_starts() {
+    let h = Harness::new("gpurecover", &pool_config("\"24GB\"", ""));
+
+    let long = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--gpu", "1", "--", "sleep", "60",
+    ]);
+    h.until("the GPU job operates", Duration::from_secs(45), || {
+        h.state_of(&long) == "running"
+    });
+    let device = h.status_json(&long)["assigned"]["gpu"]["devices"][0]
+        .as_i64()
+        .unwrap();
+
+    // Take the pid from the coordinator itself. A search of the process list
+    // also matches the command that holds the letters `qex`.
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator stops", Duration::from_secs(20), || {
+        (unsafe { libc::kill(pid, 0) }) != 0
+    });
+
+    // The next command starts a new coordinator. It reads the records, so the
+    // job still holds its device and a second job must wait.
+    let second = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--gpu", "1", "--", "true",
+    ]);
+    assert_ne!(h.coordinator_pid(), pid, "a new coordinator must operate");
+
+    assert_eq!(
+        h.status_json(&long)["assigned"]["gpu"]["devices"][0]
+            .as_i64()
+            .unwrap(),
+        device,
+        "the assignment must not change when a coordinator restarts"
+    );
+
+    // Give the new coordinator time to test the queue, then read the state.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        h.state_of(&second),
+        "queued",
+        "the only device is in use, so the second job must wait"
+    );
+
+    h.qex(&["kill", &long, "--grace", "1s"]);
+}
+
+/// `--lock NAME` must behave exactly as before: no configuration, and two jobs
+/// with one name never operate together.
+#[test]
+fn a_lock_needs_no_configuration_and_still_excludes() {
+    let h = Harness::new(
+        "lockstill",
+        "[budget]\ncpu = \"8\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let first = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--lock", "target", "--", "sleep", "60",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&first) == "running"
+    });
+
+    let second = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--lock", "target", "--", "true",
+    ]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        h.state_of(&second),
+        "queued",
+        "two jobs with one lock name must never operate together"
+    );
+    let reason = h.status_json(&second)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(reason.contains("lock `target`"), "got: {reason}");
+
+    // A lock does not park the queue. A job with no lock must pass it.
+    let free = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &free, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&free), "completed");
+
+    h.qex(&["kill", &first, "--grace", "1s"]);
+    h.ok(&["wait", &second, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&second), "completed");
+}
+
+/// A counted lock gives "at most N jobs that use this thing".
+#[test]
+fn a_counted_pool_lets_n_jobs_operate_and_makes_the_next_one_wait() {
+    let h = Harness::new(
+        "netpool",
+        "[budget]\ncpu = \"8\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [[pool]]\nname = \"net\"\ncount = 2\n",
+    );
+
+    let ids: Vec<String> = (0..3)
+        .map(|_| {
+            h.submit(&[
+                "submit", "--cpu", "1", "--mem", "64MB", "--claim", "net=1", "--", "sleep", "60",
+            ])
+        })
+        .collect();
+
+    h.until(
+        "two jobs of the pool operate",
+        Duration::from_secs(45),
+        || ids.iter().filter(|id| h.state_of(id) == "running").count() == 2,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        ids.iter().filter(|id| h.state_of(id) == "running").count(),
+        2,
+        "a pool of 2 must never hold 3 jobs"
+    );
+
+    for id in &ids {
+        h.qex(&["kill", id, "--grace", "1s"]);
+    }
+}
+
+/// A pool name that the configuration does not declare is a lock of one unit,
+/// and more than one unit of it is a fault that qex must name.
+#[test]
+fn an_undeclared_pool_is_a_lock_and_two_units_of_it_are_refused() {
+    let h = Harness::with_default_config("undeclared");
+
+    let one = h.submit(&["submit", "--claim", "thing=1", "--", "true"]);
+    h.ok(&["wait", &one, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&one), "completed");
+
+    let out = h.qex(&["submit", "--claim", "thing=2", "--", "true"]);
+    assert!(
+        !out.status.success(),
+        "qex must refuse 2 of an undeclared pool"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("lock of size 1"), "got: {err}");
+    assert!(
+        err.contains("[[pool]]"),
+        "the message must give the remedy: {err}"
+    );
+}
+
+/// A pool with no devices must also reach the job, through `QEX_CLAIM_<NAME>`.
+///
+/// A counted claim that the job cannot see is half a feature: a downloader that
+/// claims one of four network slots has no way to size its own parallelism.
+#[test]
+fn a_pool_with_no_devices_gives_the_job_its_count() {
+    let h = Harness::new(
+        "netenv",
+        "[budget]\ncpu = \"8\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [[pool]]\nname = \"net\"\ncount = 4\n",
+    );
+
+    // The pre-condition: a job with no claim gets no such variable.
+    let plain = h.submit(&["submit", "--", "sh", "-c", "echo net=[$QEX_CLAIM_NET]"]);
+    h.ok(&["wait", &plain, "--timeout", "45s"]);
+    assert!(
+        h.ok(&["logs", &plain, "--stdout"]).contains("net=[]"),
+        "a job with no claim must get no variable"
+    );
+
+    let id = h.submit(&[
+        "submit",
+        "--claim",
+        "net=2",
+        "--",
+        "sh",
+        "-c",
+        "echo net=[$QEX_CLAIM_NET]",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    assert_eq!(h.state_of(&id), "completed");
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert!(
+        out.contains("net=[2]"),
+        "a counted claim must reach the job: {out}"
+    );
+}
+
+/// A REFUSED CLAIM MUST NOT KEEP THE DEDUPE KEY.
+///
+/// `qex submit --dedupe-key K --gpu 8` against a pool of 2 is refused. If that
+/// refusal left the key in the coordinator, every later submission with the
+/// same key would give the id of a job that does not exist, and no job would
+/// ever free the key. A script that retries would then never run again.
+#[test]
+fn a_pool_claim_that_is_refused_gives_the_dedupe_key_back() {
+    let h = Harness::new("pooldedupe", &pool_config("\"24GB\", \"24GB\"", ""));
+
+    let out = h.qex(&[
+        "submit",
+        "--dedupe-key",
+        "poolkey",
+        "--gpu",
+        "8",
+        "--",
+        "true",
+    ]);
+    assert!(
+        !out.status.success(),
+        "a claim of 8 of a pool of 2 must be refused"
+    );
+
+    // The key must be free. This submission must START A JOB, and not give the
+    // id of the job that qex refused.
+    let id = h.submit(&["submit", "--dedupe-key", "poolkey", "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    assert_eq!(
+        h.state_of(&id),
+        "completed",
+        "the key of a refused job must be free"
+    );
+}
+
+/// A job that claims a GPU must not also set the variable that qex writes.
+/// The two values would disagree, and the job would then use a card that qex
+/// gave to a different job.
+#[test]
+fn a_job_that_sets_the_device_variable_itself_is_refused() {
+    let h = Harness::new("cudaconflict", &pool_config("\"24GB\"", ""));
+    let out = h.qex(&[
+        "submit",
+        "--gpu",
+        "1",
+        "--env",
+        "CUDA_VISIBLE_DEVICES=0",
+        "--",
+        "true",
+    ]);
+    assert!(!out.status.success(), "qex must refuse this job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("would disagree"), "got: {err}");
+}
+
+/// TWO USERS MUST NOT BOTH GET THE DEVICE 0.
+///
+/// This is the one test that runs TWO coordinators over ONE pool, and it is the
+/// only test of the whole cross-user path: `Held::device_indices` collects the
+/// indices this coordinator gave away, `peers::publish` writes them, the other
+/// coordinator reads them in `peers::claims`, and `free_devices` then leaves
+/// those devices alone.
+///
+/// Every other pool test sets `[peers] enabled = false`, and the `peers` unit
+/// test gives `publish` a device list that the test itself wrote. Neither one
+/// reaches `device_indices`, so its body could be replaced with an empty map
+/// and nothing failed. The two users then each start a job on the device 0, and
+/// both meet a memory error on a card that qex said was free.
+///
+/// The pool has ONE device, so the answer is not ambiguous: the second user has
+/// no other card to take.
+#[test]
+fn two_users_do_not_both_get_the_one_device() {
+    let dir = shared_peer_dir("gpu-share");
+    let config = format!(
+        "[budget]\ncpu = \"8\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = true\ndir = \"{}\"\nstale_after = \"1h\"\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\"]\n\
+         env = \"CUDA_VISIBLE_DEVICES\"\n",
+        dir.display()
+    );
+    let other = Harness::new("gpupeerb", &config);
+    let mine = Harness::new("gpupeera", &config);
+
+    // The other user takes the one device.
+    let held = other.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--gpu", "1", "--", "sleep", "300",
+    ]);
+    other.until(
+        "the other user's GPU job starts",
+        Duration::from_secs(45),
+        || other.state_of(&held) == "running",
+    );
+    assert_eq!(
+        other.status_json(&held)["assigned"]["gpu"]["devices"][0],
+        0,
+        "the other user must hold the device 0"
+    );
+
+    // THE PRE-CONDITION. This user's own queue is empty and the whole budget is
+    // free, so nothing except the other user can hold this job back.
+    let info: serde_json::Value = serde_json::from_str(&mine.ok(&["info", "--json"])).unwrap();
+    assert_eq!(info["jobs_running"], 0, "my queue must be empty: {info}");
+
+    let want = mine.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--gpu", "1", "--", "true",
+    ]);
+    mine.until(
+        "the GPU job names the other user",
+        Duration::from_secs(45),
+        || blocked_reason(&mine, &want).contains("another user holds the pool"),
+    );
+
+    // THE STATE CHANGED, and it changed in the one way that matters: the job
+    // did NOT start, and it did not receive the device that the other user
+    // holds.
+    assert_eq!(mine.state_of(&want), "queued");
+    assert!(
+        mine.status_json(&want)["assigned"]["gpu"].is_null(),
+        "a job that waits has received no device: {}",
+        mine.status_json(&want)
+    );
+    let reason = blocked_reason(&mine, &want);
+    assert!(
+        reason.contains("`gpu`") && reason.contains("no known end"),
+        "the reason must name the pool and say that qex cannot schedule the end: {reason}"
+    );
+    assert!(
+        !reason.contains("front of the queue"),
+        "a wait on another user must not read as a queue position: {reason}"
+    );
+
+    // A `Peer` keeps no capacity, so a job behind this one still starts. A
+    // reservation here would hold the machine empty for as long as the other
+    // user runs.
+    let behind = mine.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    mine.until(
+        "a job behind the GPU job still starts",
+        Duration::from_secs(45),
+        || mine.state_of(&behind) == "completed",
+    );
+
+    // `qex info` must say the same thing, and it must mark the device.
+    let info: serde_json::Value = serde_json::from_str(&mine.ok(&["info", "--json"])).unwrap();
+    assert_eq!(info["queue_state"], "waits-for-peer", "info: {info}");
+    assert_eq!(
+        info["pools"][0]["devices"][0]["peer"], true,
+        "qex info must mark the device that another user holds: {info}"
+    );
+
+    // The other user gives the device back, and this job then gets it.
+    other.ok(&["kill", &held, "--grace", "1s"]);
+    mine.until("the device comes free", Duration::from_secs(60), || {
+        mine.state_of(&want) == "completed"
+    });
+    assert_eq!(
+        mine.status_json(&want)["assigned"]["gpu"]["devices"][0],
+        0,
+        "the one device must go to this user once the other user stops"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `qex info` must report the pools, and a coordinator that cannot answer must
+/// give `null` and never `0`. A defaulted number would read as "no other user
+/// holds anything", which can be a lie.
+#[test]
+fn info_reports_the_pools_and_their_devices() {
+    let h = Harness::new("poolinfo", &pool_config("\"24GB\", \"16GB\"", ""));
+    let text = h.ok(&["info", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let pools = v["pools"].as_array().expect("info must report the pools");
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0]["name"], "gpu");
+    assert_eq!(pools[0]["total"], 2);
+    assert_eq!(pools[0]["devices"][1]["capacity"], 16u64 << 30);
+
+    let human = h.ok(&["info"]);
+    assert!(human.contains("pool gpu"), "got: {human}");
+}

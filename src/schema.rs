@@ -82,6 +82,36 @@ pub const JOB: &str = r##"{
           "type": "string",
           "description": "The memory. Give a size, or a word: \"half\" and \"guess\" give one half of the budget, and \"full\" and \"max\" give the full budget. One unit step is 1024. The default is the machine memory divided by the core count.",
           "examples": ["8GB", "512MB", "guess", "full"]
+        },
+        "gpu": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The number of devices from the pool `gpu`. The devices come from [[pool]] in ~/.config/qex.toml. qex says WHICH index the job gets and writes it into the environment of the job. qex reads no driver, so this field operates on a machine with no CUDA library.",
+          "examples": [1, 2]
+        },
+        "vram": {
+          "type": "string",
+          "description": "The quantity on EACH device that this job gets. qex does NOT add the memory of the devices together: a job that needs 40GB on one device cannot run on two devices of 24GB. With no value, the job takes the whole of each device that it gets.",
+          "examples": ["20GB"]
+        },
+        "claims": {
+          "type": "object",
+          "description": "The claims on the other pools. The key is the pool name. Give a number, or a table with a count and a size for a quantity on each device. A name that the configuration does not declare is a lock of one unit.",
+          "additionalProperties": {
+            "anyOf": [
+              { "type": "integer", "minimum": 1 },
+              {
+                "type": "object",
+                "required": ["count"],
+                "additionalProperties": false,
+                "properties": {
+                  "count": { "type": "integer", "minimum": 1 },
+                  "size": { "type": "string" }
+                }
+              }
+            ]
+          },
+          "examples": [{ "net": 1 }]
         }
       }
     },
@@ -180,7 +210,26 @@ pub const PIPELINE: &str = r##"{
                   { "type": "string", "enum": ["half", "guess", "auto", "full", "max", "all"] }
                 ]
               },
-              "mem": { "type": "string" }
+              "mem": { "type": "string" },
+              "gpu": { "type": "integer", "minimum": 1 },
+              "vram": { "type": "string" },
+              "claims": {
+                "type": "object",
+                "additionalProperties": {
+                  "anyOf": [
+                    { "type": "integer", "minimum": 1 },
+                    {
+                      "type": "object",
+                      "required": ["count"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "count": { "type": "integer", "minimum": 1 },
+                        "size": { "type": "string" }
+                      }
+                    }
+                  ]
+                }
+              }
             }
           },
           "env": {
@@ -246,6 +295,38 @@ pub const STATUS: &str = r##"{
     "oom_raises": {
       "type": "integer",
       "description": "The number of times that qex raised the memory claim of this job, because the kernel stopped an attempt at the memory limit that qex applied. This count is separate from retries_left. qex raises the claim only when it applied the limit itself, with [enforce] mode; with no limit it reports the state oom and starts no new attempt. See [retry] on_oom in the config file."
+    },
+    "locks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The locks that the job holds while it operates. Two jobs with one lock name never operate together."
+    },
+    "claims": {
+      "type": "object",
+      "description": "The counted claims of the job. The key is the pool name. This is the REQUEST. Read `assigned` for what qex gave.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "count": { "type": "integer", "description": "The number of units, or of devices." },
+          "size": { "type": ["integer", "null"], "description": "The quantity in bytes on EACH device. null means the whole of each device. qex never adds the capacity of the devices together." }
+        }
+      }
+    },
+    "assigned": {
+      "type": "object",
+      "description": "The units and the devices that qex GAVE this job. The key is the pool name. The coordinator writes this value when the job starts, and it stays after the job stops. The environment of the job holds the same indices, and the environment goes away with the job while this record stays.",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "units": { "type": "integer", "description": "The number of units, or of devices." },
+          "devices": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "description": "The device indices, for an indexed pool. The list is empty for a pool that has no devices."
+          },
+          "size": { "type": ["integer", "null"], "description": "The quantity in bytes on EACH device. null means the whole of each device." }
+        }
+      }
     },
     "usage": {
       "type": "object",

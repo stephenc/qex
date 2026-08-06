@@ -74,6 +74,9 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         dedupe_window: args.dedupe_window,
         // An ordinary job measures against its own command.
         learn_key: None,
+        gpu: args.gpu,
+        vram: args.vram,
+        claims: args.claims,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -258,6 +261,11 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
         after: args.after,
         locks: args.locks,
         retries: args.retries,
+        // Every job of the fan-out gets the same claim on the pools. A pool is
+        // a claim in the same way as the cores and the memory are.
+        gpu: args.gpu,
+        vram: args.vram,
+        claims: args.claims,
         nice: args.nice,
         no_limit_env_hints: args.no_limit_env_hints,
         // A fan-out refuses these options above, so no job of it holds a key.
@@ -954,6 +962,40 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     // then see which key gave it, and it does not read the job file again.
     if let Some(key) = &s.dedupe_key {
         println!("dedupe:    {key}");
+    }
+    if !s.claims.is_empty() {
+        println!(
+            "claims:    {}",
+            s.claims
+                .iter()
+                .map(|(name, c)| match c.size {
+                    Some(size) => format!("{name} {} ({} each)", c.count, format_size(size)),
+                    None => format!("{name} {}", c.count),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    // Show the devices that the job received. The environment of a job goes
+    // away with the job. This record stays, and it is what an agent reads
+    // AFTERWARDS to explain a failure.
+    for (name, given) in &s.assigned {
+        if given.devices.is_empty() {
+            continue;
+        }
+        let each = match given.size {
+            Some(size) => format!(" ({} each)", format_size(size)),
+            None => " (the whole of each device)".to_string(),
+        };
+        println!(
+            "devices:   {name} {}{each}",
+            given
+                .devices
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
     if !s.needs.is_empty() {
         println!(
@@ -3007,6 +3049,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             paused_until,
             paused_locks,
             health,
+            pools,
         } => {
             let now = crate::sys::now_secs();
             if args.json {
@@ -3042,6 +3085,9 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "head_job": health.as_ref().and_then(|h| h.head_job.clone()),
                         "head_blocker": health.as_ref().and_then(|h| h.head_blocker.clone()),
                         "head_passed_by": health.as_ref().and_then(|h| h.head_passed_by),
+                        // `null` says that this coordinator cannot answer. It
+                        // does not say that the machine has no pool.
+                        "pools": pools,
                     }))?
                 );
                 return Ok(0);
@@ -3142,6 +3188,43 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                     "                 {}",
                     crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
                 );
+            }
+            match pools {
+                // Say `unknown`, and never `none`. An earlier coordinator
+                // cannot answer this question, and "this machine has no pool"
+                // is a different statement.
+                None => println!(
+                    "pools:           unknown; this coordinator is version {version} and it \
+                     does not report the pools"
+                ),
+                Some(list) if list.is_empty() => {}
+                Some(list) => {
+                    for p in list {
+                        let peers = if p.peer_used > 0 {
+                            format!(", {} held by other users", p.peer_used)
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "pool {:<11} {} of {} in use{peers}",
+                            format!("{}:", p.name),
+                            p.used,
+                            p.total
+                        );
+                        for d in &p.devices {
+                            let who = if d.peer {
+                                "held by another user".to_string()
+                            } else {
+                                format!(
+                                    "{} of {} in use",
+                                    format_size(d.used),
+                                    format_size(d.capacity)
+                                )
+                            };
+                            println!("  {} {}: {who}", p.name, d.index);
+                        }
+                    }
+                }
             }
             Ok(0)
         }
@@ -3923,6 +4006,9 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         dedupe_window: args.submit.dedupe_window,
         // An ordinary job measures against its own command.
         learn_key: None,
+        gpu: args.submit.gpu,
+        vram: args.submit.vram,
+        claims: args.submit.claims,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -4723,6 +4809,8 @@ mod tests {
             needs: vec![],
             after: vec![],
             locks: vec![],
+            claims: Default::default(),
+            assigned: Default::default(),
             attempts: 1,
             retries_left: 0,
             oom_raises: 0,

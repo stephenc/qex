@@ -9,13 +9,14 @@
 //! out-of-memory error. That result is data for the agent. A job that waits for
 //! ever gives no data.
 
-use crate::config::{Config, OversizedPolicy};
+use crate::config::{Config, OversizedPolicy, Pool};
 use crate::daemon::{log, Coordinator};
-use crate::job::{self, JobState};
+use crate::job::{self, Assignment, JobState};
 use crate::paths;
-use crate::spec::JobSpec;
+use crate::spec::{JobSpec, PoolClaim};
 use crate::sys;
 use crate::units::format_size;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,159 @@ pub enum Size {
     Fits,
     /// The job is larger than the full budget. It can never fit.
     TooBig(String),
+}
+
+/// The claims of one job on the pools, with each lock as a pool of one unit.
+///
+/// The conversion happens HERE, in the coordinator, and never on the wire. A
+/// lock stays in `JobSpec::locks`, and a claim stays in `JobSpec::claims`, so a
+/// coordinator of an earlier version reads a lock in the field that it knows.
+pub fn effective_claims(spec: &JobSpec) -> BTreeMap<String, PoolClaim> {
+    let mut all = spec.claims.clone();
+    for name in &spec.locks {
+        all.entry(name.clone()).or_insert(PoolClaim {
+            count: 1,
+            size: None,
+        });
+    }
+    all
+}
+
+/// Gives the pool with one name, or the pool of one unit that a lock uses.
+fn pool_of(pools: &[Pool], name: &str) -> Pool {
+    pools
+        .iter()
+        .find(|p| p.name == name)
+        .cloned()
+        .unwrap_or_else(|| Pool::implicit(name))
+}
+
+/// Tests if a claim is a LOCK, and not a count.
+///
+/// A lock takes all of its pool or nothing. There is no part of the pool to
+/// keep for a job that waits, so such a job never becomes the head and never
+/// parks the queue behind it. One long build with a lock must not stop the
+/// whole machine.
+///
+/// # The rule is "the configuration does not declare this name", and nothing
+/// else
+///
+/// An earlier version of this function read the pool SIZE: a pool of one unit
+/// was a lock. That rule has a hole, and the hole gives two jobs one card.
+/// `lock_conflict` reads the jobs of THIS queue only, because a lock has always
+/// been a name inside one queue. A DECLARED pool is a real piece of hardware
+/// that the other users of the machine share, and `pool_wait` is the one place
+/// that reads what those users hold. A declared pool of one device would thus
+/// go through the lock path, meet no peer test, and start on the card that
+/// another user's job already holds.
+///
+/// So: a declared pool is ALWAYS counted, whatever its size, and it is
+/// peer-aware. A name that the configuration does not declare is a lock of one
+/// unit, and it keeps every behaviour that `--lock` had. `pool_check` refuses
+/// more than one unit of an undeclared name, so such a claim is always the
+/// whole of its pool.
+fn is_a_lock(pools: &[Pool], name: &str) -> bool {
+    !pools.iter().any(|p| p.name == name)
+}
+
+/// Tests the claims of one job against the configuration.
+///
+/// # Why this is not part of [`size_check`]
+///
+/// `size_check` answers "does this job fit the budget", and the answer for a
+/// job that does not fit is `TooBig`: such a job can still run alone on a quiet
+/// machine, and that result is data for the agent. A fault that THIS function
+/// finds can never become correct on this machine. An empty machine does not
+/// make a fifth device, so the job waits for a change that no scheduler can
+/// make. qex therefore refuses it at the submission, whatever `[queue]
+/// oversized` says, and the message gives the correction.
+pub fn pool_check(cfg: &Config, spec: &JobSpec) -> Result<(), String> {
+    let pools = cfg.pools().map_err(|e| e.to_string())?;
+    let claims = effective_claims(spec);
+
+    for (name, claim) in &claims {
+        let declared = pools.iter().find(|p| p.name == *name);
+
+        if claim.count == 0 {
+            // The only path to this state is `--vram` with no `--gpu`.
+            let quantity = declared
+                .and_then(|p| p.size_name.clone())
+                .unwrap_or_else(|| "VRAM".to_string());
+            return Err(format!(
+                "this job claims {} of {quantity} and claims no device. {quantity} is a quantity \
+                 on each device, so a job must also claim a device. Add `--gpu 1`.",
+                format_size(claim.size.unwrap_or(0)),
+            ));
+        }
+
+        let Some(pool) = declared else {
+            // A name that the configuration does not declare is a lock, and a
+            // lock needs no configuration. That rule holds for one unit only:
+            // qex cannot invent a second unit of something that nobody
+            // declared.
+            //
+            // The name `gpu` is the one exception, because `--gpu` promises a
+            // device index and an environment variable. A silent lock would
+            // give the job neither, and the job would then use a card that qex
+            // is not accounting for.
+            if name == crate::config::GPU_POOL {
+                return Err(format!(
+                    "there is no pool `{name}` in the configuration, so qex cannot give this \
+                     job a GPU. Add a pool to ~/.config/qex.toml:\n\n\
+                     \x20   [[pool]]\n\
+                     \x20   name    = \"gpu\"\n\
+                     \x20   size    = \"vram\"\n\
+                     \x20   devices = [\"24GB\", \"24GB\"]\n\n\
+                     Then start the job again."
+                ));
+            }
+            if claim.count > 1 || claim.size.is_some() {
+                return Err(format!(
+                    "the job claims {} of `{name}`, and the configuration does not declare \
+                     that pool, so qex treats it as a lock of size 1. This job can never \
+                     start. Add the pool to ~/.config/qex.toml:\n\n\
+                     \x20   [[pool]]\n\
+                     \x20   name  = \"{name}\"\n\
+                     \x20   count = 4\n\n\
+                     Then start the job again.",
+                    claim.count
+                ));
+            }
+            continue;
+        };
+
+        if claim.size.is_some() && !pool.is_indexed() {
+            return Err(format!(
+                "the pool `{name}` has no devices, so it holds no size. This job can never \
+                 start. Give `--claim {name}=N` only."
+            ));
+        }
+        if claim.count > pool.total {
+            return Err(format!(
+                "the job claims {} of the pool `{name}` and the pool has {}. This job can \
+                 never start. Claim {} or fewer, or add the devices to `[[pool]]` in \
+                 ~/.config/qex.toml.",
+                claim.count, pool.total, pool.total
+            ));
+        }
+        if let Some(size) = claim.size {
+            // NEVER add the capacity of the devices together. Four devices of
+            // 24GB are not 96GB for one job, and an arithmetic that says they
+            // are admits a job that cannot run.
+            if size > pool.largest_device() {
+                return Err(format!(
+                    "the job claims {} of {} for each device, and the largest device of the \
+                     pool `{name}` has {}. qex does not add the memory of the devices \
+                     together, so this job can never start. Claim {} or less.",
+                    format_size(size),
+                    pool.size_name.clone().unwrap_or_else(|| "size".to_string()),
+                    format_size(pool.largest_device()),
+                    format_size(pool.largest_device())
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Tests one job against the full budget.
@@ -129,6 +283,73 @@ enum Admit {
     },
 }
 
+/// The resources that the jobs which operate now hold.
+///
+/// The cores and the memory are two numbers. A pool needs two more: the units
+/// of the pool, and — for a pool whose devices qex names — the quantity in use
+/// on EACH device. The capacity of the devices is never added together, so the
+/// second map cannot be derived from the first.
+#[derive(Debug, Clone, Default)]
+pub struct Held {
+    pub cpu: u64,
+    pub mem: u64,
+    /// The units of each pool. The key is the pool name.
+    pub pools: BTreeMap<String, u64>,
+    /// The quantity in use on each device. The keys are the pool name and the
+    /// device index.
+    pub devices: BTreeMap<String, BTreeMap<u32, u64>>,
+}
+
+impl Held {
+    /// Adds the claims of one job that operates.
+    pub fn add(&mut self, status: &crate::job::JobStatus, pools: &[Pool]) {
+        // The claim IN FORCE lives in the record, and not in the
+        // specification. See `size_check`.
+        self.cpu += status.cpu;
+        self.mem += status.mem;
+
+        for (name, given) in &status.assigned {
+            *self.pools.entry(name.clone()).or_insert(0) += given.units;
+            if given.devices.is_empty() {
+                continue;
+            }
+            let pool = pool_of(pools, name);
+            let per_device = self.devices.entry(name.clone()).or_default();
+            for index in &given.devices {
+                // A job with no size takes the whole device, so it holds the
+                // capacity of that device.
+                let capacity = pool.devices.get(*index as usize).copied().unwrap_or(0);
+                *per_device.entry(*index).or_insert(0) += given.size.unwrap_or(capacity);
+            }
+        }
+
+        // A record that an earlier version wrote holds `locks` and no
+        // `assigned`. Count those locks, or a coordinator that starts after an
+        // upgrade gives a lock that a live job already holds.
+        for name in &status.locks {
+            if !status.assigned.contains_key(name) {
+                *self.pools.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    /// Gives the units of each pool, for `peers::publish`.
+    pub fn pool_units(&self) -> BTreeMap<String, u64> {
+        self.pools.clone()
+    }
+
+    /// Gives the device indices of each pool, for `peers::publish`.
+    ///
+    /// Another user must see WHICH device this coordinator gave away, or two
+    /// users put two jobs on the device 0.
+    pub fn device_indices(&self) -> BTreeMap<String, Vec<u32>> {
+        self.devices
+            .iter()
+            .map(|(name, used)| (name.clone(), used.keys().copied().collect()))
+            .collect()
+    }
+}
+
 /// The measurements of the machine for one pass of the scheduler.
 ///
 /// The scheduler tests EVERY job that is ready in each pass, so each job gets a
@@ -187,13 +408,26 @@ fn sibling_wait(fact: String, resource: &str) -> Admit {
     }
 }
 
-/// Tests if a lock of this job is held by a job that operates.
+/// Tests if a claim of this job takes ALL of a pool that a job already holds.
 ///
 /// A resource claim cannot express this need. Two builds in one directory need
 /// the same quantity of memory as one build, and they still destroy each
 /// other's files. Two servers need one port, whatever their size.
-fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String> {
-    if spec.locks.is_empty() {
+///
+/// # Why a pool comes through here at all
+///
+/// `--lock NAME` IS a claim on a pool of one unit, and an undeclared name is a
+/// pool of one unit. A claim that takes the whole of such a pool is thus
+/// exactly a lock, and it must keep the behaviour of a lock: the job that waits
+/// for it never becomes the head, so it never keeps capacity and the queue
+/// continues behind it. One long build with a lock would otherwise stop the
+/// whole machine.
+///
+/// A claim that a pool can divide is NOT here. `pool_wait` tests those, in
+/// `admit`, where the job can become the head and collect capacity.
+fn lock_conflict(state: &crate::daemon::State, pools: &[Pool], spec: &JobSpec) -> Option<String> {
+    let claims = effective_claims(spec);
+    if claims.is_empty() {
         return None;
     }
 
@@ -209,12 +443,27 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
         }
     }
 
-    for job in state.jobs.values() {
-        if !job.status.state.is_active() {
+    for name in claims.keys() {
+        if !is_a_lock(pools, name) {
             continue;
         }
-        for name in &spec.locks {
-            if job.spec.locks.contains(name) {
+        for job in state.jobs.values() {
+            if !job.status.state.is_active() {
+                continue;
+            }
+            // Read the REQUEST, and not the assignment.
+            //
+            // `spec.locks` and `spec.claims` are what the job asked for, and
+            // they exist from the submission on. `status.assigned` holds no
+            // name that is not in one of those two — `assign` receives
+            // `effective_claims` of this same specification — so a test of it
+            // here would be a branch that no state can reach.
+            //
+            // `Held::add` is the other place, and it reads the OPPOSITE way:
+            // it needs the units and the devices that the coordinator GAVE, so
+            // it reads `status.assigned` and falls back to `status.locks` for a
+            // record that an earlier version wrote.
+            if job.spec.locks.contains(name) || job.spec.claims.contains_key(name) {
                 return Some(format!(
                     "waits for the lock `{name}`, which the job {} ({}) holds",
                     &job.status.id.to_string()[..8],
@@ -228,6 +477,215 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
     None
 }
 
+/// Gives the devices of one pool that can hold this claim now, best first.
+///
+/// The order is the most free capacity first, and then the lowest index. That
+/// order is deterministic, it repeats, and it spreads the work over the devices
+/// in place of filling one device.
+fn free_devices(
+    pool: &Pool,
+    claim: &PoolClaim,
+    held: &Held,
+    peers: &crate::peers::Claims,
+) -> Vec<(u32, u64)> {
+    let ours = held.devices.get(&pool.name);
+    let theirs: Option<&BTreeSet<u32>> = peers.devices.get(&pool.name);
+
+    let mut free: Vec<(u32, u64)> = pool
+        .devices
+        .iter()
+        .enumerate()
+        .filter_map(|(i, capacity)| {
+            let index = i as u32;
+            // A device that another user holds is not available. A peer
+            // publishes the index only, so qex keeps the WHOLE device: qex
+            // cannot see how much of that card the other user's job takes, and
+            // a guess that leaves room would put two jobs on one card.
+            if theirs.map(|t| t.contains(&index)).unwrap_or(false) {
+                return None;
+            }
+            let used = ours.and_then(|m| m.get(&index)).copied().unwrap_or(0);
+            let left = capacity.saturating_sub(used);
+            let needed = claim.size.unwrap_or(*capacity);
+            if left >= needed && needed > 0 {
+                Some((index, left))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    free.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    free
+}
+
+/// What a pool shortage is, and WHO holds the units.
+///
+/// The class decides whether the queue may keep capacity for the job. See
+/// [`Blocker`]. A shortage that the jobs of THIS queue cause has a known end,
+/// so the head may reserve. A shortage that another user causes has no known
+/// end that qex can measure, so the head must never reserve: qex cannot make
+/// the other user give the device back, and a reservation would hold the whole
+/// machine empty for a time that qex cannot name.
+struct PoolWait {
+    blocker: Blocker,
+    reason: String,
+    held_reason: Option<String>,
+}
+
+/// Tests the counted claims of one job against the pools.
+///
+/// A LOCK IS NOT HERE. `lock_conflict` tests every undeclared name in pass 1,
+/// with the behaviour that a lock has. See [`is_a_lock`].
+fn pool_wait(
+    pools: &[Pool],
+    claims: &BTreeMap<String, PoolClaim>,
+    held: &Held,
+    peers: &crate::peers::Claims,
+) -> Option<PoolWait> {
+    for (name, claim) in claims {
+        if is_a_lock(pools, name) {
+            continue;
+        }
+        let pool = pool_of(pools, name);
+
+        // Does another user hold ANY part of this pool?
+        //
+        // That question chooses the class, and the test is deliberately "any"
+        // and not "most". A wait that has a peer component has a part that qex
+        // cannot schedule, so its end is not one that qex can name, and a
+        // reservation would then hold the machine empty for an unknown time.
+        // `Peer` never reserves, so this is the direction that cannot park the
+        // queue. A wait that is entirely the work of this queue is `Sibling`.
+        let peer_units = peers.pools.get(name).copied().unwrap_or(0);
+        let peer_devices = peers.devices.get(name).map(|d| d.len()).unwrap_or(0);
+        let by_peer = peer_units > 0 || peer_devices > 0;
+
+        // `arithmetic` is the count and nothing else. Each class below gives it
+        // a lead of its own, because the two leads are different statements:
+        // the jobs of this queue release the pool, and another user may not.
+        let (short, arithmetic) = if pool.is_indexed() {
+            let free = free_devices(&pool, claim, held, peers).len() as u64;
+            let each = match claim.size {
+                Some(size) => format!(" with {} free each", format_size(size)),
+                None => " that is free in full".to_string(),
+            };
+            (
+                free < claim.count,
+                format!(
+                    "this job needs {} device(s){each}, the pool has {}, and {free} can hold this \
+                     job now.",
+                    claim.count, pool.total
+                ),
+            )
+        } else {
+            let ours = held.pools.get(name).copied().unwrap_or(0);
+            let free = pool.total.saturating_sub(ours).saturating_sub(peer_units);
+            (
+                claim.count > free,
+                format!(
+                    "this job needs {}, the pool has {}, and the jobs of this queue hold {ours}.",
+                    claim.count, pool.total
+                ),
+            )
+        };
+
+        if !short {
+            continue;
+        }
+
+        return Some(if by_peer {
+            PoolWait {
+                blocker: Blocker::Peer { count: peers.count },
+                reason: format!(
+                    "this job cannot fit while another user holds the pool `{name}`: \
+                     {arithmetic} {} part of it. qex does not control that user, so this wait has \
+                     no known end. qex starts the jobs behind this one while the pool is not \
+                     free. Read `qex info` for the pools of this machine.",
+                    other_users(peers.count)
+                ),
+                // A `Peer` never keeps capacity, so no reader sees this text.
+                held_reason: None,
+            }
+        } else {
+            PoolWait {
+                blocker: Blocker::Sibling,
+                reason: format!(
+                    "waits for the pool `{name}`: {arithmetic} Those jobs release the pool when \
+                     they stop. qex can start a job that does not need this pool before this one."
+                ),
+                held_reason: Some(format!(
+                    "waits for the pool `{name}`: {arithmetic} qex starts no other job before \
+                     this one. Read `qex list` to see the jobs that hold the pool."
+                )),
+            }
+        });
+    }
+    None
+}
+
+/// Gives the units and the devices of each pool to one job.
+///
+/// The choice is the device with the most free capacity first, and the lowest
+/// index for a tie. The result goes into `status.json`, so a job learns which
+/// device it received and a coordinator that starts again can count the pools.
+fn assign(
+    pools: &[Pool],
+    claims: &BTreeMap<String, PoolClaim>,
+    held: &Held,
+    peers: &crate::peers::Claims,
+) -> Result<BTreeMap<String, Assignment>, String> {
+    let mut out = BTreeMap::new();
+    for (name, claim) in claims {
+        let pool = pool_of(pools, name);
+        if !pool.is_indexed() {
+            out.insert(
+                name.clone(),
+                Assignment {
+                    units: claim.count,
+                    devices: Vec::new(),
+                    size: None,
+                },
+            );
+            continue;
+        }
+
+        let free = free_devices(&pool, claim, held, peers);
+        if (free.len() as u64) < claim.count {
+            return Err(format!(
+                "waits for the pool `{name}`: this job needs {} device(s), and {} can hold \
+                 it now",
+                claim.count,
+                free.len()
+            ));
+        }
+        let mut devices: Vec<u32> = free
+            .iter()
+            .take(claim.count as usize)
+            .map(|(index, _)| *index)
+            .collect();
+        // The choice used the free capacity. The RECORD uses the index order,
+        // so `CUDA_VISIBLE_DEVICES=2,3` reads in the way that a person expects
+        // and two equal assignments give one text.
+        devices.sort_unstable();
+        // Keep `None` for a claim that takes the whole of each device.
+        //
+        // A number here would be wrong. The devices of a pool can have
+        // different capacities, and any single number would leave a part of
+        // the largest device free — which would let qex put a second job on a
+        // card that the first job already owns in full.
+        out.insert(
+            name.clone(),
+            Assignment {
+                units: claim.count,
+                devices,
+                size: claim.size,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Tests if a job can start now.
 ///
 /// `cpu` and `mem` are the claim IN FORCE. See [`size_check`].
@@ -236,14 +694,16 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
 /// the whole pass. See [`Machine`].
 fn admit(
     cfg: &Config,
+    pools: &[Pool],
+    claims: &BTreeMap<String, PoolClaim>,
     cpu: u64,
     mem: u64,
-    cpu_used: u64,
-    mem_used: u64,
+    held: &Held,
     machine: &Machine,
 ) -> Admit {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
     let mem_budget = cfg.budget_mem().unwrap_or(0);
+    let (cpu_used, mem_used) = (held.cpu, held.mem);
 
     // Test 1: the budget of this user.
     if cpu_used + cpu > cpu_budget {
@@ -315,7 +775,21 @@ fn admit(
         }
     }
 
-    // Test 3: the machine. This test finds every load, and not the load of qex
+    // Test 3: the pools. One arithmetic serves the devices and the counts, and
+    // it reads no driver: the pools come from the configuration.
+    //
+    // This test comes AFTER the peers and BEFORE the machine, because it can
+    // name either holder. `pool_wait` chooses the class from who holds the
+    // units, so a job that another user holds back never keeps capacity.
+    if let Some(wait) = pool_wait(pools, claims, held, &machine.peers) {
+        return Admit::No {
+            blocker: wait.blocker,
+            reason: wait.reason,
+            held_reason: wait.held_reason,
+        };
+    }
+
+    // Test 4: the machine. This test finds every load, and not the load of qex
     // only. It is the test that a program outside qex cannot avoid.
     let reserve = cfg.reserve_mem().unwrap_or(0);
     let available = machine.available;
@@ -400,17 +874,39 @@ enum Verdict {
 /// `cpu` and `mem` are the claim IN FORCE. See [`size_check`].
 ///
 /// `quiet` says that no job operates and the settle time passed.
+#[allow(clippy::too_many_arguments)]
 fn verdict(
     cfg: &Config,
+    pools: &[Pool],
+    spec: &JobSpec,
     cpu: u64,
     mem: u64,
-    cpu_used: u64,
-    mem_used: u64,
+    held: &Held,
     machine: &Machine,
     quiet: bool,
 ) -> Verdict {
+    // A claim that the configuration can never satisfy comes first, and the
+    // class is `OversizedParked`.
+    //
+    // The coordinator refuses such a job at the submission, so it reaches this
+    // point only when the config file changed after the submission, or when the
+    // record comes from an earlier version. It can never start, so it must
+    // never keep capacity: `OversizedParked` says exactly that, and the queue
+    // continues behind it. See `Blocker::may_reserve`.
+    if let Err(reason) = pool_check(cfg, spec) {
+        return Verdict::Wait {
+            blocker: Blocker::OversizedParked,
+            reason: format!(
+                "{reason}\nThe configuration changed after the submission of this job. This job \
+                 never starts, so qex starts the jobs behind it."
+            ),
+            held_reason: None,
+        };
+    }
+
+    let claims = effective_claims(spec);
     match size_check(cfg, cpu, mem) {
-        Size::Fits => match admit(cfg, cpu, mem, cpu_used, mem_used, machine) {
+        Size::Fits => match admit(cfg, pools, &claims, cpu, mem, held, machine) {
             Admit::Yes => Verdict::Start,
             Admit::No {
                 blocker,
@@ -543,10 +1039,19 @@ pub fn run(coord: Arc<Coordinator>) {
         // other users see them.
         {
             let state = coord.state.lock().unwrap();
-            let (cpu, mem) = state.claimed();
+            let held = state.claimed();
             let cfg = state.cfg.clone();
             drop(state);
-            crate::peers::publish(&cfg, cpu, mem);
+            // Publish the pools as well as the cores and the memory. Another
+            // user must see WHICH device this coordinator gave away, or two
+            // users put two jobs on the device 0.
+            crate::peers::publish(
+                &cfg,
+                held.cpu,
+                held.mem,
+                held.pool_units(),
+                held.device_indices(),
+            );
         }
 
         // Wait for a change, or test the machine again after a short time. The
@@ -1010,8 +1515,12 @@ struct Head {
 /// head start while the head cannot. The head keeps its place, and it starts
 /// before every job behind it as soon as it can start.
 fn choose(state: &mut crate::daemon::State) -> Choice {
-    let (cpu_used, mem_used) = state.claimed();
+    let held = state.claimed();
     let cfg = state.cfg.clone();
+    // A config file that qex cannot read gives no pool. Every claim then falls
+    // back to a pool of one unit, which is a lock, and no job gets a device it
+    // must not have.
+    let pools = cfg.pools().unwrap_or_default();
     let active = state.count_state(|s| s.is_active());
     let idle_since = state.idle_since;
     let paused = state.paused.queue.clone();
@@ -1072,7 +1581,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
             // does not hold capacity, in the same way as a job that waits for a
             // different job, so it never reaches the list of jobs that can
             // start.
-            Depends::Ready => match lock_conflict(state, &job.spec) {
+            Depends::Ready => match lock_conflict(state, &pools, &job.spec) {
                 Some(reason) => {
                     waits_for.insert(id, Waited::ALock);
                     reasons.push((id, Some(reason)));
@@ -1136,7 +1645,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         let passed_by = job.status.passed_by;
 
         match verdict(
-            &cfg, claim_cpu, claim_mem, cpu_used, mem_used, &machine, quiet,
+            &cfg, &pools, &job.spec, claim_cpu, claim_mem, &held, &machine, quiet,
         ) {
             Verdict::Start => {
                 chosen = Some(id);
@@ -1362,6 +1871,18 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             return Ok(());
         }
 
+        // The configuration changed after the submission. Say so, and leave
+        // the job in the queue. A claim that no configuration can satisfy is
+        // never started alone, because an empty machine does not make a fifth
+        // device.
+        if let Err(reason) = pool_check(&state.cfg, &job.spec) {
+            if let Some(job) = state.jobs.get_mut(&id) {
+                job.status.blocked_reason = Some(reason);
+            }
+            state.publish_changes();
+            return Ok(());
+        }
+
         let forced = match size_check(&state.cfg, job.status.cpu, job.status.mem) {
             Size::TooBig(reason) => Some(format!(
                 "{reason}. qex started this job alone because no other job operated."
@@ -1369,9 +1890,41 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             Size::Fits => None,
         };
 
+        // Give the devices INSIDE this lock hold, before the record is written
+        // and before the fork.
+        //
+        // The assignment is a result and not a request, so it goes to
+        // `status.json` and never to `spec.json`. The coordinator is the writer
+        // of the record until the supervisor starts, so this write keeps the
+        // one-writer rule.
+        let pools = state.cfg.pools().unwrap_or_default();
+        let held = state.claimed();
+        let peers = if state.cfg.peers.enabled {
+            crate::peers::claims(&state.cfg)
+        } else {
+            crate::peers::Claims::default()
+        };
+        let Some(job) = state.jobs.get(&id) else {
+            return Ok(());
+        };
+        let assigned = match assign(&pools, &effective_claims(&job.spec), &held, &peers) {
+            Ok(a) => a,
+            Err(reason) => {
+                // The capacity changed between the choice and this moment: a
+                // job of another user took the last device. Leave the job in
+                // the queue with the reason, and try again on the next tick.
+                if let Some(job) = state.jobs.get_mut(&id) {
+                    job.status.blocked_reason = Some(reason);
+                }
+                state.publish_changes();
+                return Ok(());
+            }
+        };
+
         let Some(job) = state.jobs.get_mut(&id) else {
             return Ok(());
         };
+        job.status.assigned = assigned;
         job.status.state = JobState::Starting;
         job.status.started_at = Some(sys::now_secs());
         job.status.blocked_reason = None;
@@ -1511,6 +2064,60 @@ mod tests {
         Machine::read(cfg)
     }
 
+    /// Gives the load of the jobs that operate now: the cores and the memory
+    /// only, with no pool in use.
+    fn used(cpu: u64, mem: u64) -> Held {
+        Held {
+            cpu,
+            mem,
+            ..Default::default()
+        }
+    }
+
+    /// Calls `admit` with no pool and no claim, for the tests of the cores and
+    /// the memory.
+    fn admit_plain(
+        cfg: &Config,
+        cpu: u64,
+        mem: u64,
+        cpu_used: u64,
+        mem_used: u64,
+        m: &Machine,
+    ) -> Admit {
+        admit(
+            cfg,
+            &[],
+            &BTreeMap::new(),
+            cpu,
+            mem,
+            &used(cpu_used, mem_used),
+            m,
+        )
+    }
+
+    /// Calls `verdict` with no pool and no claim, for the tests of the cores,
+    /// the memory and the oversized policy.
+    fn verdict_plain(
+        cfg: &Config,
+        cpu: u64,
+        mem: u64,
+        cpu_used: u64,
+        mem_used: u64,
+        m: &Machine,
+        quiet: bool,
+    ) -> Verdict {
+        verdict(
+            cfg,
+            &[],
+            &spec_with(cpu, mem),
+            cpu,
+            mem,
+            &used(cpu_used, mem_used),
+            m,
+            quiet,
+        )
+    }
+
     /// Gives the reason of an `Admit::No`, and fails on an `Admit::Yes`.
     fn wait_reason(a: Admit, what: &str) -> String {
         match a {
@@ -1538,6 +2145,7 @@ mod tests {
             group: None,
             group_name: None,
             locks: vec![],
+            claims: Default::default(),
             retries: 0,
             nice: None,
             needs: vec![],
@@ -1607,18 +2215,21 @@ mod tests {
         let (cpu, mem) = (2, 64 << 20);
 
         // Two cores are in use. A job of two cores fits.
-        assert!(matches!(admit(&cfg, cpu, mem, 2, 64 << 20, &m), Admit::Yes));
+        assert!(matches!(
+            admit_plain(&cfg, cpu, mem, 2, 64 << 20, &m),
+            Admit::Yes
+        ));
 
         // Four cores are in use. The same job must wait.
         let reason = wait_reason(
-            admit(&cfg, cpu, mem, 4, 64 << 20, &m),
+            admit_plain(&cfg, cpu, mem, 4, 64 << 20, &m),
             "a job must not start when the cores are in use",
         );
         assert!(reason.contains("cores"), "got: {reason}");
 
         // The memory is in use. The job must wait.
         let reason = wait_reason(
-            admit(&cfg, cpu, mem, 0, 224 << 20, &m),
+            admit_plain(&cfg, cpu, mem, 0, 224 << 20, &m),
             "a job must not start when the memory is in use",
         );
         assert!(reason.contains("memory"), "got: {reason}");
@@ -1634,7 +2245,10 @@ mod tests {
     fn a_job_that_fills_the_budget_exactly_starts() {
         let cfg = cfg_with("4", "256MB");
         let m = machine_for(&cfg);
-        assert!(matches!(admit(&cfg, 4, 256 << 20, 0, 0, &m), Admit::Yes));
+        assert!(matches!(
+            admit_plain(&cfg, 4, 256 << 20, 0, 0, &m),
+            Admit::Yes
+        ));
         assert_eq!(size_check(&cfg, 4, 256 << 20), Size::Fits);
     }
 
@@ -1646,7 +2260,7 @@ mod tests {
         cfg.system.reserve_mem = "1000GB".into();
         let m = machine_for(&cfg);
         let reason = wait_reason(
-            admit(&cfg, 1, 1 << 20, 0, 0, &m),
+            admit_plain(&cfg, 1, 1 << 20, 0, 0, &m),
             "the reserve must stop this job",
         );
         assert!(reason.contains("reserve"), "got: {reason}");
@@ -2529,13 +3143,13 @@ mod tests {
 
         // A job of 400MB operates. The first claim of 600MB fits beside it.
         assert!(matches!(
-            admit(&cfg, 1, 600 << 20, 1, 400 << 20, &m),
+            admit_plain(&cfg, 1, 600 << 20, 1, 400 << 20, &m),
             Admit::Yes
         ));
 
         // The raised claim of 1GB does not fit beside it, and it must wait.
         let reason = wait_reason(
-            admit(&cfg, 1, 1 << 30, 1, 400 << 20, &m),
+            admit_plain(&cfg, 1, 1 << 30, 1, 400 << 20, &m),
             "a raised claim must wait for capacity",
         );
         assert!(reason.contains("memory"), "got: {reason}");
@@ -2543,7 +3157,10 @@ mod tests {
         // The raised claim alone still fits the budget, so the job is not an
         // oversized job and it starts when the other job stops.
         assert_eq!(size_check(&cfg, 1, 1 << 30), Size::Fits);
-        assert!(matches!(admit(&cfg, 1, 1 << 30, 0, 0, &m), Admit::Yes));
+        assert!(matches!(
+            admit_plain(&cfg, 1, 1 << 30, 0, 0, &m),
+            Admit::Yes
+        ));
     }
 
     /// The pressure limit stops a job while the machine reclaims memory.
@@ -2554,7 +3171,7 @@ mod tests {
         if sys::memory_pressure().is_some() {
             let m = machine_for(&cfg);
             let reason = wait_reason(
-                admit(&cfg, 1, 1 << 20, 0, 0, &m),
+                admit_plain(&cfg, 1, 1 << 20, 0, 0, &m),
                 "the pressure limit must stop this job",
             );
             assert!(reason.contains("pressure"), "got: {reason}");
@@ -2630,7 +3247,7 @@ mod tests {
             blocker,
             reason,
             held_reason,
-        } = admit(&cfg, 4, 64 << 20, 0, 0, &machine)
+        } = admit_plain(&cfg, 4, 64 << 20, 0, 0, &machine)
         else {
             panic!("a job of 4 cores must not start while another user holds 3");
         };
@@ -2650,7 +3267,7 @@ mod tests {
 
         // A smaller job still fits, so the queue continues.
         assert!(matches!(
-            admit(&cfg, 1, 64 << 20, 0, 0, &machine),
+            admit_plain(&cfg, 1, 64 << 20, 0, 0, &machine),
             Admit::Yes
         ));
 
@@ -2681,7 +3298,7 @@ mod tests {
 
         let Verdict::Wait {
             blocker, reason, ..
-        } = verdict(&cfg, 64, 64 << 20, 0, 0, &machine, false)
+        } = verdict_plain(&cfg, 64, 64 << 20, 0, 0, &machine, false)
         else {
             panic!("a job of 64 cores must not start with a budget of 2");
         };
@@ -2704,7 +3321,7 @@ mod tests {
             blocker,
             held_reason,
             ..
-        } = verdict(&cfg, 64, 64 << 20, 0, 0, &machine, false)
+        } = verdict_plain(&cfg, 64, 64 << 20, 0, 0, &machine, false)
         else {
             panic!("a job of 64 cores must not start on a busy machine");
         };
@@ -2713,7 +3330,7 @@ mod tests {
 
         // The same job starts alone on a quiet machine.
         assert!(matches!(
-            verdict(&cfg, 64, 64 << 20, 0, 0, &machine, true),
+            verdict_plain(&cfg, 64, 64 << 20, 0, 0, &machine, true),
             Verdict::Start
         ));
     }
@@ -2728,7 +3345,7 @@ mod tests {
             blocker,
             reason,
             held_reason,
-        } = admit(&cfg, 4, 64 << 20, 2, 0, &machine)
+        } = admit_plain(&cfg, 4, 64 << 20, 2, 0, &machine)
         else {
             panic!("a job of 4 cores must not start while 2 are in use");
         };
@@ -2760,7 +3377,7 @@ mod tests {
         let machine = Machine::read(&cfg);
 
         // The first claim fits the budget, so a wait is a sibling wait.
-        let Verdict::Wait { blocker, .. } = verdict(&cfg, 4, 64 << 20, 2, 0, &machine, false)
+        let Verdict::Wait { blocker, .. } = verdict_plain(&cfg, 4, 64 << 20, 2, 0, &machine, false)
         else {
             panic!("a job of 4 cores must not start while 2 are in use");
         };
@@ -2768,10 +3385,676 @@ mod tests {
 
         // The raised claim is larger than the budget, so the same job now waits
         // for a quiet machine.
-        let Verdict::Wait { blocker, .. } = verdict(&cfg, 4, 512 << 20, 2, 0, &machine, false)
+        let Verdict::Wait { blocker, .. } =
+            verdict_plain(&cfg, 4, 512 << 20, 2, 0, &machine, false)
         else {
             panic!("a claim above the budget must not start");
         };
         assert_eq!(blocker, Blocker::OversizedWaitsForIdle);
+    }
+
+    // -----------------------------------------------------------------------
+    // The pools
+    // -----------------------------------------------------------------------
+
+    /// Gives a configuration with a pool of four devices and a pool of four
+    /// units. THE MACHINE THAT RUNS THIS TEST HAS NO GPU, and that is the
+    /// point: a pool is a PROMISE from the configuration, and not a probe of a
+    /// driver.
+    fn cfg_with_pools() -> Config {
+        toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\n\
+             devices = [\"24GB\", \"24GB\", \"16GB\", \"24GB\"]\n\
+             env = \"CUDA_VISIBLE_DEVICES\"\n\
+             [[pool]]\nname = \"net\"\ncount = 4\n",
+        )
+        .unwrap()
+    }
+
+    fn spec_claiming(claims: &[(&str, u64, Option<u64>)]) -> JobSpec {
+        let mut spec = spec_with(1, 1 << 20);
+        for (name, count, size) in claims {
+            spec.claims.insert(
+                (*name).to_string(),
+                PoolClaim {
+                    count: *count,
+                    size: *size,
+                },
+            );
+        }
+        spec
+    }
+
+    /// Calls `admit` for one job that claims pools.
+    fn admit_claim(cfg: &Config, pools: &[Pool], spec: &JobSpec, held: &Held) -> Admit {
+        admit(
+            cfg,
+            pools,
+            &effective_claims(spec),
+            spec.cpu,
+            spec.mem,
+            held,
+            &Machine::read(cfg),
+        )
+    }
+
+    /// Puts one job that received `given` into the load.
+    fn hold(held: &mut Held, spec: &JobSpec, given: BTreeMap<String, Assignment>, pools: &[Pool]) {
+        let mut status = crate::job::JobStatus::new(spec);
+        status.assigned = given;
+        held.add(&status, pools);
+    }
+
+    /// A machine with no GPU must still admit a GPU claim from the
+    /// configuration. This is what "a promise, and not a probe" means.
+    #[test]
+    fn a_machine_with_no_gpu_admits_a_gpu_claim_from_the_configuration() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let spec = spec_claiming(&[("gpu", 2, None)]);
+        assert!(pool_check(&cfg, &spec).is_ok());
+        assert_eq!(size_check(&cfg, spec.cpu, spec.mem), Size::Fits);
+        assert!(matches!(
+            admit_claim(&cfg, &pools, &spec, &Held::default()),
+            Admit::Yes
+        ));
+    }
+
+    /// qex must never add the memory of the devices together. Four devices of
+    /// 24GB are not 96GB for one job, and the largest device here is 24GB.
+    #[test]
+    fn vram_is_never_added_together_over_the_devices() {
+        let cfg = cfg_with_pools();
+        let reason = pool_check(&cfg, &spec_claiming(&[("gpu", 2, Some(40 << 30))]))
+            .expect_err("a claim of 40GB on each device must be impossible");
+        assert!(
+            reason.contains("never start"),
+            "the message must say that the job can never start: {reason}"
+        );
+        assert!(
+            reason.contains("24GB"),
+            "the message must name the largest device: {reason}"
+        );
+
+        // The same quantity on ONE device is correct, so the test measures the
+        // size of each device and not the sum.
+        assert!(pool_check(&cfg, &spec_claiming(&[("gpu", 2, Some(20 << 30))])).is_ok());
+    }
+
+    /// A claim above the pool total is a refusal, and not an oversized job.
+    /// An empty machine does not make a fifth device.
+    #[test]
+    fn a_claim_above_the_pool_total_can_never_start() {
+        let cfg = cfg_with_pools();
+        let reason = pool_check(&cfg, &spec_claiming(&[("gpu", 8, None)]))
+            .expect_err("a claim of 8 devices from a pool of 4 must be impossible");
+        assert!(reason.contains("never start"), "got: {reason}");
+
+        let reason = pool_check(&cfg, &spec_claiming(&[("net", 5, None)]))
+            .expect_err("a claim of 5 units from a pool of 4 must be impossible");
+        assert!(reason.contains("never start"), "got: {reason}");
+    }
+
+    /// A job whose claim the configuration can never satisfy must be
+    /// `OversizedParked`, and it must NEVER keep capacity.
+    ///
+    /// The precedent is `[queue] oversized = "queue"`. Such a job never starts,
+    /// so capacity that qex keeps for it buys the job nothing and stops every
+    /// other job. This is the case that parks a whole queue behind one job.
+    #[test]
+    fn a_claim_that_can_never_start_parks_and_never_reserves() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let spec = spec_claiming(&[("gpu", 8, None)]);
+        let Verdict::Wait {
+            blocker,
+            held_reason,
+            ..
+        } = verdict(
+            &cfg,
+            &pools,
+            &spec,
+            spec.cpu,
+            spec.mem,
+            &Held::default(),
+            &Machine::read(&cfg),
+            false,
+        )
+        else {
+            panic!("a claim of 8 devices from a pool of 4 must not start");
+        };
+        assert_eq!(blocker, Blocker::OversizedParked);
+        assert!(
+            !blocker.may_reserve(),
+            "a job that can never start must never keep capacity"
+        );
+        assert!(
+            held_reason.is_none(),
+            "a class that never reserves must have no held text"
+        );
+    }
+
+    /// A pool that the jobs of THIS queue hold is a `Sibling` wait, and the
+    /// head may keep capacity for it: qex schedules that release.
+    #[test]
+    fn a_pool_that_this_queue_holds_is_a_sibling_wait_and_may_reserve() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("net", 3, None)]);
+
+        // The pre-condition: with nothing held, the job starts.
+        assert!(matches!(
+            admit_claim(&cfg, &pools, &claim, &Held::default()),
+            Admit::Yes
+        ));
+
+        // Two of the four units go to a job of this queue. The state CHANGED.
+        let mut held = Held::default();
+        held.pools.insert("net".into(), 2);
+        let Admit::No {
+            blocker,
+            reason,
+            held_reason,
+        } = admit_claim(&cfg, &pools, &claim, &held)
+        else {
+            panic!("3 of `net` must not fit while 2 of the 4 are in use");
+        };
+        assert_eq!(blocker, Blocker::Sibling);
+        assert!(blocker.may_reserve());
+        assert!(reason.contains("net"), "got: {reason}");
+        assert!(
+            held_reason.is_some(),
+            "a class that may reserve must give the text for a reserved head"
+        );
+    }
+
+    /// A pool that ANOTHER USER holds is a `Peer` wait, and the head must
+    /// never keep capacity for it.
+    ///
+    /// qex cannot make the other user give the device back, so a reservation
+    /// would hold this machine empty for a time that qex cannot measure. That
+    /// is the fault that parks a queue for hours.
+    #[test]
+    fn a_pool_that_another_user_holds_never_reserves() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("net", 3, None)]);
+
+        let mut peers = crate::peers::Claims {
+            count: 1,
+            ..Default::default()
+        };
+        peers.pools.insert("net".into(), 2);
+        let machine = Machine {
+            available: u64::MAX / 2,
+            pressure: None,
+            peers,
+        };
+
+        let Admit::No {
+            blocker,
+            held_reason,
+            ..
+        } = admit(
+            &cfg,
+            &pools,
+            &effective_claims(&claim),
+            claim.cpu,
+            claim.mem,
+            &Held::default(),
+            &machine,
+        )
+        else {
+            panic!("3 of `net` must not fit while another user holds 2 of the 4");
+        };
+        assert_eq!(blocker, Blocker::Peer { count: 1 });
+        assert!(
+            !blocker.may_reserve(),
+            "a wait on another user must never keep capacity"
+        );
+        assert!(held_reason.is_none());
+    }
+
+    /// A name that the configuration does not declare is a lock of one unit.
+    /// `--lock NAME` needs no configuration, and it must keep that.
+    #[test]
+    fn an_undeclared_pool_name_is_a_lock_and_not_an_error() {
+        let cfg = cfg_with_pools();
+        assert!(pool_check(&cfg, &spec_claiming(&[("build-dir", 1, None)])).is_ok());
+
+        // More than one unit of a pool that nobody declared is a fault. qex
+        // cannot invent a second unit.
+        let reason = pool_check(&cfg, &spec_claiming(&[("build-dir", 2, None)]))
+            .expect_err("2 of an undeclared pool must be impossible");
+        assert!(reason.contains("lock of size 1"), "got: {reason}");
+    }
+
+    /// `--gpu` promises a device index and an environment variable. A machine
+    /// with no `gpu` pool can give neither, so qex says so and does not make a
+    /// silent lock.
+    #[test]
+    fn a_gpu_claim_with_no_gpu_pool_names_the_configuration() {
+        let cfg = cfg_with("4", "1GB");
+        let reason = pool_check(&cfg, &spec_claiming(&[("gpu", 1, None)]))
+            .expect_err("a GPU claim with no pool must be impossible");
+        assert!(reason.contains("[[pool]]"), "got: {reason}");
+        assert!(reason.contains("qex.toml"), "got: {reason}");
+    }
+
+    /// VRAM is a quantity on a device. A job that asks for it must also ask
+    /// for a device.
+    #[test]
+    fn vram_with_no_device_claim_is_refused() {
+        let cfg = cfg_with_pools();
+        let reason = pool_check(&cfg, &spec_claiming(&[("gpu", 0, Some(4 << 30))]))
+            .expect_err("VRAM with no device must be impossible");
+        assert!(reason.contains("--gpu 1"), "got: {reason}");
+    }
+
+    /// A pool with no devices holds no size.
+    #[test]
+    fn a_size_on_a_pool_with_no_devices_is_refused() {
+        let cfg = cfg_with_pools();
+        let reason = pool_check(&cfg, &spec_claiming(&[("net", 1, Some(1 << 30))]))
+            .expect_err("a size on a plain pool must be impossible");
+        assert!(reason.contains("no devices"), "got: {reason}");
+    }
+
+    /// Two jobs that claim one device each must get DIFFERENT indices, and a
+    /// job that asks for more than the pool has left must wait.
+    #[test]
+    fn two_jobs_get_different_devices_and_a_third_waits() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\", \"24GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("gpu", 1, None)]);
+        let no_peers = crate::peers::Claims::default();
+
+        let mut held = Held::default();
+        let first = assign(&pools, &effective_claims(&claim), &held, &no_peers).unwrap();
+        assert_eq!(first["gpu"].devices, vec![0]);
+        hold(&mut held, &claim, first, &pools);
+
+        let second = assign(&pools, &effective_claims(&claim), &held, &no_peers).unwrap();
+        assert_eq!(
+            second["gpu"].devices,
+            vec![1],
+            "the second job must get a device that the first job does not hold"
+        );
+        hold(&mut held, &claim, second, &pools);
+
+        // Both devices are in use. The third job must wait.
+        let Admit::No { reason, .. } = admit_claim(&cfg, &pools, &claim, &held) else {
+            panic!("a third job must wait when both devices are in use");
+        };
+        assert!(reason.contains("gpu"), "got: {reason}");
+    }
+
+    /// A job with no `--vram` takes the WHOLE of each device that it gets. A
+    /// part of that device must not go to a second job.
+    #[test]
+    fn a_claim_with_no_vram_takes_the_whole_device() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let whole = spec_claiming(&[("gpu", 1, None)]);
+        let no_peers = crate::peers::Claims::default();
+
+        let mut held = Held::default();
+        let given = assign(&pools, &effective_claims(&whole), &held, &no_peers).unwrap();
+        assert_eq!(given["gpu"].size, None, "a whole device records no size");
+
+        // The pre-condition: a small claim fits while nothing holds the device.
+        let small = spec_claiming(&[("gpu", 1, Some(1 << 30))]);
+        assert!(assign(&pools, &effective_claims(&small), &held, &no_peers).is_ok());
+
+        hold(&mut held, &whole, given, &pools);
+        assert!(
+            assign(&pools, &effective_claims(&small), &held, &no_peers).is_err(),
+            "a device that a job owns in full must hold no second job"
+        );
+    }
+
+    /// A device that a job holds in part must still take a second job while
+    /// its capacity permits.
+    #[test]
+    fn a_device_holds_two_jobs_while_its_capacity_permits() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("gpu", 1, Some(8 << 30))]);
+        let no_peers = crate::peers::Claims::default();
+
+        let mut held = Held::default();
+        for n in 0..3 {
+            let given = assign(&pools, &effective_claims(&claim), &held, &no_peers)
+                .unwrap_or_else(|e| panic!("the job {n} of 8GB must fit a device of 24GB: {e}"));
+            assert_eq!(given["gpu"].devices, vec![0]);
+            hold(&mut held, &claim, given, &pools);
+        }
+        // 24GB holds three jobs of 8GB, and no fourth.
+        assert_eq!(held.devices["gpu"][&0], 24 << 30);
+        assert!(
+            assign(&pools, &effective_claims(&claim), &held, &no_peers).is_err(),
+            "a fourth job of 8GB must not fit a device of 24GB"
+        );
+    }
+
+    /// The choice must be the most free capacity first, and the lowest index
+    /// for a tie. That order spreads the work in place of filling one device.
+    #[test]
+    fn the_device_with_the_most_free_capacity_comes_first() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"16GB\", \"24GB\", \"16GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("gpu", 1, Some(4 << 30))]);
+        let given = assign(
+            &pools,
+            &effective_claims(&claim),
+            &Held::default(),
+            &crate::peers::Claims::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            given["gpu"].devices,
+            vec![1],
+            "the device with 24GB must come before the two devices with 16GB"
+        );
+    }
+
+    /// A device that another user holds must not go to a job of this user.
+    /// Without this, two users put two jobs on the device 0.
+    #[test]
+    fn a_device_that_another_user_holds_is_not_given_again() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("gpu", 4, None)]);
+        let no_peers = crate::peers::Claims::default();
+
+        // The pre-condition: with no other user, all four devices are free.
+        assert!(assign(
+            &pools,
+            &effective_claims(&claim),
+            &Held::default(),
+            &no_peers
+        )
+        .is_ok());
+
+        let mut peers = crate::peers::Claims::default();
+        peers
+            .devices
+            .insert("gpu".into(), [0u32, 1].into_iter().collect());
+        peers.count = 1;
+
+        assert!(
+            assign(&pools, &effective_claims(&claim), &Held::default(), &peers).is_err(),
+            "a claim of 4 devices must fail while another user holds 2"
+        );
+
+        let two = spec_claiming(&[("gpu", 2, None)]);
+        let given = assign(&pools, &effective_claims(&two), &Held::default(), &peers).unwrap();
+        assert_eq!(
+            given["gpu"].devices,
+            vec![2, 3],
+            "qex must give the devices that no other user holds"
+        );
+    }
+
+    /// A lock is a pool of one unit, and a lock needs no configuration. The
+    /// conversion happens in the coordinator and never on the wire.
+    #[test]
+    fn a_lock_becomes_a_pool_of_one_unit_inside_the_coordinator() {
+        let mut spec = spec_with(1, 1 << 20);
+        spec.locks = vec!["target".into()];
+        let claims = effective_claims(&spec);
+        assert_eq!(
+            claims["target"],
+            PoolClaim {
+                count: 1,
+                size: None
+            }
+        );
+        assert!(
+            spec.claims.is_empty(),
+            "the wire field `claims` must stay empty for a job with a lock only"
+        );
+
+        // A lock takes all of its pool or nothing, so it does not keep
+        // capacity for itself and the queue continues behind it.
+        assert!(is_a_lock(&[], "target"));
+    }
+
+    /// A record that an earlier version wrote holds `locks` and no `assigned`.
+    /// Those locks must still count, or a coordinator that starts after an
+    /// upgrade gives a lock that a live job already holds.
+    #[test]
+    fn a_lock_of_an_earlier_record_still_counts() {
+        let mut spec = spec_with(1, 1 << 20);
+        spec.locks = vec!["target".into()];
+        let status = crate::job::JobStatus::new(&spec);
+        assert!(status.assigned.is_empty());
+
+        let mut held = Held::default();
+        held.add(&status, &[]);
+        assert_eq!(held.pools.get("target"), Some(&1));
+    }
+
+    /// A LOCK must never go through `pool_wait`.
+    ///
+    /// `lock_conflict` answers a lock in pass 1, so the job never becomes the
+    /// head and never keeps capacity. A `pool_wait` that also answered it would
+    /// make the job the head and park the whole queue behind one lock.
+    ///
+    /// A DECLARED pool is the other case, and it does go through `pool_wait`
+    /// whatever its size. See `is_a_lock`.
+    #[test]
+    fn a_lock_never_becomes_a_head_that_keeps_capacity() {
+        let mut held = Held::default();
+        held.pools.insert("target".into(), 1);
+        let mut spec = spec_with(1, 1 << 20);
+        spec.locks = vec!["target".into()];
+        assert!(
+            pool_wait(
+                &[],
+                &effective_claims(&spec),
+                &held,
+                &crate::peers::Claims::default()
+            )
+            .is_none(),
+            "a lock must not reach the capacity pass"
+        );
+    }
+
+    /// A DECLARED POOL IS ALWAYS COUNTED, EVEN WHEN IT HAS ONE DEVICE.
+    ///
+    /// This is the rule that closes the hole. `lock_conflict` reads the jobs of
+    /// THIS queue only, and `pool_wait` is the one place that reads what the
+    /// other users of the machine hold. A rule that sent a pool of one device
+    /// through the lock path would meet no peer test at all, and two users
+    /// would then each start a job on the device 0.
+    #[test]
+    fn a_declared_pool_of_one_device_is_counted_and_sees_the_other_users() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let whole = spec_claiming(&[("gpu", 1, None)]);
+
+        assert!(
+            !is_a_lock(&pools, "gpu"),
+            "a declared pool is counted, whatever its size"
+        );
+        assert!(
+            is_a_lock(&pools, "build-dir"),
+            "a name that the configuration does not declare is a lock"
+        );
+
+        // The pre-condition: with no other user, the one device is free.
+        let machine_free = Machine {
+            available: u64::MAX / 2,
+            pressure: None,
+            peers: crate::peers::Claims::default(),
+        };
+        assert!(matches!(
+            admit(
+                &cfg,
+                &pools,
+                &effective_claims(&whole),
+                whole.cpu,
+                whole.mem,
+                &Held::default(),
+                &machine_free,
+            ),
+            Admit::Yes
+        ));
+
+        // Another user holds the device 0. The state CHANGED: this job must
+        // now wait, and it must never keep capacity.
+        let mut peers = crate::peers::Claims {
+            count: 1,
+            ..Default::default()
+        };
+        peers
+            .devices
+            .insert("gpu".into(), [0u32].into_iter().collect());
+        let machine_busy = Machine {
+            available: u64::MAX / 2,
+            pressure: None,
+            peers,
+        };
+        let Admit::No { blocker, .. } = admit(
+            &cfg,
+            &pools,
+            &effective_claims(&whole),
+            whole.cpu,
+            whole.mem,
+            &Held::default(),
+            &machine_busy,
+        ) else {
+            panic!("a device that another user holds must not go to this job as well");
+        };
+        assert_eq!(blocker, Blocker::Peer { count: 1 });
+        assert!(!blocker.may_reserve());
+    }
+
+    /// A partial claim on a pool of one device must still divide that device.
+    #[test]
+    fn a_partial_claim_on_one_device_still_shares_the_device() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let part = spec_claiming(&[("gpu", 1, Some(4 << 30))]);
+
+        let mut held = Held::default();
+        let given = assign(
+            &pools,
+            &effective_claims(&part),
+            &held,
+            &crate::peers::Claims::default(),
+        )
+        .unwrap();
+        hold(&mut held, &part, given, &pools);
+        assert!(matches!(
+            admit_claim(&cfg, &pools, &part, &held),
+            Admit::Yes
+        ));
+    }
+
+    /// A claim of one unit made with `--claim NAME=1` must exclude in the same
+    /// way as `--lock NAME`.
+    ///
+    /// `lock_conflict` reads the REQUEST and the RESULT. A version that read
+    /// `spec.locks` only would let two jobs take one unit: the second job would
+    /// find no holder and start beside the first.
+    #[test]
+    fn a_claim_of_one_unit_excludes_in_the_same_way_as_a_lock() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+
+        let holder = add_job(&mut state, JobState::Running, 1, None, 0);
+        state.jobs.get_mut(&holder).unwrap().spec.claims.insert(
+            "port".into(),
+            PoolClaim {
+                count: 1,
+                size: None,
+            },
+        );
+
+        let mut spec = spec_with(1, 1 << 20);
+        spec.claims.insert(
+            "port".into(),
+            PoolClaim {
+                count: 1,
+                size: None,
+            },
+        );
+
+        // The pre-condition: a job that claims a DIFFERENT name is free.
+        let mut other = spec_with(1, 1 << 20);
+        other.claims.insert(
+            "other-port".into(),
+            PoolClaim {
+                count: 1,
+                size: None,
+            },
+        );
+        assert!(lock_conflict(&state, &[], &other).is_none());
+
+        let reason = lock_conflict(&state, &[], &spec)
+            .expect("a second claim of the one unit must wait for the first");
+        assert!(reason.contains("port"), "got: {reason}");
+    }
+
+    /// A pool with more than one unit counts, and it does not behave as a lock.
+    #[test]
+    fn a_counted_pool_admits_jobs_until_it_is_full() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("net", 3, None)]);
+
+        let mut held = Held::default();
+        assert!(matches!(
+            admit_claim(&cfg, &pools, &claim, &held),
+            Admit::Yes
+        ));
+
+        held.pools.insert("net".into(), 2);
+        let Admit::No { reason, .. } = admit_claim(&cfg, &pools, &claim, &held) else {
+            panic!("3 of `net` must not fit while 2 of 4 are in use");
+        };
+        assert!(reason.contains("net"), "got: {reason}");
     }
 }

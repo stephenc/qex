@@ -150,6 +150,30 @@ pub struct SubmitArgs {
     #[arg(long, value_name = "SIZE|half|full", value_parser = parse_mem_claim)]
     pub mem: Option<crate::claim::Claim>,
 
+    /// Claim N devices from the pool `gpu`.
+    ///
+    /// The devices come from `[[pool]]` in the config file. qex says which
+    /// index the job gets, and it writes that index into the environment of the
+    /// job. qex does not read a driver, so this option operates on a machine
+    /// with no CUDA library.
+    #[arg(long, value_name = "N")]
+    pub gpu: Option<u64>,
+
+    /// Claim SIZE on EACH GPU that this job gets.
+    ///
+    /// qex does NOT add the memory of the devices together. A job that needs
+    /// 40GB on one device cannot run on two devices of 24GB. With no --vram,
+    /// the job takes the whole of each device that it gets.
+    #[arg(long, value_name = "SIZE")]
+    pub vram: Option<String>,
+
+    /// Claim N units of the pool NAME. Repeat the option as needed.
+    ///
+    /// Use the form NAME=N, or NAME=N:SIZE for a quantity on each device of an
+    /// indexed pool. `--lock NAME` is the same as `--claim NAME=1`.
+    #[arg(long = "claim", value_name = "NAME=N", value_parser = crate::spec::parse_claim_pair)]
+    pub claims: Vec<(String, crate::spec::PoolClaim)>,
+
     /// A name for the job, to show in `qex list`.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
