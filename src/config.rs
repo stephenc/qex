@@ -836,6 +836,39 @@ impl HooksConfig {
     }
 }
 
+/// Controls what qex does when the kernel stops a job for memory.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetryConfig {
+    /// The number of times that qex raises the claim and starts the job again.
+    ///
+    /// This count is SEPARATE from `--retries`, and the reason is important.
+    /// `--retries` is for a fault outside the task, such as a network that is
+    /// not ready, and the user chose that number for that fault. A kill for
+    /// memory is a fault of the CLAIM, and qex made the claim in the usual
+    /// case: `--mem guess` and the learned claim both come from qex. qex must
+    /// therefore correct its own fault, and it must not spend a budget that the
+    /// user gave for a different purpose. A job with no `--retries` value thus
+    /// still gets this correction.
+    ///
+    /// The count has a limit, and 2 raises give 4 times the first claim. Each
+    /// attempt costs the full time of the job: the job in the README runs for
+    /// four hours before the kernel stops it. A ladder with no limit can thus
+    /// use a day of the machine and give no result.
+    pub on_oom: u32,
+    /// The multiplier for the claim at each raise.
+    pub growth: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            on_oom: 2,
+            growth: 2.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -849,6 +882,7 @@ pub struct Config {
     pub claims: ClaimsConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
+    pub retry: RetryConfig,
     pub history: HistoryConfig,
     pub gc: GcConfig,
     pub logs: LogsConfig,
@@ -1344,6 +1378,13 @@ impl Config {
             );
         }
         self.politeness_values()?;
+        if self.retry.on_oom > 0 && self.retry.growth <= 1.0 {
+            anyhow::bail!(
+                "config [retry] growth is {}. Use a value above 1.0. A smaller value gives the \
+                 claim that the kernel already stopped, and the job would stop again.",
+                self.retry.growth
+            );
+        }
         if self.enforce.mem_overcommit < 1.0 {
             anyhow::bail!(
                 "config [enforce] mem_overcommit is {}. Use a value of 1.0 or more. \
@@ -1900,6 +1941,10 @@ stale_after = "30s"
 oversized = "run-when-idle"
 settle = "3s"
 
+[retry]
+on_oom = 2
+growth = 2.0
+
 [submit]
 env_capture = "minimal"
 minimal_env = ["PATH", "HOME"]
@@ -1920,6 +1965,7 @@ timeout = "30s"
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();
         assert_eq!(c.enforce.mode, EnforceMode::Soft);
+        assert_eq!(c.retry.on_oom, 2);
         assert_eq!(c.submit.env_capture, EnvCapture::Minimal);
         assert_eq!(c.budget_mem().unwrap(), 20 << 30);
         assert_eq!(c.default_timeout().unwrap(), None);

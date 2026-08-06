@@ -10446,3 +10446,288 @@ max_pressure = 100
     h.ok(&["resume"]);
     h.ok(&["kill", &holder, "--grace", "1s"]);
 }
+
+/// The directory that a test uses to control a job, and the job directory of a
+/// job.
+///
+/// # Why these tests simulate the kill and do not make one
+///
+/// A genuine kill by the out-of-memory killer needs one of two things: a cgroup
+/// memory limit, or a machine with no free memory. qex can apply a limit only
+/// when the coordinator owns its cgroup, and a usual test machine gives the
+/// login session to the root user, so the limit is not available. A test that
+/// fills the machine is worse: other work operates on the same machine, and the
+/// kernel chooses its victim itself.
+///
+/// These tests therefore make the EVIDENCE that a true kill leaves — the
+/// out-of-memory record in the job directory — and the job then stops itself
+/// with the same signal that the kernel uses, `SIGKILL`. Every step after that
+/// point is the true code: the classification, the new claim, the new attempt,
+/// the words in the record, and the learner. The unit tests in `src/enforce.rs`
+/// and `src/supervisor.rs` cover the reading of the cgroup counter itself.
+struct OomJob {
+    control: PathBuf,
+}
+
+impl OomJob {
+    fn new(h: &Harness) -> Self {
+        let control = h.root.join("control");
+        std::fs::create_dir_all(&control).unwrap();
+        Self { control }
+    }
+
+    /// The command of a job that makes the evidence of a kill for memory, then
+    /// stops itself with the signal that the kernel uses.
+    ///
+    /// The job waits for the file that holds its own directory. The test knows
+    /// that directory after the submission only, because the name of the
+    /// directory is the job id.
+    ///
+    /// `kills` gives the number of attempts that stop in this way. A later
+    /// attempt stops with the code 0.
+    fn script(&self, kills: u32) -> String {
+        let c = self.control.display();
+        format!(
+            "until [ -f {c}/dir ]; do sleep 0.1; done; \
+             n=$(cat {c}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}/n; \
+             echo attempt $n; \
+             if [ $n -le {kills} ]; then echo 1 > \"$(cat {c}/dir)/oom\"; kill -9 $$; fi; \
+             exit 0"
+        )
+    }
+
+    /// Tells the job where its own directory is. The job then starts.
+    fn release(&self, h: &Harness, id: &str) {
+        let dir = h.root.join("state/qex/jobs").join(id);
+        assert!(
+            dir.is_dir(),
+            "the job directory {} is missing",
+            dir.display()
+        );
+        std::fs::write(self.control.join("dir"), dir.to_string_lossy().as_bytes()).unwrap();
+    }
+
+    /// The number of attempts that the job made.
+    fn attempts(&self) -> u32 {
+        std::fs::read_to_string(self.control.join("n"))
+            .map(|s| s.trim().parse().unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
+
+/// A job that the kernel stops for memory must run again with a LARGER claim,
+/// and the record must say that the claim was too small.
+///
+/// This is the case in the README: a long run with `--mem guess` that the
+/// kernel stops. Before this feature the job stopped with the state `killed`,
+/// `--retries` did not see it, and the same claim died in the same way on the
+/// next run.
+#[test]
+fn a_job_that_the_kernel_stops_for_memory_runs_again_with_a_larger_claim() {
+    let h = Harness::new(
+        "oomretry",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n",
+    );
+    let job = OomJob::new(&h);
+
+    let id = h.submit(&[
+        "submit",
+        "--mem",
+        "128MB",
+        "--cpu",
+        "1",
+        "--",
+        "bash",
+        "-c",
+        &job.script(1),
+    ]);
+    job.release(&h, &id);
+
+    h.ok(&["wait", &id, "--timeout", "60s"]);
+    let s = h.status_json(&id);
+
+    assert_eq!(
+        s["state"], "completed",
+        "the second attempt must succeed: {s}"
+    );
+    assert_eq!(s["attempts"], 2, "qex must start the job again: {s}");
+    assert_eq!(job.attempts(), 2, "the job itself must run two times");
+    assert_eq!(s["oom_raises"], 1, "qex must count the raise: {s}");
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        256 * 1024 * 1024,
+        "the claim must double: {s}"
+    );
+    assert_eq!(s["claim_source"], "raised", "the claim came from qex: {s}");
+
+    // The record must say what happened, in words that need no knowledge of a
+    // cgroup. A reader of `qex status` alone must understand it.
+    let note = s["error"].as_str().unwrap_or("");
+    assert!(
+        note.contains("kernel stopped") && note.contains("TOO SMALL"),
+        "the record must say that the claim was too small: {note}"
+    );
+    assert!(
+        note.contains("128MB") && note.contains("256MB"),
+        "the record must give both claims: {note}"
+    );
+
+    // The same words must reach a reader of the text output.
+    let text = h.ok(&["status", &id]);
+    assert!(
+        text.contains("qex raised it"),
+        "the claim line must say that qex raised the claim: {text}"
+    );
+    // A job that succeeded must not have the word `error` on that line. The
+    // state and the label would contradict each other.
+    assert!(
+        text.contains("note:") && !text.contains("error:"),
+        "a job that succeeded gives a note and not an error: {text}"
+    );
+
+    // The log must hold every attempt, in the same way as `--retries`.
+    let logs = h.ok(&["logs", &id]);
+    assert!(
+        logs.contains("attempt 1") && logs.contains("attempt 2"),
+        "the log must hold every attempt: {logs}"
+    );
+
+    // The learner must use the lesson. The next job of the same command gets a
+    // claim above the claim that the kernel stopped, and the agent gives no
+    // `--mem` value at all.
+    let next = h.submit(&["submit", "--", "bash", "-c", &job.script(1)]);
+    h.ok(&["wait", &next, "--timeout", "60s"]);
+    let s = h.status_json(&next);
+    assert_eq!(s["claim_source"], "learned", "got: {s}");
+    assert!(
+        s["mem"].as_u64().unwrap() > 128 * 1024 * 1024,
+        "the claim must be above the claim that the kernel stopped: {s}"
+    );
+}
+
+/// A job that a USER stopped must NOT run again, and it must teach the learner
+/// nothing.
+///
+/// This test protects the feature from doing harm. The kernel and `qex kill`
+/// both use `SIGKILL`. A job that somebody stopped on purpose must never run
+/// again with a larger claim: qex would repeat work that the user stopped, and
+/// it would also record that the command needs more memory than it does.
+#[test]
+fn a_job_that_a_user_killed_is_not_retried_and_teaches_the_learner_nothing() {
+    let h = Harness::new(
+        "userkill",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n",
+    );
+
+    // Give the job the evidence of a kill for memory as well.
+    //
+    // This step is the point of the test. qex reads the out-of-memory count of
+    // the SESSION when it applies no limit, and that count also holds a kill in
+    // a different program of the same user. The mark from `qex kill` must win
+    // against that evidence. Without the mark, this job looks like a job that
+    // the kernel stopped for memory, and qex starts it again with a larger
+    // claim.
+    let job = OomJob::new(&h);
+    let control = h.root.join("control");
+    let script = format!(
+        "until [ -f {c}/dir ]; do sleep 0.1; done; echo 1 > \"$(cat {c}/dir)/oom\"; \
+         echo ready > {c}/ready; sleep 60",
+        c = control.display()
+    );
+    let id = h.submit(&["submit", "--mem", "128MB", "--", "bash", "-c", &script]);
+    h.until("the job operates", Duration::from_secs(30), || {
+        h.state_of(&id) == "running"
+    });
+    job.release(&h, &id);
+    h.until("the job made the record", Duration::from_secs(30), || {
+        control.join("ready").exists()
+    });
+
+    // Use KILL, which is the signal that the out-of-memory killer uses. With
+    // TERM the two causes are already separate.
+    h.ok(&["kill", &id, "--signal", "KILL", "--grace", "1s"]);
+    h.until("the job stops", Duration::from_secs(30), || {
+        h.status_json(&id)["state"]
+            .as_str()
+            .map(|s| s != "running" && s != "starting")
+            .unwrap_or(false)
+    });
+
+    let s = h.status_json(&id);
+    assert_eq!(s["state"], "killed", "a command stopped this job: {s}");
+    assert_eq!(s["attempts"], 1, "qex must not start the job again: {s}");
+    assert_eq!(s["oom_raises"], 0, "qex must not raise the claim: {s}");
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        128 * 1024 * 1024,
+        "the claim must not change: {s}"
+    );
+
+    // The learner must hold nothing. The memory that a job reached before
+    // somebody stopped it says nothing about the memory that it needs.
+    let store = h.root.join("state/qex/usage.json");
+    assert!(
+        !store.exists(),
+        "a job that a command stopped must teach the learner nothing, and the store holds: {}",
+        std::fs::read_to_string(&store).unwrap_or_default()
+    );
+}
+
+/// The claim must not double for ever. A job that reaches the limit keeps the
+/// state `oom`, and the record says what the user must do.
+///
+/// Each attempt costs the full time of the job. A ladder with no limit can use
+/// a day of the machine and give no result.
+#[test]
+fn a_claim_that_stays_too_small_stops_at_the_limit() {
+    let h = Harness::new(
+        "oomlimit",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [retry]\non_oom = 2\ngrowth = 2.0\n",
+    );
+    let job = OomJob::new(&h);
+
+    // Every attempt stops for memory.
+    let id = h.submit(&[
+        "submit",
+        "--mem",
+        "128MB",
+        "--cpu",
+        "1",
+        "--",
+        "bash",
+        "-c",
+        &job.script(9),
+    ]);
+    job.release(&h, &id);
+
+    // The code is 125: something stopped the job.
+    let out = h.qex(&["wait", &id, "--timeout", "90s"]);
+    assert_eq!(out.status.code(), Some(125), "got: {out:?}");
+
+    let s = h.status_json(&id);
+    assert_eq!(s["state"], "oom", "got: {s}");
+    assert_eq!(s["attempts"], 3, "one attempt and two raises: {s}");
+    assert_eq!(s["oom_raises"], 2, "got: {s}");
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        512 * 1024 * 1024,
+        "the claim doubles two times: {s}"
+    );
+
+    let note = s["error"].as_str().unwrap_or("");
+    assert!(
+        note.contains("TOO SMALL") && note.contains("--mem"),
+        "the record must say what the user must do: {note}"
+    );
+    assert!(
+        note.contains("128MB") && note.contains("512MB"),
+        "the record must give the first claim and the last one: {note}"
+    );
+}

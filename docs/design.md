@@ -207,9 +207,15 @@ This is deliberate, and the reason is the job that climbs for hours: a claim
 that is too small stops the job, and a claim that is a little large costs
 capacity only.
 
-qex records a job that COMPLETED only. A job that somebody stopped, or that the
-out-of-memory killer stopped, shows the memory that it reached and not the
-memory that it needs, and that number would teach qex the wrong size.
+qex records a job that COMPLETED, and a job that the KERNEL STOPPED FOR MEMORY.
+The second kind is a lower bound and not a peak: the job did not finish, so the
+true need is above the value. qex keeps the two kinds apart in `usage.json`, and
+the next claim goes above the largest of both. A lower bound costs a whole run
+to obtain, and an average with the smaller runs would lose it.
+
+qex records nothing else. A job that somebody stopped, or that reached its time
+limit, shows the memory that it reached and not the memory that it needs, and
+that number would teach qex the wrong size.
 
 ### Is there fairness between agents?
 
