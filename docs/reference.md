@@ -81,7 +81,12 @@ qex records two kinds of measurement, and it keeps them apart:
 | The job | What the sample says |
 | ------- | -------------------- |
 | completed | The memory that the job needs. |
-| the kernel stopped it for memory | A **lower bound**. The need is above this value. |
+| the kernel stopped it at its own limit | A **lower bound**. The need is above this value. |
+
+qex keeps one lower bound for a command, because a ladder of attempts makes one
+at each step and they would fill the store. The learned claim also never goes
+above `[budget] mem`: qex makes that number itself, and it must not make a
+number that it then refuses.
 
 A lower bound costs a whole run to obtain, so qex never averages it away. The
 next claim is above it, and a smaller run that succeeds later does not remove
@@ -119,10 +124,34 @@ Each attempt costs the full time of the job, which is why the ladder has a
 limit. A job that stops for memory at the limit keeps the state `oom`, and the
 record tells you to give a larger `--mem` value or to use a larger machine.
 
-qex tells a kill for memory from a kill by a command with the count in the
-cgroup, which Linux keeps for every process. `qex kill` also writes a mark
-before it sends the signal, and that mark always wins: a job that you stopped
-never runs again with a larger claim, and it teaches the learner nothing.
+The job goes through the **queue** again. Its claim is now larger, and the queue
+never admitted that claim, so qex tests it against the budget in the same way as
+a new job. A raised job thus waits while other jobs hold the budget, and the sum
+of the claims stays inside the budget.
+
+#### When qex acts, and when it only reports
+
+qex finds a kill for memory with the count in `memory.events`, which Linux keeps
+for each cgroup. The counter of a cgroup counts the kills in each cgroup below
+it, so **where qex reads it decides what qex may do**:
+
+| `[enforce] mode` | What qex reads | What qex does |
+| ---------------- | -------------- | ------------- |
+| `soft` or `hard` | The cgroup that qex made for this job. | Reports `oom`, raises the claim, runs the job again, and teaches the learner. |
+| `off` (default)  | The cgroup of your login session. | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
+
+With no limit, the count also rises when the kernel stops a **different program
+of the same user**. A machine that is short of memory is also the machine on
+which a person uses `kill -9`, so the two events arrive together. That evidence
+does not prove that the claim of this job was too small: the machine can be full
+while the claim is correct. qex therefore reports the state and stops.
+
+To get the correction, set `[enforce] mode`. The kernel then stops the job at
+the claim, and a kill is proof that the claim was too small.
+
+`qex kill` writes a mark before it sends the signal, and that mark always wins.
+A job that you stopped never runs again with a larger claim, and it teaches the
+learner nothing.
 
 On a machine with no cgroup, such as macOS, qex has no count. A `SIGKILL` that
 no qex command sent then gives the state `killed`, which starts no new attempt,

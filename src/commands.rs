@@ -1981,6 +1981,21 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     let mut spec = crate::job::read_spec(&dir)
         .with_context(|| format!("reading the specification of the job {id}"))?;
 
+    // Use the claim IN FORCE, and not the claim of the submission.
+    //
+    // The record holds the claim that the job had at the end. That value is the
+    // value of the specification, except after a kill for memory: qex then
+    // raised the claim, and the job succeeded at the larger value. A rerun from
+    // the specification would repeat the claim that the kernel already stopped,
+    // and the correction that cost a whole run would go away.
+    if let Ok(status) = crate::job::read_status(&dir) {
+        if status.mem > spec.mem {
+            spec.mem = status.mem;
+            spec.cpu = status.cpu.max(spec.cpu);
+            spec.claim_source = status.claim_source.clone();
+        }
+    }
+
     // A new job needs a new id, and it must not keep the dependencies of the
     // first job: those jobs have stopped, and a dependency on a job that
     // succeeded is not correct.

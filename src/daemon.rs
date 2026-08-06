@@ -135,6 +135,31 @@ impl State {
     pub fn count_state(&self, f: impl Fn(JobState) -> bool) -> usize {
         self.jobs.values().filter(|j| f(j.status.state)).count()
     }
+
+    /// Puts a job in the queue, after each job of the same priority or a higher
+    /// priority. The queue is thus stable.
+    ///
+    /// A job enters the queue two times in its life: at the submission, and
+    /// again after the kernel stopped it for memory and qex raised its claim.
+    /// The second case must use the same rule as the first, or a job that qex
+    /// corrects would go in front of the jobs that waited for it.
+    pub fn enqueue(&mut self, id: uuid::Uuid) {
+        if self.queue.contains(&id) {
+            return;
+        }
+        let priority = self.jobs.get(&id).map(|j| j.spec.priority).unwrap_or(0);
+        let pos = self
+            .queue
+            .iter()
+            .position(|other| {
+                self.jobs
+                    .get(other)
+                    .map(|j| j.spec.priority < priority)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(self.queue.len());
+        self.queue.insert(pos, id);
+    }
 }
 
 /// The coordinator. The threads share this value.
@@ -541,7 +566,7 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
     // learns immediately. It does not wait for the job to start.
     let warning = {
         let state = coord.state.lock().unwrap();
-        match crate::sched::size_check(&state.cfg, &spec) {
+        match crate::sched::size_check(&state.cfg, spec.cpu, spec.mem) {
             crate::sched::Size::Fits => None,
             crate::sched::Size::TooBig(reason) => {
                 use crate::config::OversizedPolicy;
@@ -591,7 +616,6 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
 
     {
         let mut state = coord.state.lock().unwrap();
-        let priority = spec.priority;
         status.sequence = state.next_sequence;
         state.next_sequence += 1;
         state.jobs.insert(
@@ -603,20 +627,7 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
             },
         );
 
-        // Put the job in the queue after each job of the same priority or a
-        // higher priority. The queue is thus stable.
-        let pos = state
-            .queue
-            .iter()
-            .position(|other| {
-                state
-                    .jobs
-                    .get(other)
-                    .map(|j| j.spec.priority < priority)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(state.queue.len());
-        state.queue.insert(pos, id);
+        state.enqueue(id);
     }
 
     // Keep a short record of this job, so a reader can tell "the record was

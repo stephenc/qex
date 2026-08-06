@@ -307,11 +307,29 @@ impl JobSpec {
         // This step is the reason that qex measures each job. `guess` is safe
         // and frequently far too large: a test suite that uses 165MB would hold
         // one half of the budget and stop other work for the length of the run.
-        let learned = if cfg.learn.enabled && (asked_cpu.is_none() || asked_mem.is_none()) {
+        let mut learned = if cfg.learn.enabled && (asked_cpu.is_none() || asked_mem.is_none()) {
             crate::usage::suggest(&crate::usage::load(), &cwd, &command, cfg.learn.margin)
         } else {
             None
         };
+
+        // A learned claim never goes above the budget.
+        //
+        // qex makes this number itself, and it must not make a number that it
+        // then refuses. A job that the kernel stopped for memory at the budget
+        // leaves a lower bound AT the budget, and the margin above that bound
+        // gave a claim of 1.5 budgets. `[queue] oversized = "reject"` then
+        // refused the submission with "Decrease the claim", and the user had
+        // given no claim to decrease.
+        //
+        // The claim stops at the budget instead. The job then starts, and if it
+        // still needs more memory, the record says that qex has no larger claim
+        // and that the machine is too small. That answer names a step that the
+        // user can take.
+        if let (Some(s), Ok(budget)) = (learned.as_mut(), cfg.budget_mem()) {
+            s.mem = s.mem.min(budget);
+        }
+        let learned = learned;
 
         let mut source = "default";
         let cpu = match asked_cpu {

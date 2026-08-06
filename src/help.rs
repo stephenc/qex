@@ -324,9 +324,10 @@ qex records a job that completed, and a job that the kernel stopped for memory.
 The two give different evidence, and qex keeps them apart:
 
   - a job that COMPLETED gives the memory that the job needs;
-  - a job that the KERNEL STOPPED for memory gives a lower bound. The true need
-    is above that value, so the next claim is above it as well. A smaller run
-    that succeeds later does not remove that lesson.
+  - a job that the KERNEL STOPPED AT ITS OWN LIMIT gives a lower bound. The true
+    need is above that value, so the next claim is above it as well. A smaller
+    run that succeeds later does not remove that lesson. qex records this
+    measurement when it applied the limit itself; see `qex help config`.
 
 qex records nothing else. A job that you stopped, or that reached its time
 limit, shows the memory that it reached and not the memory that it needs.
@@ -686,10 +687,18 @@ qex, so qex corrects its own fault and does not spend your count.
 
 The claim never goes above `[budget] mem`. A job that already claims the whole
 budget keeps the state `oom`, and the record says that you need a larger machine
-or a larger budget.
+or a larger budget. The job also goes through the QUEUE again, because the queue
+never admitted the new claim.
 
-Set `on_oom = 0` to stop this behaviour. A job that the kernel stops then keeps
-the state `oom` immediately.
+qex acts on the evidence of THIS JOB only. With `mode = \"soft\"` or
+`mode = \"hard\"` above, qex makes a cgroup for each job and reads the count of
+that cgroup: the kernel stopped the job at the claim, so the claim was too
+small. With `mode = \"off\"`, which is the default, qex reads the count of your
+login session, and that count also rises when the kernel stops a DIFFERENT
+program of the same user. qex then reports the state `oom` and starts no new
+attempt: the machine can be full while the claim of this job is correct.
+
+Set `[enforce] mode` to get the correction. Set `on_oom = 0` to stop it.
 
 Enforcement
 -----------
@@ -822,10 +831,15 @@ qex job states
 The states `queued`, `starting` and `running` are not final. Each other state is
 final and does not change.
 
-The state `oom` is different from `failed`. It says that the claim was too
-small. qex raises the claim and starts the job again by itself, up to 2 times.
-A job that keeps this state used more memory than qex can claim on this machine,
-so give a larger `--mem` value or use a larger machine.
+The state `oom` is different from `failed`. It says that the kernel stopped the
+job for memory.
+
+When qex applied the memory limit itself, that kill proves that the claim was
+too small: qex raises the claim and starts the job again, up to 2 times. With no
+limit, which is the default, qex reads the count of the login session, and that
+count also rises for a different program of the same user. qex then reports the
+state and starts no new attempt. The record of the job says which of the two
+happened, and what you can do.
 
 The state `killed` also covers a kill that qex cannot explain. The kernel and
 `qex kill` both use the signal KILL, and a machine with no cgroup keeps no count
