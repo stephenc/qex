@@ -5377,4 +5377,39 @@ fn a_job_is_told_the_size_of_its_claim() {
     h.ok(&["wait", &id, "--timeout", "45s"]);
     let out = h.ok(&["logs", &id, "--stdout"]);
     assert_eq!(out.trim(), "[][]", "the option must write nothing: {out}");
+
+    // A job file must be able to say the same thing. Without the field, the
+    // file is refused, because a job file rejects a name that qex does not
+    // know.
+    let file = h.root.join("off.toml");
+    std::fs::write(
+        &file,
+        "name = \"off\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
+         no_limit_env_hints = true\n\n\
+         [resources]\ncpu = 2\n",
+    )
+    .unwrap();
+    let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(out.trim(), "[][]", "the job file must turn it off: {out}");
+
+    // And the same file without that line gets the claim.
+    let file = h.root.join("on.toml");
+    std::fs::write(
+        &file,
+        "name = \"on\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\n\
+         [resources]\ncpu = 2\n",
+    )
+    .unwrap();
+    let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[2][2]",
+        "the job file must get the claim: {out}"
+    );
 }

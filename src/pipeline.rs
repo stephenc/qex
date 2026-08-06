@@ -52,6 +52,8 @@ pub struct Stage {
     pub env_capture: Option<crate::config::EnvCapture>,
     /// How politely this stage uses the processor. See the job file.
     pub nice: Option<i32>,
+    /// Do not tell this stage how large its claim is. See the job file.
+    pub no_limit_env_hints: Option<bool>,
     /// The stages that must succeed before this one.
     pub needs: Vec<String>,
     /// The stages that must stop before this one, whatever their result.
@@ -241,6 +243,7 @@ pub fn stage_spec(
         priority: stage.priority,
         env_capture: stage.env_capture,
         nice: stage.nice,
+        no_limit_env_hints: stage.no_limit_env_hints,
         // The caller resolves these names inside the file.
         needs: Vec::new(),
         after: Vec::new(),

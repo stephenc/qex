@@ -32,6 +32,16 @@ pub struct JobFile {
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<EnvCapture>,
+    /// Do not tell the job how large its claim is.
+    ///
+    /// qex writes the claim into the environment of the job (`GOMAXPROCS`,
+    /// `OMP_NUM_THREADS`, `GOMEMLIMIT` and more), so a runtime sizes its thread
+    /// pool to the claim and not to the machine. Give `true` here for a job
+    /// that must see the machine as it is.
+    ///
+    /// This field is the same as `--no-limit-env-hints`, and the command line
+    /// replaces this file.
+    pub no_limit_env_hints: Option<bool>,
     /// The jobs that must succeed before this job starts.
     ///
     /// Give an id or a name. If one of these jobs does not succeed, this job
@@ -368,9 +378,21 @@ impl JobSpec {
         // and `--env` ONLY. A user who asks for that asked for it deliberately,
         // and sixteen variables that qex chose would break the promise of the
         // option. `none` means none.
+        // The command line replaces the job file, and the job file replaces the
+        // configuration — the same order as every other value here.
+        //
         // `--no-limit-env-hints` is the answer for one job, and
         // `[claims] export_env = false` is the answer for every job.
-        if cfg.claims.export_env && !opts.no_limit_env_hints && capture != EnvCapture::None {
+        let hints = if opts.no_limit_env_hints {
+            false
+        } else {
+            match file.no_limit_env_hints {
+                Some(off) => !off,
+                None => cfg.claims.export_env,
+            }
+        };
+
+        if hints && capture != EnvCapture::None {
             export_claim(&mut env, cpu, mem, &cfg.claims.also);
         }
 

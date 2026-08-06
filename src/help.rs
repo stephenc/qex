@@ -589,6 +589,7 @@ A full file
     after = [\"cleanup\"]           # wait for these jobs, whatever the result
     env_capture = \"all\"           # all, minimal or none
     nice = 10                     # -20 to 19; a larger number gives way
+    no_limit_env_hints = false    # true: do not tell the job its claim size
 
     [resources]
     cpu = 3

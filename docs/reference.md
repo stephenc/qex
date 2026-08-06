@@ -785,7 +785,15 @@ gives one.
 Turn it all off with `[claims] export_env = false`.
 
 `qex submit --no-limit-env-hints` turns it off for one job, for a job that must
-see the machine as it is.
+see the machine as it is. A job file and a pipeline stage say the same thing
+with a field:
+
+```toml
+no_limit_env_hints = true
+```
+
+The command line replaces the file, and the file replaces the configuration —
+the same order as every other value.
 
 `--env-capture none` also turns it off for that job. That mode says the job
 starts with an empty environment and receives `[env]` and `--env` only, and
