@@ -44,6 +44,35 @@ are waiting for and wrong for work that outlives your attention.
 | short, and you wait for it now | `qex run -- ...` |
 | long, or you come back to it | `qex submit`, then `qex status <id> --wait` |
 
+## Many jobs at one time: read the stream
+
+```sh
+qex events --json
+```
+
+That command writes one JSON object on one line for each change of state, as it
+happens. Read it in place of a loop that asks about each job. Twenty jobs give
+one stream, and you learn of each result at the moment of the result.
+
+Keep the `seq` number of the last line that you read, and give it to `--since`
+when your program starts again. You then lose nothing:
+
+```sh
+qex events --json --since 348
+```
+
+Each `job` line carries the whole record, the same as `qex status --json`, so
+you need no second command to learn the exit code, the measured use or the
+cause of a failure.
+
+The coordinator keeps the last 512 events and never waits for a reader. If you
+fall behind, you receive a `gap` line that counts what you lost — qex never
+hides a gap. Do the work of an event in a different thread or process, and keep
+the reader reading.
+
+Run `qex help events` for the lines and the numbers, and `qex schema event` for
+the schema.
+
 ## Your session can stop, and the work continues
 
 **This is the property that makes qex safe for an agent that a person can
@@ -349,6 +378,6 @@ binary, for a machine with no network.
 
 ## Everything else
 
-`qex help <topic>` covers `job-file`, `resources`, `states`, `exit-codes` and
-`config`. `qex schema job` and `qex schema status` give the JSON Schema of each
-format. See the [reference](reference.md) for the full command list.
+`qex help <topic>` covers `job-file`, `resources`, `states`, `events`,
+`exit-codes` and `config`. `qex schema job`, `qex schema status` and
+`qex schema event` give the JSON Schema of each format. See the [reference](reference.md) for the full command list.

@@ -10,11 +10,12 @@ pub fn schema(which: &str) -> Option<&'static str> {
         "job" | "job-file" | "spec" => Some(JOB),
         "status" | "job-status" => Some(STATUS),
         "pipeline" | "pipelines" | "pipeline-file" => Some(PIPELINE),
+        "event" | "events" | "stream" => Some(EVENT),
         _ => None,
     }
 }
 
-pub const NAMES: &[&str] = &["job", "status", "pipeline"];
+pub const NAMES: &[&str] = &["job", "status", "pipeline", "event"];
 
 pub const JOB: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -303,6 +304,67 @@ pub const STATUS: &str = r##"{
 }
 "##;
 
+/// The schema of one line of `qex events`.
+///
+/// The stream is the interface for a program, so it needs a schema as much as
+/// the status does. A reader that writes a parser from an example writes a
+/// parser for the fields that its example held.
+pub const EVENT: &str = r##"{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/qex/schema/event.json",
+  "title": "qex event line",
+  "description": "One line of `qex events --json`. The command writes one of these objects on each line, at the moment of the change. Read the field `event` first. IGNORE A VALUE OF `event` THAT YOU DO NOT KNOW: a later version of qex can add one, and a reader that stops at an unknown line loses the lines after it.",
+  "type": "object",
+  "required": ["event", "time"],
+  "properties": {
+    "event": {
+      "type": "string",
+      "enum": ["stream", "job", "gap", "bye"],
+      "description": "The type of the line. `stream` is the first line and names the coordinator. `job` is a change of the record of one job. `gap` counts the events that you lost. `bye` says that the coordinator stops now."
+    },
+    "time": { "type": "integer", "description": "The time of the line, in seconds after the Unix epoch." },
+    "seq": {
+      "type": "integer",
+      "description": "The number of this event, on a `job` line. KEEP THE LARGEST NUMBER THAT YOU READ. Give it to `qex events --since N` when your program starts again, and you lose nothing. The numbers belong to one coordinator: they start at 1 again after the coordinator stops."
+    },
+    "version": { "type": "string", "description": "On a `stream` line: the version of the coordinator." },
+    "pid": { "type": "integer", "description": "On a `stream` line: the process id of the coordinator." },
+    "coordinator_started_at": {
+      "type": "integer",
+      "description": "On a `stream` line: the time when this coordinator started. A value that differs from the value of your last stream says that the coordinator restarted, so your sequence numbers belong to a coordinator that is gone."
+    },
+    "first_seq": { "type": "integer", "description": "On a `stream` line: the oldest event that the coordinator still holds." },
+    "last_seq": { "type": "integer", "description": "On a `stream` line: the newest event that the coordinator holds." },
+    "id": { "type": "string", "format": "uuid", "description": "On a `job` line: the id of the job." },
+    "name": { "type": "string", "description": "On a `job` line: the name of the job." },
+    "state": {
+      "type": "string",
+      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled", "skipped"],
+      "description": "On a `job` line: the state of the job now. Run `qex help states` for each state."
+    },
+    "previous": {
+      "type": ["string", "null"],
+      "description": "On a `job` line: the state before this event. The value is null for the first line of a job, which is the line that says that qex accepted it."
+    },
+    "change": {
+      "type": "string",
+      "enum": ["state", "reason"],
+      "description": "On a `job` line: `state` when the job moved to a different state, and `reason` when the job stays in the queue and the reason that it waits changed. Read `job.blocked_reason` for that reason."
+    },
+    "job": {
+      "type": "object",
+      "description": "On a `job` line: the whole record of the job, in the form that `qex status --json` gives. See `qex schema status`. You thus need no second command to learn the exit code, the measured use or the cause of a failure."
+    },
+    "missed": {
+      "type": "integer",
+      "description": "On a `gap` line: the number of events that you did not receive. The coordinator keeps the last events only, and it never waits for a reader. Read the stream in a loop, and do the work of an event in a different thread or process."
+    },
+    "next_seq": { "type": "integer", "description": "On a `gap` line: the number of the next event that you receive." },
+    "reason": { "type": "string", "description": "On a `gap` or `bye` line: the reason, in words for a person to read." }
+  }
+}
+"##;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +493,20 @@ mod tests {
             14,
             "the schema has a field that the job file does not accept"
         );
+    }
+
+    /// The event schema must name each type of line. A type that the schema
+    /// does not name looks like a fault to a reader that meets it.
+    #[test]
+    fn the_event_schema_names_each_type_of_line() {
+        let parsed: serde_json::Value = serde_json::from_str(EVENT).unwrap();
+        let types = parsed["properties"]["event"]["enum"].as_array().unwrap();
+        for name in ["stream", "job", "gap", "bye"] {
+            assert!(
+                types.iter().any(|t| t == name),
+                "the schema does not name the line `{name}`"
+            );
+        }
     }
 
     /// The example in the job schema must parse as a job file.

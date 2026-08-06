@@ -28,6 +28,7 @@ pub const TOPICS: &[&str] = &[
     "config",
     "resources",
     "states",
+    "events",
     "output",
     "exit-codes",
     "pipeline",
@@ -43,6 +44,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "config" | "configuration" => Some(CONFIG),
         "resources" | "resource" | "budget" => Some(RESOURCES),
         "states" | "state" => Some(STATES),
+        "events" | "event" | "stream" => Some(EVENTS),
         "output" | "json" => Some(OUTPUT),
         "exit-codes" | "exit" | "exitcodes" => Some(EXIT_CODES),
         "pipeline" | "pipelines" => Some(PIPELINE),
@@ -173,6 +175,22 @@ The three commands you need
     ID=$(qex submit --cpu 2 --mem 4GB -- uv run train.py)
     qex wait $ID
     qex logs $ID
+
+Many jobs at one time: read the stream
+--------------------------------------
+
+    qex events --json
+
+That command writes one JSON object on one line for each change of state, as it
+happens. Read it in place of a loop that asks about each job. Twenty jobs give
+one stream, and you learn of each result at the moment of the result.
+
+Keep the `seq` number of the last line that you read. Give it to
+`--since` when your program starts again, and you lose nothing:
+
+    qex events --json --since 348
+
+Run `qex help events` for the lines, the numbers and the gaps.
 
 If you operate inside a harness
 -------------------------------
@@ -1189,6 +1207,108 @@ field: it says what the job waited for and how long it waited.
 Use `qex list --state running` to select the jobs in one state.
 ";
 
+pub const EVENTS: &str = "\
+qex events: one stream for every job
+====================================
+
+    qex events --json
+
+The command writes ONE JSON OBJECT ON ONE LINE for each change, as it happens.
+Use it in place of a loop that asks about each job. An agent that drives twenty
+jobs reads one stream, and it does not send twenty commands again and again.
+
+    qex events --json | while read -r line; do ... done
+
+The command needs no timer. It writes each line at the moment of the change,
+and it uses no CPU time while it waits.
+
+The lines
+---------
+
+Each line has the field `event`, which gives its type. Ignore a type that you do
+not know: a later version of qex can add one.
+
+    stream   the first line. It names the coordinator and the numbers that it
+             holds. Read `coordinator_started_at` to see that the coordinator
+             restarted.
+    job      the record of one job changed. See below.
+    gap      you lost events, and this line counts them.
+    bye      the coordinator stops now, and it says why.
+
+A `job` line holds:
+
+    seq        the number of this event. KEEP IT. See `--since`.
+    time       the time of the change
+    id, name   the job
+    state      the state now
+    previous   the state before, or null for the first line of a job
+    change     `state`, or `reason` for a job that waits in the queue
+    job        the whole record, the same as `qex status --json`
+
+The field `job` holds everything, so you need no second command to learn the
+exit code, the measured use or the cause of a failure.
+
+A job that waits gives a line with `change` = `reason`. The field
+`job.blocked_reason` then says what the job waits for: memory, a lock, or a
+different job. The reason arrives a moment after the job enters the queue,
+because the scheduler writes it.
+
+Read the stream again after a stop
+----------------------------------
+
+    qex events --json --since 348      # the events after the number 348
+    qex events --json --since start    # everything that the coordinator holds
+    qex events --json --since now      # the new events only
+
+The default is `start`. Keep the largest `seq` that you read, and give it to
+`--since` when your program starts again. You then lose nothing.
+
+The numbers belong to ONE coordinator. The coordinator stops when no job
+operates, and the next command starts a new one, which starts at 1 again. The
+first line of the stream gives `coordinator_started_at`, so you can see that
+this happened.
+
+What happens when you do not read fast enough
+---------------------------------------------
+
+The coordinator keeps the last 512 events. It NEVER waits for a reader, and it
+never grows its memory for one. If you do not read the stream fast enough, the
+coordinator drops the oldest events and you receive a `gap` line that COUNTS
+them. Do the work of an event in a different thread or process, and keep the
+reader reading.
+
+qex reports a gap. It does not hide one, because a reader that loses `failed`
+and hears nothing waits for a result that will never arrive.
+
+The end of the stream
+---------------------
+
+The coordinator stops when no job operates and no command arrives for one hour.
+A reader does NOT hold it open. Before it stops, it writes a `bye` line, and the
+command then exits with the code 0.
+
+If the stream ends with NO `bye` line, something stopped the coordinator. The
+command writes a message to stderr and exits with the code 1. The records of the
+jobs are on the disk and they are correct; run the command again to read the
+stream of the next coordinator.
+
+Options
+-------
+
+    --json            one JSON object for each line. Use this option.
+    --since VALUE     `start`, `now`, or the last number that you read
+    --count N         stop after N events
+    --timeout TIME    stop after this time. The exit code is then 124.
+
+An earlier coordinator
+----------------------
+
+A coordinator that operates can be older than this command. Such a coordinator
+does not know this request, and `qex events` REFUSES to run: it names the
+coordinator, and it gives the command that stops it. It never gives you an empty
+stream, because an empty stream and a stream with no events look the same.
+";
+
 pub const OUTPUT: &str = "\
 qex output and files
 ====================
@@ -1206,6 +1326,7 @@ For the schema of these documents:
 
     qex schema status
     qex schema job
+    qex schema event
 
 Job files on the disk
 ---------------------
@@ -1314,6 +1435,8 @@ buffer and shows nothing until the buffer fills, because `grep` needs the option
 Watch the queue
 ---------------
 
+    qex events --json  one line for each change of state, as it happens.
+                       Use this command in a program. See `qex help events`.
     qex top            the jobs, the claim of each one, and its true use now
     qex top --once     one page, for a script
     qex top -i 5       a refresh every 5 seconds

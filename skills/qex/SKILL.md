@@ -152,6 +152,27 @@ again.
 with the same key gives you the first job whatever command you wrote, so give
 each different piece of work its own key.
 
+## Many jobs at one time
+
+Do not ask about each job in a loop. Read one stream:
+
+```sh
+qex events --json      # one JSON object on one line for each change of state
+```
+
+Each `job` line holds the whole record, the same as `qex status --json`, so you
+need no second command for the exit code or the cause of a failure. Keep the
+`seq` of the last line that you read and give it to `--since` when you start
+again, and you lose nothing:
+
+```sh
+qex events --json --since 348
+```
+
+The coordinator keeps the last 512 events and never waits for a reader. If you
+fall behind you receive a `gap` line that counts what you lost; qex never hides
+a gap. Run `qex help events` for the detail.
+
 ## Claims
 
 Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate together,
@@ -192,6 +213,7 @@ qex list                     what operates, what waits, and WHY it waits
 qex list --cwd .             the jobs of this directory
 qex kill <id>                stop a job that operates, and each of its children
 qex cancel <id>              take a job out of the queue
+qex events --json            one line for each change of state, as it happens
 qex top                      watch the queue; press q to leave
 qex watchers                 find the polling loops that already wait on this machine
 qex clean --auto             delete the records that stopped more than an hour ago

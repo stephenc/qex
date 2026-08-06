@@ -41,6 +41,18 @@ pub enum Request {
     /// A CLI sends this request only to a coordinator that is new enough to
     /// answer it. See the `capabilities` module for the reason.
     Capabilities,
+    /// Opens the event stream.
+    ///
+    /// This request is the one request that gives MANY answers. The coordinator
+    /// writes one `Event` response for each change, until the reader closes the
+    /// connection or the coordinator stops. The connection carries no other
+    /// request after this one.
+    ///
+    /// The CLI sends this request only to a coordinator that says `events` in
+    /// its capabilities. An earlier coordinator cannot read the name `events`,
+    /// so it answers with an error, and it does not accept the request in
+    /// silence.
+    Events { since: crate::events::Cursor },
 }
 
 /// A message from the coordinator to the CLI.
@@ -102,6 +114,11 @@ pub enum Response {
     },
     /// The things that the coordinator can do.
     Capabilities { names: Vec<String> },
+    /// One line of the event stream.
+    ///
+    /// The coordinator sends many of these for one `Events` request. Each one
+    /// holds one event, and the CLI writes that event alone on one line.
+    Event { event: Box<crate::events::Event> },
     /// The command failed.
     Error { message: String, kind: ErrorKind },
 }
@@ -147,6 +164,10 @@ mod tests {
             Request::Cancel { id },
             Request::Clean { id },
             Request::Info,
+            Request::Capabilities,
+            Request::Events {
+                since: crate::events::Cursor::After(7),
+            },
         ];
         for r in requests {
             let line = serde_json::to_string(&r).unwrap();
