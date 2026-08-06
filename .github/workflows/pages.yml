@@ -1,0 +1,67 @@
+name: Pages
+
+# The site at https://stephenc.github.io/qex, from the `docs` directory.
+#
+# # Why this workflow exists
+#
+# GitHub makes a deployment of its own when the source of the site is a
+# directory. That deployment STOPS when a new commit arrives, and the release
+# workflow pushes `chore(release): vX.Y.Z` a few minutes after the commit that
+# started it. Each push thus stopped the deployment of the push before it, and
+# the deployment that survived waited for a deployment that no longer existed
+# and reached its time limit after ten minutes.
+#
+# Every build of the site failed in that way, and the site kept the pages of an
+# earlier day while each new page looked as if it had gone out.
+#
+# Two rules below correct it:
+#
+#   1. `cancel-in-progress: false` — a deployment that operates goes to its end,
+#      and the next one waits. A deployment takes about one minute, so the queue
+#      is short.
+#   2. `paths` — the release commit changes Cargo.toml and Cargo.lock only, and
+#      it thus starts no deployment at all. The site changes when the words
+#      change, and at no other time.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/configure-pages@v5
+      - name: Jekyll
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v3
+
+  deploy:
+    name: Deploy the site
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
