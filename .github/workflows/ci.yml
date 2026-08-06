@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
@@ -48,7 +48,7 @@ jobs:
         # and not on the other says immediately where to look.
         os: [ubuntu-22.04, ubuntu-24.04, macos-14]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read the number from Cargo.toml
         id: msrv
         run: |
@@ -86,7 +86,7 @@ jobs:
     timeout-minutes: 5
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Each commit must follow Conventional Commits
@@ -115,7 +115,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust for ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal

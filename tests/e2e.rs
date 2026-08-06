@@ -945,7 +945,12 @@ fn a_job_that_stops_at_its_time_limit_keeps_its_result() {
     }
 
     for id in &ids {
-        h.ok(&["wait", id, "--timeout", "60s"]);
+        // Not `ok`: a job that reaches its limit gives the code 125, and that
+        // is the case that this test looks for. On a fast machine each job
+        // finishes first and the code is 0. Both are correct, and the test is
+        // about the RECORD, which must never say `timeout` and `exit code 0`
+        // together.
+        h.qex(&["wait", id, "--timeout", "60s"]);
         let s = h.status_json(id);
         let state = s["state"].as_str().unwrap();
         let code = s["exit_code"].as_i64();
@@ -1938,8 +1943,14 @@ fn a_replacement_of_the_program_does_not_stop_the_jobs() {
     );
 
     // `qex info` must report the replacement, so a reader learns the cause.
+    //
+    // The test for the replacement reads `/proc/self/exe`, which gives the path
+    // and the words `(deleted)` after somebody replaces the file. macOS has no
+    // equivalent, so qex cannot report the replacement there. The part above —
+    // THE JOB CONTINUES — is the part that matters, and it operates on both.
     let info = run(&["info", "--no-start", "--json"], &copy);
     let v: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    #[cfg(target_os = "linux")]
     assert_eq!(v["program_replaced"], true);
 
     if let Some(pid) = v["pid"].as_i64() {

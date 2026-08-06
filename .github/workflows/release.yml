@@ -27,7 +27,7 @@ jobs:
       previous: ${{ steps.next.outputs.previous }}
       release: ${{ steps.next.outputs.bump != 'none' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: next
@@ -55,7 +55,7 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --bins
@@ -85,7 +85,7 @@ jobs:
             target: aarch64-apple-darwin
             os: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Rust for ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal
@@ -129,7 +129,7 @@ jobs:
           shasum -a 256 "$file" >"$file.sha256"
           cat "$file.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: qex-${{ matrix.name }}
           path: |
@@ -146,7 +146,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           # The default token cannot start another workflow with its own push,
@@ -155,7 +155,7 @@ jobs:
           # deep.
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: files
           merge-multiple: true
@@ -222,7 +222,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: v${{ needs.version.outputs.version }}
       - run: rustup toolchain install stable --profile minimal

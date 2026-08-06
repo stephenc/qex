@@ -1688,11 +1688,25 @@ fn warn_if_temporary(path: &std::path::Path) {
 
     // The directories that a machine or a harness empties. `TMPDIR` covers
     // macOS, where the value is a directory of the user under `/var/folders`.
-    let mut roots: Vec<String> = vec!["/tmp".into(), "/var/tmp".into()];
+    //
+    // Each name goes through `canonicalize` as well, because the path of the id
+    // file went through it. macOS makes this necessary: `TMPDIR` there is
+    // `/var/folders/...`, and `/var` is a link to `/private/var`, so the two
+    // paths never agree as text.
+    let mut roots: Vec<String> = Vec::new();
+    let mut add = |value: &str| {
+        let path = std::path::Path::new(value);
+        if let Ok(real) = std::fs::canonicalize(path) {
+            roots.push(real.to_string_lossy().trim_end_matches('/').to_string());
+        }
+        roots.push(value.trim_end_matches('/').to_string());
+    };
+    add("/tmp");
+    add("/var/tmp");
     for name in ["TMPDIR", "CLAUDE_JOB_DIR", "XDG_RUNTIME_DIR"] {
         if let Ok(value) = std::env::var(name) {
             if !value.is_empty() {
-                roots.push(value.trim_end_matches('/').to_string());
+                add(&value);
             }
         }
     }

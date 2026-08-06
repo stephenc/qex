@@ -93,28 +93,13 @@ fn sysctl_u64(name: &[u8]) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn vm_available() -> Option<u64> {
-    // Call host_statistics64 with HOST_VM_INFO64. A new allocation can use the
-    // free pages and the inactive pages without a page operation to disk.
-    const HOST_VM_INFO64: libc::c_int = 4;
-    const HOST_VM_INFO64_COUNT: libc::mach_msg_type_number_t = 38;
+    // The structure and the count come from `libc`. qex made its own structure
+    // before, and that structure was WRONG: the real one mixes 32-bit and
+    // 64-bit fields and it aligns to 8 bytes, so the size that qex sent to the
+    // kernel did not agree with the size that the kernel writes.
+    let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
 
-    #[repr(C)]
-    struct VmStatistics64 {
-        free_count: u32,
-        active_count: u32,
-        inactive_count: u32,
-        wire_count: u32,
-        // The kernel structure has more fields, but qex reads the first fields
-        // only. The count that qex sends to the kernel covers all the fields.
-        rest: [u32; 34],
-    }
-
-    // Zero, and not `Default`: the standard library gives `Default` for an
-    // array of 32 elements at the most, and this array holds 34. The kernel
-    // writes each field of this structure, so the value before the call has no
-    // effect.
-    let mut stats: VmStatistics64 = unsafe { std::mem::zeroed() };
-    let mut count = HOST_VM_INFO64_COUNT;
     // `libc` marks `mach_host_self` as deprecated and gives the `mach2` crate
     // as the answer. qex reads one value from it, and a dependency for one
     // value is a poor exchange. The function itself is not deprecated: it is
@@ -123,7 +108,7 @@ fn vm_available() -> Option<u64> {
     let rc = unsafe {
         libc::host_statistics64(
             libc::mach_host_self(),
-            HOST_VM_INFO64,
+            libc::HOST_VM_INFO64,
             &mut stats as *mut _ as *mut libc::integer_t,
             &mut count,
         )
@@ -131,8 +116,36 @@ fn vm_available() -> Option<u64> {
     if rc != 0 {
         return None;
     }
+
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-    Some((stats.free_count as u64 + stats.inactive_count as u64) * page_size)
+
+    // WHICH PAGES A NEW JOB CAN USE.
+    //
+    // The free pages are not the answer on macOS. macOS keeps the memory of
+    // the machine in use, and it gives the memory back when a program asks for
+    // it. A count of the free pages alone thus says that a machine with 16GB
+    // has 300MB, and qex would then keep each job in the queue for ever on a
+    // machine that has no fault.
+    //
+    // These four kinds of page go to a new job with no operation to the disk:
+    //
+    //   free         nothing holds them
+    //   inactive     a program had them, and the kernel can take them back
+    //   purgeable    a program said that the kernel can discard them
+    //   speculative  the kernel read them before a program asked
+    //
+    // This total is higher than the memory that a job receives in the worst
+    // case, and that is the correct direction on macOS. macOS compresses memory
+    // and writes it to the disk; it does not stop a program for memory in the
+    // way that the Linux out-of-memory killer does. A number that is too low
+    // stops each job for ever, which is a fault with no remedy. A number that is
+    // a little high makes the machine slow, which the user can see and correct.
+    let usable = stats.free_count as u64
+        + stats.inactive_count as u64
+        + stats.purgeable_count as u64
+        + stats.speculative_count as u64;
+
+    Some(usable * page_size)
 }
 
 /// Gives an identifier for the current start of the machine.
