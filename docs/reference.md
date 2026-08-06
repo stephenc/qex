@@ -1057,6 +1057,65 @@ configuration says `export_env = false` stays off for every job.
 starts with an empty environment and receives `[env]` and `--env` only, and
 `none` means none.
 
+## A command when a job stops
+
+`[hooks] on_stop` names a command that qex runs when a job reaches its final
+state. Use it for a notification, so that a person who left the machine learns
+that a long job stopped.
+
+```toml
+[hooks]
+on_stop = ["notify-send", "a qex job stopped"]
+on_stop_states = ["completed", "failed", "killed", "timeout", "oom"]
+timeout = "30s"
+```
+
+The hook is in the config file, and a job file has no hook field. The hook
+belongs to the machine and to the person at it, and not to the work.
+
+The value is a program and its arguments. qex starts no shell, in the same way
+as for a job. To use a shell feature, name the shell:
+
+```toml
+[hooks]
+on_stop = ["bash", "-lc", "echo \"$QEX_JOB_NAME $QEX_STATE\" >> ~/qex.log"]
+```
+
+The job supplies these variables. A variable with no value is empty text.
+
+| Variable | Value |
+| -------- | ----- |
+| `QEX_JOB_ID` | the job id |
+| `QEX_JOB_NAME` | the job name |
+| `QEX_STATE` | the final state |
+| `QEX_EXIT_CODE` | the exit code, if the job stopped without a signal |
+| `QEX_SIGNAL` | the signal number, if a signal stopped the job |
+| `QEX_ELAPSED_SECS` | the seconds that the job ran |
+| `QEX_CWD` | the directory of the job |
+| `QEX_JOB_DIR` | the directory of the record, which holds the logs |
+| `QEX_ATTEMPTS` | the number of times that qex started the job |
+| `QEX_MAX_RSS` | the maximum memory in bytes |
+| `QEX_TAGS` | the tags, separated by a space |
+
+The values arrive in the environment and never in a command line. A job name
+with a shell character is thus a name, and never a command.
+
+`on_stop_states` selects the jobs that give a message. The default list holds
+each state of a job that ran. `cancelled` and `skipped` are not in it: you
+cancelled the job yourself, and one failure in a pipeline of twenty stages would
+give twenty messages. Add those names to get them.
+
+qex gives these guarantees. It runs the hook one time for each job, also when
+the coordinator stops and starts again while the job runs. It runs the hook
+after the final state is on the disk, so the job has its result, the budget is
+free and the next job starts before the hook does anything. A hook that uses
+more than `[hooks] timeout` receives a signal and stops. A hook that fails does
+not change the job. The output of the hook goes to `hook.log` in the directory
+of the job.
+
+A job that failed and ran again gives one message, with the final result.
+`QEX_ATTEMPTS` gives the number of attempts.
+
 ## More help inside the tool
 
 Each topic below is also in the binary, so an agent needs no network:

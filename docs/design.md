@@ -37,7 +37,16 @@ fail or restart, and the job must continue and must still record its result. A
     status.json    the state, the exit code, the times and the true use
     stdout.log
     stderr.log
+    hook.ran       the record that the stop hook of this job ran (mode 0600)
+    hook.log       the output of that hook (mode 0600)
 ```
+
+`hook.ran` gives the stop hook one run for each job. Several processes can make
+a job terminal: the supervisor writes the usual result, and the coordinator
+writes `cancelled`, `skipped` and the failure of a job whose supervisor stopped.
+Each of them makes this file with `create_new` before it starts the hook, and
+that operation succeeds for one process only. A person thus receives one
+message, also when the coordinator stops and starts again while the job runs.
 
 `status.json` is the primary record. It records the command, the directory, the
 state, the exit code, the times and the measured use. The supervisor writes it

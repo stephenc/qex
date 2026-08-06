@@ -99,7 +99,8 @@ impl std::str::FromStr for JobState {
             "skipped" => Ok(Self::Skipped),
             other => Err(format!(
                 "unknown job state `{other}`. Use one of these states: queued, starting, \
-                 running, completed, failed, killed, timeout, expired, oom, cancelled"
+                 running, completed, failed, killed, timeout, expired, oom, cancelled, \
+                 skipped"
             )),
         }
     }
