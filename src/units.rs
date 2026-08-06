@@ -115,6 +115,21 @@ pub fn parse_duration(s: &str) -> Result<Option<std::time::Duration>, String> {
     Ok(Some(std::time::Duration::from_secs_f64(secs)))
 }
 
+/// Writes a count and the word for the thing that it counts.
+///
+/// The word takes an `s` when the count is not one. A message that says
+/// `1 lines` looks like a fault of qex, and the reader then doubts the number
+/// as well as the words.
+///
+/// Give the word in the singular: `count_of(3, "job")` gives `3 jobs`.
+pub fn count_of(count: usize, word: &str) -> String {
+    if count == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{count} {word}s")
+    }
+}
+
 /// Writes a duration in a short form for the status output.
 ///
 /// Examples: `1h5m`, `45s`, `2d3h`.

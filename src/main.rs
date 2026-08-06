@@ -45,6 +45,8 @@ mod daemon;
 #[cfg(unix)]
 mod enforce;
 #[cfg(unix)]
+mod fanout;
+#[cfg(unix)]
 mod help;
 #[cfg(unix)]
 mod history;
