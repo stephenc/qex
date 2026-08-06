@@ -421,6 +421,7 @@ fn a_kill_stops_every_process_of_a_job() {
 ///
 /// This function reads `/proc` and compares the process group id. It does not
 /// compare a command line, so it cannot match the test itself.
+#[cfg(target_os = "linux")]
 fn count_in_group(pgid: i32) -> usize {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;
@@ -438,6 +439,27 @@ fn count_in_group(pgid: i32) -> usize {
         }
     }
     count
+}
+
+/// The same count on macOS, which has no `/proc`.
+///
+/// This function read `/proc` on both systems before, so it gave 0 on macOS.
+/// The first assertion of the test then failed, and the LAST one — that no
+/// process of the job continues after `qex kill` — passed with no work, because
+/// 0 is also the correct answer for a job that stopped. A test that cannot fail
+/// gives no information.
+#[cfg(not(target_os = "linux"))]
+fn count_in_group(pgid: i32) -> usize {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pgid="])
+        .output()
+    else {
+        return 0;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.trim().parse::<i32>() == Ok(pgid))
+        .count()
 }
 
 /// The job result must stay correct after the coordinator fails. The supervisor
