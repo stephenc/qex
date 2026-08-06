@@ -916,9 +916,15 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
     // Take the job and test it again, with one lock only.
     //
     // The scheduler chose this job and then released the lock. In that moment,
-    // `qex cancel` can change the job, and `qex clean` can delete it. This code
-    // must thus test the job again. Without the test, qex starts a job that the
-    // user cancelled, and the user receives an answer that says the opposite.
+    // `qex cancel` can change the job, `qex clean` can delete it, and
+    // `qex pause` can stop the queue. This code must thus test the job again.
+    // Without the test, qex starts a job that the user cancelled, and the user
+    // receives an answer that says the opposite.
+    //
+    // The pause is in this list for the same reason: `qex pause queue` answers
+    // "paused" and the job starts, and `qex pause lock gpu0` tells the person
+    // that the lock is theirs while a job takes it in the same instant. That
+    // order is the whole claim of the lock half of this feature.
     //
     // This code uses no `expect` on the map. A panic here occurs while this
     // thread holds the lock, which poisons the lock and stops the coordinator.
@@ -931,6 +937,22 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         };
         if job.status.state != JobState::Queued {
             // `qex cancel` or a different thread changed the job.
+            return Ok(());
+        }
+
+        if state.paused.queue.is_some() {
+            log(&format!("job {id} does not start: the queue is paused"));
+            return Ok(());
+        }
+        if let Some(name) = job
+            .spec
+            .locks
+            .iter()
+            .find(|n| state.paused.locks.contains_key(*n))
+        {
+            log(&format!(
+                "job {id} does not start: a person holds the lock `{name}`"
+            ));
             return Ok(());
         }
 

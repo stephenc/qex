@@ -666,11 +666,22 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     if state.paused.expire(sys::now_secs()) {
         state.save_pause();
     }
-    if let Some(record) = &state.paused.queue {
-        log(&format!(
+    match &state.paused.queue {
+        Some(record) if record.fault => {
+            // Say this in the log AND keep it in the file. The next command
+            // then reads a record that qex can parse, and the words that a
+            // person needs stay with it.
+            log(&format!(
+                "qex could not read its pause record, so it holds the queue: {}",
+                record.reason.as_deref().unwrap_or("unknown")
+            ));
+            state.save_pause();
+        }
+        Some(record) => log(&format!(
             "the queue is paused; a person paused it at {}",
             sys::clock_text(record.paused_at)
-        ));
+        )),
+        None => {}
     }
     for name in state.paused.locks.keys() {
         log(&format!("a person holds the lock `{name}`"));
@@ -910,7 +921,8 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
             target,
             reason,
             until,
-        } => handle_pause(coord, target, reason, until),
+            by_pid,
+        } => handle_pause(coord, target, reason, until, by_pid),
         Request::Resume { target } => handle_resume(coord, target),
         Request::PauseState => {
             let state = coord.state.lock().unwrap();
@@ -932,20 +944,20 @@ fn handle_pause(
     target: crate::proto::PauseTarget,
     reason: Option<String>,
     until: Option<u64>,
+    by_pid: i32,
 ) -> Response {
     use crate::proto::PauseTarget;
 
     let mut state = coord.state.lock().unwrap();
-    // The pid of the CLI process is not available here, so the record names the
-    // coordinator. A person who reads the file learns which queue is paused.
-    let record = crate::pause::PauseRecord::new(std::process::id() as i32, reason, until);
 
     match target {
         PauseTarget::Queue => {
+            let record = keep_the_end(state.paused.queue.take(), by_pid, reason, until);
             state.paused.queue = Some(record);
             log("a person paused the queue; qex starts no job");
         }
         PauseTarget::Lock { name } => {
+            let record = keep_the_end(state.paused.locks.remove(&name), by_pid, reason, until);
             log(&format!("a person asked for the lock `{name}`"));
             state.paused.locks.insert(name, record);
         }
@@ -960,6 +972,37 @@ fn handle_pause(
     // Wake the scheduler, so the jobs of the queue get the new reason at once.
     coord.notify();
     answer
+}
+
+/// Makes the record of a pause, and keeps what a second command did not give.
+///
+/// # The fault that this function prevents
+///
+/// `qex pause queue` looks like a command that a person can run twice. A second
+/// command that replaced the whole record would change a pause of 30 minutes
+/// into a pause with no end, because the second command gave no `--for`. An
+/// agent that pauses to protect itself would thus take the machine from a
+/// person for the rest of the day.
+///
+/// A second command therefore ADDS: it keeps the start, and it keeps the end
+/// and the reason that it does not give. To replace an end, run `qex resume`
+/// first.
+fn keep_the_end(
+    old: Option<crate::pause::PauseRecord>,
+    by_pid: i32,
+    reason: Option<String>,
+    until: Option<u64>,
+) -> crate::pause::PauseRecord {
+    let mut record = crate::pause::PauseRecord::new(by_pid, reason, until);
+    // A record that qex made because it could not read the file is not a pause
+    // that a person asked for, so a real pause replaces it in full.
+    if let Some(old) = old.filter(|o| !o.fault) {
+        record.paused_at = old.paused_at;
+        record.by_pid = old.by_pid;
+        record.reason = record.reason.or(old.reason);
+        record.until = record.until.or(old.until);
+    }
+    record
 }
 
 /// Removes a pause.
@@ -1027,8 +1070,12 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         config_error: state.config_error.clone(),
         cpu_claimed,
         mem_claimed,
+        // `paused-by-fault` is a state of its own, and not a flag beside
+        // `paused`. Two parallel fields drift, and a reader that learns the
+        // pause but not its cause cannot correct the cause.
         queue_state: Some(
-            match state.paused.queue {
+            match &state.paused.queue {
+                Some(record) if record.fault => "paused-by-fault",
                 Some(_) => "paused",
                 None => "running",
             }
@@ -1649,5 +1696,46 @@ mod tests {
         release_dedupe(&mut state, id);
         assert!(state.dedupe.is_empty());
         assert_eq!(state.dedupe_holder("k", 3600), None);
+    }
+
+    /// A second `qex pause queue` must not lose the end of the first one.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// `qex pause queue` looks like a command that a person can run twice. A
+    /// second command that replaced the whole record would change a pause of 30
+    /// minutes into a pause with no end, because the second command gave no
+    /// `--for`. An agent that pauses to protect itself would then take the
+    /// machine from a person for the rest of the day.
+    #[test]
+    fn a_second_pause_keeps_the_end_and_the_reason_of_the_first() {
+        let first = crate::pause::PauseRecord {
+            paused_at: 1_000,
+            by_pid: 11,
+            reason: Some("recording a demo".into()),
+            until: Some(2_800),
+            fault: false,
+        };
+
+        let second = keep_the_end(Some(first.clone()), 22, None, None);
+        assert_eq!(second.until, Some(2_800), "the end must stay");
+        assert_eq!(second.reason.as_deref(), Some("recording a demo"));
+        assert_eq!(second.paused_at, 1_000, "the pause began at the first one");
+
+        // A second command that GIVES a value uses it.
+        let third = keep_the_end(Some(first.clone()), 22, Some("a build".into()), Some(9_000));
+        assert_eq!(third.until, Some(9_000));
+        assert_eq!(third.reason.as_deref(), Some("a build"));
+
+        // A pause that qex made because it could not read the file is not a
+        // pause that a person asked for, so a real pause replaces it in full.
+        let fault = crate::pause::PauseRecord {
+            fault: true,
+            ..first
+        };
+        let real = keep_the_end(Some(fault), 22, None, None);
+        assert_eq!(real.until, None);
+        assert_eq!(real.by_pid, 22);
+        assert!(!real.fault);
     }
 }

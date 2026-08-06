@@ -450,7 +450,14 @@ b0bb2614  queued  train  ...  waits for the lock `gpu0`, which a person holds
 
 The pause is a file beside the job records, so it survives a coordinator that
 stops. It covers your queue only; it does not pause another user of the
-machine.
+machine. A job with `--retries` waits too: its supervisor reads the same file.
+
+If qex cannot read that file, it holds the queue and says so. A file that qex
+cannot read can hold a pause, and qex does not know. `qex resume queue` writes
+a new file.
+
+A second `qex pause queue` keeps the end and the reason of the first one. To
+replace an end, run `qex resume queue` first.
 
 `qex pause` with no word says what is paused now. `qex info`, `qex top` and
 `qex list` say it too, and a pause with no end is reported loudly each time.
