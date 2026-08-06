@@ -59,8 +59,9 @@ the variable `QEX_JOB_NAME` with those letters in it, and never a command.
 qex starts no shell for the hook, in the same way as for a job. A shell that you
 name in `on_stop` reads the variables, and the quotation is then yours to write.
 
-The hook has a time limit, and its output goes to `hook.log` in the job
-directory with mode 0600. A hook that fails changes no job.
+The hook has a time limit and a size limit. Its output goes to `hook.log` in the
+job directory with mode 0600, and `qex logs <id> --hook` reads that file. A hook
+that fails changes no job.
 
 ## The several-user accounting
 

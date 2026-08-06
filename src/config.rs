@@ -1282,10 +1282,15 @@ impl Config {
         // would keep the hook silent for the jobs that the user wants. Refuse
         // the file instead.
         for name in &self.hooks.on_stop_states {
-            let state = name.parse::<crate::job::JobState>().map_err(|e| {
+            // Name the final states only. The general list of the states also
+            // holds `queued`, `starting` and `running`, and the test below
+            // refuses each of those three. A message must not offer a value
+            // that the next line refuses.
+            let state = name.parse::<crate::job::JobState>().map_err(|_| {
                 anyhow::anyhow!(
-                    "config [hooks] on_stop_states: {e}. Use the names of the states that a \
-                     job stops in."
+                    "config [hooks] on_stop_states holds `{name}`, which is not a job state. \
+                     Use the final states: completed, failed, killed, timeout, oom, \
+                     cancelled, skipped."
                 )
             })?;
             if !state.is_terminal() {

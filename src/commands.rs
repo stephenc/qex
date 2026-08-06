@@ -946,7 +946,24 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
         return follow(&dir, &args.select);
     }
 
-    let streams = chosen_streams(&args.select);
+    // The log of the stop hook is not a stream of the job, so it comes alone.
+    // A reader who asks why a notification did not arrive must not receive the
+    // output of the job with that answer.
+    let streams = if args.hook {
+        // Say that there is no file. An empty answer would look like a hook
+        // that ran and wrote nothing, and the reader would test the wrong
+        // thing.
+        if !dir.join("hook.log").exists() {
+            eprintln!(
+                "qex: qex ran no stop hook for this job, so there is no log. \
+                 Read `qex config show` to see the hook and the states that it runs on."
+            );
+            return Ok(0);
+        }
+        vec![("hook", "hook.log")]
+    } else {
+        chosen_streams(&args.select)
+    };
     // The record says what the LIMIT removed. That is not in the file, and no
     // option gives it back, so each path below says it.
     let status = crate::job::read_status(&dir).ok();

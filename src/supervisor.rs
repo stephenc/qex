@@ -133,7 +133,16 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
 
         match job::read_status(&dir) {
             Ok(status) if status.state.is_terminal() => {
-                job.status = status;
+                job.status = status.clone();
+
+                // Run the hook here as well.
+                //
+                // The supervisor writes the terminal record and then runs the
+                // hook. A signal in the moment between those two steps leaves a
+                // job with a correct result and no notification. This call
+                // closes that moment. It costs nothing when the supervisor did
+                // its work: the claim file stops the second run.
+                crate::hook::fire_detached(&cfg, &dir, &status);
             }
             other => {
                 // The supervisor stopped before it wrote a result. Something
@@ -446,6 +455,18 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             status.error = Some(message);
             status.blocked_reason = None;
             job::write_status(&dir, &status)?;
+
+            // Leave the cgroup of the job before the hook runs.
+            //
+            // This process put itself in that cgroup for the job, and the job
+            // never started. The hook is not the job, so it must not receive
+            // the memory limit of the job. Without this step, a hook in a
+            // `hard` mode cgroup meets a limit that belongs to other work.
+            if let Some(cgroup) = crate::enforce::job_cgroup_path(&dir) {
+                crate::enforce::leave_cgroup(&cgroup);
+                crate::enforce::remove_cgroup(&cgroup);
+            }
+
             crate::hook::fire(&cfg, &dir, &status);
             return Ok(1);
         }

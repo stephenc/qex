@@ -765,10 +765,22 @@ failure only:
 
 The hook cannot damage the queue. qex runs it after the final state is on the
 disk, so the job has its result, the budget is free, and the next job starts
-before the hook does anything. qex runs the hook one time for each job. A hook
-that uses more than `[hooks] timeout` receives a signal and stops. A hook that
-fails does not change the job. The output of the hook goes to `hook.log` in the
-directory of the job.
+before the hook does anything.
+
+qex never runs the hook two times for one job. It runs the hook one time for
+each job that stops, EXCEPT when the machine or the process stops in the moment
+between the record of the run and the run itself: qex then loses that message,
+and it does not try again. A message that arrives two times is worse than a
+message that is lost.
+
+A hook that uses more than `[hooks] timeout` receives TERM and then KILL, in a
+process group of its own. A hook that writes more than 1MB stops in the same
+way, and qex cuts the file to that size. A hook that fails does not change the
+job.
+
+The output goes to `hook.log` in the directory of the job. Read it with
+`qex logs <id> --hook`, which also gives the verdict of qex: a hook that did not
+start, a hook that was too slow, or a hook that stopped with an error.
 
 Default job size
 ----------------
@@ -1078,6 +1090,8 @@ Logs
     qex logs <id> --max-matches 20  show 20 matches, and count the others
     qex logs <id> --follow        the output while the job operates
     qex logs <id> --follow --tail 50   the last 50 lines, then the new lines
+    qex logs <id> --hook          the output of the stop hook, and the verdict
+                                  of qex on it
     qex logs <id> --follow --grep ERROR  the matches as they arrive
 
 Every path has a limit. A search reports the number of lines that match, so a

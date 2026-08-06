@@ -15,7 +15,7 @@ qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
-qex logs   <id> [--follow] [--tail N] [--stdout|--stderr]
+qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
 qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
@@ -870,13 +870,27 @@ each state of a job that ran. `cancelled` and `skipped` are not in it: you
 cancelled the job yourself, and one failure in a pipeline of twenty stages would
 give twenty messages. Add those names to get them.
 
-qex gives these guarantees. It runs the hook one time for each job, also when
-the coordinator stops and starts again while the job runs. It runs the hook
-after the final state is on the disk, so the job has its result, the budget is
-free and the next job starts before the hook does anything. A hook that uses
-more than `[hooks] timeout` receives a signal and stops. A hook that fails does
-not change the job. The output of the hook goes to `hook.log` in the directory
-of the job.
+qex gives these guarantees:
+
+- **qex never runs the hook two times for one job.** The job directory holds the
+  file `hook.ran`, and the process that makes that file is the process that runs
+  the hook. This holds also when the coordinator stops and starts again while
+  the job runs. qex runs the hook one time for each job that stops, EXCEPT when
+  the machine or the process stops between the two steps: qex makes `hook.ran`
+  first, so a failure in that moment loses the message and qex does not try
+  again. A message that arrives two times is worse than a message that is lost.
+- **A hook cannot hold the queue.** qex starts it after the final state is on
+  the disk, so the job has its result, the budget is free and the next job
+  starts before the hook does anything.
+- **A hook has a time limit and a size limit.** A hook that uses more than
+  `[hooks] timeout` receives TERM and then KILL, in a process group of its own.
+  A hook that writes more than 1MB stops in the same way, and qex cuts the file
+  to that size.
+- **A hook that fails does not change the job.**
+
+The output of the hook goes to `hook.log` in the directory of the job. Read it
+with `qex logs <id> --hook`, which also gives the verdict of qex on the hook: a
+hook that did not start, that was too slow, or that stopped with an error.
 
 A job that failed and ran again gives one message, with the final result.
 `QEX_ATTEMPTS` gives the number of attempts.
