@@ -32,21 +32,29 @@ pub enum Size {
 ///
 /// This test uses the budget, not the free capacity. A job that fails this test
 /// can never start by the normal rule.
-pub fn size_check(cfg: &Config, spec: &JobSpec) -> Size {
+///
+/// # Which claim the queue uses
+///
+/// The caller gives the claim IN FORCE, and not the claim in the specification.
+/// The two are the same until the kernel stops the job for memory: qex then
+/// raises the claim in the record and gives the job back to the queue. The
+/// queue must use the raised claim, because that is the claim that the job
+/// holds and that the memory limit applies. A test against the first claim
+/// would admit a job of 1GB into the space that qex kept for 600MB.
+pub fn size_check(cfg: &Config, cpu: u64, mem: u64) -> Size {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
     let mem_budget = cfg.budget_mem().unwrap_or(0);
 
     let mut reasons = Vec::new();
-    if spec.cpu > cpu_budget {
+    if cpu > cpu_budget {
         reasons.push(format!(
-            "the job claims {} cores and the budget is {} cores",
-            spec.cpu, cpu_budget
+            "the job claims {cpu} cores and the budget is {cpu_budget} cores"
         ));
     }
-    if spec.mem > mem_budget {
+    if mem > mem_budget {
         reasons.push(format!(
             "the job claims {} of memory and the budget is {}",
-            format_size(spec.mem),
+            format_size(mem),
             format_size(mem_budget)
         ));
     }
@@ -107,23 +115,24 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
 }
 
 /// Tests if a job can start now.
-fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
+///
+/// `cpu` and `mem` are the claim IN FORCE. See [`size_check`].
+fn admit(cfg: &Config, cpu: u64, mem: u64, cpu_used: u64, mem_used: u64) -> Admit {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
     let mem_budget = cfg.budget_mem().unwrap_or(0);
 
     // Test 1: the budget of this user.
-    if cpu_used + spec.cpu > cpu_budget {
+    if cpu_used + cpu > cpu_budget {
         return Admit::No(format!(
-            "waits for cores: {} of {} are in use and the job needs {}",
-            cpu_used, cpu_budget, spec.cpu
+            "waits for cores: {cpu_used} of {cpu_budget} are in use and the job needs {cpu}"
         ));
     }
-    if mem_used + spec.mem > mem_budget {
+    if mem_used + mem > mem_budget {
         return Admit::No(format!(
             "waits for memory: {} of {} is in use and the job needs {}",
             format_size(mem_used),
             format_size(mem_budget),
-            format_size(spec.mem)
+            format_size(mem)
         ));
     }
 
@@ -132,13 +141,13 @@ fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
     if cfg.peers.enabled {
         let peers = crate::peers::claims(cfg);
         if peers.cpu > 0 || peers.mem > 0 {
-            if cpu_used + peers.cpu + spec.cpu > cpu_budget {
+            if cpu_used + peers.cpu + cpu > cpu_budget {
                 return Admit::No(format!(
                     "waits for cores: {} user(s) claim {} cores",
                     peers.count, peers.cpu
                 ));
             }
-            if mem_used + peers.mem + spec.mem > mem_budget {
+            if mem_used + peers.mem + mem > mem_budget {
                 return Admit::No(format!(
                     "waits for memory: {} user(s) claim {}",
                     peers.count,
@@ -152,7 +161,7 @@ fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
     // only. It is the test that a program outside qex cannot avoid.
     let reserve = cfg.reserve_mem().unwrap_or(0);
     let available = sys::available_memory();
-    if available < reserve + spec.mem {
+    if available < reserve + mem {
         // Say what this number is, and what it is not.
         //
         // A machine can be healthy and still report a small number here: the
@@ -168,7 +177,7 @@ fn admit(cfg: &Config, spec: &JobSpec, cpu_used: u64, mem_used: u64) -> Admit {
             "waits for memory: the machine reports {} that a new program can use, and the job \
              needs {} with {} in reserve",
             format_size(available),
-            format_size(spec.mem),
+            format_size(mem),
             format_size(reserve)
         );
         match sys::memory_pressure() {
@@ -787,8 +796,13 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
             continue;
         };
 
-        match size_check(&cfg, &job.spec) {
-            Size::Fits => match admit(&cfg, &job.spec, cpu_used, mem_used) {
+        // The claim in force lives in the record, and not in the
+        // specification. qex raises it after the kernel stops the job for
+        // memory, and the queue must then use the raised claim.
+        let (claim_cpu, claim_mem) = (job.status.cpu, job.status.mem);
+
+        match size_check(&cfg, claim_cpu, claim_mem) {
+            Size::Fits => match admit(&cfg, claim_cpu, claim_mem, cpu_used, mem_used) {
                 Admit::Yes if chosen.is_none() => {
                     chosen = Some(id);
                     break;
@@ -950,7 +964,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        let forced = match size_check(&state.cfg, &job.spec) {
+        let forced = match size_check(&state.cfg, job.status.cpu, job.status.mem) {
             Size::TooBig(reason) => Some(format!(
                 "{reason}. qex started this job alone because no other job operated."
             )),
@@ -1115,15 +1129,15 @@ mod tests {
     #[test]
     fn a_job_inside_the_budget_fits() {
         let cfg = cfg_with("4", "8GB");
-        assert_eq!(size_check(&cfg, &spec_with(4, 8 << 30)), Size::Fits);
-        assert_eq!(size_check(&cfg, &spec_with(1, 1 << 30)), Size::Fits);
+        assert_eq!(size_check(&cfg, 4, 8 << 30), Size::Fits);
+        assert_eq!(size_check(&cfg, 1, 1 << 30), Size::Fits);
     }
 
     #[test]
     fn a_job_larger_than_the_budget_is_too_big() {
         let cfg = cfg_with("4", "8GB");
 
-        let Size::TooBig(reason) = size_check(&cfg, &spec_with(64, 1 << 30)) else {
+        let Size::TooBig(reason) = size_check(&cfg, 64, 1 << 30) else {
             panic!("a job of 64 cores must not fit a budget of 4 cores");
         };
         assert!(
@@ -1131,7 +1145,7 @@ mod tests {
             "the reason must name the cores: {reason}"
         );
 
-        let Size::TooBig(reason) = size_check(&cfg, &spec_with(1, 64 << 30)) else {
+        let Size::TooBig(reason) = size_check(&cfg, 1, 64 << 30) else {
             panic!("a job of 64GB must not fit a budget of 8GB");
         };
         assert!(
@@ -1141,7 +1155,7 @@ mod tests {
 
         // A job that is too large in both values must give both reasons. The
         // agent then corrects the claim one time only.
-        let Size::TooBig(reason) = size_check(&cfg, &spec_with(64, 64 << 30)) else {
+        let Size::TooBig(reason) = size_check(&cfg, 64, 64 << 30) else {
             panic!("this job must not fit");
         };
         assert!(
@@ -1167,19 +1181,19 @@ mod tests {
     #[test]
     fn the_budget_limits_the_jobs_that_operate_together() {
         let cfg = cfg_with("4", "256MB");
-        let job = spec_with(2, 64 << 20);
+        let (cpu, mem) = (2, 64 << 20);
 
         // Two cores are in use. A job of two cores fits.
-        assert!(matches!(admit(&cfg, &job, 2, 64 << 20), Admit::Yes));
+        assert!(matches!(admit(&cfg, cpu, mem, 2, 64 << 20), Admit::Yes));
 
         // Four cores are in use. The same job must wait.
-        let Admit::No(reason) = admit(&cfg, &job, 4, 64 << 20) else {
+        let Admit::No(reason) = admit(&cfg, cpu, mem, 4, 64 << 20) else {
             panic!("a job must not start when the cores are in use");
         };
         assert!(reason.contains("cores"), "got: {reason}");
 
         // The memory is in use. The job must wait.
-        let Admit::No(reason) = admit(&cfg, &job, 0, 224 << 20) else {
+        let Admit::No(reason) = admit(&cfg, cpu, mem, 0, 224 << 20) else {
             panic!("a job must not start when the memory is in use");
         };
         assert!(reason.contains("memory"), "got: {reason}");
@@ -1194,11 +1208,8 @@ mod tests {
     #[test]
     fn a_job_that_fills_the_budget_exactly_starts() {
         let cfg = cfg_with("4", "256MB");
-        assert!(matches!(
-            admit(&cfg, &spec_with(4, 256 << 20), 0, 0),
-            Admit::Yes
-        ));
-        assert_eq!(size_check(&cfg, &spec_with(4, 256 << 20)), Size::Fits);
+        assert!(matches!(admit(&cfg, 4, 256 << 20, 0, 0), Admit::Yes));
+        assert_eq!(size_check(&cfg, 4, 256 << 20), Size::Fits);
     }
 
     /// The reserve keeps memory for the programs that qex does not control.
@@ -1207,7 +1218,7 @@ mod tests {
         let mut cfg = cfg_with("4", "8GB");
         // Ask for a reserve that is larger than the machine. Each job must wait.
         cfg.system.reserve_mem = "1000GB".into();
-        let Admit::No(reason) = admit(&cfg, &spec_with(1, 1 << 20), 0, 0) else {
+        let Admit::No(reason) = admit(&cfg, 1, 1 << 20, 0, 0) else {
             panic!("the reserve must stop this job");
         };
         assert!(reason.contains("reserve"), "got: {reason}");
@@ -1870,13 +1881,43 @@ mod tests {
         }
     }
 
+    /// The queue must test the claim IN FORCE, and not the claim of the
+    /// submission.
+    ///
+    /// qex raises the claim in the record after the kernel stops a job for
+    /// memory, and it gives the job back to the queue. A test against the first
+    /// claim would admit a job of 1GB into the space that qex kept for 600MB,
+    /// and the sum of the claims would go above the budget. Stopping that is
+    /// the work of this module.
+    #[test]
+    fn the_queue_tests_the_claim_that_the_job_holds_now() {
+        let cfg = cfg_with("4", "1GB");
+
+        // A job of 400MB operates. The first claim of 600MB fits beside it.
+        assert!(matches!(
+            admit(&cfg, 1, 600 << 20, 1, 400 << 20),
+            Admit::Yes
+        ));
+
+        // The raised claim of 1GB does not fit beside it, and it must wait.
+        let Admit::No(reason) = admit(&cfg, 1, 1 << 30, 1, 400 << 20) else {
+            panic!("a raised claim must wait for capacity");
+        };
+        assert!(reason.contains("memory"), "got: {reason}");
+
+        // The raised claim alone still fits the budget, so the job is not an
+        // oversized job and it starts when the other job stops.
+        assert_eq!(size_check(&cfg, 1, 1 << 30), Size::Fits);
+        assert!(matches!(admit(&cfg, 1, 1 << 30, 0, 0), Admit::Yes));
+    }
+
     /// The pressure limit stops a job while the machine reclaims memory.
     #[test]
     fn the_pressure_limit_stops_a_job() {
         let mut cfg = cfg_with("4", "8GB");
         cfg.system.max_pressure = -1.0;
         if sys::memory_pressure().is_some() {
-            let Admit::No(reason) = admit(&cfg, &spec_with(1, 1 << 20), 0, 0) else {
+            let Admit::No(reason) = admit(&cfg, 1, 1 << 20, 0, 0) else {
                 panic!("the pressure limit must stop this job");
             };
             assert!(reason.contains("pressure"), "got: {reason}");

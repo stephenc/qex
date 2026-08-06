@@ -148,6 +148,26 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // line stops is one that a test cannot make happen".
                 crate::hook::fire_detached(&dir, &status);
             }
+            // The supervisor gave the job back to the queue.
+            //
+            // It does this after the kernel stopped the job for memory: the
+            // claim is now larger, and the queue never admitted that claim. The
+            // coordinator must test the new claim against the budget, in the
+            // same way as a new job. Without this branch the job would go to
+            // the state `failed` with "the supervisor stopped without a
+            // result", and the work would stop.
+            Ok(status) if status.state == JobState::Queued => {
+                job.status = status;
+                job.status.supervisor_pid = None;
+                let claim = job.status.mem;
+                // Use the rule of the submission, so a job that qex corrects
+                // does not go in front of the jobs that waited for it.
+                state.enqueue(id);
+                log(&format!(
+                    "job {id} is in the queue again, and it waits for capacity for {}",
+                    crate::units::format_size(claim)
+                ));
+            }
             other => {
                 // The supervisor stopped before it wrote a result. Something
                 // stopped it: a signal, or the out-of-memory killer.
@@ -251,6 +271,19 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // coordinator that starts again finds the supervisor of this job.
     status.supervisor_pid = Some(std::process::id() as i32);
     job::write_status(&dir, &status).context("writing the job status")?;
+
+    // Delete the marks of the attempt before this one.
+    //
+    // Each mark says what stopped ONE attempt. This point is safe for both: the
+    // job has no process id yet, so `qex kill` refuses the job and can write no
+    // mark, and no job process operates that the kernel can stop.
+    //
+    // Without this step, a job with `--retries` that a command stopped on the
+    // first attempt kept that mark for ever. A second attempt that the kernel
+    // stopped for memory then said that a command stopped it, and the lesson of
+    // the kill for memory went away.
+    crate::enforce::clear_user_kill(&dir);
+    crate::enforce::clear_oom(&dir);
 
     // Keep what an earlier attempt of this job removed from the output. The
     // limit belongs to the stream and not to one attempt, so the count of the
@@ -620,16 +653,27 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // cgroup, so this method finds a process that changed its process group.
     if let Some(cgroup) = crate::enforce::job_cgroup_path(&dir) {
         if crate::enforce::cgroup_had_oom(&cgroup) {
-            crate::enforce::mark_oom(&dir);
+            // This cgroup belongs to this job, so the count belongs to this job.
+            crate::enforce::mark_oom(&dir, crate::enforce::OomScope::Job);
         }
         crate::enforce::kill_cgroup(&cgroup);
     }
 
     // Test the out-of-memory count again. An increase during this job, with a
     // SIGKILL that no qex command sent, is the out-of-memory killer.
+    //
+    // Say WHICH cgroup gave the count. With a cgroup of its own, the count is
+    // about this job. Without one, qex reads the cgroup of the session, and the
+    // counter of a cgroup counts the kills in each cgroup below it: a kill in a
+    // different program of this user raises the same number.
     if let Some(cgroup) = &watch_cgroup {
         if crate::enforce::oom_count(cgroup) > oom_before {
-            crate::enforce::mark_oom(&dir);
+            let scope = if cgroup_dir.is_some() {
+                crate::enforce::OomScope::Job
+            } else {
+                crate::enforce::OomScope::Session
+            };
+            crate::enforce::mark_oom(&dir, scope);
         }
     }
 
@@ -703,8 +747,14 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let timed_out = outcome.load(std::sync::atomic::Ordering::SeqCst) == RACE_TIMER;
 
     status.state = classify(&spec, code, signal, timed_out, &dir);
-    if let Some(note) = unexplained_kill_note(status.state, signal, &dir) {
-        status.error = Some(note);
+    // Keep an earlier message. The two messages that this field can already
+    // hold say that the memory limit is NOT active, or that qex could not read
+    // the configuration. Each of those is the cause of the note below, and not
+    // a smaller fact than it.
+    if status.error.is_none() {
+        if let Some(note) = unexplained_kill_note(status.state, signal, &dir) {
+            status.error = Some(note);
+        }
     }
     status.exit_code = code;
     status.signal = signal;
@@ -725,14 +775,50 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // `--mem guess` that the kernel stops at hour four. The claim was too
     // small, the claim came from qex, and qex can correct it.
     if status.state == JobState::Oom {
+        // Act on the evidence of THIS JOB only.
+        //
+        // qex reads a cgroup counter to find a kill for memory. With a cgroup
+        // of its own for the job, that counter counts this job and nothing
+        // else, and the kernel stopped the job at the limit that qex made from
+        // the claim: the claim was too small, and that is a fact.
+        //
+        // With no cgroup of its own, qex reads the counter of the session. That
+        // counter also counts a kill in a different program of this user, and a
+        // machine that is short of memory is the machine on which a person uses
+        // `kill -9`. The two arrive together, so the count alone does not say
+        // that THIS job was the victim, and it does not say that the claim was
+        // too small: the machine can be full while the claim is correct.
+        //
+        // qex therefore REPORTS the state `oom` on the weaker evidence, and it
+        // ACTS on the stronger evidence only. A new attempt with a larger claim
+        // repeats work, holds more of the machine, and teaches the learner a
+        // number that no measurement supports.
+        let scope = crate::enforce::oom_evidence(&dir);
+        if scope != Some(crate::enforce::OomScope::Job) {
+            let note = format!(
+                "the kernel stopped this job for memory, and its claim was {}. qex applies no \
+                 memory limit to a job in this configuration, so it counts the kills of the \
+                 whole login session and it cannot prove that the claim of this job was too \
+                 small: the machine can be full while the claim is correct. qex therefore did \
+                 NOT start the job again. Compare the `usage` field with the claim. Give a \
+                 larger `--mem` value, or set `[enforce] mode` in the config file, and qex then \
+                 corrects the claim itself.",
+                crate::units::format_size(status.mem)
+            );
+            log(&format!("job {id}: {note}"));
+            status.error = Some(note);
+            job::write_status(&dir, &status)?;
+            return Ok(code.unwrap_or(1));
+        }
+
         // Keep the lesson NOW, and not at the end of this function.
         //
-        // The retry below does not come back to this point: it calls this
-        // function again and gives its result to the caller. A record at the
-        // end would thus lose the measurement of every attempt except the last,
-        // and the measurement of an attempt that the kernel stopped is the most
+        // The new attempt does not come back to this point: this process gives
+        // the job to the coordinator and stops. A record at the end would thus
+        // lose the measurement of every attempt except the last, and the
+        // measurement of an attempt that the kernel stopped is the most
         // valuable measurement that qex holds.
-        crate::usage::record(&spec, &status);
+        crate::usage::record_lower_bound(&spec, &status);
 
         match raise_claim(&cfg, &status, spec.mem) {
             Raise::To(next) => {
@@ -755,6 +841,8 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 status.error = Some(message);
                 status.pid = None;
                 status.finished_at = None;
+                // This process stops now, so it holds the record no longer.
+                status.supervisor_pid = None;
                 job::write_status(&dir, &status)?;
 
                 // The out-of-memory record belongs to the attempt that stopped.
@@ -762,11 +850,30 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 // out-of-memory kill as well, whatever stopped it.
                 crate::enforce::clear_oom(&dir);
 
-                // Give the machine a moment to give the memory back. The kernel
-                // frees the pages of the job that it stopped, and the next
-                // attempt asks for more memory than that job held.
-                std::thread::sleep(Duration::from_secs(1));
-                return main(id);
+                // GIVE THE JOB BACK TO THE COORDINATOR, and do not start it here.
+                //
+                // A retry after a failure keeps the same claim, so this process
+                // can start the job again itself: the budget that the queue gave
+                // to this job is still the correct budget.
+                //
+                // A retry after a kill for memory has a LARGER claim, and the
+                // queue never saw that claim. A start from this process would
+                // put a job of 1GB in a budget that admitted 600MB, beside a
+                // job that holds the rest, and the sum would be above the
+                // budget. Stopping exactly that is the work of the queue. With
+                // `[enforce] mode = "hard"` the kernel would also receive the
+                // sum of the limits, and the machine would meet the load that
+                // the budget exists to prevent.
+                //
+                // The record says `queued` now. The coordinator reads that
+                // record when this process stops, puts the job in the queue
+                // again, and starts it when the machine has capacity for the
+                // NEW claim.
+                log(&format!(
+                    "job {id} waits for the queue again, with the claim {}",
+                    crate::units::format_size(next)
+                ));
+                return Ok(0);
             }
             Raise::Stop(reason) => {
                 log(&format!("job {id}: {reason}"));
@@ -1346,19 +1453,36 @@ fn raise_claim(cfg: &crate::config::Config, status: &job::JobStatus, first_claim
     // here gives the claim of this attempt and the rules below then stop the
     // ladder.
     let budget = cfg.budget_mem().unwrap_or(status.mem);
-    let wanted = (status.mem as f64 * cfg.retry.growth) as u64;
-    // Never above the budget, and never below the claim that this attempt had.
-    // A job that is already larger than the budget keeps its own claim, and the
-    // test below then stops the ladder.
-    let next = wanted.min(budget.max(status.mem));
 
+    // A job that already claims the budget or more has no larger claim.
+    //
+    // Say that in its own words. An oversized job is a supported case: the
+    // queue starts such a job alone. Its claim is ABOVE the budget, so a
+    // sentence that calls that claim "the whole budget" contradicts itself and
+    // gives the reader a number that is not the number in the record.
+    if status.mem >= budget {
+        return Raise::Stop(format!(
+            "the kernel stopped this job, because the job used more memory than its claim of \
+             {claim}. THE CLAIM WAS TOO SMALL. The memory budget of qex on this machine is {}, \
+             so qex has no larger claim to give. Use a machine with more memory, or raise \
+             `[budget] mem` in the config file.",
+            crate::units::format_size(budget)
+        ));
+    }
+
+    // Never above the budget. qex must not claim memory that it does not have.
+    let next = ((status.mem as f64 * cfg.retry.growth) as u64).min(budget);
+
+    // A multiplier a little above 1.0 can give the claim that already failed,
+    // because the calculation gives whole bytes. A new attempt at that claim
+    // would stop in the same way and cost a whole run.
     if next <= status.mem {
         return Raise::Stop(format!(
             "the kernel stopped this job, because the job used more memory than its claim of \
-             {claim}. THE CLAIM WAS TOO SMALL. That claim is already the whole memory budget of \
-             qex on this machine ({}), so qex cannot raise it. Use a machine with more memory, \
-             or raise `[budget] mem` in the config file.",
-            crate::units::format_size(budget)
+             {claim}. THE CLAIM WAS TOO SMALL. The config file sets `[retry] growth = {}`, which \
+             gives the same claim again, so qex did not start the job again. Give a larger claim \
+             with `--mem`, or raise `growth` in the config file.",
+            cfg.retry.growth
         ));
     }
 
@@ -1761,7 +1885,7 @@ mod tests {
     #[test]
     fn a_kill_for_memory_gives_the_state_oom() {
         let dir = job_dir("oom");
-        crate::enforce::mark_oom(&dir);
+        crate::enforce::mark_oom(&dir, crate::enforce::OomScope::Job);
         assert_eq!(
             classify(&spec(), None, Some(libc::SIGKILL), false, &dir),
             JobState::Oom
@@ -1788,7 +1912,7 @@ mod tests {
             JobState::Killed
         );
 
-        crate::enforce::mark_oom(&dir);
+        crate::enforce::mark_oom(&dir, crate::enforce::OomScope::Session);
         assert_eq!(
             classify(&spec(), None, Some(libc::SIGKILL), false, &dir),
             JobState::Killed,
@@ -1915,9 +2039,40 @@ mod tests {
         );
 
         // A job that is larger than the budget already keeps its own claim.
-        let Raise::Stop(_) = raise_claim(&cfg, &oom_status(20 << 30, 0, 1), 20 << 30) else {
+        //
+        // The message must not call that claim "the whole budget". An
+        // oversized job is a supported case, and the text would then give a
+        // number that is not the number in the record.
+        let Raise::Stop(reason) = raise_claim(&cfg, &oom_status(20 << 30, 0, 1), 20 << 30) else {
             panic!("an oversized job has no larger claim");
         };
+        assert!(
+            reason.contains("20GB") && reason.contains("6GB"),
+            "the reason must give the claim and the budget: {reason}"
+        );
+        assert!(
+            !reason.contains("claim of 20GB. THE CLAIM WAS TOO SMALL. That claim is already"),
+            "the reason must not call a claim above the budget the whole budget: {reason}"
+        );
+    }
+
+    /// A multiplier a little above 1.0 can give the claim that already failed.
+    /// A new attempt at that claim costs a whole run and stops in the same way.
+    #[test]
+    fn a_multiplier_that_gives_the_same_claim_stops_the_ladder() {
+        let cfg: crate::config::Config =
+            toml::from_str("[budget]\nmem = \"64GB\"\n[retry]\non_oom = 3\ngrowth = 1.0000001\n")
+                .unwrap();
+        cfg.validate().expect("the config file is valid");
+
+        let Raise::Stop(reason) = raise_claim(&cfg, &oom_status(1024, 0, 1), 1024) else {
+            panic!("a multiplier that gives the same claim must stop the ladder");
+        };
+        assert!(reason.contains("growth"), "got: {reason}");
+        assert!(
+            reason.contains("--mem"),
+            "the reason must say what to do: {reason}"
+        );
     }
 
     /// The config file can turn the correction off. qex must then say why it

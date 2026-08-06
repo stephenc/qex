@@ -245,7 +245,7 @@ pub const STATUS: &str = r##"{
     "retries_left": { "type": "integer", "description": "The number of times that qex may still start this job again after a failure. See --retries." },
     "oom_raises": {
       "type": "integer",
-      "description": "The number of times that qex raised the memory claim of this job, because the kernel stopped an attempt for memory. This count is separate from retries_left. See [retry] on_oom in the config file."
+      "description": "The number of times that qex raised the memory claim of this job, because the kernel stopped an attempt at the memory limit that qex applied. This count is separate from retries_left. qex raises the claim only when it applied the limit itself, with [enforce] mode; with no limit it reports the state oom and starts no new attempt. See [retry] on_oom in the config file."
     },
     "usage": {
       "type": "object",

@@ -10465,6 +10465,13 @@ max_pressure = 100
 /// point is the true code: the classification, the new claim, the new attempt,
 /// the words in the record, and the learner. The unit tests in `src/enforce.rs`
 /// and `src/supervisor.rs` cover the reading of the cgroup counter itself.
+///
+/// The record says `job`, which is the evidence of a cgroup that qex made for
+/// this job. qex acts on that evidence only, so the test must produce it. On a
+/// machine with a delegated cgroup, `[enforce] mode` gives it. These tests must
+/// not use that mode: qex then starts the coordinator again in a systemd unit,
+/// which does not receive the `XDG_*` values of the test, and the test would
+/// use the state directory of the user.
 struct OomJob {
     control: PathBuf,
 }
@@ -10491,7 +10498,7 @@ impl OomJob {
             "until [ -f {c}/dir ]; do sleep 0.1; done; \
              n=$(cat {c}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}/n; \
              echo attempt $n; \
-             if [ $n -le {kills} ]; then echo 1 > \"$(cat {c}/dir)/oom\"; kill -9 $$; fi; \
+             if [ $n -le {kills} ]; then echo job > \"$(cat {c}/dir)/oom\"; kill -9 $$; fi; \
              exit 0"
         )
     }
@@ -10594,6 +10601,17 @@ fn a_job_that_the_kernel_stops_for_memory_runs_again_with_a_larger_claim() {
         "the log must hold every attempt: {logs}"
     );
 
+    // `qex rerun` must repeat the claim that WORKED, and not the claim that the
+    // kernel stopped. The correction cost a whole run, so it must not go away.
+    let again = h.ok(&["rerun", &id]);
+    h.ok(&["wait", &again, "--timeout", "60s"]);
+    let s = h.status_json(&again);
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        256 * 1024 * 1024,
+        "a rerun must use the claim in force, and not the first claim: {s}"
+    );
+
     // The learner must use the lesson. The next job of the same command gets a
     // claim above the claim that the kernel stopped, and the agent gives no
     // `--mem` value at all.
@@ -10634,7 +10652,7 @@ fn a_job_that_a_user_killed_is_not_retried_and_teaches_the_learner_nothing() {
     let job = OomJob::new(&h);
     let control = h.root.join("control");
     let script = format!(
-        "until [ -f {c}/dir ]; do sleep 0.1; done; echo 1 > \"$(cat {c}/dir)/oom\"; \
+        "until [ -f {c}/dir ]; do sleep 0.1; done; echo job > \"$(cat {c}/dir)/oom\"; \
          echo ready > {c}/ready; sleep 60",
         c = control.display()
     );
@@ -10729,5 +10747,258 @@ fn a_claim_that_stays_too_small_stops_at_the_limit() {
     assert!(
         note.contains("128MB") && note.contains("512MB"),
         "the record must give the first claim and the last one: {note}"
+    );
+}
+
+/// A kill for memory that qex cannot connect to THIS job must not start the job
+/// again, and must teach the learner nothing.
+///
+/// With no memory limit — the default — qex reads the out-of-memory count of the
+/// whole login session. That count also rises when the kernel stops a DIFFERENT
+/// program of the same user. A machine that is short of memory is also the
+/// machine on which a person uses `kill -9`, so the two events arrive together.
+///
+/// qex may report the state `oom` on that evidence. It must not act on it: a new
+/// attempt repeats work, holds more of the machine, and teaches the learner a
+/// number that no measurement supports.
+#[test]
+fn a_kill_for_memory_with_no_limit_reports_but_does_not_run_the_job_again() {
+    let h = Harness::new(
+        "oomsession",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n",
+    );
+    let job = OomJob::new(&h);
+    let control = h.root.join("control");
+
+    // The record says `session`, which is the evidence of the counter of the
+    // login session. qex writes that value when it made no cgroup for the job.
+    let script = format!(
+        "until [ -f {c}/dir ]; do sleep 0.1; done; echo session > \"$(cat {c}/dir)/oom\"; \
+         kill -9 $$",
+        c = control.display()
+    );
+    let id = h.submit(&["submit", "--mem", "128MB", "--", "bash", "-c", &script]);
+    job.release(&h, &id);
+
+    let out = h.qex(&["wait", &id, "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(125), "got: {out:?}");
+
+    let s = h.status_json(&id);
+    // The report is correct: the kernel stopped the job for memory.
+    assert_eq!(s["state"], "oom", "got: {s}");
+    // The action must not happen.
+    assert_eq!(s["attempts"], 1, "qex must not start the job again: {s}");
+    assert_eq!(s["oom_raises"], 0, "qex must not raise the claim: {s}");
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        128 * 1024 * 1024,
+        "the claim must not change: {s}"
+    );
+
+    let note = s["error"].as_str().unwrap_or("");
+    assert!(
+        note.contains("did NOT start the job again"),
+        "the record must say that qex did not act: {note}"
+    );
+    assert!(
+        note.contains("enforce") && note.contains("--mem"),
+        "the record must say what the user can do: {note}"
+    );
+
+    // The learner must hold nothing. The machine can be full while the claim of
+    // this job is correct, so this kill is not a measurement of this command.
+    let store = h.root.join("state/qex/usage.json");
+    assert!(
+        !store.exists(),
+        "a kill that qex cannot connect to this job must teach it nothing, and the store holds: {}",
+        std::fs::read_to_string(&store).unwrap_or_default()
+    );
+}
+
+/// A job with a RAISED claim must go through the queue again, and it must wait
+/// for capacity for the new claim.
+///
+/// The queue exists to keep the sum of the claims inside the budget. A raise
+/// makes a claim that the queue never admitted, so a new attempt that started
+/// in the supervisor would put that claim beside the jobs that already hold the
+/// budget. With `[enforce] mode = "hard"` the kernel would receive the sum of
+/// those limits, and the machine would meet the load that the budget exists to
+/// prevent.
+#[test]
+fn a_raised_claim_waits_for_capacity_in_the_queue() {
+    let h = Harness::new(
+        "oomreadmit",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"4\"\nmem = \"1GB\"\n",
+    );
+    let job = OomJob::new(&h);
+    let control = h.root.join("control");
+
+    // This job holds 400MB of the budget until the test releases it.
+    let holder = h.submit(&[
+        "submit",
+        "--name",
+        "holder",
+        "--mem",
+        "400MB",
+        "--cpu",
+        "1",
+        "--",
+        "bash",
+        "-c",
+        &format!(
+            "until [ -f {c}/stop ]; do sleep 0.2; done",
+            c = control.display()
+        ),
+    ]);
+
+    // 400MB and 600MB fit the budget of 1GB together. The kernel stops this job
+    // one time, and the raise then asks for 1GB, which does not fit beside the
+    // job that holds 400MB.
+    let id = h.submit(&[
+        "submit",
+        "--name",
+        "grower",
+        "--mem",
+        "600MB",
+        "--cpu",
+        "1",
+        "--",
+        "bash",
+        "-c",
+        &job.script(1),
+    ]);
+
+    h.until("both jobs operate", Duration::from_secs(30), || {
+        h.state_of(&holder) == "running" && h.state_of(&id) == "running"
+    });
+    job.release(&h, &id);
+
+    h.until("qex raised the claim", Duration::from_secs(30), || {
+        h.status_json(&id)["oom_raises"].as_u64() == Some(1)
+    });
+
+    // The job must WAIT. The other job holds 400MB of the budget of 1GB, and
+    // this job now claims 1GB.
+    let s = h.status_json(&id);
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        1024 * 1024 * 1024,
+        "the raise must stop at the budget: {s}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut saw_reason = false;
+    while Instant::now() < deadline {
+        let s = h.status_json(&id);
+        let state = s["state"].as_str().unwrap_or("");
+        assert_eq!(
+            state, "queued",
+            "the job must wait for capacity for its new claim: {s}"
+        );
+        assert_eq!(
+            h.state_of(&holder),
+            "running",
+            "the job that holds the budget must still operate"
+        );
+        if s["blocked_reason"]
+            .as_str()
+            .map(|r| r.contains("memory"))
+            .unwrap_or(false)
+        {
+            saw_reason = true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        saw_reason,
+        "the job must say that it waits for memory: {}",
+        h.status_json(&id)
+    );
+
+    // Release the capacity. The job then starts and succeeds.
+    std::fs::write(control.join("stop"), b"1").unwrap();
+    h.ok(&["wait", &holder, "--timeout", "60s"]);
+    h.ok(&["wait", &id, "--timeout", "60s"]);
+
+    let s = h.status_json(&id);
+    assert_eq!(s["state"], "completed", "got: {s}");
+    assert_eq!(s["attempts"], 2, "got: {s}");
+}
+
+/// A mark that says how an attempt stopped must not stay for the next attempt.
+///
+/// A job with `--retries` can stop in two different ways. `qex kill` stopped
+/// attempt 1 here, and the kernel stopped attempt 2 for memory. The mark of the
+/// first attempt stayed before, so attempt 2 said that a command stopped it. The
+/// record then named a cause that no command made, and the lesson of the kill
+/// for memory went away.
+#[test]
+fn a_mark_from_one_attempt_does_not_decide_the_next_attempt() {
+    let h = Harness::new(
+        "oommarks",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n",
+    );
+    let job = OomJob::new(&h);
+    let c = h.root.join("control");
+
+    let script = format!(
+        "until [ -f {c}/dir ]; do sleep 0.1; done; \
+         n=$(cat {c}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}/n; \
+         if [ $n -eq 1 ]; then trap 'exit 3' TERM; touch {c}/ready; sleep 60 & wait; fi; \
+         if [ $n -eq 2 ]; then echo job > \"$(cat {c}/dir)/oom\"; kill -9 $$; fi; \
+         exit 0",
+        c = c.display()
+    );
+
+    let id = h.submit(&[
+        "submit",
+        "--retries",
+        "2",
+        "--mem",
+        "128MB",
+        "--cpu",
+        "1",
+        "--",
+        "bash",
+        "-c",
+        &script,
+    ]);
+    job.release(&h, &id);
+
+    // Stop attempt 1 with a command. The job answers with the exit code 3, so
+    // its state is `failed` and `--retries` starts it again.
+    h.until("attempt 1 operates", Duration::from_secs(30), || {
+        c.join("ready").exists()
+    });
+    h.ok(&["kill", &id, "--signal", "TERM", "--grace", "30s"]);
+
+    h.ok(&["wait", &id, "--timeout", "90s"]);
+    let s = h.status_json(&id);
+
+    assert_eq!(s["state"], "completed", "got: {s}");
+    assert_eq!(
+        s["attempts"], 3,
+        "one kill, one kill for memory, one run: {s}"
+    );
+    assert_eq!(
+        s["oom_raises"], 1,
+        "the mark of attempt 1 must not hide the kill for memory of attempt 2: {s}"
+    );
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        256 * 1024 * 1024,
+        "the claim must double after the kill for memory: {s}"
+    );
+    // `--retries` gave 2 and one attempt used one of them. A kill for memory
+    // must not use that count.
+    assert_eq!(
+        s["retries_left"], 1,
+        "a kill for memory must not spend a `--retries` credit: {s}"
     );
 }

@@ -313,18 +313,71 @@ pub fn oom_count(_cgroup: &Path) -> u64 {
 /// signal is the signal that `qex kill` sends, so this test separates the two
 /// causes. The states `oom` and `killed` need different corrections.
 pub fn was_oom_killed(job_dir: &Path) -> bool {
-    if job_dir.join("oom").exists() {
-        return true;
-    }
-    match job_cgroup_path(job_dir) {
-        Some(cgroup) => cgroup_had_oom(&cgroup),
-        None => false,
+    oom_evidence(job_dir).is_some()
+}
+
+/// How well qex knows that the kernel stopped a job for memory.
+///
+/// The two values need different answers, and the difference between them is
+/// the difference between a report and an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OomScope {
+    /// qex made the cgroup of this job and read the counter of THAT cgroup.
+    ///
+    /// The count belongs to this job and to no other program, and the kernel
+    /// stopped the job at the limit that qex made from the claim. The claim was
+    /// therefore too small, and qex can act on that.
+    Job,
+    /// qex read the counter of the session, because it made no cgroup.
+    ///
+    /// The counter of a cgroup counts the kills in each cgroup below it, so it
+    /// also counts a kill in a different program of the same user. A machine
+    /// that is short of memory is also the machine on which a person uses
+    /// `kill -9`, so the two events arrive together.
+    ///
+    /// This evidence is sufficient to REPORT the state `oom`. It is not
+    /// sufficient to run the job again with a larger claim, and it is not
+    /// sufficient to teach the learner: the claim can be correct, and the
+    /// machine full.
+    Session,
+}
+
+impl OomScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Job => "job",
+            Self::Session => "session",
+        }
     }
 }
 
-/// Records an out-of-memory event for a job.
-pub fn mark_oom(job_dir: &Path) {
-    std::fs::write(job_dir.join("oom"), b"1").ok();
+/// Gives the evidence that qex holds for a kill for memory.
+pub fn oom_evidence(job_dir: &Path) -> Option<OomScope> {
+    if let Ok(text) = std::fs::read_to_string(job_dir.join("oom")) {
+        return Some(match text.trim() {
+            "job" => OomScope::Job,
+            // A record from an earlier version of qex holds `1` and names no
+            // scope. Read it as the weaker evidence: qex then reports the state
+            // and starts no new attempt, which is the safe answer.
+            _ => OomScope::Session,
+        });
+    }
+    // qex made the cgroup of the job, so the counter of that cgroup counts the
+    // kills of this job only.
+    match job_cgroup_path(job_dir) {
+        Some(cgroup) if cgroup_had_oom(&cgroup) => Some(OomScope::Job),
+        _ => None,
+    }
+}
+
+/// Records an out-of-memory event for a job, with the evidence for it.
+pub fn mark_oom(job_dir: &Path, scope: OomScope) {
+    // Keep the stronger evidence. The supervisor makes two tests, and the
+    // second test can read the counter of the session.
+    if oom_evidence(job_dir) == Some(OomScope::Job) {
+        return;
+    }
+    std::fs::write(job_dir.join("oom"), scope.as_str().as_bytes()).ok();
 }
 
 /// Deletes the out-of-memory record of a job.
@@ -355,6 +408,17 @@ pub fn mark_user_kill(job_dir: &Path) {
 /// Tests if a command stopped this job.
 pub fn was_user_killed(job_dir: &Path) -> bool {
     job_dir.join("killed-by-user").exists()
+}
+
+/// Deletes that mark.
+///
+/// The mark belongs to ONE attempt, in the same way as the out-of-memory
+/// record. A job with `--retries` can stop with `qex kill` on the first attempt
+/// and stop for memory on the second, and a mark that stayed would say that a
+/// command stopped an attempt that no command touched. The record would then
+/// lose the lesson of the kill for memory.
+pub fn clear_user_kill(job_dir: &Path) {
+    std::fs::remove_file(job_dir.join("killed-by-user")).ok();
 }
 
 /// Tests if this machine can tell an out-of-memory kill from another kill.
@@ -486,14 +550,51 @@ mod tests {
     #[test]
     fn the_out_of_memory_record_is_read_back() {
         let dir = std::env::temp_dir().join(format!("qex-oom-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
 
         assert!(
             !was_oom_killed(&dir),
             "a new job has no out-of-memory record"
         );
-        mark_oom(&dir);
+        mark_oom(&dir, OomScope::Session);
         assert!(was_oom_killed(&dir));
+        assert_eq!(oom_evidence(&dir), Some(OomScope::Session));
+
+        // The stronger evidence replaces the weaker evidence, and the weaker
+        // evidence never replaces the stronger. qex acts on `Job` only, so a
+        // second test that overwrote the first would decide the behaviour.
+        mark_oom(&dir, OomScope::Job);
+        assert_eq!(oom_evidence(&dir), Some(OomScope::Job));
+        mark_oom(&dir, OomScope::Session);
+        assert_eq!(oom_evidence(&dir), Some(OomScope::Job));
+
+        clear_oom(&dir);
+        assert_eq!(oom_evidence(&dir), None);
+
+        // A record from an earlier version of qex names no scope. Read it as
+        // the weaker evidence: qex then reports the state and starts no new
+        // attempt, which is the safe answer.
+        std::fs::write(dir.join("oom"), b"1").unwrap();
+        assert_eq!(oom_evidence(&dir), Some(OomScope::Session));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The mark of a kill by a command must go away with the attempt that it
+    /// belongs to. A mark that stayed said that a command stopped an attempt
+    /// that no command touched.
+    #[test]
+    fn the_mark_of_a_kill_by_a_command_can_be_cleared() {
+        let dir = std::env::temp_dir().join(format!("qex-userkill-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!was_user_killed(&dir));
+        mark_user_kill(&dir);
+        assert!(was_user_killed(&dir));
+        clear_user_kill(&dir);
+        assert!(!was_user_killed(&dir));
 
         std::fs::remove_dir_all(&dir).ok();
     }

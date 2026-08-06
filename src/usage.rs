@@ -161,43 +161,57 @@ pub fn load() -> Store {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+/// Records the peak of a job that completed.
+///
+/// A job that did not complete does not come here. It reached the memory that
+/// something stopped it at, and that number is not the memory that the job
+/// needs.
+pub fn record(spec: &JobSpec, status: &JobStatus) {
+    if status.state != crate::job::JobState::Completed || status.usage.max_rss == 0 {
+        return;
+    }
+    add(spec, status, Measurement::Peak, status.usage.max_rss);
+}
+
+/// Records a lower bound from a job that the kernel stopped for memory.
+///
+/// # The caller must hold the evidence of THIS JOB
+///
+/// Call this function only when qex made the cgroup of the job and read the
+/// counter of that cgroup. The kernel then stopped the job at the limit that
+/// qex made from the claim, so the claim was too small and the need is above
+/// it.
+///
+/// The counter of the session does not support this record. It also counts a
+/// kill in a different program of the same user, and the machine can be full
+/// while the claim of this job is correct. A bound from that evidence would
+/// raise the claim of a command that needs no more memory, and the ladder of
+/// attempts would raise it again at each run.
+pub fn record_lower_bound(spec: &JobSpec, status: &JobStatus) {
+    if status.state != crate::job::JobState::Oom {
+        return;
+    }
+    // Take the LARGER of the claim and the measured peak.
+    //
+    // The kernel stopped the job at the claim, so the need is above the claim.
+    // The measurement can be larger when the job used memory that the limit
+    // does not count, and it can be zero when the kernel stopped the job before
+    // any child of the supervisor ended. The larger of the two is the value
+    // that does not repeat the failure.
+    add(
+        spec,
+        status,
+        Measurement::LowerBound,
+        status.usage.max_rss.max(status.mem),
+    );
+}
+
 /// Adds one measurement for a command.
 ///
 /// Two supervisors can stop at the same time, so this function holds a lock on
 /// the file while it reads and writes. Without the lock, one measurement would
 /// replace the other.
-pub fn record(spec: &JobSpec, status: &JobStatus) {
-    let (kind, bytes) = match status.state {
-        crate::job::JobState::Completed => {
-            // A job with no measurement gives nothing.
-            if status.usage.max_rss == 0 {
-                return;
-            }
-            (Measurement::Peak, status.usage.max_rss)
-        }
-        crate::job::JobState::Oom => {
-            // Take the LARGER of the claim and the measured peak.
-            //
-            // The two numbers answer the same question from two sides. With a
-            // memory limit, the kernel stops the job at the claim, so the need
-            // is above the claim. With no limit, the kernel stops the job while
-            // the machine is full, and the peak of the job is then the evidence
-            // that qex has. The larger of the two is the value that does not
-            // repeat the failure, and a claim that is a little too large costs
-            // capacity only.
-            //
-            // The measurement can also be zero here: the kernel can stop a job
-            // before any child of the supervisor ends. The claim is then the
-            // only evidence, and it is sufficient.
-            (
-                Measurement::LowerBound,
-                status.usage.max_rss.max(status.mem),
-            )
-        }
-        // A job that somebody stopped, or that reached its time limit, says
-        // nothing about the memory that it needs.
-        _ => return,
-    };
+fn add(spec: &JobSpec, status: &JobStatus, kind: Measurement, bytes: u64) {
     if bytes == 0 {
         return;
     }
@@ -230,6 +244,32 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
     let mut store = load();
     let entry = store.commands.entry(key(&spec.cwd, against)).or_default();
     entry.name = spec.name.clone();
+
+    // Keep ONE lower bound for a command.
+    //
+    // A ladder of attempts makes a bound at each step: one job of three
+    // attempts made three bounds and filled three of the five places. The
+    // measurements of the jobs that completed then went away, and the store
+    // held one job only. The largest bound holds every fact that the smaller
+    // bounds of the same ladder hold, so qex keeps that one.
+    if kind == Measurement::LowerBound {
+        if let Some(pos) = entry
+            .samples
+            .iter()
+            .position(|s| s.kind == Measurement::LowerBound)
+        {
+            if entry.samples[pos].max_rss >= bytes {
+                // An earlier bound is larger, so this one adds nothing. Move it
+                // to the end, so that it stays the newest measurement.
+                let earlier = entry.samples.remove(pos);
+                entry.samples.push(earlier);
+                write_store(&path, &store, &lock);
+                return;
+            }
+            entry.samples.remove(pos);
+        }
+    }
+
     entry.samples.push(Sample {
         kind,
         max_rss: bytes,
@@ -243,11 +283,16 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
     let extra = entry.samples.len().saturating_sub(SAMPLES);
     entry.samples.drain(..extra);
 
-    if let Ok(bytes) = serde_json::to_vec_pretty(&store) {
-        // Mode 0600: this file names the jobs of this user.
-        crate::job::write_atomic(&path, &bytes, 0o600).ok();
-    }
+    write_store(&path, &store, &lock);
+}
 
+/// Writes the store and releases the lock.
+fn write_store(path: &std::path::Path, store: &Store, lock: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(bytes) = serde_json::to_vec_pretty(store) {
+        // Mode 0600: this file names the jobs of this user.
+        crate::job::write_atomic(path, &bytes, 0o600).ok();
+    }
     unsafe {
         libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
     }
@@ -610,22 +655,32 @@ mod tests {
             cpu: 1,
             mem: 4 << 30,
             timeout: None,
+            max_queue_time: None,
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
             claim_source: "explicit".into(),
+            learn_key: None,
             group: None,
             group_name: None,
             locks: vec![],
             retries: 0,
+            nice: None,
             needs: vec![],
             after: vec![],
             submitted_at: 0,
+            dedupe_key: None,
+            dedupe_window: 0,
         };
 
         let mut status = crate::job::JobStatus::new(&spec);
         status.state = crate::job::JobState::Oom;
         status.usage.max_rss = 1 << 30;
+        record_lower_bound(&spec, &status);
+
+        // `record` keeps the peak of a job that COMPLETED. A job that the
+        // kernel stopped needs the caller to hold the evidence of that job, so
+        // it has a function of its own and this one must do nothing.
         record(&spec, &status);
 
         let store = load();

@@ -206,11 +206,20 @@ note:      the kernel stopped attempt 1 of this job, because the job used more
            the claim to 16GB and starts the job again.
 ```
 
-qex also keeps the lesson: that kill says that the command needs **more than**
-8GB, so the next run of the same command starts above that value and does not
-die in the same way. See [the reference](docs/reference.md#a-job-that-the-kernel-stops-for-memory)
-for the limit on the raises and for the machine on which qex cannot tell a kill
-for memory from a kill by a command.
+The job goes through the queue again, so its new claim meets the budget in the
+same way as a new job. qex also keeps the lesson: that kill says that the
+command needs **more than** 8GB, so the next run of the same command starts
+above that value and does not die in the same way.
+
+qex makes this correction when it applied the memory limit itself, with
+`[enforce] mode`. The kernel then stopped the job at the claim, and the kill is
+proof. With no limit — the default — qex can read the count of the login session
+only, and that count also rises when the kernel stops a different program of the
+same user. qex then reports the state `oom`, says what you can do, and starts no
+new attempt: the machine can be full while your claim is correct.
+
+See [the reference](docs/reference.md#a-job-that-the-kernel-stops-for-memory)
+for the limit on the raises.
 
 ## The documentation
 
