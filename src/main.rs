@@ -14,44 +14,95 @@
 //! 3. qex uses the resource claims to select the jobs that operate together.
 //!    Two agents on one machine thus do not start the out-of-memory killer.
 
+/// qex needs the process control of Unix, so it does not build for Windows.
+///
+/// Without this message, a build for Windows gives 114 errors from the modules
+/// below, and not one of them says what a reader must do. A tool that reports a
+/// fault must give the cause and the remedy, and that rule holds for the build
+/// as much as for a job.
+#[cfg(not(unix))]
+compile_error!(
+    "qex builds for Linux and macOS only.\n\n     qex controls processes with the session and the process group of Unix, and it holds a job \
+     with `waitpid` on one process id. Windows has no equivalent of those, so this is a port \
+     and not an option that somebody can turn on.\n\n     ON WINDOWS, USE WSL2. qex builds and operates there with no change, and the jobs that an \
+     agent starts (make, cargo, uv) are usually in WSL2 as well.\n\n     See https://github.com/stephenc/qex for the reason in full."
+);
+
+#[cfg(unix)]
 mod capabilities;
+#[cfg(unix)]
 mod claim;
+#[cfg(unix)]
 mod cli;
+#[cfg(unix)]
 mod client;
+#[cfg(unix)]
 mod commands;
+#[cfg(unix)]
 mod config;
+#[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
 mod enforce;
+#[cfg(unix)]
 mod help;
+#[cfg(unix)]
 mod history;
+#[cfg(unix)]
 mod job;
+#[cfg(unix)]
 mod keys;
+#[cfg(unix)]
 mod lifecycle;
+#[cfg(unix)]
 mod logsel;
+#[cfg(unix)]
 mod paths;
+#[cfg(unix)]
 mod peers;
+#[cfg(unix)]
 mod pipeline;
+#[cfg(unix)]
 mod proto;
+#[cfg(unix)]
 mod sched;
+#[cfg(unix)]
 mod schema;
+#[cfg(unix)]
 mod spec;
+#[cfg(unix)]
 mod style;
+#[cfg(unix)]
 mod supervisor;
+#[cfg(unix)]
 mod sys;
 #[cfg(test)]
+#[cfg(unix)]
 mod testutil;
+#[cfg(unix)]
 mod top;
+#[cfg(unix)]
 mod units;
+#[cfg(unix)]
 mod usage;
+#[cfg(unix)]
 mod watchers;
 
+#[cfg(unix)]
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use clap::{CommandFactory, Parser};
+#[cfg(unix)]
 use cli::{Cli, Command};
 
 /// The exit code for a command line that qex cannot read.
+#[cfg(unix)]
 const EXIT_USAGE: i32 = 2;
 
+#[cfg(not(unix))]
+fn main() {}
+
+#[cfg(unix)]
 fn main() {
     // Let the system stop this process when a reader closes a pipe.
     //
@@ -75,6 +126,7 @@ fn main() {
     std::process::exit(code);
 }
 
+#[cfg(unix)]
 fn run() -> Result<i32> {
     let cli = Cli::parse();
 
@@ -125,6 +177,7 @@ fn run() -> Result<i32> {
 ///
 /// The banner comes first. An agent that reads a few lines only must still see
 /// the pointer to `qex help agents`.
+#[cfg(unix)]
 fn print_root_help() {
     print!("{}", help::banner());
     println!();
@@ -134,6 +187,7 @@ fn print_root_help() {
     println!("Topics for `qex help <topic>`: {}", help::TOPICS.join(", "));
 }
 
+#[cfg(unix)]
 fn cmd_help(topic: Option<&str>) -> Result<i32> {
     let Some(name) = topic else {
         print_root_help();
@@ -155,6 +209,7 @@ fn cmd_help(topic: Option<&str>) -> Result<i32> {
     }
 }
 
+#[cfg(unix)]
 fn cmd_schema(which: Option<&str>) -> Result<i32> {
     let Some(name) = which else {
         eprintln!(
@@ -179,6 +234,7 @@ fn cmd_schema(which: Option<&str>) -> Result<i32> {
     }
 }
 
+#[cfg(unix)]
 fn cmd_config(args: cli::ConfigArgs) -> Result<i32> {
     use cli::ConfigAction;
 
@@ -215,6 +271,7 @@ fn cmd_config(args: cli::ConfigArgs) -> Result<i32> {
 ///
 /// This text shows the calculated values, not the text of the config file. A
 /// reader can then see the true budget without a calculation.
+#[cfg(unix)]
 fn print_config_summary(cfg: &config::Config) -> Result<()> {
     let path = paths::config_file()?;
     println!(

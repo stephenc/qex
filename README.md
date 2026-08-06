@@ -71,7 +71,14 @@ Or build it from the source:
 cargo install --path .
 ```
 
-qex needs Linux or macOS. It has no other requirement. The first command starts
+qex needs Linux or macOS. It has no other requirement.
+
+**On Windows, use WSL2** — qex builds and runs there unchanged, and the jobs an
+agent starts (`make`, `cargo`, `uv`) usually live in WSL2 anyway. A native
+Windows build is a port, not a flag: qex holds a job with `waitpid` on one
+process id and stops a job tree with a process group, and Windows has neither.
+Building for Windows fails with one message that says this, rather than a page
+of errors. The first command starts
 the background coordinator for you, and you do not configure a service.
 
 ## Five minutes
