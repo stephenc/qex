@@ -5323,6 +5323,29 @@ fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
 fn a_job_is_told_the_size_of_its_claim() {
     let h = Harness::with_default_config("claimenv");
 
+    // A JOB THAT MADE NO CLAIM IS TOLD NOTHING.
+    //
+    // The default claim is one core. A job with no claim that heard "one core"
+    // would run sixteen times slower on a machine of sixteen cores, with no
+    // error and no warning, and a node job would stop with `Reached heap limit`
+    // because the default memory claim is below the heap that node takes by
+    // itself. qex tells a job the claim that SOMEBODY CHOSE, and never the
+    // claim that qex invented.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS][$NODE_OPTIONS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][][]",
+        "a job that made no claim must be told nothing: {out}"
+    );
+
     let id = h.submit(&[
         "submit",
         "--cpu",
@@ -5368,6 +5391,8 @@ fn a_job_is_told_the_size_of_its_claim() {
         "submit",
         "--cpu",
         "2",
+        "--mem",
+        "2GB",
         "--no-limit-env-hints",
         "--",
         "sh",
@@ -5401,7 +5426,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         &file,
         "name = \"on\"\n\
          command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\n\
-         [resources]\ncpu = 2\n",
+         [resources]\ncpu = 2\nmem = \"2GB\"\n",
     )
     .unwrap();
     let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);

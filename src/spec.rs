@@ -382,17 +382,35 @@ impl JobSpec {
         // configuration — the same order as every other value here.
         //
         // `--no-limit-env-hints` is the answer for one job, and
-        // `[claims] export_env = false` is the answer for every job.
-        let hints = if opts.no_limit_env_hints {
-            false
-        } else {
-            match file.no_limit_env_hints {
-                Some(off) => !off,
-                None => cfg.claims.export_env,
-            }
-        };
+        // `[claims] export_env = false` is the answer for every job. The
+        // configuration comes FIRST: a file that says `no_limit_env_hints =
+        // false` must not turn the feature on again for a machine where the
+        // configuration turned it off.
+        let hints = cfg.claims.export_env
+            && !opts.no_limit_env_hints
+            && !file.no_limit_env_hints.unwrap_or(false);
 
-        if hints && capture != EnvCapture::None {
+        // WRITE THE CLAIM ONLY WHEN SOMEBODY CHOSE IT.
+        //
+        // The rule of this function is that a value somebody chose is a
+        // decision. A claim that QEX invented is not such a decision, and the
+        // default claim is ONE CORE.
+        //
+        // Without this test, `qex submit -- cargo test` on a machine of sixteen
+        // cores writes GOMAXPROCS=1 and CARGO_BUILD_JOBS=1, and the job becomes
+        // sixteen times slower with no error and no warning. A node job meets
+        // something worse: the default memory claim gives a heap far below the
+        // heap that node takes by itself, and the job stops with `FATAL ERROR:
+        // Reached heap limit`.
+        //
+        // A learned claim is not a decision either, and it makes the fault
+        // permanent: qex measures the job that it made single-threaded, learns
+        // one core, and writes one core again on the next run.
+        //
+        // Give `--cpu` and `--mem`, and qex tells the job what you asked for.
+        let chosen = source == "explicit";
+
+        if hints && chosen && capture != EnvCapture::None {
             export_claim(&mut env, cpu, mem, &cfg.claims.also);
         }
 
@@ -632,10 +650,20 @@ fn export_claim(
                 // standard error, and that line goes into the log of the job.
                 // A test that compares the error output fails because of it, so
                 // this is not a default.
-                set(
-                    "JAVA_TOOL_OPTIONS",
-                    &format!("-XX:ActiveProcessorCount={cores} -Xmx{heap_mb}m"),
-                );
+                // `-Xmx0m` makes the JVM refuse to start, and qex accepts a
+                // claim small enough to give that. Below one megabyte of heap,
+                // give the count of the cores and no heap.
+                if heap_mb > 0 {
+                    set(
+                        "JAVA_TOOL_OPTIONS",
+                        &format!("-XX:ActiveProcessorCount={cores} -Xmx{heap_mb}m"),
+                    );
+                } else {
+                    set(
+                        "JAVA_TOOL_OPTIONS",
+                        &format!("-XX:ActiveProcessorCount={cores}"),
+                    );
+                }
             }
             "make" => {
                 // This replaces the `-j` of a Makefile that gives one.

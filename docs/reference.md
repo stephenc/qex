@@ -762,9 +762,22 @@ go: NumCPU=16 GOMAXPROCS=2
 | `JULIA_NUM_THREADS`, `DOTNET_PROCESSOR_COUNT`, `POLARS_MAX_THREADS` | Julia, .NET, Polars |
 | `NODE_OPTIONS=--max-old-space-size` | node, at three quarters of the claim |
 
+**Give both `--cpu` and `--mem`.** qex writes these variables only when the
+whole claim came from you: a job that gives one of the two takes the other from
+the default or from what qex learned, and qex then writes nothing rather than
+guess which half you meant.
+
+**qex writes these only when you chose the claim.** `--cpu` and `--mem` are a
+decision; the default claim of one core is not, and a job that heard it would
+run single-threaded on a machine of sixteen cores. A learned claim is not a
+decision either, and it would make that fault permanent: qex would measure the
+job it had capped at one core, learn one core, and cap it again.
+
 **qex never replaces a value that is already there.** A value from your shell,
 from the job file or from `--env` is a decision that somebody made, and qex
-fills the values that nobody chose.
+fills the values that nobody chose. With `--env-capture minimal` the shell's
+value does not survive the capture, so qex writes its own — the rule is about
+the environment that the job receives, and not about the shell you typed in.
 
 This is the nearest thing to a limit that operates on macOS as well as on Linux,
 and it needs no cgroup and no privilege. It stays a promise: a program that asks
