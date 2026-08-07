@@ -401,10 +401,14 @@ impl JobSpec {
         //
         // Without this test, `qex submit -- cargo test` on a machine of sixteen
         // cores writes GOMAXPROCS=1 and CARGO_BUILD_JOBS=1, and the job becomes
-        // sixteen times slower with no error and no warning. A node job meets
-        // something worse: the default memory claim gives a heap far below the
-        // heap that node takes by itself, and the job stops with `FATAL ERROR:
-        // Reached heap limit`.
+        // sixteen times slower with no error and no warning.
+        //
+        // A node job meets something worse: it receives a SMALLER heap than it
+        // receives with no qex at all. Measured on this machine, the default
+        // claim is 1805MB, which gives node a heap of 1353MB, and node 12 takes
+        // 2096MB by itself. A job that goes above the heap stops. Measured with
+        // a heap of 32MB: `FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed -
+        // JavaScript heap out of memory`, exit code 134.
         //
         // A learned claim is not a decision either, and it makes the fault
         // permanent: qex measures the job that it made single-threaded, learns
@@ -796,6 +800,25 @@ mod tests {
             "`-Xmx0m` makes the JVM refuse to start"
         );
         assert_eq!(env["QEX_MEM_MB"], "0");
+        assert_eq!(env["GOMAXPROCS"], "2");
+        // 100KB is above zero, so `GOMEMLIMIT` still holds the true claim.
+        assert_eq!(env["GOMEMLIMIT"], (100u64 * 1024).to_string());
+
+        // A CLAIM OF ZERO GETS NO GOMEMLIMIT AT ALL, and `qex submit --mem 0`
+        // gives exactly that. `GOMEMLIMIT=0` is a limit of zero and not "no
+        // limit": measured on go 1.22.2, a program that allocates 32MB
+        // collected 248 times with it, and 7 times without it.
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 0, &[ClaimHint::Java]);
+        assert!(
+            !env.contains_key("GOMEMLIMIT"),
+            "a claim of zero must give no memory limit: {env:?}"
+        );
+        assert!(!env.contains_key("NODE_OPTIONS"), "{env:?}");
+        assert_eq!(env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2");
+        // The claim itself still arrives, because zero IS what the user asked
+        // for. A script reads it and decides for itself.
+        assert_eq!(env["QEX_MEM"], "0");
         assert_eq!(env["GOMAXPROCS"], "2");
     }
 

@@ -5344,8 +5344,9 @@ fn a_job_is_told_the_size_of_its_claim() {
     //
     // The default claim is one core. A job with no claim that heard "one core"
     // would run sixteen times slower on a machine of sixteen cores, with no
-    // error and no warning, and a node job would stop with `Reached heap limit`
-    // because the default memory claim is below the heap that node takes by
+    // error and no warning. A node job would receive a SMALLER heap than it
+    // receives with no qex at all: measured on this machine, the default claim
+    // of 1805MB gives node a heap of 1353MB, and node 12 takes 2096MB by
     // itself. qex tells a job the claim that SOMEBODY CHOSE, and never the
     // claim that qex invented.
     let id = h.submit(&[
