@@ -131,8 +131,8 @@ Use `qex run` for work that is SHORT AND HEAVY and that you wait for now: a test
 suite, a release build, a data conversion. The job goes in the queue, so it
 starts when the machine has room, and the other people and agents on this
 machine keep the capacity that they claimed. The output arrives as it happens,
-on the same two streams, and the exit code is the exit code of the job. Nothing
-else in your script changes.
+on the same two streams, and the exit code is the exit code of the job, or 125
+when something stopped the job. Nothing else in your script changes.
 
 WHAT YOU GIVE UP. `qex run` ties the job to this command, but only for the stops
 that it can catch:

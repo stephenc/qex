@@ -1859,14 +1859,19 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// exit code are the same as before. The command takes a place in the queue, so
 /// it waits when the machine is busy, and it holds a claim while it operates.
 ///
+/// The exit code is the exit code of the job ONLY when the job ran. A job that
+/// something stopped gave no exit code of its own, and this command then gives
+/// the code of the state, which is the code of `qex wait`. See `exit_code_for`.
+///
 /// A job of `qex run` is a job like any other. It has a record, a log file and
 /// an id.
 ///
 /// This command stops the job when it receives SIGINT (Ctrl-C) or SIGTERM,
 /// because a user expects Ctrl-C to stop the work. It stops the job with a
-/// `Kill` request to the coordinator, and NOT with a signal: the supervisor
-/// gives the job its own process group, inside the session of the supervisor,
-/// so a signal to the process group of this command never reaches the job.
+/// `Kill` request to the coordinator, or with a `Cancel` request when the job
+/// still waits in the queue, and NOT with a signal: the supervisor gives the
+/// job its own process group, inside the session of the supervisor, so a signal
+/// to the process group of this command never reaches the job.
 ///
 /// A hangup, such as a terminal that closes, and a SIGKILL therefore do not
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for

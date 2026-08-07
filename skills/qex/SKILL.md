@@ -92,9 +92,9 @@ BOTH streams. Prefer it: one command gives everything.
 
 `qex run` gives the exit code of the job when the job RAN, and for every other
 state it gives the same code as the table above. **125 from `qex run` does not
-say that your work failed.** A job of `qex run` is a job like any other, so another
-agent on this machine can run `qex kill` or `qex cancel` on it. Read the line on
-stderr before you start the work again.
+say that your work failed.** A job of `qex run` is a job like any other, so
+another agent on this machine can run `qex kill` or `qex cancel` on it. Read the
+line on stderr before you start the work again.
 
 ## Your session can stop, and the work continues
 
