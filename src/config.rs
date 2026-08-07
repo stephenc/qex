@@ -5,7 +5,7 @@
 
 use crate::{paths, sys, units};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Selects the quantity of the environment that a job receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -568,9 +568,42 @@ pub struct ClaimsConfig {
     /// into the log of the job, and a test that compares the error output
     /// fails because of it.
     ///
-    /// `make` writes `MAKEFLAGS`, which replaces the `-j` of a Makefile that
-    /// gives one.
-    pub also: Vec<String>,
+    /// `make` writes `MAKEFLAGS=-jN`. This changes only a Makefile that gives
+    /// no `-j` of its own, because the Makefile wins. It thus makes a Makefile
+    /// parallel that its author never ran in parallel, and a Makefile with an
+    /// incomplete dependency graph then fails.
+    pub also: Vec<ClaimHint>,
+}
+
+/// A variable of `[claims] also`.
+///
+/// This is an enumeration and not text, so a name with a spelling fault gives
+/// an error from the config file. A silent no-op is the wrong answer for a
+/// feature whose purpose is to stop a job from taking more than it claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimHint {
+    /// `JAVA_TOOL_OPTIONS`, for the JVM.
+    Java,
+    /// `MAKEFLAGS`, for GNU Make.
+    Make,
+}
+
+impl<'de> Deserialize<'de> for ClaimHint {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "java" => Ok(Self::Java),
+            "make" => Ok(Self::Make),
+            // The three parts: what happened, why it matters, what to do.
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown name `{s}` in `[claims] also`. qex writes no variable \
+                 for that name, so each job of a build receives the size of the \
+                 machine and not the size of its claim. Give `java`, or `make`, \
+                 or both."
+            ))),
+        }
+    }
 }
 
 impl Default for ClaimsConfig {

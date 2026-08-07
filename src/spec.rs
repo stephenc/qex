@@ -8,7 +8,7 @@
 //! own directory are thus not correct for the job. The specification that the
 //! coordinator receives is complete. It does not use any external values.
 
-use crate::config::{Config, EnvCapture};
+use crate::config::{ClaimHint, Config, EnvCapture};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -39,8 +39,10 @@ pub struct JobFile {
     /// pool to the claim and not to the machine. Give `true` here for a job
     /// that must see the machine as it is.
     ///
-    /// This field is the same as `--no-limit-env-hints`, and the command line
-    /// replaces this file.
+    /// This field is the same as `--no-limit-env-hints`. It does not REPLACE
+    /// the command line, and the command line does not replace it: `true` from
+    /// any source turns the claim off, and no source turns it on again. There
+    /// is no `--limit-env-hints`.
     pub no_limit_env_hints: Option<bool>,
     /// The jobs that must succeed before this job starts.
     ///
@@ -378,14 +380,15 @@ impl JobSpec {
         // and `--env` ONLY. A user who asks for that asked for it deliberately,
         // and sixteen variables that qex chose would break the promise of the
         // option. `none` means none.
-        // The command line replaces the job file, and the job file replaces the
-        // configuration — the same order as every other value here.
         //
-        // `--no-limit-env-hints` is the answer for one job, and
-        // `[claims] export_env = false` is the answer for every job. The
-        // configuration comes FIRST: a file that says `no_limit_env_hints =
-        // false` must not turn the feature on again for a machine where the
-        // configuration turned it off.
+        // THIS IS NOT THE USUAL ORDER OF THE SOURCES. Most values here take
+        // the command line, then the job file, then the configuration, and a
+        // later source REPLACES an earlier one. These three sources are an
+        // AND: `[claims] export_env = false`, `--no-limit-env-hints` and
+        // `no_limit_env_hints = true` each turn the claim off on their own, and
+        // no source turns it on again. There is no `--limit-env-hints`, so a
+        // job file that says `true` stands, and a machine whose configuration
+        // says `export_env = false` stays off for every job.
         let hints = cfg.claims.export_env
             && !opts.no_limit_env_hints
             && !file.no_limit_env_hints.unwrap_or(false);
@@ -588,26 +591,32 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 ///
 /// # What was measured
 ///
-/// On one machine of 16 cores, with a claim of 2 cores and 2GB:
+/// One machine of 16 cores and 28GB. A claim of 2 cores and 2GB, for which qex
+/// writes `GOMAXPROCS=2` and `--max-old-space-size=1536`. Each runtime was
+/// asked for its own value:
 ///
-///     go     GOMAXPROCS=2                 gives GOMAXPROCS(0) == 2
-///     java   -XX:ActiveProcessorCount=2   gives availableProcessors() == 2
-///     node   --max-old-space-size=2048    gives a heap limit of 2096MB
+///     go 1.22.2   GOMAXPROCS=2                gives runtime.GOMAXPROCS(0) == 2
+///     node 12     --max-old-space-size=1536   gives a heap limit of 1584MB
+///     java 11     -XX:ActiveProcessorCount=2 -Xmx1536m
+///                                             gives availableProcessors() == 2
+///                                             and maxMemory() == 1536MB
 ///
 /// Two results changed this list:
 ///
 /// `-XX:MaxRAMPercentage` does NOT limit the heap to the claim, because the JVM
-/// takes that percentage of the memory of the MACHINE: a claim of 2GB on a
-/// machine of 28GB still gave a heap of 7GB. A limit needs `-Xmx`.
+/// takes that percentage of the memory of the MACHINE. Measured: `java` with no
+/// option at all gave a maximum heap of 7224MB on this 28GB machine, and
+/// `-XX:MaxRAMPercentage=25` gave the same 7224MB. A limit needs `-Xmx`.
 ///
-/// node gives no variable for the number of cores. `availableParallelism()`
-/// stays at the number of the machine, and `UV_THREADPOOL_SIZE` changes the
-/// pool for files and for DNS only.
+/// qex writes no core count for node. Measured on node 12:
+/// `os.cpus().length` is 16, the number of the MACHINE, and node reads no
+/// variable that changes it. (`os.availableParallelism` arrived in node 19 and
+/// was not measured here.)
 fn export_claim(
     env: &mut std::collections::BTreeMap<String, String>,
     cpu: u64,
     mem: u64,
-    also: &[String],
+    also: &[ClaimHint],
 ) {
     let cores = cpu.to_string();
     let mut set = |key: &str, value: &str| {
@@ -641,26 +650,43 @@ fn export_claim(
 
     // Memory. `GOMEMLIMIT` is a soft limit: Go collects more frequently as the
     // job comes near it, and it does not stop the job.
-    set("GOMEMLIMIT", &mem.to_string());
+    //
+    // ZERO IS A LIMIT OF ZERO, and not "no limit". qex accepts `--mem 0`, and
+    // Go then collects for ever. Measured on go 1.22.2, with a program that
+    // allocates 32MB: 7 collections with no GOMEMLIMIT, 6 with
+    // GOMEMLIMIT=2147483648, and 248 with GOMEMLIMIT=0.
+    if mem > 0 {
+        set("GOMEMLIMIT", &mem.to_string());
+    }
 
     // A heap needs room for the rest of the process, so node receives three
     // quarters of the claim.
+    //
+    // A claim below one megabyte rounds the heap to zero, and zero is not a
+    // limit. `-Xmx0m` makes the JVM refuse to start (measured on java 11:
+    // `Invalid maximum heap size: -Xmx0m`, exit code 1), and node 12 ignores
+    // `--max-old-space-size=0` and takes its default heap of 2096MB. Neither
+    // form says what qex means, so qex writes no heap at all.
     let heap_mb = (mem / (1 << 20)) * 3 / 4;
     if heap_mb > 0 {
         set("NODE_OPTIONS", &format!("--max-old-space-size={heap_mb}"));
     }
 
     // The two that qex writes only when the configuration asks for them.
+    //
+    // `ClaimHint` holds the names, so an unknown name in `[claims] also` is an
+    // error from the config file and never a silent no-op here.
     for name in also {
-        match name.as_str() {
-            "java" => {
-                // Each JVM writes `Picked up JAVA_TOOL_OPTIONS:` to its
-                // standard error, and that line goes into the log of the job.
-                // A test that compares the error output fails because of it, so
-                // this is not a default.
-                // `-Xmx0m` makes the JVM refuse to start, and qex accepts a
-                // claim small enough to give that. Below one megabyte of heap,
-                // give the count of the cores and no heap.
+        match name {
+            ClaimHint::Java => {
+                // Each JVM writes a line to its STANDARD ERROR. Measured on
+                // java 11: `Picked up JAVA_TOOL_OPTIONS: -XX:Active...`. That
+                // line goes into the log of the job, and a test that compares
+                // the error output fails because of it. This is why `java` is
+                // not a default.
+                //
+                // Below one megabyte of heap, give the count of the cores and
+                // no heap. See the note above `heap_mb`.
                 if heap_mb > 0 {
                     set(
                         "JAVA_TOOL_OPTIONS",
@@ -673,11 +699,24 @@ fn export_claim(
                     );
                 }
             }
-            "make" => {
-                // This replaces the `-j` of a Makefile that gives one.
+            ClaimHint::Make => {
+                // THE MAKEFILE WINS, so this changes only a Makefile that gives
+                // no `-j` of its own. Measured on GNU Make 4.3, with eight
+                // targets of 0.4 seconds:
+                //
+                //     Makefile          MAKEFLAGS in the environment   time
+                //     MAKEFLAGS += -j8  (none), -j2 and -j8            0.40s
+                //     MAKEFLAGS  = -j1  (none), -j2 and -j8            3.21s
+                //     (no -j)           (none) 3.21s, -j2 1.61s, -j8   0.40s
+                //
+                // The cost is therefore the opposite of a replacement: it makes
+                // a Makefile parallel that its author never ran in parallel. A
+                // Makefile with an incomplete dependency graph then fails.
+                // Measured: one such Makefile gave the exit code 0 with no
+                // `MAKEFLAGS`, and the exit code 2 with `MAKEFLAGS=-j8`. This
+                // is why `make` is not a default.
                 set("MAKEFLAGS", &format!("-j{cores}"));
             }
-            _ => {}
         }
     }
 }
@@ -729,7 +768,7 @@ mod tests {
         assert!(!env.contains_key("MAKEFLAGS"));
 
         let mut env = BTreeMap::new();
-        export_claim(&mut env, 3, 4 << 30, &["java".into(), "make".into()]);
+        export_claim(&mut env, 3, 4 << 30, &[ClaimHint::Java, ClaimHint::Make]);
         assert!(env["JAVA_TOOL_OPTIONS"].contains("-XX:ActiveProcessorCount=3"));
         assert!(env["JAVA_TOOL_OPTIONS"].contains("-Xmx3072m"));
         assert_eq!(env["MAKEFLAGS"], "-j3");
@@ -746,7 +785,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         let mut env = BTreeMap::new();
-        export_claim(&mut env, 2, 100 * 1024, &["java".into()]);
+        export_claim(&mut env, 2, 100 * 1024, &[ClaimHint::Java]);
 
         assert!(
             !env.contains_key("NODE_OPTIONS"),

@@ -5319,9 +5319,26 @@ fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
 /// many cores it has receives the number of the MACHINE, so a job with a claim
 /// of two cores on a machine of sixteen starts sixteen threads and takes the
 /// capacity that qex gave to the other jobs.
+///
+/// THIS TEST USES `env_capture = "minimal"`, and the reason is not secrecy.
+/// With the default `all`, the shell of the developer reaches the job, and an
+/// ambient `GOMAXPROCS` or `MAKEFLAGS` defeats every assertion here: qex fills
+/// a value that nobody chose, so a value that the shell chose stays and the
+/// test reads it. Measured: `GOMAXPROCS=4 cargo test` gave `[][4][]` where the
+/// test asks for `[][][]`.
+///
+/// `cargo mutants` makes this certain and not merely possible. It starts a
+/// jobserver and gives the child cargo `MAKEFLAGS=--jobserver-auth=...`, so
+/// the UNMUTATED baseline fails and no mutant is ever reached. The same is
+/// true for anybody who runs `cargo test` under a `make -j` wrapper.
 #[test]
 fn a_job_is_told_the_size_of_its_claim() {
-    let h = Harness::with_default_config("claimenv");
+    let h = Harness::new(
+        "claimenv",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"minimal\"\n",
+    );
 
     // A JOB THAT MADE NO CLAIM IS TOLD NOTHING.
     //
@@ -5519,9 +5536,13 @@ fn a_job_is_told_the_size_of_its_claim() {
 ///
 /// `export_env = false` turns the claim off for all of them, and `also` adds
 /// the two variables that qex does not write without a request. Each of those
-/// two has a cost, so neither is a default: `JAVA_TOOL_OPTIONS` makes every JVM
-/// write `Picked up JAVA_TOOL_OPTIONS: ...` to its standard error, and
-/// `MAKEFLAGS` replaces the `-j` of a Makefile that gives one.
+/// two has a cost, so neither is a default: every JVM writes `Picked up
+/// JAVA_TOOL_OPTIONS: ...` to its standard error, and `MAKEFLAGS` makes a
+/// build parallel that its author never ran in parallel.
+///
+/// `env_capture = "minimal"` for the same reason as the test above: a
+/// `MAKEFLAGS` in the shell of the developer otherwise reaches the job and
+/// defeats the assertion. `cargo mutants` sets exactly that variable.
 #[test]
 fn the_config_file_controls_the_claim_in_the_environment() {
     let show = [
@@ -5534,6 +5555,7 @@ fn the_config_file_controls_the_claim_in_the_environment() {
         "claimsoff",
         "[peers]\nenabled = false\n\
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"minimal\"\n\
          [claims]\nexport_env = false\n",
     );
     let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
@@ -5551,6 +5573,7 @@ fn the_config_file_controls_the_claim_in_the_environment() {
         "claimsalso",
         "[peers]\nenabled = false\n\
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"minimal\"\n\
          [claims]\nalso = [\"java\", \"make\"]\n",
     );
     let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
@@ -5562,5 +5585,36 @@ fn the_config_file_controls_the_claim_in_the_environment() {
         out.trim(),
         "[2][2][-XX:ActiveProcessorCount=2 -Xmx1536m][-j2]",
         "`also` must add the two variables: {out}"
+    );
+
+    // A NAME WITH A SPELLING FAULT MUST STOP THE COMMAND.
+    //
+    // A silent no-op is the wrong answer for a feature whose purpose is to
+    // stop a job from taking more than it claimed: the user reads the config
+    // file, believes the JVM is limited, and it is not.
+    let h = Harness::new(
+        "claimsbad",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [claims]\nalso = [\"jvm\"]\n",
+    );
+    let out = h.qex(&["submit", "--cpu", "2", "--mem", "2GB", "--", "true"]);
+    assert!(
+        !out.status.success(),
+        "an unknown name must stop the submit"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    // The three parts: what happened, why it matters, what the reader must do.
+    assert!(
+        err.contains("jvm"),
+        "the message must name the value: {err}"
+    );
+    assert!(
+        err.contains("size of the machine"),
+        "the message must say why it matters: {err}"
+    );
+    assert!(
+        err.contains("`java`") && err.contains("`make`"),
+        "the message must give the remedy: {err}"
     );
 }

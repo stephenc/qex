@@ -792,8 +792,15 @@ also = ["java", "make"]
 
 `java` writes `JAVA_TOOL_OPTIONS`, and every JVM then writes `Picked up
 JAVA_TOOL_OPTIONS: ...` to its standard error, which lands in the log of the
-job. `make` writes `MAKEFLAGS=-jN`, which replaces the `-j` of a Makefile that
-gives one.
+job.
+
+`make` writes `MAKEFLAGS=-jN`. **A Makefile that gives its own `-j` wins**, so
+this changes a Makefile that gives none — and that is the cost. It makes a
+build parallel that its author never ran in parallel, and a Makefile with an
+incomplete dependency graph then fails.
+
+A name in `also` that is not `java` or `make` gives an error. qex does not
+ignore it.
 
 Turn it all off with `[claims] export_env = false`.
 
@@ -805,8 +812,11 @@ with a field:
 no_limit_env_hints = true
 ```
 
-The command line replaces the file, and the file replaces the configuration —
-the same order as every other value.
+**These three sources are not the usual order.** Most values take the command
+line, then the file, then the configuration, and a later source replaces an
+earlier one. Here each source can only turn the claim OFF: there is no
+`--limit-env-hints`, so a job file that says `true` stands, and a machine whose
+configuration says `export_env = false` stays off for every job.
 
 `--env-capture none` also turns it off for that job. That mode says the job
 starts with an empty environment and receives `[env]` and `--env` only, and
