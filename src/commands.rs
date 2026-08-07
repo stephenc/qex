@@ -1476,6 +1476,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             jobs_queued,
             cpu_budget,
             mem_budget,
+            config_error,
             cpu_claimed,
             mem_claimed,
         } => {
@@ -1494,9 +1495,31 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "mem_budget": mem_budget,
                         "cpu_claimed": cpu_claimed,
                         "mem_claimed": mem_claimed,
+                        "config_error": config_error,
                     }))?
                 );
                 return Ok(0);
+            }
+            // Say this first. Every number below comes from the values that
+            // the coordinator holds, and those are no longer the values in the
+            // file.
+            if let Some(fault) = &config_error {
+                // Put the `qex:` prefix on EVERY line. A TOML parse error is
+                // three lines and a caret, and a prefix on the first line only
+                // makes the other lines look like output of the command.
+                let fault: String = fault
+                    .lines()
+                    .map(|l| format!("qex:   {l}\n"))
+                    .collect::<Vec<_>>()
+                    .concat();
+                eprint!(
+                    "qex: WARNING: the configuration file changed, and qex cannot read it:\n\
+                     {fault}\
+                     qex:   The coordinator keeps the values that it had, and they are the \
+                     values below.\n\
+                     qex:   Correct the file. The coordinator reads it again by itself. Run \
+                     `qex config show` for the full message.\n"
+                );
             }
             println!("coordinator pid: {pid}");
             println!(

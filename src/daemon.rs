@@ -8,7 +8,7 @@
 //! writes `status.json`. The coordinator keeps a copy in memory only. A
 //! coordinator that stops thus loses no result.
 
-use crate::config::Config;
+use crate::config::{Config, ConfigFile};
 use crate::job::{self, JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
@@ -49,7 +49,234 @@ pub struct State {
     pub next_sequence: u64,
     /// The time when this coordinator started.
     pub started_at: u64,
+    /// A number made from the BYTES of the configuration file that this
+    /// coordinator holds.
+    ///
+    /// The coordinator reads the file again when this value changes, so an
+    /// edit reaches a coordinator that already operates.
+    pub config_seen: u64,
+    /// A number that the file gave, and the time when it FIRST gave it.
+    ///
+    /// The coordinator takes a change only after every look at the file gave
+    /// this same number for `CONFIG_SETTLE`. See `reload_config` for the fault
+    /// that this stops, and for the limit of a guard that looks.
+    pub config_settling: Option<(u64, Instant)>,
+    /// The fault in the configuration file, if the last read gave one.
+    ///
+    /// The coordinator keeps the values that it had. A file that qex cannot
+    /// read must not become the DEFAULT values in silence: that would turn a
+    /// budget of 2 cores into a budget of 12 with no word to anybody.
+    pub config_error: Option<String>,
     pub stop: bool,
+}
+
+/// How long every look at the configuration file must give the same content
+/// before qex takes it.
+///
+/// This is a TIME, and not a count of turns of the scheduler. It is also not a
+/// promise that the file held that content for the whole of it. See
+/// `reload_config` for the measurement that made it a time, and for the limit.
+pub const CONFIG_SETTLE: Duration = Duration::from_millis(500);
+
+/// Gives a short number for what one look at the file gave.
+///
+/// THE CONTENT, AND NOT THE TIME OF THE FILE.
+///
+/// Linux takes the time of a file from a coarse clock, with the granularity of
+/// one tick: 4 milliseconds on a usual machine. Two writes inside one tick give
+/// a file the SAME time, so a test of the time misses the second write — and it
+/// misses it for ever, because nothing later changes that value. A number made
+/// from the bytes has no such window.
+///
+/// The first byte separates the four answers, so that a file that goes away
+/// and a file with content give different numbers.
+///
+/// This is FNV-1a, which qex uses in the other places that need a short name
+/// for a long value.
+fn config_fingerprint(read: &ConfigFile) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |byte: u8| {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    match read {
+        ConfigFile::Missing => eat(0),
+        ConfigFile::NotRegular => eat(1),
+        ConfigFile::Unreadable(_) => eat(3),
+        ConfigFile::Text(bytes) => {
+            eat(2);
+            for byte in bytes {
+                eat(*byte);
+            }
+        }
+    }
+    hash
+}
+
+/// Reads the configuration file again when somebody changed it.
+///
+/// # The fault that this removes
+///
+/// The coordinator read the file one time, at its start, and it operates for
+/// hours. A user who changed `[budget] cpu` then saw `qex config show` report
+/// the NEW value, because that command reads the file, and `qex info` report
+/// the OLD one, because that command asks the coordinator. The two commands of
+/// qex disagreed about the budget of qex, and neither said that one of them was
+/// old.
+///
+/// The values that this changes are the budget, the reserve and the rules of
+/// the queue. They apply to the jobs that START after the change; a job that
+/// operates keeps the claim that it made.
+///
+/// # A file that a writer has not finished
+///
+/// The caller gives the bytes. This function takes the values from THOSE
+/// bytes, and it does not read the file again: a second read can give
+/// different bytes, and the coordinator would then hold values that do not
+/// belong to the number in `config_seen`.
+///
+/// THIS FUNCTION LOOKS AT THE FILE, AND IT DOES NOT WATCH IT. The scheduler
+/// looks about ten times in `CONFIG_SETTLE`, and this function takes the
+/// content when every look gave the same content. Read the limit of that below
+/// before you write a sentence about it. A write that does not replace the file
+/// in one step — a shell `>`
+/// and a redirect, a program that writes one line at a time — leaves a file
+/// that stops in the middle, and A FILE THAT STOPS IN THE MIDDLE IS STILL VALID
+/// TOML. It parses and it validates, and it is wrong in two ways:
+///
+/// 1. Every key that the writer did not reach yet takes its DEFAULT value. A
+///    review measured a budget of 2 cores that became 12, and 10 jobs that
+///    started together in place of 2.
+/// 2. A stop in the MIDDLE OF A LINE gives a wrong value that is not a default
+///    value. A review measured a file that was becoming `cpu = 16` and that qex
+///    read as `cpu = 1`.
+///
+/// Both said nothing, because qex CAN read such a file.
+///
+/// # The measurement that made this a time and not a count of turns
+///
+/// This test counted two TURNS of the scheduler before it counted time, and a
+/// turn is not half a second. `sched::run` waits on a condition variable with a
+/// timeout of 500ms, and every request thread calls `Coordinator::notify`, so a
+/// coordinator with work in the queue turns far faster than the timeout. A
+/// measurement with a mark on each turn gave a median gap of 500.7ms with
+/// nothing to do and 17.0ms with a loop of `qex submit` running, with a minimum
+/// of 1.2ms. A partial write with a pause of 300ms in the middle then installed
+/// the DEFAULT budget in 3 trials of 3. The count of turns gave a guard about
+/// thirty times shorter than the words promised.
+///
+/// # THE LIMIT OF A LOOK, WHICH NO NUMBER OF LOOKS REMOVES
+///
+/// A count of looks is not a promise about the time between them. A writer that
+/// puts two whole files at the path in turn, in step with the looks, gives
+/// every look the same content while the file was never that content for more
+/// than one period. Measured on this branch: a writer that changed the file
+/// every 25ms with a rename made the coordinator take a half-written file in 3
+/// trials of 5, on a coordinator with nothing to do.
+///
+/// The first form of this guard looked every 500ms, and a writer with a period
+/// near one second walked through it; `a_file_that_goes_back_and_forth_does_not
+/// _change_the_budget` holds that case. The 50ms look moved the hole from a
+/// period near a second to a period near a tenth of one. IT DID NOT CLOSE IT,
+/// AND NO FIXED PERIOD CAN: a sampler always has a frequency that walks past
+/// it. Only a message from the file system closes it, and this branch removed
+/// that dependency on purpose.
+///
+/// This is a good trade, and the words must say which trade it is. A writer
+/// that changes the file with that regularity, for long enough, is not a shell
+/// `>` and is not an editor: those write the file one time. A shell loop with
+/// its usual jitter could not do it in 5 trials of 5; only a writer with an
+/// exact period could. So: SAY "ABOUT TEN LOOKS, AND EVERY LOOK GAVE THE SAME
+/// CONTENT". NEVER SAY "UNCHANGED FOR HALF A SECOND".
+///
+/// A file that STAYS half-written is a different thing again, and this function
+/// takes it. A file that gives the same content at every look for
+/// `CONFIG_SETTLE` is the configuration, whatever the user meant.
+pub fn reload_config(state: &mut State, read: ConfigFile) {
+    let now = config_fingerprint(&read);
+    if now == state.config_seen {
+        state.config_settling = None;
+        return;
+    }
+    match state.config_settling {
+        // The same number as before: take it when it is old enough.
+        Some((seen, since)) if seen == now => {
+            if since.elapsed() < CONFIG_SETTLE {
+                return;
+            }
+        }
+        // A number that this function did not see last time. Start the wait.
+        _ => {
+            state.config_settling = Some((now, Instant::now()));
+            return;
+        }
+    }
+    state.config_settling = None;
+    state.config_seen = now;
+
+    let bytes = match read {
+        ConfigFile::Text(bytes) if !bytes.is_empty() => bytes,
+        // A FILE THAT IS GONE OR EMPTY IS NOT A NEW CONFIGURATION.
+        //
+        // `Config::load` gives the default values for a file that does not
+        // exist, which is correct at the start of a coordinator and wrong
+        // here: an editor that empties a file before it writes it, and a shell
+        // `>` that does the same, would turn a budget of 2 cores into the
+        // default budget for as long as that window lasts. Keep the values.
+        ConfigFile::Text(_) | ConfigFile::Missing | ConfigFile::Unreadable(_) => {
+            // Say WHICH fault this is. The earlier text of `config_error`
+            // names a line of a file that no longer holds that line, and a
+            // reader who looks for it does not find it.
+            let message = "the file is empty, or qex cannot read it".to_string();
+            log(&format!(
+                "{message}. The coordinator keeps the values that it had."
+            ));
+            state.config_error = Some(message);
+            return;
+        }
+        ConfigFile::NotRegular => {
+            let message = "the path of the configuration file is not a regular file".to_string();
+            log(&format!(
+                "{message}. The coordinator keeps the values that it had."
+            ));
+            state.config_error = Some(message);
+            return;
+        }
+    };
+
+    let path = paths::config_file().unwrap_or_default();
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            let message = "the configuration file is not text".to_string();
+            log(&format!(
+                "{message}. The coordinator keeps the values that it had."
+            ));
+            state.config_error = Some(message);
+            return;
+        }
+    };
+
+    // `validate` as well as parse. The start of a coordinator refuses a file
+    // that does not validate, and this path installed one: a budget of `two`
+    // gave every job a budget of 0 with no word to anybody.
+    match Config::parse_short(&path, &text).and_then(|c| c.validate().map(|_| c)) {
+        Ok(cfg) => {
+            state.config_error = None;
+            log("the configuration file changed; the coordinator read it again");
+            state.cfg = cfg;
+        }
+        Err(e) => {
+            // Keep the values that this coordinator has. The default values
+            // would be a budget that nobody asked for.
+            let message = format!("{e:#}");
+            log(&format!(
+                "the configuration file changed and qex cannot read it: {message}. \
+                 The coordinator keeps the values that it had."
+            ));
+            state.config_error = Some(message);
+        }
+    }
 }
 
 /// Gives the position of a state in the life of a job.
@@ -158,6 +385,13 @@ impl Coordinator {
                 idle_since: Some(Instant::now()),
                 next_sequence: 1,
                 started_at: crate::sys::now_secs(),
+                // The start of a coordinator already read the file, and it
+                // stopped if it could not. Take that value as the one this
+                // coordinator holds, so the first turn of the scheduler makes
+                // no change.
+                config_seen: config_fingerprint(&crate::config::read_config_file()),
+                config_settling: None,
+                config_error: None,
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -495,6 +729,7 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         jobs_queued: state.count_state(|s| s == JobState::Queued),
         cpu_budget: state.cfg.budget_cpu().unwrap_or(0),
         mem_budget: state.cfg.budget_mem().unwrap_or(0),
+        config_error: state.config_error.clone(),
         cpu_claimed,
         mem_claimed,
     }

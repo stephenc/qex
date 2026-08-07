@@ -191,6 +191,25 @@ pub fn run(coord: Arc<Coordinator>) {
             return;
         }
 
+        // Read the configuration again when somebody changed it, so an edit
+        // reaches a coordinator that already operates.
+        //
+        // THE READ IS OUTSIDE THE LOCK. A read of a file can take any length of
+        // time. A review put a FIFO at the path of the configuration file and
+        // measured `qex info` with no answer in 15 seconds: this thread waited
+        // in the open, and the three other threads waited for the mutex that
+        // this thread held. `read_config_file` now refuses a file that is not a
+        // regular file, and this line keeps the mutex free while it reads.
+        //
+        // THIS LOOP IS NOT A CLOCK. The wait at the end of the loop has a
+        // timeout of 500ms, but every request thread calls `notify`, so a turn
+        // is as short as the work makes it. Measured with a mark on each turn:
+        // the median gap was 500.7ms with nothing to do, and 17.0ms with a loop
+        // of `qex submit` running, with a minimum of 1.2ms. `reload_config`
+        // therefore measures TIME, and it must never count turns.
+        let config = crate::config::read_config_file();
+        crate::daemon::reload_config(&mut coord.state.lock().unwrap(), config);
+
         // Read the status file of each job that operates. The supervisors write
         // those files, so this is how the coordinator learns that a job started.
         let changed = coord.state.lock().unwrap().refresh_active();
@@ -213,11 +232,30 @@ pub fn run(coord: Arc<Coordinator>) {
 
         // Wait for a change, or test the machine again after a short time. The
         // free memory changes without a message, so a timer is necessary.
+        //
+        // WHILE THE CONFIGURATION FILE SETTLES, LOOK OFTEN. `reload_config`
+        // takes the content when every look in `CONFIG_SETTLE` gave that
+        // content. With one look every 500ms there are TWO looks in the window,
+        // and a writer with a period near one second gives them both the same
+        // half-written file. A test on macOS met that, and the coordinator took
+        // the file. Ten looks make that writer far less likely to pass.
+        //
+        // TEN LOOKS DO NOT CLOSE THE HOLE. They move it to a writer with a
+        // period near a tenth of a second, and no fixed period closes it: a
+        // sampler always has a frequency that walks past it. Measured on this
+        // branch: a writer that changed the file every 25ms with a rename made
+        // the coordinator take a half-written file in 3 trials of 5. Do not
+        // write that this loop makes the content certain. See `reload_config`.
+        //
+        // The cost is nothing when the file is not changing, because
+        // `config_settling` is `None` and the wait is 500ms as before.
         let state = coord.state.lock().unwrap();
-        let _ = coord
-            .changed
-            .wait_timeout(state, Duration::from_millis(500))
-            .unwrap();
+        let wait = if state.config_settling.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(500)
+        };
+        let _ = coord.changed.wait_timeout(state, wait).unwrap();
     }
 }
 

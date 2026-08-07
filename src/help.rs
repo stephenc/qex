@@ -707,6 +707,43 @@ a job at its claim. If qex cannot set a limit, it writes a warning and continues
 in the `off` mode.
 
 A key name with a spelling error gives an error. qex does not ignore it.
+
+When the coordinator reads this file
+------------------------------------
+
+The coordinator reads this file at its start, and it reads it again when the
+content of the file changes. qex looks at the file about ten times in half a
+second, and it takes the content when every look gave the same content, so the
+new values arrive in about half a second to one second. They apply to the jobs
+that START after the change. A job that operates keeps the claim that it made.
+
+Those looks are not a delay for its own sake. A program that writes this file
+one line at a time leaves a file that stops in the middle, and a file that stops
+in the middle is still valid TOML. Every key that the writer did not reach yet
+takes its DEFAULT value, and a stop in the middle of a line gives a wrong value
+that is not a default value: a file that is becoming `cpu = 16` reads as
+`cpu = 1`. qex says nothing in either case, because it CAN read such a file.
+
+A file that changes back and forth in step with those looks can still be taken.
+qex LOOKS at the file, and it gets no message when the file changes, so a writer
+that puts two whole files at the path in turn at the period of the looks gives
+every look the same content. No number of looks removes that. Write this file in
+one step to be safe: write a temporary file, then rename it over this one.
+
+A file that qex cannot read does not become the default values. The coordinator
+keeps the values that it had, and `qex info` says so. That covers a file with a
+fault, an empty file, a file that is gone, and a path that is not a regular
+file. Correct the file, and the coordinator reads it again with no other step.
+
+The path must be a regular file, or a link to one. The open of a FIFO waits for
+a writer, and a read of a device gives bytes with no end, so every command that
+reads this file refuses a path of another kind and says so at once.
+
+A NEW option is different. The coordinator holds the code that started it, so a
+coordinator of an earlier build does not know a name that a later build added.
+It refuses the file and keeps the values that it had. Install the new qex FIRST,
+then run `qex info` for the pid and `kill <pid>` to replace the coordinator, and
+put the new option in the file last.
 ";
 
 pub const RESOURCES: &str = "\
