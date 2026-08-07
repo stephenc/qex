@@ -211,6 +211,15 @@ impl Harness {
     fn job_dir(&self, id: &str) -> PathBuf {
         self.root.join("state/qex/jobs").join(id)
     }
+
+    /// Writes the config file again, while the installation operates.
+    ///
+    /// A user does this with an editor. The coordinator that already operates
+    /// keeps the values that it read when it started, and each NEW process
+    /// reads what this function wrote.
+    fn write_config(&self, config: &str) {
+        std::fs::write(self.root.join("cfg/qex.toml"), config).unwrap();
+    }
 }
 
 impl Drop for Harness {
@@ -2656,6 +2665,88 @@ fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
     assert_eq!(status["state"], "completed", "got: {status}");
     assert_eq!(status["attempts"], 2, "got: {status}");
     assert_eq!(status["exit_code"], 0, "got: {status}");
+}
+
+/// The record of a job must hold the SHORT form of a config fault.
+///
+/// # Why this test starts real processes
+///
+/// `Config::load` gives a long message: it names the version of this build, it
+/// explains that a coordinator holds the code that started it, and it gives
+/// three numbered steps for an upgrade. That is correct for a person whose
+/// command stopped at a terminal.
+///
+/// The supervisor of a job must NOT ask for that form. It puts the fault in the
+/// record of the job, and `qex status` prints that record, so the long message
+/// would fill the `error:` field of a job that already ran with advice about an
+/// upgrade — which reads as a fault in qex, and which hides the words that
+/// matter there: that no limit operates.
+///
+/// A unit test on the message alone cannot hold this. The message is a pure
+/// function of its arguments, so a test of it passes whichever form the
+/// supervisor asks for. `src/supervisor.rs` calling `Config::load()` instead of
+/// `Config::load_for_job_record()` brings the fault back, and only a test that
+/// reads a real `qex status` sees it.
+///
+/// # Why the job starts in this state at all
+///
+/// `qex submit` reads the config file, so it stops while the file holds a field
+/// that qex does not know. The job must therefore be in the QUEUE before the
+/// file changes. The budget of one core holds it there, and the end of the job
+/// that occupies the budget releases it.
+#[test]
+fn a_config_fault_in_the_record_of_a_job_stays_short() {
+    let good = "[budget]\ncpu = \"1\"\nmem = \"2GB\"\n\
+                [peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n";
+    let h = Harness::new("cfgrec", good);
+
+    // One core of budget, and one job that takes it. The next job waits.
+    let occupier = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "128MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.has_started(&occupier)
+    });
+
+    let victim = h.submit(&["submit", "--cpu", "1", "--mem", "128MB", "--", "true"]);
+    assert_eq!(
+        h.state_of(&victim),
+        "queued",
+        "the budget of one core must hold the second job in the queue"
+    );
+
+    // NOW the file gets a field that this qex does not know. The coordinator
+    // keeps the values that it read when it started, so it still schedules the
+    // job; the supervisor of that job is a new process, and it reads this.
+    h.write_config(&format!("{good}\n[hooks]\non_stop = [\"true\"]\n"));
+
+    // Release the budget. The waiting job then starts under the broken file.
+    h.qex(&["kill", &occupier, "--grace", "1s"]);
+    h.until("the second job stops", Duration::from_secs(60), || {
+        h.state_of(&victim) == "completed"
+    });
+
+    let status = h.ok(&["status", &victim]);
+
+    // The test must prove that the supervisor MET the fault. Without this, a
+    // run in which the supervisor read a correct file would pass this test
+    // while measuring nothing at all.
+    assert!(
+        status.contains("NO LIMIT OPERATES"),
+        "the supervisor did not meet the config fault, so this test measured \
+         nothing: {status}"
+    );
+
+    // The long message names the coordinator in every paragraph. One word is
+    // therefore enough to separate the two forms.
+    assert!(
+        !status.contains("coordinator"),
+        "the record of a job must hold the short form of a config fault. The \
+         supervisor asked for the long form, which belongs to a person at a \
+         terminal and not to the `error:` field of a job that already ran: \
+         {status}"
+    );
 }
 
 fn _unused(_: &Path) {}

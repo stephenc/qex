@@ -304,15 +304,126 @@ pub struct Config {
     pub gc: GcConfig,
 }
 
+/// How much of the message about the config file the reader needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    /// A person at a terminal, whose command stopped. This reader must learn
+    /// the cause and the remedy, because nothing else will tell them.
+    Full,
+    /// A place that keeps the message and shows it again later. The record of a
+    /// job is such a place, and `qex status` prints it.
+    ///
+    /// The long message is advice about an upgrade. In the `error:` field of a
+    /// job that ran, it reads as a fault in qex, and it hides the one line that
+    /// the reader of that field needs. The short form gives the answer of the
+    /// parser and nothing else.
+    Short,
+}
+
+/// Makes the message for a config file that qex cannot read.
+///
+/// # Why this is not the message of the parser alone
+///
+/// `Config` refuses a field that it does not know, and that rule is correct: a
+/// value with a spelling fault must not be ignored in silence. But it has a
+/// second cause that the parser cannot see. A user who writes an option of a
+/// NEWER qex, and then runs an OLDER qex, gets "unknown field" for an option
+/// that is not a fault at all.
+///
+/// The commands that need the config file then stop: `qex submit`, `qex run`,
+/// `qex pipeline`, `qex gc`, `qex du` and `qex config show`. `daemon` reads it
+/// too, so qex cannot START a coordinator.
+///
+/// # Why the message names so few commands that continue
+///
+/// Two questions decide whether a command continues, and the second one is easy
+/// to miss. Test BOTH before you change this text.
+///
+/// 1. Does the command read the config file? `grep -n 'Config::load' src/`. A
+///    call with `?` stops. `qex top` (`unwrap_or_default`) and the supervisor
+///    of a job (it takes the default values) continue.
+/// 2. Does the command need a COORDINATOR? `Client::connect` starts one when
+///    none operates, and a coordinator cannot start from a file that qex
+///    cannot read. `qex info`, `qex list`, `qex status`, `qex kill`, `qex
+///    cancel`, `qex clean` and `qex rerun` therefore continue only WHILE a
+///    coordinator operates. With none, each waits 10 seconds and then reports
+///    that the coordinator did not start — a message that names no cause.
+///
+/// This message tells the reader to `kill` the coordinator, so it must never
+/// promise a command that the `kill` takes away. Only `qex wait`, `qex top`,
+/// `qex logs` and `qex version` continue in every state.
+///
+/// The order matters, and the message gives it. A new option belongs in the
+/// config file only after the COORDINATOR is the new build. The program on the
+/// disk is not sufficient: a coordinator operates for hours, it holds the code
+/// that started it, and it reads the config file ONCE, when it starts
+/// (`daemon::run`, and then `State.cfg` for ever). A new option in the file thus
+/// has no effect until a new coordinator reads it, and qex ignores it in
+/// silence, which is the fault that this message must stop.
+fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) -> anyhow::Error {
+    let short = anyhow::anyhow!("parsing config file {}: {error}", path.display());
+    if detail == Detail::Short || !error.message().contains("unknown field") {
+        return short;
+    }
+
+    anyhow::anyhow!(
+        "{short}\n\n\
+         qex refuses a field that it does not know, because a name with a spelling \
+         fault must not be ignored in silence.\n\n\
+         This qex is version {}. If that name is an option of a NEWER qex, then the \
+         file and the program do not agree. Each command that needs this file stops \
+         until they agree, and qex cannot start a coordinator, so a queue whose \
+         coordinator retires stays where it is. Your jobs continue, and `qex wait` \
+         and `qex top` continue. `qex info`, `qex list` and `qex status` continue \
+         while a coordinator operates. Read `qex help config`.\n\n\
+         Put a new option in the config file only AFTER the coordinator is the new \
+         build. The program on the disk is not sufficient: a coordinator operates for \
+         hours, it holds the code that started it, and it reads this file once, when \
+         it starts. A new option that you write before that moment has no effect, and \
+         qex ignores it in silence.\n\n\
+         To correct it now:\n\
+         \x20   1. Install the new qex. Do this FIRST: while the old qex is the \
+         program on the disk, no coordinator can start from this file.\n\
+         \x20   2. Run `qex info` for the version and the pid of the coordinator. A \
+         coordinator stops when no job operates; `kill <pid>` changes it at once, and \
+         the jobs that operate continue.\n\
+         \x20   3. Run `qex info` again. The version must be the new one.\n\n\
+         To go back instead, remove that section from {}.",
+        // The version of the BUILD, and not the number in Cargo.toml. `main`
+        // holds `0.0.0-dev` for ever, so `CARGO_PKG_VERSION` says nothing about
+        // which build reads the file. `version::VERSION` names the commit, and
+        // this message is about a file and a program that do not agree.
+        crate::version::VERSION,
+        path.display()
+    )
+}
+
 impl Config {
     /// Reads `~/.config/qex.toml`.
     ///
     /// If the file does not exist, this function gives the default values.
+    ///
+    /// A fault gives the long message, for a person at a terminal. Use
+    /// `load_for_job_record` where the message goes into a record.
     pub fn load() -> Result<Self> {
+        Self::read(Detail::Full)
+    }
+
+    /// Reads the config file for the supervisor of a job.
+    ///
+    /// The supervisor puts the fault in the record of the job, and `qex status`
+    /// prints that record. The long message is advice about an upgrade, so in
+    /// an `error:` field it reads as a fault in qex. This form gives the answer
+    /// of the parser only; `qex config show` gives the long message to the
+    /// person who asks for it.
+    pub fn load_for_job_record() -> Result<Self> {
+        Self::read(Detail::Short)
+    }
+
+    fn read(detail: Detail) -> Result<Self> {
         let path = paths::config_file()?;
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text)
-                .with_context(|| format!("parsing config file {}", path.display())),
+            Ok(text) => toml::from_str(&text).map_err(|e| config_error(&path, e, detail)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         }
@@ -445,6 +556,104 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A field that qex does not know must give the order of the steps.
+    ///
+    /// The usual cause is not a spelling fault. It is a user who wrote an
+    /// option of a NEWER qex and then ran an OLDER one. That state stops the
+    /// commands that need the file, and `qex submit` is the first one that the
+    /// user meets. The message must therefore say which commands continue, and
+    /// `qex info` is the one that gives the pid of the coordinator.
+    ///
+    /// It must also say that the program on the disk is not sufficient. A
+    /// coordinator operates for hours and holds the code that started it, so a
+    /// new option reaches a coordinator that cannot read it.
+    #[test]
+    fn a_field_that_qex_does_not_know_gives_the_order_of_the_steps() {
+        let path = std::path::Path::new("/home/me/.config/qex.toml");
+        let error = toml::from_str::<Config>("[hooks]\non_stop = [\"true\"]\n").unwrap_err();
+        let text = config_error(path, error, Detail::Full).to_string();
+
+        assert!(
+            text.contains("unknown field"),
+            "the message must keep the answer of the parser: {text}"
+        );
+        // The way back must be there as well. A user who cannot install a new
+        // qex now needs a command that works now.
+        assert!(
+            text.contains("remove that section"),
+            "the message must give the way back: {text}"
+        );
+        // The message must name what stops and what continues. A user who
+        // reads "every command stops" looks for a fault that is not there.
+        assert!(
+            text.contains("qex info") && text.contains("continue"),
+            "the message must say which commands continue: {text}"
+        );
+        // `qex info` needs a COORDINATOR, and step 2 of this same message tells
+        // the reader to kill the coordinator. A promise with no qualifier would
+        // therefore send that reader into a 10 second wait and a message that
+        // names no cause.
+        assert!(
+            text.contains("while a coordinator operates"),
+            "the promise about `qex info` must carry its qualifier: {text}"
+        );
+        // Step 1 must be first, and the message must say WHY. A reader who
+        // kills the coordinator with the old qex still on the disk cannot start
+        // a new one.
+        assert!(
+            text.contains("Do this FIRST"),
+            "the message must say that the install comes before the kill: {text}"
+        );
+        assert!(
+            text.contains("AFTER the coordinator is the new build"),
+            "the message must give the order of the steps: {text}"
+        );
+        assert!(
+            text.contains("not sufficient"),
+            "the message must say that the program on the disk is not sufficient: {text}"
+        );
+        assert!(
+            text.contains(crate::version::VERSION),
+            "the message must name the version that reads the file: {text}"
+        );
+
+        // A fault that is NOT an unknown field keeps the short message. A user
+        // who wrote incorrect TOML needs no lesson about a coordinator.
+        let other = toml::from_str::<Config>("[budget\n").unwrap_err();
+        let text = config_error(path, other, Detail::Full).to_string();
+        assert!(
+            !text.contains("coordinator"),
+            "a fault of the form of the file must not give the version lesson: {text}"
+        );
+    }
+
+    /// The record of a job takes the SHORT message.
+    ///
+    /// The supervisor puts this text in the `error:` field of the job, and `qex
+    /// status` prints it. The long message is advice about an upgrade of the
+    /// coordinator. In the record of a job that already ran it reads as a fault
+    /// in qex, and it pushes the one line that matters — that no limit operates
+    /// — off the screen.
+    #[test]
+    fn the_record_of_a_job_takes_the_short_message() {
+        let path = std::path::Path::new("/home/me/.config/qex.toml");
+        let error = toml::from_str::<Config>("[hooks]\non_stop = [\"true\"]\n").unwrap_err();
+        let text = config_error(path, error, Detail::Short).to_string();
+
+        assert!(
+            text.contains("unknown field"),
+            "the short message must still give the answer of the parser: {text}"
+        );
+        assert!(
+            !text.contains("coordinator"),
+            "the record of a job must not hold the lesson about the coordinator: {text}"
+        );
+        assert!(
+            text.lines().count() <= 6,
+            "the short message must fit in a record: {text}"
+        );
+    }
 
     #[test]
     fn empty_config_is_valid_and_gives_working_defaults() {
