@@ -303,7 +303,12 @@ waiting for the next second of it. Every job therefore starts at `nice 10`:
 nice = 10             # -20 to 19; a larger number gives way
 io = "none"           # none, best-effort or idle (Linux only)
 oom_score_adj = 0     # a larger number offers the job to the OOM killer first
+                      # (Linux only)
 ```
+
+`nice` operates on Linux and on macOS. `io` and `oom_score_adj` are Linux only:
+macOS has no equivalent of either, so qex reads the two values there and does
+nothing with them.
 
 `qex submit --nice 0` for one job that must not give way, and `nice = 0` in the
 configuration to return to the earlier behaviour for every job. A job file and a
@@ -321,7 +326,20 @@ that says 10.
 qex refuses a `nice` outside -20 to 19, an `io` that is not one of the three
 names, and an `oom_score_adj` outside -1000 to 1000. It applies each of these
 between the fork and the exec of the job, where it cannot report a fault, so a
-value that the system refuses would do nothing and say nothing.
+value with a fault would give every job something that nobody asked for and say
+nothing. Measured on Linux: `nice = 100` runs a job at nice 19, because
+`setpriority` moves the number into the range and reports success; `io =
+"iddle"` reads as `io = "none"`; and the kernel refuses a write of
+`oom_score_adj = 90000`, so the job keeps the score that it had.
+
+The supervisor of a job tests these three values again when it starts the job,
+because the file can change after the submission. A file with a fault at that
+moment gives a job with the DEFAULT politeness values, and `qex status` names
+the fault in the `error` field of the job.
+
+A change to `[politeness]` reaches the jobs that START after it, and it does not
+touch a job that operates. qex sets these values once, between the fork and the
+exec, and it never sets them again.
 
 `io = "idle"` gives the disk to everything else first, which matters when a
 build reads a whole source tree while somebody saves a file.

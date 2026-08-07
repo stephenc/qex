@@ -220,6 +220,68 @@ where
     d.deserialize_any(WholeNumber).map(Some)
 }
 
+/// Reads a whole number that can be below zero, with or without quotation
+/// marks.
+///
+/// [`whole_number_opt`] takes a count, so it refuses a number below zero.
+/// `[politeness] nice` and `[politeness] oom_score_adj` are the two fields that
+/// need a number below zero, so they need this function.
+///
+/// The rule of the documentation is that the quotation marks make no
+/// difference. Without this function `nice = "10"` refused the file with
+/// ``invalid type: string "10", expected i32``, which names a type in the
+/// program and gives no remedy, while `cpu = "1"` in the same file was
+/// accepted.
+fn signed_number<'de, D>(d: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    /// The message for a value from which qex can read no whole number.
+    fn refuse<E: de::Error>(wrote: &dyn fmt::Display) -> E {
+        de::Error::custom(format!(
+            "the value is `{wrote}`, and qex cannot read a whole number from it. Write a \
+             whole number, such as 10, with or without quotation marks. A number below \
+             zero takes a minus sign, such as -5."
+        ))
+    }
+
+    struct SignedNumber;
+
+    impl Visitor<'_> for SignedNumber {
+        type Value = i32;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a whole number such as 10, with or without quotation marks")
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
+            i32::try_from(v).map_err(|_| refuse(&v))
+        }
+        // An integer above `i64::MAX`. See the same method in `text_or_number`.
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
+            i32::try_from(v).map_err(|_| refuse(&v))
+        }
+        // A whole number that TOML read as a float, such as `10.0`. A value
+        // with a fraction stops here, because qex cannot obey half a step of
+        // priority and it must not choose one of the two neighbours in silence.
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i32, E> {
+            if v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64 {
+                Ok(v as i32)
+            } else {
+                Err(refuse(&v))
+            }
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
+            v.trim().parse::<i32>().map_err(|_| refuse(&v))
+        }
+    }
+
+    d.deserialize_any(SignedNumber)
+}
+
 /// Reads a decimal number that a person can write inside quotation marks.
 ///
 /// The mirror of [`text_or_number`] for `[system] max_pressure`,
@@ -445,6 +507,7 @@ pub struct PolitenessConfig {
     /// makes the call; the system refuses it; and the job then runs at the
     /// priority that it already had. A negative value on a machine where qex
     /// has no privilege thus costs nothing and gives nothing.
+    #[serde(deserialize_with = "signed_number")]
     pub nice: i32,
     /// The class of the job for the disk, on Linux.
     ///
@@ -461,6 +524,7 @@ pub struct PolitenessConfig {
     ///
     /// A background build should lose that competition before an editor with an
     /// hour of unsaved work. A user cannot LOWER this value without privilege.
+    #[serde(deserialize_with = "signed_number")]
     pub oom_score_adj: i32,
 }
 
@@ -1005,9 +1069,12 @@ impl Config {
     ///
     /// Each of these values goes to the system between the fork and the exec of
     /// a job. That code cannot report a fault: it has no lock and no allocation
-    /// available, so it gives up in silence. A value with a fault would then do
-    /// nothing, for every job, and say nothing. `io = "iddle"` would read as
-    /// `io = "none"`, and the user would look for the cause in the kernel.
+    /// available, so it gives up in silence. A value with a fault would then
+    /// give every job something that nobody asked for, and say nothing.
+    /// Measured on Linux: `nice = 100` gives a job at nice 19, because
+    /// `setpriority` moves the value into the range and reports success;
+    /// `io = "iddle"` reads as `io = "none"`; and the kernel refuses a write of
+    /// `oom_score_adj = 90000`, so the job keeps the score that it had.
     ///
     /// The test therefore belongs here, where qex can still name the file, the
     /// value and the remedy.
@@ -1016,8 +1083,9 @@ impl Config {
         if !(-20..=19).contains(&p.nice) {
             anyhow::bail!(
                 "config [politeness] nice is {}. Use a number from -20 to 19. The system \
-                 accepts no other number, so this value gives the job the priority that it \
-                 already had, and qex cannot tell you at the moment that it happens.",
+                 takes no other number: it moves the value into that range and reports \
+                 success, so the job gets a priority that you did not ask for and nothing \
+                 says so. Measured on Linux: `nice = 100` gives a job at nice 19.",
                 p.nice
             );
         }
@@ -1407,13 +1475,56 @@ mod tests {
         );
     }
 
+    /// A politeness value must accept quotation marks, like every other number
+    /// in this file.
+    ///
+    /// The rule of the documentation is that the quotation marks make no
+    /// difference. `nice = "10"` refused the file with
+    /// ``invalid type: string "10", expected i32``, which names a type in the
+    /// program and gives no remedy, while `cpu = "1"` in the same file was
+    /// accepted.
+    #[test]
+    fn a_politeness_number_accepts_quotation_marks() {
+        let quoted: Config =
+            toml::from_str("[politeness]\nnice = \"15\"\noom_score_adj = \"-500\"\n").unwrap();
+        let bare: Config =
+            toml::from_str("[politeness]\nnice = 15\noom_score_adj = -500\n").unwrap();
+        assert_eq!(quoted.politeness.nice, bare.politeness.nice);
+        assert_eq!(
+            quoted.politeness.oom_score_adj,
+            bare.politeness.oom_score_adj
+        );
+        assert_eq!(quoted.politeness.nice, 15);
+        assert_eq!(quoted.politeness.oom_score_adj, -500);
+
+        // TOML reads `10.0` as a float, and a whole number is a whole number in
+        // both forms.
+        let float: Config = toml::from_str("[politeness]\nnice = 10.0\n").unwrap();
+        assert_eq!(float.politeness.nice, 10);
+
+        // A value from which qex can read no whole number must name the remedy
+        // and not a type in the program.
+        for text in [
+            "[politeness]\nnice = \"ten\"\n",
+            "[politeness]\nnice = 10.5\n",
+            "[politeness]\noom_score_adj = 9999999999\n",
+        ] {
+            let err = toml::from_str::<Config>(text).unwrap_err().to_string();
+            assert!(
+                err.contains("Write a whole number"),
+                "the message for `{text}` must give the remedy: {err}"
+            );
+        }
+    }
+
     /// A politeness value that the system cannot obey must be refused here.
     ///
     /// qex applies these values between the fork and the exec of a job, where
     /// it cannot report a fault and gives up in silence. A value with a fault
-    /// would thus do nothing, for every job, and say nothing. `io = "iddle"`
-    /// would read as `io = "none"`, and a user would look for the cause in the
-    /// kernel.
+    /// would thus give every job something that nobody asked for, and say
+    /// nothing. Measured on Linux: `nice = 100` gives a job at nice 19, because
+    /// `setpriority` moves the number into the range and reports success;
+    /// `io = "iddle"` reads as `io = "none"`.
     #[test]
     fn a_politeness_value_that_the_system_refuses_is_refused_at_the_start() {
         for (text, word) in [

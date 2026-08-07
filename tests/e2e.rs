@@ -5178,3 +5178,108 @@ fn a_job_gives_way_to_the_work_of_a_person() {
         "a nice value that the machine refuses must not stop the job"
     );
 }
+
+/// Each `[politeness]` value must reach the job AND every child of the job.
+///
+/// The child matters more than the job itself. A job is frequently a shell that
+/// starts a build, and the build does the work. Linux keeps the nice value, the
+/// io class and the oom score across a fork, so one call between the fork and
+/// the exec covers the whole tree. This test measures the tree, and not the
+/// call, because a later change could set the values on the wrong process.
+#[test]
+#[cfg(target_os = "linux")]
+fn every_politeness_value_reaches_the_job_and_its_children() {
+    let h = Harness::new(
+        "polite-all",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [politeness]\nnice = 12\nio = \"idle\"\noom_score_adj = 500\n",
+    );
+
+    // Field 19 of /proc/<pid>/stat is the nice value. The command reads the
+    // three values for itself, and then again in a child of itself.
+    let probe = "report() { \
+                 echo \"$1 nice=$(awk '{print $19}' /proc/$2/stat) \
+                 oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
+                 report parent $$; sh -c 'report() { \
+                 echo \"$1 nice=$(awk \"{print \\$19}\" /proc/$2/stat) \
+                 oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
+                 report child $$'";
+    let id = h.submit(&["submit", "--", "sh", "-c", probe]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+
+    for who in ["parent", "child"] {
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(who))
+            .unwrap_or_else(|| panic!("the job gave no {who} line: {out}"));
+        assert!(
+            line.contains("nice=12"),
+            "the {who} must take `[politeness] nice`: {line}"
+        );
+        assert!(
+            line.contains("oom=500"),
+            "the {who} must take `[politeness] oom_score_adj`: {line}"
+        );
+        assert!(
+            line.contains("idle"),
+            "the {who} must take `[politeness] io`: {line}"
+        );
+    }
+}
+
+/// A `[politeness]` value with a fault, at the moment that a job starts, must
+/// give the DEFAULT values and name the fault.
+///
+/// `qex submit` tests the file, but the file can change after the submission: a
+/// job can wait in the queue while somebody edits the file, and `qex rerun`
+/// needs no config file at all. The supervisor reads the file for itself and
+/// parses it WITHOUT validating it, so without a second test the job would take
+/// the value as it is. Measured: `nice = 100` ran a job at nice 19, because
+/// `setpriority` moves the number into the range and reports success, and
+/// nothing said so.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
+    let good = "[peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                [politeness]\nnice = 12\n";
+    let h = Harness::new("polite-late", good);
+    let probe = "awk '{print $19}' /proc/$$/stat";
+
+    let first = h.submit(&["submit", "--", "sh", "-c", probe]);
+    h.ok(&["wait", &first, "--timeout", "45s"]);
+    assert_eq!(h.ok(&["logs", &first, "--stdout"]).trim(), "12");
+
+    // The file goes wrong AFTER the submission. The coordinator refuses it and
+    // keeps the values that it had; the supervisor must refuse it as well.
+    std::fs::write(
+        h.root.join("cfg/qex.toml"),
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [politeness]\nnice = 100\n",
+    )
+    .unwrap();
+
+    let out = h.qex(&["rerun", &first]);
+    assert!(out.status.success(), "`qex rerun` must still start the job");
+    let again = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    h.ok(&["wait", &again, "--timeout", "45s"]);
+    let status = h.status_json(&again);
+    assert_eq!(
+        status["state"], "completed",
+        "a config file with a fault must not stop the job: {status}"
+    );
+    assert_eq!(
+        h.ok(&["logs", &again, "--stdout"]).trim(),
+        "10",
+        "the job must take the DEFAULT nice value, and not the value with the fault"
+    );
+    let error = status["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("[politeness] nice"),
+        "the record of the job must name the fault: {status}"
+    );
+}

@@ -376,9 +376,33 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let _ = &cgroup_dir;
 
     // How politely this job uses the machine. See `PolitenessConfig`.
-    let nice = spec.nice.unwrap_or(cfg.politeness.nice);
-    let io_class = cfg.politeness.io.clone();
-    let oom_adj = cfg.politeness.oom_score_adj;
+    //
+    // THE SUPERVISOR TESTS THESE VALUES AGAIN, and it does not trust the test
+    // that `qex submit` made. `load_short` above parses the file and does not
+    // validate it, and the file can change between the submission and the
+    // start: `qex rerun` needs no config file, and a job can wait in the queue
+    // while somebody edits the file. Measured with `[politeness] nice = 100` in
+    // the file at the start of the job: the job ran at nice 19, because
+    // `setpriority` moves a number outside the range into the range and reports
+    // success. The coordinator refuses such a file and keeps the values that it
+    // had, so the supervisor must do the same.
+    let politeness = match cfg.politeness_values() {
+        Ok(()) => cfg.politeness.clone(),
+        Err(e) => {
+            let message = format!(
+                "{e} This job uses the default politeness values, so it gives way as a job \
+                 of qex did before."
+            );
+            log(&message);
+            if status.error.is_none() {
+                status.error = Some(message);
+            }
+            crate::config::PolitenessConfig::default()
+        }
+    };
+    let nice = spec.nice.unwrap_or(politeness.nice);
+    let io_class = politeness.io.clone();
+    let oom_adj = politeness.oom_score_adj;
 
     unsafe {
         cmd.pre_exec(move || {

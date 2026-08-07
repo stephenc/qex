@@ -389,17 +389,21 @@ impl JobSpec {
         // The priority of the job for the processor, from the command line or
         // from the job file.
         //
-        // The system accepts -20 to 19 and nothing else. qex makes that call
-        // between the fork and the exec of the job, where it has no way to
-        // report a fault, so a number outside the range would leave the job at
-        // the usual priority and say nothing. The test belongs here.
+        // A nice value goes from -20 to 19. qex makes that call between the
+        // fork and the exec of the job, where it has no way to report a fault,
+        // and `setpriority` does not report one either: it moves a number
+        // outside the range INTO the range and reports success. `--nice 100`
+        // would thus give a job at nice 19 and say nothing. The test belongs
+        // here, where qex can still name the value and the remedy.
         let nice = opts.nice.or(file.nice);
         if let Some(n) = nice {
             if !(-20..=19).contains(&n) {
                 bail!(
-                    "the nice value {n} is outside the range that the system accepts. Use a \
-                     number from -20 to 19. A larger number gives way to the work of a \
-                     person, and 0 says that this job must not give way."
+                    "the nice value {n} is outside the range -20 to 19. Use a number from \
+                     -20 to 19. The system moves any other number into that range without a \
+                     word, so the job would take a priority that you did not ask for. A \
+                     larger number gives way to the work of a person, and 0 says that this \
+                     job must not give way."
                 );
             }
         }
@@ -677,12 +681,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A nice value that the system cannot obey must be refused at the
-    /// submission.
+    /// A nice value outside -20 to 19 must be refused at the submission.
     ///
     /// qex makes that call between the fork and the exec, where it cannot
-    /// report a fault. A number outside the range would leave the job at the
-    /// usual priority and say nothing.
+    /// report a fault, and `setpriority` reports none: it moves a number
+    /// outside the range into the range and reports success. Measured on
+    /// Linux, `setpriority(PRIO_PROCESS, 0, 100)` gives 0 and leaves the
+    /// process at nice 19. Without this test `--nice 100` would give a job at
+    /// nice 19 and say nothing.
     #[test]
     fn a_nice_value_outside_the_range_is_refused() {
         let _guard = env_lock();

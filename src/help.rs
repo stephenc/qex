@@ -665,6 +665,7 @@ that qex uses now.
     nice = 10             # -20 to 19; a larger number gives way
     io = \"none\"           # none, best-effort or idle (Linux)
     oom_score_adj = 0     # a larger number offers the job to the OOM killer
+                          # first (Linux)
 
     [submit]
     env_capture = \"all\"           # all, minimal or none
