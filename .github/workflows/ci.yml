@@ -80,20 +80,12 @@ jobs:
           key: msrv-${{ steps.msrv.outputs.version }}
       - run: cargo +${{ steps.msrv.outputs.version }} check --all-targets --locked
 
-  commits:
-    name: The form of the commit messages
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      - name: Each commit must follow Conventional Commits
-        run: |
-          .github/scripts/check-commits.sh \
-            "${{ github.event.pull_request.base.sha }}" \
-            "${{ github.event.pull_request.head.sha }}"
+  # The form of the title of a pull request is in `pr-title.yml`, and not here.
+  #
+  # That test must run again when a person changes the title, which is an
+  # `edited` event and not a push. This workflow must NOT run on `edited`: it
+  # would build the four release targets and run the tests on three machines
+  # each time a person corrects a word.
 
   # Prove that each target of the release builds, before a merge to main and not
   # after it. A release that fails to build for one machine is a release that

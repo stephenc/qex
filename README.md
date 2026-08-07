@@ -214,8 +214,8 @@ reports a failure that the program does not have.
 The documentation, the code comments, the help text and the error messages use
 Simplified Technical English (ASD-STE100).
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The first line of each commit message
-gives the next version number, so its form is part of the build.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The title of a pull request gives the
+next version number, so its form is part of the build.
 
 ## License
 
