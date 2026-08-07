@@ -836,15 +836,24 @@ const RACE_TIMER: u8 = 2;
 fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
     // The processor. A larger number gives way to everything else.
     //
-    // A user cannot ask for a number below zero without privilege. qex still
-    // makes the call: it fails with EPERM, the job continues at the priority
-    // that it had, and no other step is lost.
+    // A user cannot ask for a number below the number that the process has,
+    // without privilege. qex still makes the call: it fails, the job continues
+    // at the priority that it had, and no other step is lost. Measured on
+    // Linux with the usual `RLIMIT_NICE` of 0: `setpriority(PRIO_PROCESS, 0,
+    // -5)` from nice 0 gives EACCES and leaves the process at 0.
     //
     // The call happens for 0 as well. `--nice 0` says "this job must not give
-    // way", and it must therefore SET 0, and not leave the priority that the
-    // job received from the supervisor. The supervisor runs at the priority of
-    // the command that started the coordinator, so a coordinator that a user
-    // started under `nice` would otherwise make `--nice 0` mean nothing.
+    // way", so qex asks for 0 and does not leave the priority that the job
+    // received from the supervisor. On a machine with no privilege that ASK
+    // frequently gives nothing: a coordinator that a user started under `nice
+    // 5` cannot put its job back at 0, and the job then runs at 5. qex makes
+    // the call so that it obeys the user where the machine permits it, and it
+    // does not promise more.
+    //
+    // A number ABOVE the range is worse than a number below it. `setpriority`
+    // moves such a number INTO the range and reports success, so it never
+    // reaches this code as a fault. `Config::validate` and `JobSpec::resolve`
+    // refuse it, and the supervisor tests the configuration again above.
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, nice);
     }
@@ -897,41 +906,8 @@ fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
 /// only and it allocates nothing.
 #[cfg(target_os = "linux")]
 fn write_oom_score(value: i32) {
-    // The buffer holds ANY `i32`, and not the -1000 to 1000 that the kernel
-    // accepts.
-    //
-    // `Config::validate` refuses a value outside that range, so a larger number
-    // does not arrive here. The buffer still holds one, because this code runs
-    // in the child between the fork and the exec. An index outside the buffer
-    // is a panic; a panic formats a message; and that allocates and takes two
-    // locks in a process where no lock is safe. The job would then die, and
-    // this function must never be able to stop a job.
-    //
-    // 10 characters hold 2147483647, and the sign takes one more.
-    let mut buf = [0u8; 10];
-    let mut n = 0;
-    let negative = value < 0;
-    let mut v = value.unsigned_abs();
-    if v == 0 {
-        buf[n] = b'0';
-        n += 1;
-    }
-    let start = n;
-    while v > 0 {
-        buf[n] = b'0' + (v % 10) as u8;
-        v /= 10;
-        n += 1;
-    }
-    buf[start..n].reverse();
-
-    let mut out = [0u8; 11];
-    let mut len = 0;
-    if negative {
-        out[0] = b'-';
-        len = 1;
-    }
-    out[len..len + n].copy_from_slice(&buf[..n]);
-    len += n;
+    let mut out = [0u8; OOM_TEXT];
+    let len = write_i32(value, &mut out);
 
     unsafe {
         let path = c"/proc/self/oom_score_adj";
@@ -941,6 +917,52 @@ fn write_oom_score(value: i32) {
             libc::close(fd);
         }
     }
+}
+
+/// The space that the text of any `i32` needs.
+///
+/// `-2147483648` is 11 characters: 10 digits and the sign.
+const OOM_TEXT: usize = 11;
+
+/// Writes the text of a whole number into a buffer, and gives its length.
+///
+/// # Why the buffer holds ANY `i32`
+///
+/// The kernel takes -1000 to 1000, and `Config::validate` refuses anything
+/// else, so a larger number does not arrive here. The buffer still holds one.
+///
+/// This code runs in the child, between the fork and the exec. An index outside
+/// a buffer is a panic; a panic formats a message; and that allocates and takes
+/// two locks in a process where no lock is safe. The job would then die. A
+/// buffer that fits the values that qex EXPECTS puts the life of the job behind
+/// a test in another file. A buffer that fits every value it can RECEIVE does
+/// not.
+#[cfg(target_os = "linux")]
+fn write_i32(value: i32, out: &mut [u8; OOM_TEXT]) -> usize {
+    // The digits, in the wrong order. `unsigned_abs` and not `-value`, because
+    // `-i32::MIN` is not an `i32` and it would stop here in a debug build.
+    let mut digits = [0u8; 10];
+    let mut n = 0;
+    let mut v = value.unsigned_abs();
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+
+    let mut len = 0;
+    if value < 0 {
+        out[0] = b'-';
+        len = 1;
+    }
+    for i in (0..n).rev() {
+        out[len] = digits[i];
+        len += 1;
+    }
+    len
 }
 
 /// Gives the last words of the supervisor of a job.
@@ -1091,6 +1113,44 @@ fn read_usage() -> Usage {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// The text of the OOM score must fit the buffer for EVERY `i32`.
+    ///
+    /// This code runs in the child, between the fork and the exec. An index
+    /// outside the buffer is a panic; a panic formats a message; and that
+    /// allocates and takes two locks in a process where no lock is safe. The
+    /// job would then die, and this step must never be able to stop a job.
+    ///
+    /// An earlier form of this code held a buffer for -1000 to 1000 and nothing
+    /// held the value inside that range. This test therefore uses the two ends
+    /// of the type, and not the two ends of the range that the kernel accepts.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_oom_score_text_fits_the_buffer_for_every_number() {
+        for value in [
+            i32::MIN,
+            i32::MIN + 1,
+            -100000,
+            -1000,
+            -1,
+            0,
+            1,
+            9,
+            10,
+            500,
+            1000,
+            999999,
+            i32::MAX,
+        ] {
+            let mut out = [0u8; OOM_TEXT];
+            let len = write_i32(value, &mut out);
+            assert_eq!(
+                std::str::from_utf8(&out[..len]).unwrap(),
+                value.to_string(),
+                "the text of {value} is wrong"
+            );
+        }
+    }
 
     /// The words of the supervisor must reach the record of the job.
     ///
