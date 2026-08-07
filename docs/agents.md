@@ -111,7 +111,7 @@ Your script does not change, and `ID=$(qex submit ...)` stays correct. qex says
 what happened on stderr:
 
 ```
-qex: this submission started no job. The dedupe key `train:/home/me/p` gives
+qex: this submission started no job. The dedupe key `train_home_me_p` gives
 the job 7f3c8a12-..., and that job is in the state `running`.
 ```
 
@@ -254,7 +254,8 @@ Ctrl-C stops this wait and the job continues. Run `qex status $ID --wait` to
 wait again, or `qex kill $ID` to stop the job.
 
 `qex run` gives 124 for no other reason. It waits with no limit of its own, and
-a job that reaches the time limit of `--timeout` gives 125, because something stopped that job.
+a job that reaches the time limit of `--timeout` gives 125, because something
+stopped that job.
 
 ## Two fields that need care
 

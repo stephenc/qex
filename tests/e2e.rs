@@ -469,7 +469,10 @@ fn a_second_submission_with_one_key_gives_the_first_job_and_starts_no_job() {
     // submitted moves the cursor of the reader and writes over the text
     // around it.
     let evil = h.submit(&["submit", "--dedupe-key", "x\u{1b}[2Jy", "--", "true"]);
-    let shown = h.status_json(&evil)["dedupe_key"].as_str().unwrap().to_string();
+    let shown = h.status_json(&evil)["dedupe_key"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(
         !shown.contains('\u{1b}'),
         "the ESC byte reached the reader: {shown:?}"
@@ -583,6 +586,59 @@ fn a_job_that_stopped_frees_its_key_and_a_window_keeps_it() {
         "a job that failed must not hold its key, or a second run is not possible"
     );
     h.qex(&["wait", &again]);
+}
+
+/// The window is the time that the key STAYS. At the end of it, the key goes.
+///
+/// The test is at the edge of the window, because that is the one place where
+/// a rule of this shape goes wrong. A window of 1 second that kept the key at
+/// exactly 1 second would give the caller the job of the earlier run, and the
+/// caller would call that a success.
+///
+/// The edge is a whole second wide, because the coordinator counts in whole
+/// seconds, so this test waits for that second and does not race.
+#[test]
+fn a_key_goes_at_the_end_of_the_window_and_not_after_it() {
+    let h = Harness::with_default_config("dedupe-edge");
+
+    let first = h.submit(&[
+        "submit",
+        "--dedupe-key",
+        "e",
+        "--dedupe-window",
+        "1",
+        "--",
+        "true",
+    ]);
+    h.ok(&["wait", &first]);
+    let finished = h.status_json(&first)["finished_at"].as_u64().unwrap();
+
+    // Wait until one whole second has passed since the job stopped.
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if now.saturating_sub(finished) >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let second = h.submit(&[
+        "submit",
+        "--dedupe-key",
+        "e",
+        "--dedupe-window",
+        "1",
+        "--",
+        "true",
+    ]);
+    assert_ne!(
+        second, first,
+        "the key must go at the end of the window, and not one second after it"
+    );
+    h.ok(&["wait", &second]);
 }
 
 /// `qex submit --json` must say if THIS command started the work.

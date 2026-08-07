@@ -261,7 +261,7 @@ The second run gives THE SAME id and exits with the code 0, so your script does
 not change and `ID=$(qex submit ...)` stays correct. qex writes the reason to
 stderr:
 
-    qex: this submission started no job. The dedupe key `train:/home/me/p`
+    qex: this submission started no job. The dedupe key `train_home_me_p`
     gives the job 7f3c8a12-..., and that job is in the state `running`.
 
 DO NOT READ `qex list` AND DECIDE FOR YOURSELF. That test is a PROXY: you read

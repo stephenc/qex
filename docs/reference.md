@@ -81,7 +81,8 @@ Ctrl-C stops this wait and the job continues. Run `qex status $ID --wait` to
 wait again, or `qex kill $ID` to stop the job.
 
 `qex run` gives 124 for no other reason. It waits with no limit of its own, and
-a job that reaches the time limit of `--timeout` gives 125, because something stopped that job.
+a job that reaches the time limit of `--timeout` gives 125, because something
+stopped that job.
 
 ## Resource claims
 
@@ -154,7 +155,7 @@ the script needs no test.
 The reason goes to stderr:
 
 ```
-qex: this submission started no job. The dedupe key `build:/home/me/p` gives
+qex: this submission started no job. The dedupe key `build_home_me_p` gives
 the job 7f3c8a12-..., and that job is in the state `running`.
 ```
 
@@ -200,6 +201,12 @@ key.
 
 The key is in the record of the job, so `qex status` and `qex list --json` show
 it, and a coordinator that starts again gives each key back to its job.
+
+qex shows the key in the same safe form that it uses for a job name: it keeps
+the letters, the numbers, `-`, `_` and `.`, and it replaces each other character
+with `_`. A key is text that another agent chose, and a key that held an ESC
+byte would move the cursor of the reader. The key that qex holds is the key that
+you gave, so `--dedupe-key` still needs the form that you wrote.
 
 ### How a script learns which case it got
 
@@ -703,7 +710,9 @@ Each shell puts the name on the line as ONE word, and a name such as
 
 **qex SHOWS a safe form of each name.** `qex list`, `qex status`, `qex top`, the
 sentence that says why a job waits, the completions, and the JSON of each of
-them hold a name that uses these characters and no other:
+them hold a name that uses these characters and no other. The same rule applies
+to a group name and to a dedupe key, because each of them is text that another
+agent chose:
 
 - the letters `A` to `Z` and `a` to `z`
 - the numbers `0` to `9`
