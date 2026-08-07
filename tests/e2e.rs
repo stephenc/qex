@@ -2797,6 +2797,354 @@ fn a_config_fault_in_the_record_of_a_job_stays_short() {
     );
 }
 
+/// A job that writes far more than the limit must leave a file that is not
+/// larger than the limit, with the first lines, the last lines, and a line that
+/// says how much went.
+///
+/// A job wrote 386MB of standard output in a review, and nothing stopped it.
+/// qex is made to be started and left, so nobody sees a disk fill, and the same
+/// disk holds the record of each job. This test holds that fault.
+#[test]
+fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
+    let h = Harness::new(
+        "logcap",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // About 3.4MB of output, which is 50 times the limit.
+    let id = h.submit(&["submit", "--", "sh", "-c", "seq 1 500000"]);
+    let wait = h.qex(&["wait", &id, "--timeout", "60s"]);
+
+    // The limit must never fail a job. Reaching it is normal.
+    assert_eq!(
+        wait.status.code(),
+        Some(0),
+        "the limit on the output must not fail the job"
+    );
+    assert_eq!(h.state_of(&id), "completed");
+
+    let path = h.job_dir(&id).join("stdout.log");
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        size <= 64 * 1024,
+        "the file holds {size} bytes, and the limit is 65536"
+    );
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.lines().any(|l| l == "1"),
+        "the first line went, and it holds the start of the job"
+    );
+    assert!(
+        text.lines().any(|l| l == "500000"),
+        "the last line went, and it holds the end of the job"
+    );
+    assert!(
+        !text.lines().any(|l| l == "250000"),
+        "the middle must go, and it stayed"
+    );
+    assert!(
+        text.contains("are not in this file"),
+        "the file must say what went: {:.400}",
+        text
+    );
+
+    // The file beside the log file must go with the job.
+    assert!(
+        !h.job_dir(&id).join("stdout.log.tail").exists(),
+        "the file that held the last output stayed"
+    );
+
+    // The record must say what went. A reader that gives `--tail 20` never sees
+    // the line in the file, so the count must also be in the status.
+    let status = h.status_json(&id);
+    let dropped = &status["logs_dropped"];
+    assert!(
+        dropped["stdout_bytes"].as_u64().unwrap() > 0,
+        "the record must say how many bytes went: {status}"
+    );
+    assert!(
+        dropped["stdout_lines"].as_u64().unwrap() > 1000,
+        "the record must say how many lines went: {status}"
+    );
+    assert_eq!(dropped["limit"].as_u64().unwrap(), 64 * 1024);
+
+    // THE COUNT MUST BALANCE. The lines that the file holds and the lines that
+    // the record says went are together the lines that the job wrote.
+    //
+    // A count that is only "large" hides a part that qex does not count. The
+    // measured example: qex cuts the head back when the output passes the
+    // limit, and it reads the log file to count the lines in that cut. With a
+    // log file that qex opened for writing only, that read gives nothing, the
+    // count loses about 8000 lines, and the record then says that the job wrote
+    // 492000 lines when it wrote 500000.
+    // A line is a line end, so the count is the line ends that are not the line
+    // ends of the notes of qex.
+    let notes = text.lines().filter(|l| l.starts_with("[qex]")).count() as u64;
+    let kept = text.matches('\n').count() as u64 - notes;
+    assert_eq!(
+        kept + dropped["stdout_lines"].as_u64().unwrap(),
+        500_000,
+        "the file holds {kept} line(s) and the record says that {} went. Together they \
+         must be the 500000 lines that the job wrote.",
+        dropped["stdout_lines"]
+    );
+
+    // THE BYTES MUST BALANCE IN THE SAME WAY, and for a stronger reason: this
+    // is the number that `qex status` prints to a person, as "qex removed
+    // 3.2MB". An assertion of `> 0` beside a line count that balances exactly
+    // left `stdout_bytes` with no exact test anywhere: a change that multiplied
+    // that count in place of adding it passed every unit test and every
+    // end-to-end test.
+    //
+    // The bytes of the notes of qex are not output of the job, so they come
+    // off. Each note is one line and it ends with one line end.
+    let note_bytes: u64 = text
+        .lines()
+        .filter(|l| l.starts_with("[qex]"))
+        .map(|l| l.len() as u64 + 1)
+        .sum();
+    let kept_bytes = text.len() as u64 - note_bytes;
+    assert_eq!(
+        kept_bytes + dropped["stdout_bytes"].as_u64().unwrap(),
+        3_388_895,
+        "the file holds {kept_bytes} byte(s) of the job and the record says that {} went. \
+         Together they must be the 3388895 bytes that `seq 1 500000` writes.",
+        dropped["stdout_bytes"]
+    );
+
+    // The head must hold whole lines only. It stops at a byte, so qex moves the
+    // cut back to the last line end. Measured before that change: the head
+    // ended `3498` and then `3`, where the job wrote `3499`, and a reader has
+    // no way to see that `3` is half of a line.
+    let head = &text[..text
+        .find("[qex]")
+        .expect("the file must hold a note of qex")];
+    for line in head.lines() {
+        let n: u64 = line
+            .parse()
+            .unwrap_or_else(|_| panic!("the head holds `{line}`, which is not a whole line"));
+        assert!((1..=500_000).contains(&n), "`{line}` is not in the output");
+    }
+
+    // THE CUT BACK MUST COST ONE LINE, AND NOT A QUARTER OF THE HEAD. qex looks
+    // back from the cut for the LAST line end, inside a window. A search that
+    // takes the FIRST line end of that window gives a head that is still a true
+    // prefix and still ends at a line end, so every assertion above holds, and
+    // the reader silently loses 4090 of the 16383 bytes.
+    //
+    // The cost is therefore the length of ONE line, and the lines here are the
+    // numbers 1 to 500000, so no line is longer than seven bytes. A window is
+    // 4096 bytes, so this test separates the two rules by a wide margin.
+    let head_budget: u64 = 64 * 1024 / 4;
+    let cut_cost = head_budget - head.len() as u64;
+    assert!(
+        cut_cost < 64,
+        "the cut back to a line end removed {cut_cost} bytes of the head budget of \
+         {head_budget}. No line of this output is longer than seven bytes, so the cut back \
+         must move to the LAST line end before the cut, and not to the first one of the \
+         window."
+    );
+
+    // The commands must not present a part of the output as the whole output.
+    let logs = h.qex(&["logs", &id, "--stdout", "--tail", "5"]);
+    let notice = String::from_utf8_lossy(&logs.stderr);
+    assert!(
+        notice.contains("qex removed"),
+        "`qex logs` must say what went: {notice}"
+    );
+
+    let json = h.ok(&["logs", &id, "--stdout", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(value["stdout_dropped_lines"].as_u64().unwrap() > 1000);
+}
+
+/// Output with no line end must keep its last part.
+///
+/// qex removes the incomplete first line of the tail, so that a reader never
+/// meets one half of a line. An earlier version applied that rule when the tail
+/// held no line end at all, and it then removed the whole tail: a job that
+/// wrote one enormous line left the head only. One JSON document, one base64
+/// block, and a progress display that uses `\r` all give output of that form.
+#[test]
+fn a_job_that_writes_one_enormous_line_keeps_its_end() {
+    let h = Harness::new(
+        "logcap-line",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // 8MB with no line end at all, and a mark at the very end.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "dd if=/dev/zero bs=1M count=8 2>/dev/null | tr '\\0' 'A'; printf THE-VERY-END",
+    ]);
+    let wait = h.qex(&["wait", &id, "--timeout", "60s"]);
+    assert_eq!(wait.status.code(), Some(0));
+
+    let path = h.job_dir(&id).join("stdout.log");
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(size <= 64 * 1024, "the file holds {size} bytes");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.ends_with("THE-VERY-END"),
+        "the end of the output went, and the file holds the head only"
+    );
+    assert!(
+        text.contains("middle of a line"),
+        "the file must say that the last part is not a whole line"
+    );
+}
+
+/// A second attempt must not remove output that fits in the limit.
+///
+/// qex removes nothing before the output passes the limit. An earlier version
+/// cut the file back at the first byte of the second attempt: a retry of a job
+/// that wrote a third of the limit lost 87KB, and the file said that the output
+/// had reached the limit, which was not true.
+#[test]
+fn a_retry_that_fits_the_limit_keeps_the_output_of_both_attempts() {
+    let h = Harness::new(
+        "logcap-retry",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"1MB\"\n",
+    );
+    // Each attempt writes about 110KB, and the two together fit in the limit.
+    let id = h.submit(&[
+        "submit",
+        "--retries",
+        "1",
+        "--",
+        "sh",
+        "-c",
+        "seq 1 20000; echo THE-LAST-LINE; exit 1",
+    ]);
+    h.qex(&["wait", &id, "--timeout", "60s"]);
+
+    let text = std::fs::read_to_string(h.job_dir(&id).join("stdout.log")).unwrap();
+    assert!(
+        !text.contains("[qex]"),
+        "qex wrote a note about the limit, and the output fits in the limit"
+    );
+    assert_eq!(
+        text.lines().filter(|l| *l == "THE-LAST-LINE").count(),
+        2,
+        "each attempt must keep its output"
+    );
+    assert!(
+        text.contains("--- attempt 2 ---"),
+        "the mark between the attempts went"
+    );
+    assert_eq!(
+        h.status_json(&id)["logs_dropped"],
+        serde_json::Value::Null,
+        "the record says that qex removed output, and it removed nothing"
+    );
+}
+
+/// `qex logs --follow` must not lose the output after the limit.
+///
+/// The log file of a job becomes SHORTER at the moment that the output passes
+/// `[logs] max_bytes`, because the supervisor keeps the head and removes the
+/// middle. That never happened before this limit existed. The position of the
+/// follower was then after the end of the file, it read nothing more, and the
+/// command gave the code 0 and no word: the reader saw the output stop in the
+/// middle and had no reason to doubt it. This is the command that an agent uses
+/// to watch a job.
+#[test]
+fn follow_does_not_lose_the_output_of_a_job_that_passes_the_limit() {
+    let h = Harness::new(
+        "logcap-follow",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // The job writes in three steps, and it waits between them:
+    //
+    // 1. About 61KB, which is below the limit. The follower reads it, and its
+    //    position is then near 61KB.
+    // 2. 6KB more. The output passes the limit, and the file becomes about
+    //    17KB. The position of the follower is now far after the end.
+    // 3. The last line, which arrives in the file when the job stops.
+    //
+    // The file at the end is smaller than the position of the follower, so a
+    // follower that does not watch the length gives nothing after step 1.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "seq 1 12000; sleep 2; seq 12001 13000; sleep 2; echo THE-FINAL-LINE",
+    ]);
+
+    let out = h.qex(&["logs", &id, "--stdout", "--follow"]);
+    assert_eq!(out.status.code(), Some(0));
+    let lines = String::from_utf8_lossy(&out.stdout).into_owned();
+    let notice = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(
+        lines.contains("THE-FINAL-LINE"),
+        "the follower lost each line after the limit. It gave:\n{:.600}\n--- stderr ---\n{}",
+        lines,
+        notice
+    );
+    assert!(
+        notice.contains("removed"),
+        "the follower must say that qex removed output. It said: {notice}"
+    );
+}
+
+/// A follower that starts AFTER the limit must still learn what went.
+///
+/// The test above starts before the limit, so the follower sees the log file
+/// become shorter and it says so from that event. A follower that starts after
+/// that moment never sees a shorter file: the file grows only, and the record
+/// still says nothing, because the supervisor writes the count when the job
+/// stops. Without the last read of the record, that follower gets the head, the
+/// tail, and no word at all about the millions of lines between them.
+///
+/// The `.tail` file exists between the two moments, and only then, so the test
+/// waits for it and starts the follower inside that window.
+#[test]
+fn a_follower_that_starts_after_the_limit_still_learns_what_went() {
+    let h = Harness::new(
+        "logcap-late",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // The job passes the limit at once, and then it waits. The follower thus
+    // starts after the file became shorter, and before the job stops.
+    let id = h.submit(&["submit", "--", "sh", "-c", "seq 1 500000; sleep 5"]);
+    let tail = h.job_dir(&id).join("stdout.log.tail");
+    h.until(
+        "the output passes the limit",
+        Duration::from_secs(60),
+        || tail.exists(),
+    );
+
+    let out = h.qex(&["logs", &id, "--stdout", "--follow"]);
+    assert_eq!(out.status.code(), Some(0));
+    let lines = String::from_utf8_lossy(&out.stdout).into_owned();
+    let notice = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(
+        lines.contains("\n500000\n"),
+        "the follower lost the end of the output: {:.400}",
+        lines
+    );
+    assert!(
+        notice.contains("from the middle of this stream"),
+        "the follower must give the count of the output that went, and it said: {notice}"
+    );
+}
+
 fn _unused(_: &Path) {}
 
 /// Waits until a `qex run` that a test started stops, and gives its output.

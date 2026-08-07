@@ -425,6 +425,7 @@ mod tests {
             attempts: 1,
             retries_left: 0,
             caused_by: None,
+            logs_dropped: None,
             tags: vec![],
         }
     }

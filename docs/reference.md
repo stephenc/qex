@@ -266,6 +266,9 @@ max_pressure = 20     # maximum PSI memory pressure (Linux only)
 [queue]
 oversized = "run-when-idle"   # run-when-idle, reject or queue
 
+[logs]
+max_bytes = "32MB"    # the output that qex keeps for each stream of each job
+
 [defaults]
 cpu = 1               # the default is 1 core
 mem = "2GB"           # the default is the machine memory / the core count
@@ -509,6 +512,138 @@ home directory and `$x` as a variable, so give the name inside a single quote:
 
 This command is for a person. An agent writes the full command and needs no
 completion.
+## The limit on the output of a job
+
+`[logs] max_bytes` is the space that one stream of one job can use. The default
+is 32MB for `stdout.log` and 32MB for `stderr.log`.
+
+qex applies the limit **while the job writes**. The supervisor reads the output
+through a pipe, so a job that writes 400MB never puts 400MB on the disk. That
+disk also holds the record of each job, and qex is made to be started and left,
+so a job with no limit can fill it while nobody looks.
+
+qex keeps **both ends** of the output:
+
+```
+line 1                        <- the head: the start-up and the configuration
+...
+[qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+[qex] The limit is `[logs] max_bytes` = 32MB. qex kept the first 8MB and the
+      last 24MB. To keep more, make max_bytes larger.
+...
+Error: the build failed         <- the tail: the failure
+```
+
+The head holds the reason that the job started. The tail holds the reason that
+it stopped. A reader needs both.
+
+qex removes nothing until the output passes the limit. A job that writes less
+than `max_bytes`, less the room that qex keeps for the notes (2KB), thus keeps
+every byte in one piece and gets no note. A second attempt of a job that failed
+keeps the output of the first attempt in the same way.
+
+Above that point, qex keeps the first quarter of the limit and the last part.
+A job that passes the point by one byte therefore gets the same file as a job
+that passes it by a gigabyte. The reason is that qex writes the file while the
+job runs: at that moment, nobody knows how much output comes after it.
+
+A job never fails because of this limit. Reaching the limit is normal.
+
+`qex status` and `qex logs` say how much went, so a reader never takes a part of
+the output for the whole output:
+
+```sh
+qex status $ID --json    # the field logs_dropped gives the bytes and the lines
+```
+
+Those lines are not on the disk, so `qex logs --all` does not give them back.
+
+While the job operates, qex holds the last part of the output in a file beside
+the log file (`stdout.log.tail`). It writes that part into the log file and
+deletes it when the job stops. **The log file thus becomes shorter at the moment
+that the output passes the limit.** `qex logs --follow` watches for that, says
+that qex removed the middle, and continues at the new end of the file. It shows
+the head, then the line that says that the limit is reached, and then the last
+part when the job stops.
+
+The last part starts in the middle of a line, because qex removed the bytes
+before it. qex removes that fragment when it is a small part of the last part,
+and keeps it in each other case with a line that says that the text starts in
+the middle of a line. One JSON document, one base64 block and a progress display
+that uses `\r` all give output with no line end, or with one line end far into
+the file.
+
+Use `max_bytes = "0"` for no limit. The words `"none"`, `"never"` and
+`"unlimited"` do the same, and they are the words that `[defaults] timeout`
+takes. A job can then fill the disk.
+
+### When a change to the limit takes effect
+
+The supervisor of a job reads `[logs] max_bytes` one time, when the job starts.
+A change to the file therefore:
+
+* does **nothing** to a job that already writes. That job keeps the limit that
+  it started with, to the end of its last attempt.
+* controls the **next job to start**, immediately. The supervisor is a new
+  process and it reads the file itself, so this change does not wait for the
+  coordinator to read the file again.
+
+Measured: with `max_bytes = "64KB"`, a job that writes 4000 lines kept a file of
+63848 bytes although the file changed to `"1MB"` while the job wrote. The next
+job kept 1046928 bytes.
+
+To give a new limit to a job that already operates, stop the job and start it
+again with `qex rerun $ID`.
+
+### What the job sees
+
+The standard output and the standard error of a job are a **pipe**, and not a
+regular file. The supervisor reads that pipe and writes the file. Almost every
+program sees no difference, but three things change:
+
+* `lseek` on the output gives `ESPIPE`, and `stat` gives a FIFO in place of a
+  regular file. A program that asks for its position in its own output, or that
+  reads back what it wrote, meets an error.
+* Two children of one job that write more than 4096 bytes in one operation can
+  now mix in the middle of a line. With a regular file, each write stayed
+  together.
+* `isatty` gives false, as it did before. A program that tests for a terminal
+  behaves in the same way.
+
+If a program needs a regular file, give it one:
+
+```sh
+qex submit -- sh -c 'my-program > out.txt'
+```
+
+### A job that leaves a process with the output open
+
+A pipe closes when the last process that holds it stops. A job that starts a
+process which outlives it therefore keeps the pipe open after the job itself
+ends. `setsid`, `nohup ... &` and a daemon that a test starts all make that
+shape.
+
+**qex waits 30 seconds for the output to close, and then it writes the result.**
+A record that arrives is worth more than a wait with no end. The record of such
+a job says:
+
+* `state` is the state that the job earned. The wait does not fail the job.
+* `error` says that the output did not close, and that a log file can be
+  missing its last part.
+* `logs_dropped.incomplete` is `true`. The counts beside it are the counts that
+  arrived, and not the full quantity, so a program must not read them as
+  complete.
+
+Measured: a job that runs `setsid sh -c "sleep 120" &` and then writes one line
+finished 30 seconds after it started, with `state` `completed`,
+`incomplete: true`, and that `error`.
+
+To get the result at once, stop the process that holds the output, or give that
+process an output of its own:
+
+```sh
+qex submit -- sh -c 'setsid my-daemon > daemon.log 2>&1 &'
+```
 
 ## More help inside the tool
 

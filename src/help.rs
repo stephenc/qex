@@ -663,6 +663,9 @@ that qex uses now.
     enabled = true        # use the earlier jobs of a command as the claim
     margin = 1.5          # the multiplier for a measurement
 
+    [logs]
+    max_bytes = \"32MB\"    # the output that qex keeps for each stream of a job
+
     [history]
     keep = \"1d\"           # how long to keep the id of a job after its removal
 
@@ -694,6 +697,37 @@ A submission without `--cpu` or `--mem` uses the `[defaults]` section. If that
 section gives no value, qex uses 1 core and an equal part of the machine
 memory. On a machine with 16 cores and 32GB, the default job is 1 core and 2GB.
 The default job size thus scales with the machine.
+
+The limit on the output of a job
+--------------------------------
+
+`[logs] max_bytes` is the space that one stream of one job can use. The default
+is 32MB for `stdout.log` and 32MB for `stderr.log`.
+
+qex applies this limit WHILE THE JOB WRITES. A job that writes 400MB thus never
+puts 400MB on the disk. The same disk holds the record of each job, and qex is
+made to be started and left, so a job with no limit can fill that disk while
+nobody looks.
+
+qex keeps the first part of the output and the last part. The first part holds
+the start-up and the configuration. The last part holds the failure. Between
+the two, qex writes a line that says how many bytes and how many lines went:
+
+    [qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+
+`qex status` and `qex logs` also give that count, so a reader always knows that
+the file is not the whole output. `qex status --json` gives it in the field
+`logs_dropped`.
+
+Use `max_bytes = \"0\"` for no limit. The words \"none\", \"never\" and \"unlimited\"
+do the same, and they are the words that `[defaults] timeout` takes. Then a job
+can fill the disk.
+
+The supervisor of a job reads this field one time, when the job starts. A change
+to the file thus does nothing to a job that already writes, and it controls the
+next job to start. The supervisor reads the file itself, so the new value does
+not wait for the coordinator to read the file again. To give a new limit to a
+job that operates, stop it and use `qex rerun`.
 
 Enforcement
 -----------
@@ -896,6 +930,10 @@ qex writes one directory for each job:
         stdout.log    the standard output of the job
         stderr.log    the standard error of the job
 
+A job that writes more than `[logs] max_bytes` also has `stdout.log.tail` or
+`stderr.log.tail` while it operates. That file holds the last part of the
+output, and qex writes it into the log file and deletes it when the job stops.
+
 The directory has mode 0700 because `spec.json` can contain secrets.
 
 `status.json` is the primary record. The supervisor of the job writes it in one
@@ -924,6 +962,60 @@ Logs
 
 Every path has a limit. A search reports the number of lines that match, so a
 pattern that matches 3000 lines tells you that the pattern is too wide.
+
+The output of a job also has a limit
+------------------------------------
+
+A job can write more than `[logs] max_bytes` (the default is 32MB for each
+stream). qex then keeps the first part of the output and the last part, and it
+writes one line between them:
+
+    [qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+
+Those lines are NOT on the disk. `--all` does not give them back, because
+nothing holds them. `qex status` and `qex logs` say how much went, and
+`qex status --json` gives the numbers in the field `logs_dropped`.
+
+qex removes nothing until the output passes the limit. A job that writes less
+than the limit, less the room that qex keeps for the notes (2KB), keeps every
+byte in one piece, and a second attempt of a job that failed keeps the output of
+the first attempt. Above that point, a job that passes the limit by one byte
+gets the same file as a job that passes it by a gigabyte: qex writes the file
+while the job runs, and at that moment nobody knows how much output follows.
+
+The log file becomes shorter at the moment that the output passes the limit.
+`qex logs --follow` says so, and it continues at the new end of the file.
+
+Make `[logs] max_bytes` larger for a job that must keep everything, or write
+the output of the job to a file of your own.
+
+The output of a job is a pipe
+-----------------------------
+
+The supervisor reads the output through a pipe and writes the file itself. The
+standard output and the standard error of a job are thus a pipe, and not a
+regular file. Almost every program sees no difference. Three things change:
+
+    lseek gives ESPIPE, and stat gives a FIFO in place of a regular file. A
+        program that asks for its position in its own output meets an error.
+    Two children of one job that write more than 4096 bytes in one operation
+        can mix in the middle of a line. A regular file kept each write
+        together.
+    isatty gives false, as it did before.
+
+If a program needs a regular file, give it one:
+
+    qex submit -- sh -c 'my-program > out.txt'
+
+A pipe closes when the last process that holds it stops, so a job that leaves a
+process behind (`setsid`, `nohup ... &`, a daemon that a test starts) keeps its
+output open after the job ends. qex waits 30 seconds for the output to close and
+then writes the result: a record that arrives is worth more than a wait with no
+end. The record then says `incomplete` in the field `logs_dropped`, and `error`
+says that a log file can be missing its last part. The wait does not fail the
+job. To get the result at once, give that process an output of its own:
+
+    qex submit -- sh -c 'setsid my-daemon > daemon.log 2>&1 &'
 
 Use `--follow --grep` in place of a pipe to `grep`. A pipe holds the lines in a
 buffer and shows nothing until the buffer fills, because `grep` needs the option

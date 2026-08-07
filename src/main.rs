@@ -55,6 +55,8 @@ mod keys;
 #[cfg(unix)]
 mod lifecycle;
 #[cfg(unix)]
+mod logcap;
+#[cfg(unix)]
 mod logsel;
 #[cfg(unix)]
 mod paths;
@@ -669,6 +671,16 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     println!(
         "keep free:    {} of memory",
         units::format_size(cfg.reserve_mem()?)
+    );
+    println!(
+        "job output:   {}",
+        match cfg.log_max_bytes()? {
+            Some(limit) => format!(
+                "{} for each stream of each job; qex keeps the first part and the last part",
+                units::format_size(limit)
+            ),
+            None => "NO LIMIT; a job can fill the disk that holds the records".to_string(),
+        }
     );
     match enforce::startup_warning(cfg) {
         Some(warning) => {
