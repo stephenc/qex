@@ -38,7 +38,24 @@ cd "$(dirname "$0")/../.."
 # version that no rule chose. The comparison is against the WHOLE string:
 # `0.0.0-dev2` is a different state and it must not pass.
 expected="0.0.0-dev"
-current="$(awk -F'"' '/^version *= *"/ { print $2; exit }' Cargo.toml)"
+# The version of THIS package, and never the version of a dependency.
+#
+# `version = "..."` appears in a dependency as well, so a search of the whole
+# file finds whichever comes first and not the one that names this package. This
+# script WRITES that line, so a search that finds the wrong one would rewrite a
+# dependency — and the test at the end of this script reads the file the same
+# way, so it would agree with the mistake and report success.
+#
+# `[package]` comes first in this file today. That is a habit and not a rule,
+# and a habit is not a thing to write over a file with.
+package_version() {
+    awk -F'"' '
+        /^\[/ { table = $0 }
+        table == "[package]" && /^version *= *"/ { print $2; exit }
+    ' Cargo.toml
+}
+
+current="$(package_version)"
 if [ "$current" != "$expected" ]; then
     echo "Cargo.toml holds \`$current\`, and this script writes only over \`$expected\`." >&2
     echo >&2
@@ -54,9 +71,19 @@ fi
 # `version`. A dependency gives its version inside a table on one line, such as
 # `clap = { version = "4" }`, so no dependency matches.
 awk -v v="$version" '
-    !done && /^version *= *"/ { print "version = \"" v "\""; done = 1; next }
+    /^\[/ { table = $0 }
+    table == "[package]" && !done && /^version *= *"/ {
+        print "version = \"" v "\""
+        done = 1
+        next
+    }
     { print }
-' Cargo.toml >Cargo.toml.new
+    END { if (!done) { exit 1 } }
+' Cargo.toml >Cargo.toml.new || {
+    echo "no \`version\` line inside \`[package]\` in Cargo.toml." >&2
+    rm -f Cargo.toml.new
+    exit 1
+}
 mv Cargo.toml.new Cargo.toml
 
 # In Cargo.lock, the version of qex follows the name of qex.
@@ -69,7 +96,7 @@ mv Cargo.lock.new Cargo.lock
 
 # Prove that the two files agree, because a build with `--locked` stops when
 # they do not.
-toml="$(awk -F'"' '/^version *= *"/ { print $2; exit }' Cargo.toml)"
+toml="$(package_version)"
 if [ "$toml" != "$version" ]; then
     echo "Cargo.toml holds $toml, and this script wrote $version" >&2
     exit 1
