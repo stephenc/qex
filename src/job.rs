@@ -107,6 +107,68 @@ pub struct Usage {
     pub cpu_secs: f64,
 }
 
+/// Gives the SAFE FORM of a job name: the ONLY form that qex shows.
+///
+/// A safe name holds the letters `A` to `Z` and `a` to `z`, the numbers `0` to
+/// `9`, and the three characters `-`, `_` and `.`. Every other character
+/// becomes `_`, and a run of them becomes ONE `_`. A name that starts with `-`
+/// loses that first character to `_`, because a word that starts with `-` has
+/// the form of an option. The result stops at 128 characters.
+///
+///     deploy prod$(id)   ->  deploy_prod_id_
+///     -version           ->  _version
+///
+/// # Where this is used
+///
+/// **Every place that qex puts a name in front of a reader**: `qex list`, `qex
+/// status`, `qex top`, `qex du`, `qex gc`, the sentence that says why a job
+/// waits, the log of the coordinator, the completions, and the JSON of each of
+/// them. The record on the disk keeps the name that the user gave.
+///
+/// A machine that reads the JSON renders what qex gives it, and it knows no
+/// more than qex does, so the JSON holds the safe form as well.
+///
+/// # Why
+///
+/// A name is text that another agent chose. A name that holds an ESC byte,
+/// written to a terminal by `qex list`, moves the cursor and writes over the
+/// text around it. No shell and no TAB are needed for that. A name that holds a
+/// space or a `;` teaches a word that the reader cannot paste back.
+///
+/// A record on the disk is not a promise about its content. qex wrote records
+/// before this rule, and one of them can hold such a name. NOTHING is carried
+/// over: the safe form comes from the name that the record holds, so the rule
+/// reaches every record at once and `qex gc` is not the thing that applies it.
+///
+/// The job stays reachable, because `resolve_id` finds a job by its safe name
+/// as well as by the name that the record holds. A safe name that `qex list`
+/// shows thus goes back into `qex status` as it stands.
+///
+/// **This is not a reason to write a word to a command line as it stands.**
+/// Each shell still makes the word safe at the point of use. The answer of `qex
+/// __complete` is text that came off a disk, and it is not a guarantee. The two
+/// work together, and one does not replace the other.
+pub fn safe_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut replaced = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+            out.push(c);
+            replaced = false;
+        } else if !replaced {
+            out.push('_');
+            replaced = true;
+        }
+    }
+    if out.starts_with('-') {
+        out.replace_range(0..1, "_");
+    }
+    // Every character above is ASCII, so 128 characters are 128 bytes and this
+    // cuts on a character boundary.
+    out.truncate(128);
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: uuid::Uuid,
@@ -231,6 +293,14 @@ pub struct JobStatus {
 }
 
 impl JobStatus {
+    /// The name that qex SHOWS. See `safe_name`.
+    ///
+    /// Read the field `name` only to write the record, or to find a job by the
+    /// name that the user gave.
+    pub fn display_name(&self) -> String {
+        safe_name(&self.name)
+    }
+
     pub fn new(spec: &JobSpec) -> Self {
         Self {
             id: spec.id,

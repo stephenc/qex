@@ -154,13 +154,15 @@ pub fn describe_missing(id: uuid::Uuid) -> String {
             "there is no job with the id {id}, and qex has no record of one. \
              Test the id, or submit the job."
         ),
+        // The SAFE name in each sentence below. This text goes to a reader,
+        // and the line of the history is not touched. See `job::safe_name`.
         Some(entry) => match (entry.removed_at, entry.final_state) {
             (Some(when), Some(state)) => format!(
                 "the job {id} ({}) existed and its state was `{state}`. Something deleted \
                  its record {} ago, with `qex clean` or by a deletion of the state \
                  directory. The work of that job HAPPENED. Do not submit it again unless \
                  you want to repeat the work.",
-                entry.name,
+                crate::job::safe_name(&entry.name),
                 crate::units::format_duration(std::time::Duration::from_secs(
                     crate::sys::now_secs().saturating_sub(when)
                 ))
@@ -168,7 +170,7 @@ pub fn describe_missing(id: uuid::Uuid) -> String {
             (Some(when), None) => format!(
                 "the job {id} ({}) existed. Something deleted its record {} ago. qex does \
                  not know how that job ended.",
-                entry.name,
+                crate::job::safe_name(&entry.name),
                 crate::units::format_duration(std::time::Duration::from_secs(
                     crate::sys::now_secs().saturating_sub(when)
                 ))
@@ -177,7 +179,7 @@ pub fn describe_missing(id: uuid::Uuid) -> String {
                 "the job {id} ({}) existed, and qex accepted it {} ago, but its record is \
                  gone and qex did not delete it. Something removed the state directory. \
                  The job may have run.",
-                entry.name,
+                crate::job::safe_name(&entry.name),
                 crate::units::format_duration(std::time::Duration::from_secs(
                     crate::sys::now_secs().saturating_sub(entry.submitted_at)
                 ))

@@ -22,6 +22,7 @@ qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
 qex info                    the coordinator: its pid, its budget and its load
 qex config show             the values that qex uses now
 qex schema job|status       the JSON Schema of each format
+qex completions <shell>     the completions for bash, zsh or fish
 qex help <topic>
 ```
 
@@ -414,6 +415,100 @@ Two people or two agents that share a machine each run their own coordinator, so
 each must make this change for itself.
 
 Run `qex help config` for every field.
+
+## Completions for your shell
+
+```sh
+qex completions bash | sudo tee /etc/bash_completion.d/qex   # bash, for everybody
+qex completions bash > ~/.local/share/bash-completion/completions/qex
+qex completions zsh  > ~/.zfunc/_qex        # with ~/.zfunc in your fpath
+qex completions fish > ~/.config/fish/completions/qex.fish
+```
+
+The commands and the options come from the command line definition itself, so
+they cannot disagree with the commands that qex has.
+
+**bash, zsh and fish also offer the jobs.** A job id is a uuid, and nobody types
+a uuid. After `qex status`, `qex wait`, `qex logs`, `qex rerun`, `qex clean`,
+`qex kill` and `qex cancel`, the shell offers each job by its id AND by its
+name. `qex kill` offers the jobs that operate, and `qex cancel` offers the jobs
+that wait: a candidate that the command would refuse teaches the wrong command.
+
+The shell asks qex at the moment of the TAB, with a hidden command,
+`qex __complete`. **That command never starts a coordinator.** It reads the
+records on the disk. A press of TAB is not a request to start a process, and a
+user who pressed TAB in a directory with no work must not leave a coordinator
+behind.
+
+`elvish` and `powershell` are also accepted, and they get the commands and the
+options only. qex does not test them, and a completion that nobody tested
+teaches a value that may not exist.
+
+**A job name is text that another agent chose, so the shell must not run it.**
+Each shell puts the name on the line as ONE word, and a name such as
+`build; rm -rf ~` is thus an argument of qex and never a command.
+
+**qex SHOWS a safe form of each name.** `qex list`, `qex status`, `qex top`, the
+sentence that says why a job waits, the completions, and the JSON of each of
+them hold a name that uses these characters and no other:
+
+- the letters `A` to `Z` and `a` to `z`
+- the numbers `0` to `9`
+- the characters `-`, `_` and `.`
+
+Every other character becomes `_`, and a run of them becomes ONE `_`. A first
+character of `-` becomes `_`, because a word that starts with `-` has the form
+of an option. The result stops at 128 characters.
+
+```
+deploy prod$(id)   ->  deploy_prod_id_
+-version           ->  _version
+```
+
+**The record on the disk keeps the name that you gave.** qex changes no record.
+
+**A safe name goes back into a command as it stands.** Take it from `qex list
+--json` or from `qex status`, which give the whole name. The NAME column of the
+table stops at 16 characters, as it did before this rule, so a long name in that
+column is not the whole name. The name that you gave still finds the job as
+well:
+
+```sh
+qex status deploy_prod_id_     # the name that qex shows
+qex status 'deploy prod$(id)'  # the name that you gave
+qex status -- -version         # a name that starts with `-`: put it after `--`
+```
+
+Two names that give one safe form make that word name more than one job. qex
+then gives the error that it already gives for such a word: it lists the jobs
+and it asks for an id.
+
+**Why.** A name is text that another agent chose. A name that holds an ESC byte,
+written to a terminal by `qex list`, moves the cursor and writes over the text
+around it; no shell and no TAB are needed for that. A name that holds a space or
+a `;` teaches a word that you cannot paste back.
+
+This rule covers the NAME of a job and the name of a group. A lock name, a tag,
+a value of `--show-env` and the name of the program still reach the terminal as
+they are. See issue #49.
+
+The rule holds for a record that qex wrote at any time, because the safe form
+comes from the name in the record. Nothing waits for `qex gc`.
+
+The rule does not replace the quoting: each shell still puts a word on the line
+as ONE word, because the answer of `qex __complete` is text that came off a disk
+and it is not a guarantee. The two work together.
+
+No candidate starts with `~` or with `$`, because the safe form replaces both
+with `_`: a job named `~/tilde` is offered as `_tilde`. A press of TAB is thus
+correct in bash, zsh and fish.
+
+**Take care when you TYPE such a name yourself.** Every shell reads `~/x` as a
+home directory and `$x` as a variable, so give the name inside a single quote:
+`qex status '~/tilde'`.
+
+This command is for a person. An agent writes the full command and needs no
+completion.
 
 ## More help inside the tool
 

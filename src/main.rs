@@ -160,6 +160,8 @@ fn run() -> Result<i32> {
         Command::Info(args) => commands::info(args),
         Command::Version(args) => commands::version(args),
         Command::Watchers(args) => watchers::report(args.json),
+        Command::Completions(args) => cmd_completions(args.shell),
+        Command::Complete(args) => commands::complete(args),
         Command::Top(args) => top::run(args),
         Command::Daemon(_) => {
             daemon::run()?;
@@ -172,6 +174,365 @@ fn run() -> Result<i32> {
                 .context("the supervise command needs a job id")?;
             supervisor::main(id)
         }
+    }
+}
+
+/// Writes the completions for one shell.
+///
+/// This command is for a person. An agent writes the full command and needs no
+/// completion, so this text does not appear in `qex help agents`.
+///
+/// The words come from the command line definition itself, so they cannot
+/// disagree with the commands that qex has.
+#[cfg(unix)]
+fn cmd_completions(shell: clap_complete::Shell) -> Result<i32> {
+    use std::io::Write;
+
+    let mut command = Cli::command();
+    let hidden: Vec<String> = command
+        .get_subcommands()
+        .filter(|c| c.is_hide_set())
+        .map(|c| c.get_name().to_string())
+        .collect();
+    let valued = options_that_take_a_value(&command);
+    let mut out = Vec::new();
+    clap_complete::generate(shell, &mut command, "qex", &mut out);
+
+    // The commands and the options come from the definition above. The IDS AND
+    // THE NAMES cannot: they change with each job, so the shell must ask qex at
+    // the moment of the TAB. `qex __complete` answers that question, and it
+    // reads the records on the disk and starts no coordinator.
+    //
+    // Each part below offers the correct set for its command: `qex kill` offers
+    // the jobs that operate, `qex cancel` offers the jobs that wait, and the
+    // commands that read a record offer every job.
+    //
+    // Remove the commands that qex hides. `daemon`, `supervise` and
+    // `__complete` are commands that qex gives to itself, and
+    // `#[command(hide = true)]` keeps them out of the help text. It does NOT
+    // keep them out of the completions, so a person who pressed TAB was offered
+    // `qex daemon` — a command that starts a coordinator in the foreground —
+    // beside `qex submit`.
+    let text = remove_hidden(&String::from_utf8_lossy(&out), &hidden, shell);
+    let text = zsh_jobs(&text, shell);
+
+    let mut out = text.into_bytes();
+    out.extend_from_slice(dynamic_part(shell, &valued).as_bytes());
+
+    std::io::stdout().write_all(&out)?;
+    Ok(0)
+}
+
+/// Takes the hidden commands out of the completions.
+///
+/// Each shell holds them in a different form, so each needs its own removal.
+/// A shell that qex cannot treat keeps them, which is the behaviour that qex
+/// had; the words are untidy and they are not dangerous.
+#[cfg(unix)]
+fn remove_hidden(text: &str, hidden: &[String], shell: clap_complete::Shell) -> String {
+    use clap_complete::Shell;
+
+    if hidden.is_empty() {
+        return text.to_string();
+    }
+
+    match shell {
+        // bash gives one list of words for each level: `opts="submit run ..."`.
+        Shell::Bash => text
+            .lines()
+            .map(|line| {
+                if !line.trim_start().starts_with("opts=\"") {
+                    return line.to_string();
+                }
+                let mut kept = line.to_string();
+                for name in hidden {
+                    kept = kept.replace(&format!(" {name}\""), "\"");
+                    kept = kept.replace(&format!(" {name} "), " ");
+                }
+                kept
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+
+        // zsh and fish each give one line for each command.
+        Shell::Zsh | Shell::Fish => text
+            .lines()
+            .filter(|line| {
+                !hidden.iter().any(|name| {
+                    line.contains(&format!("'{name}:")) || line.contains(&format!("-a \"{name}\""))
+                })
+            })
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+
+        // elvish and powershell each OFFER a command on one line. The block
+        // that says what the command accepts stays, and it offers nothing.
+        Shell::Elvish | Shell::PowerShell => text
+            .lines()
+            .filter(|line| {
+                !hidden.iter().any(|name| {
+                    line.trim_start().starts_with(&format!("cand {name} "))
+                        || line.contains(&format!("::new('{name}', '{name}',"))
+                })
+            })
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+
+        _ => text.to_string(),
+    }
+}
+
+/// The commands that take a job, and the set that each one offers.
+///
+/// `qex kill` takes a job that operates, and `qex cancel` takes a job that
+/// waits in the queue. A candidate that the command would refuse teaches the
+/// wrong command.
+#[cfg(unix)]
+const READS: &str = "status wait logs rerun clean";
+#[cfg(unix)]
+const ACTIVE: &str = "kill";
+#[cfg(unix)]
+const QUEUED: &str = "cancel";
+
+/// The options of those commands that take a VALUE, as bash sees them.
+///
+/// bash gives the completion the word before the cursor and nothing else, so
+/// the completion must know which of those words takes the next word. Without
+/// this, `qex kill --signal <TAB>` offered a job, and `qex status --json
+/// <TAB>` offered none.
+///
+/// The list comes from the command line definition, so an option that a later
+/// change adds is here without a second edit.
+#[cfg(unix)]
+fn options_that_take_a_value(command: &clap::Command) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let takes_a_job = |name: &str| {
+        READS.split(' ').any(|c| c == name)
+            || ACTIVE.split(' ').any(|c| c == name)
+            || QUEUED.split(' ').any(|c| c == name)
+    };
+    for sub in command
+        .get_subcommands()
+        .filter(|s| takes_a_job(s.get_name()))
+    {
+        for arg in sub.get_arguments() {
+            // A flag such as `--json` takes no value, and it must stay out.
+            if !arg.get_action().takes_values() {
+                continue;
+            }
+            if let Some(long) = arg.get_long() {
+                words.push(format!("--{long}"));
+            }
+            for long in arg.get_all_aliases().unwrap_or_default() {
+                words.push(format!("--{long}"));
+            }
+            if let Some(short) = arg.get_short() {
+                words.push(format!("-{short}"));
+            }
+        }
+    }
+    words.sort();
+    words.dedup();
+    words.join(" ")
+}
+
+/// Makes the job arguments of the zsh completions offer the jobs.
+///
+/// zsh needs more than an extra function at the end of the file, and for two
+/// reasons.
+///
+/// 1. The file gives the completion to the shell in its last lines, so a
+///    function that follows those lines arrives too late.
+/// 2. clap gives each job argument the action `_default`, which offers every
+///    file and every command on the machine. A press of TAB after `qex kill `
+///    thus gave 2674 candidates, and the jobs were lost among them.
+///
+/// This puts `_qex_jobs` at the top of the file, below the `#compdef` line that
+/// zsh needs first, and it then names that function as the action of each job
+/// argument.
+#[cfg(unix)]
+fn zsh_jobs(text: &str, shell: clap_complete::Shell) -> String {
+    if shell != clap_complete::Shell::Zsh {
+        return text.to_string();
+    }
+
+    let helper = r#"
+# The ids and the names of the jobs. `qex __complete` reads the records on the
+# disk, so a press of TAB starts no coordinator.
+_qex_jobs() {
+    local -a candidates
+    candidates=(${(f)"$(qex __complete $1 2>/dev/null)"})
+    (( ${#candidates} )) && compadd -a candidates
+}
+"#;
+
+    // Which set each command offers.
+    let set_of = |name: &str| -> Option<&'static str> {
+        if READS.split(' ').any(|c| c == name) {
+            Some("ids")
+        } else if ACTIVE.split(' ').any(|c| c == name) {
+            Some("active")
+        } else if QUEUED.split(' ').any(|c| c == name) {
+            Some("queued")
+        } else {
+            None
+        }
+    };
+
+    let mut done = false;
+    let mut here: Option<&'static str> = None;
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !done && line.trim() == "#compdef qex" {
+            lines.push(line.to_string());
+            lines.push(helper.to_string());
+            done = true;
+            continue;
+        }
+        // `(kill)` opens the arguments of `qex kill`.
+        if line.starts_with('(') && line.ends_with(')') {
+            here = set_of(line.trim_matches(['(', ')']));
+        }
+        // A job argument, such as `'*::ids -- The job ids to stop:_default' \`.
+        //
+        // The line must be a POSITIONAL one. An option line starts with the
+        // name of the option, and it takes a value that is not a job: `qex kill
+        // --signal <TAB>` must offer a signal and never a job.
+        let positional =
+            line.starts_with("':") || line.starts_with("'::") || line.starts_with("'*::");
+        match here {
+            Some(what) if positional && line.ends_with(":_default' \\") => {
+                let head = &line[..line.len() - ":_default' \\".len()];
+                // The SPACE after the colon is not decoration. zsh runs an
+                // action as a command only when the action starts with a
+                // space; without it zsh reads `_qex_jobs ids` as one name, and
+                // it then offers nothing at all.
+                lines.push(format!("{head}: _qex_jobs {what}' \\"));
+            }
+            _ => lines.push(line.to_string()),
+        }
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// The part of the completions that asks qex for the ids and the names.
+#[cfg(unix)]
+fn dynamic_part(shell: clap_complete::Shell, valued: &str) -> String {
+    use clap_complete::Shell;
+
+    #[allow(non_snake_case)]
+    let VALUED = valued;
+
+    match shell {
+        Shell::Bash => format!(
+            r#"
+# The ids and the names of the jobs. `qex __complete` reads the records on the
+# disk, so a press of TAB starts no coordinator.
+_qex_jobs() {{
+    local subcommand="" word
+    for word in "${{COMP_WORDS[@]:1}}"; do
+        case "$word" in
+            -*) ;;
+            *) subcommand="$word"; break ;;
+        esac
+    done
+
+    local what=""
+    case " {READS} " in *" $subcommand "*) what="ids" ;; esac
+    case " {ACTIVE} " in *" $subcommand "*) what="active" ;; esac
+    case " {QUEUED} " in *" $subcommand "*) what="queued" ;; esac
+    [ -n "$what" ] || return 0
+
+    local cur="${{COMP_WORDS[COMP_CWORD]}}"
+    # An option, and not a job. Leave those to the part above.
+    case "$cur" in -*) return 0 ;; esac
+
+    # The word before takes a VALUE, so this word is that value and not a job:
+    # `qex kill --signal <TAB>` must offer a signal.
+    #
+    # The test names the options that take a value, and it does not ask whether
+    # the word starts with a dash. A flag such as `--json` takes no value, so
+    # `qex status --json <TAB>` is still a job.
+    local prev="${{COMP_WORDS[COMP_CWORD-1]}}"
+    case " {VALUED} " in *" $prev "*) return 0 ;; esac
+
+    # Read the candidates one line at a time, and compare them as text.
+    #
+    # `compgen -W` EXPANDS ITS WORD LIST AGAIN, so a job named
+    # `$(rm -rf ~)` would run when somebody pressed TAB. An agent chooses the
+    # names of the jobs, and a person presses the TAB, so that name is not
+    # trusted text. This loop expands nothing, and it keeps a name that holds a
+    # space in one piece.
+    local candidate
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        case "$candidate" in "$cur"*) ;; *) continue ;; esac
+        # Put the name on the line in a form that the shell reads as ONE word.
+        #
+        # bash writes a candidate to the line as it stands, so the name
+        # `x; rm -rf ~` would put `; rm -rf ~` on the line beside the command,
+        # and the next press of ENTER would then run it. `printf %q` puts a
+        # backslash before each character that the shell reads, so the name
+        # stays one argument of qex.
+        #
+        # `compopt -o filenames` asks bash to do the same work, and this code
+        # used it first. bash then treats each name as a FILE: a job with the
+        # name of a directory got a `/` after it, `$HOME` became a directory as
+        # well, and a name that starts with `~` was expanded to a home
+        # directory. Each of the three gave qex a name that no job has.
+        # `printf %q` has none of that behaviour. It was measured on bash
+        # 5.1.16 and on bash 3.2.57, and it gave the stored name in each.
+        printf -v candidate '%q' "$candidate"
+        # A leading `~` as well. bash 5.1 escapes it above and bash 3.2 does
+        # NOT, and bash then reads `~/x` on the line as a home directory. A
+        # name is not a path, so the word keeps the character that it holds.
+        case "$candidate" in "~"*) candidate="\\$candidate" ;; esac
+        COMPREPLY[${{#COMPREPLY[@]}}]="$candidate"
+    done < <(qex __complete "$what" 2>/dev/null)
+}}
+
+_qex_with_jobs() {{
+    _qex "$@"
+    _qex_jobs
+}}
+
+# `-o nosort` came with bash 4.4, and `complete` refuses the WHOLE command when
+# it meets an option name that it does not know. Without this test, sourcing
+# this file on the bash 3.2 of macOS wrote `complete: nosort: invalid option
+# name`, bound nothing, and the jobs never arrived. clap gates its own line in
+# the same way, above.
+#
+# Do not answer that by dropping `-o nosort`: it is what keeps the newest job
+# first, and bash sorts the candidates again without it.
+if [[ "${{BASH_VERSINFO[0]}}" -eq 4 && "${{BASH_VERSINFO[1]}}" -ge 4 || "${{BASH_VERSINFO[0]}}" -gt 4 ]]; then
+    complete -F _qex_with_jobs -o nosort -o bashdefault -o default qex
+else
+    complete -F _qex_with_jobs -o bashdefault -o default qex
+fi
+"#
+        ),
+
+        // zsh gets its part from `zsh_jobs`, because the function must exist
+        // before the file gives the completion to the shell.
+        Shell::Zsh => String::new(),
+
+        Shell::Fish => format!(
+            r#"
+# The ids and the names of the jobs. `qex __complete` reads the records on the
+# disk, so a press of TAB starts no coordinator.
+complete -c qex -n "__fish_seen_subcommand_from {READS}" -f -a "(qex __complete ids)"
+complete -c qex -n "__fish_seen_subcommand_from {ACTIVE}" -f -a "(qex __complete active)"
+complete -c qex -n "__fish_seen_subcommand_from {QUEUED}" -f -a "(qex __complete queued)"
+"#
+        ),
+
+        // elvish and powershell get the commands and the options, and no ids.
+        // qex has no way to test them, and a completion that nobody tested is
+        // worse than none: it teaches a value that may not exist.
+        _ => String::new(),
     }
 }
 

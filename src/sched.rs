@@ -83,7 +83,9 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
                 return Some(format!(
                     "waits for the lock `{name}`, which the job {} ({}) holds",
                     &job.status.id.to_string()[..8],
-                    job.status.name
+                    // The SAFE name. This sentence goes to a reader, through
+                    // `blocked_reason`. See `job::safe_name`.
+                    job.status.display_name()
                 ));
             }
         }
@@ -322,7 +324,7 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
             return Depends::Waiting(format!(
                 "waits for the job {} ({}), which is {}",
                 &dep.to_string()[..8],
-                other.status.name,
+                other.status.display_name(),
                 other.status.state
             ));
         }
@@ -338,7 +340,7 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
             let root_name = state
                 .jobs
                 .get(&root)
-                .map(|j| j.status.name.clone())
+                .map(|j| j.status.display_name())
                 .unwrap_or_else(|| "unknown".to_string());
             let root_state = state
                 .jobs
@@ -376,7 +378,7 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
             return Depends::Waiting(format!(
                 "waits for the job {} ({}) to stop, whatever its result",
                 &dep.to_string()[..8],
-                other.status.name
+                other.status.display_name()
             ));
         }
     }
@@ -589,7 +591,8 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         job.status.forced = forced.is_some();
         job.status.forced_reason = forced.clone();
         let status = job.status.clone();
-        let name = job.spec.name.clone();
+        // The SAFE name: this value goes into the log of the coordinator.
+        let name = crate::job::safe_name(&job.spec.name);
         state.queue.retain(|q| *q != id);
         (forced, name, status)
     };
