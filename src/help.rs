@@ -134,11 +134,13 @@ machine keep the capacity that they claimed. The output arrives as it happens,
 on the same two streams, and the exit code is the exit code of the job. Nothing
 else in your script changes.
 
-WHAT YOU GIVE UP. `qex run` ties the job to this command:
+WHAT YOU GIVE UP. `qex run` ties the job to this command, but only for the stops
+that it can catch:
 
     Ctrl-C stops the job, and not this command only.
-    A harness that stops you signals the process group, and the job
-    stops with it.
+    A SIGTERM on this command stops the job too.
+    A SIGKILL does NOT stop the job, and neither does the hangup of
+    a terminal that closes. The job continues, and `qex list` finds it.
 
 That is correct for work that you are waiting for, and it is WRONG for work that
 lives longer than your attention. `qex submit` gives the job a life of its own:

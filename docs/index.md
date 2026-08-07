@@ -32,6 +32,9 @@ building
 done
 ```
 
+Use `qex run` for work that you wait for now. Ctrl-C stops the job with it. See
+[the page for agents](agents.md) for the stops that do not reach the job.
+
 Or submit it, walk away, and ask later:
 
 ```console

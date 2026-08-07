@@ -57,16 +57,21 @@ is the exit code of the job:
 qex run -- cargo test
 ```
 
-**`qex run` ties the job to that command.** Ctrl-C stops the job, and a harness
-that stops you signals the process group, which stops the job too. That is right
-for work you are waiting for, and wrong for work that outlives your attention —
-use `qex submit` for anything you might come back to.
+**`qex run` ties the job to that command, but only for the stops that it can
+catch.** Ctrl-C stops the job, and a SIGTERM on `qex run` stops the job. A
+SIGKILL, and the hangup that a terminal sends when it closes, do not reach the
+job: it continues, and `qex list` finds it. That is right for work you are
+waiting for, and wrong for work that outlives your attention — use `qex submit`
+for anything you might come back to.
+
+**If your harness stopped you hard, look for the job.** `qex list` shows a job
+of `qex run` that continued, and `qex kill <id>` stops it.
 
 ## Which command to wait with
 
 | Your situation | Use |
 | --- | --- |
-| You wait now, in this command, and the work is short | `qex run -- CMD` (the job stops if you are stopped) |
+| You wait now, in this command, and the work is short | `qex run -- CMD` (Ctrl-C or SIGTERM stops the job; a SIGKILL does not) |
 | Your harness reports background commands | `qex status <id> --wait` in the background |
 | A script needs the exit code only | `qex wait <id>` |
 
