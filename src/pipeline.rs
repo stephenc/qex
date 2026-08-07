@@ -50,6 +50,8 @@ pub struct Stage {
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<crate::config::EnvCapture>,
+    /// How politely this stage uses the processor. See the job file.
+    pub nice: Option<i32>,
     /// The stages that must succeed before this one.
     pub needs: Vec<String>,
     /// The stages that must stop before this one, whatever their result.
@@ -238,6 +240,7 @@ pub fn stage_spec(
         tags: stage.tags.clone(),
         priority: stage.priority,
         env_capture: stage.env_capture,
+        nice: stage.nice,
         // The caller resolves these names inside the file.
         needs: Vec::new(),
         after: Vec::new(),
@@ -262,6 +265,40 @@ mod tests {
         let parsed: PipelineFile = toml::from_str(text)?;
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    /// The `nice` value of a stage must reach the job.
+    ///
+    /// A pipeline stage takes the field, and `stage_spec` copies it. Without
+    /// this test, a stage that asks to give way could lose that value on the
+    /// way to the supervisor, and the pipeline would then use the machine as
+    /// rudely as before while a person waits.
+    #[test]
+    fn the_nice_value_of_a_stage_reaches_the_job() {
+        let p = file(
+            r#"
+[[jobs]]
+name = "build"
+command = ["make"]
+nice = 15
+
+[[jobs]]
+name = "test"
+command = ["make", "test"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = crate::config::Config::default();
+        let group = uuid::Uuid::new_v4();
+        let with_value = stage_spec(&p.jobs[0], &cfg, group, "ci").unwrap();
+        assert_eq!(with_value.nice, Some(15));
+
+        // A stage with no value of its own keeps `None`, so the supervisor
+        // reads `[politeness] nice`. A value here would replace the choice of
+        // the machine for a stage that asked for nothing.
+        let without = stage_spec(&p.jobs[1], &cfg, group, "ci").unwrap();
+        assert_eq!(without.nice, None);
     }
 
     #[test]

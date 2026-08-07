@@ -322,16 +322,9 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         .env_clear()
         .envs(&spec.env);
 
-    unsafe {
-        cmd.pre_exec(|| {
-            // A new process group. `qex kill` then signals every process of the
-            // job with one call to `killpg`.
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    // The new process group goes in the SAME `pre_exec` as the politeness of
+    // the job, below. That call needs the configuration, which this function
+    // reads above, so one closure does both and the job forks once.
 
     // Apply the memory limit before the job starts.
     //
@@ -381,6 +374,51 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         status.error = Some(fault.clone());
     }
     let _ = &cgroup_dir;
+
+    // How politely this job uses the machine. See `PolitenessConfig`.
+    //
+    // THE SUPERVISOR TESTS THESE VALUES AGAIN, and it does not trust the test
+    // that `qex submit` made. `load_short` above parses the file and does not
+    // validate it, and the file can change between the submission and the
+    // start: `qex rerun` needs no config file, and a job can wait in the queue
+    // while somebody edits the file. Measured with `[politeness] nice = 100` in
+    // the file at the start of the job: the job ran at nice 19, because
+    // `setpriority` takes 19 for any number above the range and reports
+    // success, and nothing said so. The coordinator refuses such a file and
+    // keeps the values that it had. The supervisor holds no earlier values, so
+    // it takes the DEFAULT values and puts the fault in the record of the job.
+    let politeness = match cfg.politeness_values() {
+        Ok(()) => cfg.politeness.clone(),
+        Err(e) => {
+            let message = format!(
+                "{e} This job uses the default politeness values, so it gives way as a job \
+                 of qex did before."
+            );
+            log(&message);
+            add_fault(&mut status.error, message);
+            crate::config::PolitenessConfig::default()
+        }
+    };
+    let nice = spec.nice.unwrap_or(politeness.nice);
+    let io_class = politeness.io.clone();
+    let oom_adj = politeness.oom_score_adj;
+
+    unsafe {
+        cmd.pre_exec(move || {
+            // A new process group. `qex kill` then signals every process of the
+            // job with one call to `killpg`.
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            // The steps below make the job give way. NOT ONE OF THEM CAN STOP
+            // THE JOB: a machine that refuses them gives a job that runs at the
+            // usual priority, which is what qex did before. A failure here must
+            // never take the work away from the user.
+            apply_politeness(nice, &io_class, oom_adj);
+            Ok(())
+        });
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -599,10 +637,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         let note = "the output of this job did not close, so a log file can be missing its \
                     last part. A process of the job kept the pipe open. Read the log file, \
                     and start the job again if you need the full output.";
-        status.error = Some(match status.error.take() {
-            Some(first) => format!("{first}; {note}"),
-            None => note.to_string(),
-        });
+        add_fault(&mut status.error, note.to_string());
         // Say it in the record as well, and not in the text only.
         //
         // The counts here are the counts that arrived. A copy that did not
@@ -788,6 +823,178 @@ const RACE_JOB: u8 = 1;
 /// The timer fired first, so the job reached its time limit.
 const RACE_TIMER: u8 = 2;
 
+/// Adds a fault to the record of a job, and keeps the faults that are there.
+///
+/// # The fault that this removes
+///
+/// A job can meet more than one fault before it starts. `error` held ONE of
+/// them, because each writer replaced the field. Measured with
+/// `[enforce] mode = "hard"` on a machine with no cgroup delegation AND
+/// `[politeness] nice = 100`: `qex status --json` gave the memory-limit fault
+/// only. The politeness fault reached `supervisor.log`, which no command reads,
+/// so a user saw a job that ran at a priority nobody asked for and had nothing
+/// to read about it.
+///
+/// The reader needs every fault, so this function joins them.
+///
+/// The mark between two faults is `; `, which is the mark that the output limit
+/// already used for the same purpose. One mark, and one place that joins.
+fn add_fault(error: &mut Option<String>, message: String) {
+    match error {
+        Some(already) => {
+            already.push_str("; ");
+            already.push_str(&message);
+        }
+        None => *error = Some(message),
+    }
+}
+
+/// Makes a job give way to the work of a person.
+///
+/// This function operates in the child, between the fork and the exec. It must
+/// therefore call the system only: no allocation, and no lock. Each step gives
+/// up in silence, because a job that runs at the usual priority is the
+/// behaviour that qex had before, and it is far better than no job at all.
+fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
+    // The processor. A larger number gives way to everything else.
+    //
+    // A user cannot ask for a number below the number that the process has,
+    // without privilege. qex still makes the call: it fails, the job continues
+    // at the priority that it had, and no other step is lost. Measured on
+    // Linux with the usual `RLIMIT_NICE` of 0: `setpriority(PRIO_PROCESS, 0,
+    // -5)` from nice 0 gives EACCES and leaves the process at 0.
+    //
+    // The call happens for 0 as well. `--nice 0` asks that the job does not
+    // give way, so qex asks for 0 and does not leave the priority that the job
+    // received from the supervisor. On a machine with no privilege that ASK
+    // frequently gives nothing. Measured with a coordinator started under
+    // `nice 5`: `--nice 0` gave a job at nice 5, and `--nice 10` and
+    // `--nice 19` gave 10 and 19. qex makes the call so that it obeys the user
+    // where the machine permits it, and the help text and the documentation say
+    // that qex can only make a job give way MORE than the coordinator does.
+    //
+    // A number ABOVE the range is worse than a number below it. `setpriority`
+    // moves such a number INTO the range and reports success, so it never
+    // reaches this code as a fault. `Config::validate` and `JobSpec::resolve`
+    // refuse it, and the supervisor tests the configuration again above.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+    }
+
+    // The disk, on Linux. A build that reads the whole source tree makes an
+    // editor wait for its own file without this.
+    #[cfg(target_os = "linux")]
+    {
+        // From <linux/ioprio.h>. The class is in the top three bits.
+        const IOPRIO_WHO_PROCESS: libc::c_int = 1;
+        const IOPRIO_CLASS_SHIFT: libc::c_int = 13;
+        const CLASS_BEST_EFFORT: libc::c_int = 2;
+        const CLASS_IDLE: libc::c_int = 3;
+
+        let value = match io_class {
+            // Level 4, the middle of the eight levels of the class.
+            //
+            // THIS IS NOT NECESSARILY MORE POLITE THAN `none`. The man page of
+            // `ionice` gives the level of a process that asked for nothing as
+            // `(cpu_nice + 20) / 5`, so a job at the default `nice = 10` gets
+            // level 6 with no call at all, and level 4 asks for MORE of the
+            // disk than that. `none` is the default of qex for this reason, and
+            // `idle` is the value that makes a job give way.
+            "best-effort" => Some((CLASS_BEST_EFFORT << IOPRIO_CLASS_SHIFT) | 4),
+            "idle" => Some(CLASS_IDLE << IOPRIO_CLASS_SHIFT),
+            _ => None,
+        };
+        if let Some(value) = value {
+            unsafe {
+                libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, value);
+            }
+        }
+
+        // The out-of-memory score. A background job should lose that
+        // competition before an editor that holds an hour of work.
+        //
+        // This writes a file, and a write in a child between the fork and the
+        // exec must not allocate. `write` on a fixed buffer is safe here.
+        if oom_score_adj != 0 {
+            write_oom_score(oom_score_adj);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS has no equivalent of either, and `nice` above covers the
+        // processor. The values are read and ignored, which the configuration
+        // says.
+        let _ = (io_class, oom_score_adj);
+    }
+}
+
+/// Writes the out-of-memory score of this process.
+///
+/// This operates between the fork and the exec, so it uses the system calls
+/// only and it allocates nothing.
+#[cfg(target_os = "linux")]
+fn write_oom_score(value: i32) {
+    let mut out = [0u8; OOM_TEXT];
+    let len = write_i32(value, &mut out);
+
+    unsafe {
+        let path = c"/proc/self/oom_score_adj";
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, out.as_ptr() as *const libc::c_void, len);
+            libc::close(fd);
+        }
+    }
+}
+
+/// The space that the text of any `i32` needs.
+///
+/// `-2147483648` is 11 characters: 10 digits and the sign.
+#[cfg(target_os = "linux")]
+const OOM_TEXT: usize = 11;
+
+/// Writes the text of a whole number into a buffer, and gives its length.
+///
+/// # Why the buffer holds ANY `i32`
+///
+/// The kernel takes -1000 to 1000, and `Config::validate` refuses anything
+/// else, so a larger number does not arrive here. The buffer still holds one.
+///
+/// This code runs in the child, between the fork and the exec. An index outside
+/// a buffer is a panic; a panic formats a message; and that allocates and takes
+/// two locks in a process where no lock is safe. The job would then die. A
+/// buffer that fits the values that qex EXPECTS puts the life of the job behind
+/// a test in another file. A buffer that fits every value it can RECEIVE does
+/// not.
+#[cfg(target_os = "linux")]
+fn write_i32(value: i32, out: &mut [u8; OOM_TEXT]) -> usize {
+    // The digits, in the wrong order. `unsigned_abs` and not `-value`, because
+    // `-i32::MIN` is not an `i32` and it would stop here in a debug build.
+    let mut digits = [0u8; 10];
+    let mut n = 0;
+    let mut v = value.unsigned_abs();
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+        if v == 0 {
+            break;
+        }
+    }
+
+    let mut len = 0;
+    if value < 0 {
+        out[0] = b'-';
+        len = 1;
+    }
+    for i in (0..n).rev() {
+        out[len] = digits[i];
+        len += 1;
+    }
+    len
+}
+
 /// Gives the last words of the supervisor of a job.
 ///
 /// The supervisor writes its faults to `supervisor.log`, and a supervisor that
@@ -936,6 +1143,66 @@ fn read_usage() -> Usage {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// A second fault must not push the first one out of the record.
+    ///
+    /// A job can meet more than one fault before it starts. Measured with
+    /// `[enforce] mode = "hard"` on a machine with no cgroup delegation AND
+    /// `[politeness] nice = 100`: `qex status --json` gave the memory-limit
+    /// fault only, and the politeness fault reached `supervisor.log`, which no
+    /// command reads. The user then had a job at a priority that nobody asked
+    /// for and nothing to read about it.
+    #[test]
+    fn a_job_with_two_faults_keeps_both_of_them() {
+        let mut error = None;
+        add_fault(&mut error, "the memory limit is not active.".into());
+        assert_eq!(error.as_deref(), Some("the memory limit is not active."));
+
+        add_fault(&mut error, "the politeness values have a fault.".into());
+        let both = error.unwrap();
+        assert!(
+            both.contains("memory limit") && both.contains("politeness"),
+            "the record must keep both faults, and it said: {both}"
+        );
+    }
+
+    /// The text of the OOM score must fit the buffer for EVERY `i32`.
+    ///
+    /// This code runs in the child, between the fork and the exec. An index
+    /// outside the buffer is a panic; a panic formats a message; and that
+    /// allocates and takes two locks in a process where no lock is safe. The
+    /// job would then die, and this step must never be able to stop a job.
+    ///
+    /// An earlier form of this code held a buffer for -1000 to 1000 and nothing
+    /// held the value inside that range. This test therefore uses the two ends
+    /// of the type, and not the two ends of the range that the kernel accepts.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_oom_score_text_fits_the_buffer_for_every_number() {
+        for value in [
+            i32::MIN,
+            i32::MIN + 1,
+            -100000,
+            -1000,
+            -1,
+            0,
+            1,
+            9,
+            10,
+            500,
+            1000,
+            999999,
+            i32::MAX,
+        ] {
+            let mut out = [0u8; OOM_TEXT];
+            let len = write_i32(value, &mut out);
+            assert_eq!(
+                std::str::from_utf8(&out[..len]).unwrap(),
+                value.to_string(),
+                "the text of {value} is wrong"
+            );
+        }
+    }
 
     /// The words of the supervisor must reach the record of the job.
     ///
@@ -1139,6 +1406,7 @@ mod tests {
             group_name: None,
             locks: vec![],
             retries: 0,
+            nice: None,
             needs: vec![],
             after: vec![],
             submitted_at: 0,

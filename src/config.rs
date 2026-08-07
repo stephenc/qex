@@ -220,6 +220,68 @@ where
     d.deserialize_any(WholeNumber).map(Some)
 }
 
+/// Reads a whole number that can be below zero, with or without quotation
+/// marks.
+///
+/// [`whole_number_opt`] takes a count, so it refuses a number below zero.
+/// `[politeness] nice` and `[politeness] oom_score_adj` are the two fields that
+/// need a number below zero, so they need this function.
+///
+/// The rule of the documentation is that the quotation marks make no
+/// difference. Without this function `nice = "10"` refused the file with
+/// ``invalid type: string "10", expected i32``, which names a type in the
+/// program and gives no remedy, while `cpu = "1"` in the same file was
+/// accepted.
+fn signed_number<'de, D>(d: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    /// The message for a value from which qex can read no whole number.
+    fn refuse<E: de::Error>(wrote: &dyn fmt::Display) -> E {
+        de::Error::custom(format!(
+            "the value is `{wrote}`, and qex cannot read a whole number from it. Write a \
+             whole number, such as 10, with or without quotation marks. A number below \
+             zero takes a minus sign, such as -5."
+        ))
+    }
+
+    struct SignedNumber;
+
+    impl Visitor<'_> for SignedNumber {
+        type Value = i32;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a whole number such as 10, with or without quotation marks")
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
+            i32::try_from(v).map_err(|_| refuse(&v))
+        }
+        // An integer above `i64::MAX`. See the same method in `text_or_number`.
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
+            i32::try_from(v).map_err(|_| refuse(&v))
+        }
+        // A whole number that TOML read as a float, such as `10.0`. A value
+        // with a fraction stops here, because qex cannot obey half a step of
+        // priority and it must not choose one of the two neighbours in silence.
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i32, E> {
+            if v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64 {
+                Ok(v as i32)
+            } else {
+                Err(refuse(&v))
+            }
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
+            v.trim().parse::<i32>().map_err(|_| refuse(&v))
+        }
+    }
+
+    d.deserialize_any(SignedNumber)
+}
+
 /// Reads a decimal number that a person can write inside quotation marks.
 ///
 /// The mirror of [`text_or_number`] for `[system] max_pressure`,
@@ -415,6 +477,75 @@ impl Default for QueueConfig {
     }
 }
 
+/// The names that `[politeness] io` accepts.
+///
+/// `none` leaves the class of the job as it is.
+///
+/// The supervisor names the same three classes again, because it needs the
+/// NUMBER of each class for `ioprio_set` and this list holds the names only.
+/// Keep the two together: a name here that the supervisor does not know would
+/// leave every job in the usual class in silence.
+pub const IO_CLASSES: [&str; 3] = ["none", "best-effort", "idle"];
+
+/// How politely a job uses the machine.
+///
+/// # Why this exists
+///
+/// The queue controls HOW MANY cores a job uses. It does not control HOW RUDELY
+/// the job uses them. A build inside its budget still makes an editor stutter
+/// and a video call break up, because the job and the person ask the scheduler
+/// for the same cores and the scheduler treats them alike.
+///
+/// qex knows something that the scheduler does not: this work is in a queue, so
+/// nobody is waiting for the next second of it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PolitenessConfig {
+    /// The `nice` value of a job, from -20 to 19.
+    ///
+    /// A larger number gives the job less of the processor when something else
+    /// wants it. 0 is the value of a command that you type.
+    ///
+    /// A user cannot LOWER this number without privilege, and the usual
+    /// `RLIMIT_NICE` of 0 makes every number below zero such a number. qex
+    /// still makes the call; the system refuses it; and the job then runs at
+    /// the priority that it already had. Measured on Linux:
+    /// `setpriority(PRIO_PROCESS, 0, -5)` from nice 0 gives EACCES, and a job
+    /// submitted with `--nice -5` ran at nice 0 and completed.
+    #[serde(deserialize_with = "signed_number")]
+    pub nice: i32,
+    /// The class of the job for the disk, on Linux.
+    ///
+    /// `idle` gives the disk to everything else first. `best-effort` is the
+    /// usual class, and `none` leaves the class as it is.
+    ///
+    /// macOS has no equivalent, and qex ignores this value there.
+    pub io: String,
+    /// The value that qex adds to the out-of-memory score of a job, on Linux.
+    ///
+    /// The kernel chooses a victim when the machine has no memory left. A
+    /// larger number makes the job a more likely victim, and 0 leaves the
+    /// choice as it is.
+    ///
+    /// A background build should lose that competition before an editor with an
+    /// hour of unsaved work. A user cannot LOWER this value without privilege.
+    #[serde(deserialize_with = "signed_number")]
+    pub oom_score_adj: i32,
+}
+
+impl Default for PolitenessConfig {
+    fn default() -> Self {
+        Self {
+            // A background job gives way, and it still gets the whole machine
+            // when nothing else wants it. This is the value that `nice` itself
+            // gives with no argument.
+            nice: 10,
+            io: "none".into(),
+            oom_score_adj: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubmitConfig {
@@ -561,6 +692,7 @@ pub struct Config {
     pub peers: PeersConfig,
     pub queue: QueueConfig,
     pub submit: SubmitConfig,
+    pub politeness: PolitenessConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
     pub history: HistoryConfig,
@@ -937,6 +1069,55 @@ impl Config {
         Ok(Some(bytes))
     }
 
+    /// Reads the `[politeness]` values, and refuses one that the system cannot
+    /// obey.
+    ///
+    /// Each of these values goes to the system between the fork and the exec of
+    /// a job. That code cannot report a fault: it has no lock and no allocation
+    /// available, so it gives up in silence. A value with a fault would then
+    /// give every job something that nobody asked for, and say nothing.
+    /// Measured on Linux, from nice 0 and with no privilege: `nice = 100` gives
+    /// a job at nice 19, because `setpriority` takes 19 for any number above
+    /// the range and reports success; `nice = -21` gives EACCES and the job
+    /// keeps the priority that it had, because the number is below the range
+    /// AND below the number that the process has; `io = "iddle"` reads as
+    /// `io = "none"`; and the kernel refuses a write of
+    /// `oom_score_adj = 90000`, so the job keeps the score that it had.
+    ///
+    /// The test therefore belongs here, where qex can still name the file, the
+    /// value and the remedy.
+    pub fn politeness_values(&self) -> Result<()> {
+        let p = &self.politeness;
+        if !(-20..=19).contains(&p.nice) {
+            anyhow::bail!(
+                "config [politeness] nice is {}. Use a number from -20 to 19. The system \
+                 takes no other number, and it does not tell qex: above the range it uses \
+                 19 and reports success, and below the range it refuses the change on a \
+                 machine with no privilege. Each job then gets a priority that you did not \
+                 ask for, and nothing says so.",
+                p.nice
+            );
+        }
+        if !IO_CLASSES.contains(&p.io.as_str()) {
+            anyhow::bail!(
+                "config [politeness] io is `{}`. Use one of: {}. qex sets the class of a job \
+                 between the fork and the exec, where it cannot report a fault, so a name \
+                 with a fault would leave every job in the usual class in silence.",
+                p.io,
+                IO_CLASSES.join(", ")
+            );
+        }
+        if !(-1000..=1000).contains(&p.oom_score_adj) {
+            anyhow::bail!(
+                "config [politeness] oom_score_adj is {}. Use a number from -1000 to 1000. \
+                 The kernel refuses every other number, so this value changes nothing, and \
+                 the job stays as likely a victim as an editor of the user.",
+                p.oom_score_adj
+            );
+        }
+        Ok(())
+    }
+
     /// Reads each field that the config parser does not read immediately.
     ///
     /// Call this function at start. qex then reports an incorrect config file
@@ -959,6 +1140,7 @@ impl Config {
                 self.learn.margin
             );
         }
+        self.politeness_values()?;
         if self.enforce.mem_overcommit < 1.0 {
             anyhow::bail!(
                 "config [enforce] mem_overcommit is {}. Use a value of 1.0 or more. \
@@ -1300,6 +1482,108 @@ mod tests {
             text.lines().count() <= 6,
             "the short message must fit in a record: {text}"
         );
+    }
+
+    /// A politeness value must accept quotation marks, like every other number
+    /// in this file.
+    ///
+    /// The rule of the documentation is that the quotation marks make no
+    /// difference. `nice = "10"` refused the file with
+    /// ``invalid type: string "10", expected i32``, which names a type in the
+    /// program and gives no remedy, while `cpu = "1"` in the same file was
+    /// accepted.
+    #[test]
+    fn a_politeness_number_accepts_quotation_marks() {
+        let quoted: Config =
+            toml::from_str("[politeness]\nnice = \"15\"\noom_score_adj = \"-500\"\n").unwrap();
+        let bare: Config =
+            toml::from_str("[politeness]\nnice = 15\noom_score_adj = -500\n").unwrap();
+        assert_eq!(quoted.politeness.nice, bare.politeness.nice);
+        assert_eq!(
+            quoted.politeness.oom_score_adj,
+            bare.politeness.oom_score_adj
+        );
+        assert_eq!(quoted.politeness.nice, 15);
+        assert_eq!(quoted.politeness.oom_score_adj, -500);
+
+        // TOML reads `10.0` as a float, and a whole number is a whole number in
+        // both forms.
+        let float: Config = toml::from_str("[politeness]\nnice = 10.0\n").unwrap();
+        assert_eq!(float.politeness.nice, 10);
+
+        // A value from which qex can read no whole number must name the remedy
+        // and not a type in the program.
+        //
+        // The last one is ABOVE `i64::MAX`. The `toml` crate reads an integer as
+        // i64 where it fits and goes to u64 for a larger one, so that value is
+        // the one form that reaches `visit_u64`. A review called that method
+        // unreachable from TOML; this line is the file that reaches it.
+        for text in [
+            "[politeness]\nnice = \"ten\"\n",
+            "[politeness]\nnice = 10.5\n",
+            "[politeness]\noom_score_adj = 9999999999\n",
+            "[politeness]\nnice = 9223372036854775808\n",
+        ] {
+            let err = toml::from_str::<Config>(text).unwrap_err().to_string();
+            assert!(
+                err.contains("Write a whole number"),
+                "the message for `{text}` must give the remedy: {err}"
+            );
+        }
+
+        // A type that is neither a number nor text reaches `expecting`, and
+        // that text is the whole remedy that the user gets. serde writes
+        // "invalid type: boolean `true`, expected <the text of `expecting`>",
+        // so an empty or wrong `expecting` leaves the user with the name of a
+        // type in the program and no answer.
+        for text in [
+            "[politeness]\nnice = true\n",
+            "[politeness]\noom_score_adj = [1, 2]\n",
+        ] {
+            let err = toml::from_str::<Config>(text).unwrap_err().to_string();
+            assert!(
+                err.contains("a whole number such as 10, with or without quotation marks"),
+                "the message for `{text}` must name the two forms that qex takes: {err}"
+            );
+        }
+    }
+
+    /// A politeness value that the system cannot obey must be refused here.
+    ///
+    /// qex applies these values between the fork and the exec of a job, where
+    /// it cannot report a fault and gives up in silence. A value with a fault
+    /// would thus give every job something that nobody asked for, and say
+    /// nothing. Measured on Linux: `nice = 100` gives a job at nice 19, because
+    /// `setpriority` moves the number into the range and reports success;
+    /// `io = "iddle"` reads as `io = "none"`.
+    #[test]
+    fn a_politeness_value_that_the_system_refuses_is_refused_at_the_start() {
+        for (text, word) in [
+            ("[politeness]\nnice = 100\n", "-20 to 19"),
+            ("[politeness]\nnice = -21\n", "-20 to 19"),
+            ("[politeness]\nio = \"banana\"\n", "best-effort"),
+            ("[politeness]\noom_score_adj = 5000\n", "-1000 to 1000"),
+            ("[politeness]\noom_score_adj = 100000000\n", "-1000 to 1000"),
+        ] {
+            let c: Config = toml::from_str(text).unwrap();
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(word),
+                "the message for `{text}` must give the remedy `{word}`, and it said: {err}"
+            );
+        }
+
+        // Every value that the system accepts must pass.
+        for class in IO_CLASSES {
+            let c: Config = toml::from_str(&format!(
+                "[politeness]\nnice = 19\nio = \"{class}\"\noom_score_adj = 1000\n"
+            ))
+            .unwrap();
+            c.validate().unwrap();
+        }
+        let c: Config =
+            toml::from_str("[politeness]\nnice = -20\noom_score_adj = -1000\n").unwrap();
+        c.validate().unwrap();
     }
 
     #[test]

@@ -682,6 +682,16 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
             None => "NO LIMIT; a job can fill the disk that holds the records".to_string(),
         }
     );
+
+    // Show this, although the JSON form already holds it.
+    //
+    // `[politeness]` changes the priority of EVERY job, and it does so by
+    // default. A user who asks why a build is slow reads this text form, and a
+    // value that only the JSON form holds is a value that nobody reads.
+    println!(
+        "politeness:   nice {}; io {}, oom_score_adj {} (Linux only)",
+        cfg.politeness.nice, cfg.politeness.io, cfg.politeness.oom_score_adj
+    );
     match enforce::startup_warning(cfg) {
         Some(warning) => {
             println!("enforcement:  {:?} — NOT ACTIVE", cfg.enforce.mode);

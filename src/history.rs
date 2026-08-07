@@ -265,6 +265,7 @@ mod tests {
             group_name: None,
             locks: vec![],
             retries: 0,
+            nice: None,
             needs: vec![],
             after: vec![],
             submitted_at: crate::sys::now_secs(),

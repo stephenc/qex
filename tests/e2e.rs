@@ -5141,3 +5141,174 @@ fn check_the_bash_candidates(
         bait.display()
     );
 }
+
+/// A job must give way to the work of a person.
+///
+/// The queue controls how many cores a job uses. It does not control how rudely
+/// the job uses them, and a build inside its budget still makes an editor
+/// stutter. qex knows what the scheduler of the machine does not: this work sat
+/// in a queue, so nobody waits for the next second of it.
+#[test]
+fn a_job_gives_way_to_the_work_of_a_person() {
+    let h = Harness::with_default_config("polite");
+
+    // `ps` reports the nice value on Linux and on macOS alike.
+    let id = h.submit(&["submit", "--", "sh", "-c", "ps -o ni= -p $$"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "10",
+        "a job must be polite by default, and this one was not: {out}"
+    );
+
+    // A job that asks not to give way says so. The coordinator of this test
+    // runs at nice 0, so qex does not have to LOWER the value here and 0
+    // reaches the job. A coordinator under `nice 5` could not do this.
+    let id = h.submit(&["submit", "--nice", "0", "--", "sh", "-c", "ps -o ni= -p $$"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(out.trim(), "0", "`--nice 0` must reach the job: {out}");
+
+    // A machine that refuses the change must still run the job. The system
+    // refuses a number below the one that the coordinator has, unless qex has
+    // privilege, and qex does not ask for privilege.
+    let id = h.submit(&["submit", "--nice", "-5", "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    assert_eq!(
+        h.status_json(&id)["state"],
+        "completed",
+        "a nice value that the machine refuses must not stop the job"
+    );
+}
+
+/// Each `[politeness]` value must reach the job AND every child of the job.
+///
+/// The child matters more than the job itself. A job is frequently a shell that
+/// starts a build, and the build does the work. Linux keeps the nice value, the
+/// io class and the oom score across a fork, so one call between the fork and
+/// the exec covers the whole tree. This test measures the tree, and not the
+/// call, because a later change could set the values on the wrong process.
+///
+/// EVERY io class needs its own run. `ionice_set` takes one number that holds
+/// the class and the level together, so `best-effort` and `idle` share no code
+/// beyond the call. A test of `idle` alone left the whole `best-effort` line
+/// free: a review deleted it, and changed `|` to `&`, to `^`, and `<<` to `>>`,
+/// and every one of the four still passed.
+#[test]
+#[cfg(target_os = "linux")]
+fn every_politeness_value_reaches_the_job_and_its_children() {
+    // The name of the class as `ionice -p` gives it, for each name that
+    // `[politeness] io` takes. `best-effort` carries the level, because the
+    // level is half of the number that qex builds.
+    for (io, expect) in [
+        ("idle", "idle"),
+        ("best-effort", "best-effort: prio 4"),
+        ("none", "none: prio 0"),
+    ] {
+        let h = Harness::new(
+            &format!("polite-{io}"),
+            &format!(
+                "[peers]\nenabled = false\n\
+                 [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                 [politeness]\nnice = 12\nio = \"{io}\"\noom_score_adj = 500\n"
+            ),
+        );
+
+        // Field 19 of /proc/<pid>/stat is the nice value. The command reads the
+        // three values for itself, and then again in a child of itself.
+        let probe = "report() { \
+                     echo \"$1 nice=$(awk '{print $19}' /proc/$2/stat) \
+                     oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
+                     report parent $$; sh -c 'report() { \
+                     echo \"$1 nice=$(awk \"{print \\$19}\" /proc/$2/stat) \
+                     oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
+                     report child $$'";
+        // `[politeness]` changes the priority of every job, so the text form of
+        // `qex config show` must name the values. A user who asks why a build
+        // is slow reads this text, and not the JSON.
+        let shown = h.ok(&["config", "show"]);
+        assert!(
+            shown.contains("nice 12") && shown.contains(&format!("io {io}")),
+            "`qex config show` must name the politeness values: {shown}"
+        );
+
+        let id = h.submit(&["submit", "--", "sh", "-c", probe]);
+        h.ok(&["wait", &id, "--timeout", "45s"]);
+        let out = h.ok(&["logs", &id, "--stdout"]);
+
+        for who in ["parent", "child"] {
+            let line = out
+                .lines()
+                .find(|l| l.starts_with(who))
+                .unwrap_or_else(|| panic!("the job gave no {who} line: {out}"));
+            assert!(
+                line.contains("nice=12"),
+                "the {who} must take `[politeness] nice`: {line}"
+            );
+            assert!(
+                line.contains("oom=500"),
+                "the {who} must take `[politeness] oom_score_adj`: {line}"
+            );
+            assert!(
+                line.contains(expect),
+                "the {who} must take `io = \"{io}\"` as `{expect}`: {line}"
+            );
+        }
+    }
+}
+
+/// A `[politeness]` value with a fault, at the moment that a job starts, must
+/// give the DEFAULT values and name the fault.
+///
+/// `qex submit` tests the file, but the file can change after the submission: a
+/// job can wait in the queue while somebody edits the file, and `qex rerun`
+/// needs no config file at all. The supervisor reads the file for itself and
+/// parses it WITHOUT validating it, so without a second test the job would take
+/// the value as it is. Measured: `nice = 100` ran a job at nice 19, because
+/// `setpriority` moves the number into the range and reports success, and
+/// nothing said so.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
+    let good = "[peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                [politeness]\nnice = 12\n";
+    let h = Harness::new("polite-late", good);
+    let probe = "awk '{print $19}' /proc/$$/stat";
+
+    let first = h.submit(&["submit", "--", "sh", "-c", probe]);
+    h.ok(&["wait", &first, "--timeout", "45s"]);
+    assert_eq!(h.ok(&["logs", &first, "--stdout"]).trim(), "12");
+
+    // The file goes wrong AFTER the submission. The coordinator refuses it and
+    // keeps the values that it had; the supervisor must refuse it as well.
+    std::fs::write(
+        h.root.join("cfg/qex.toml"),
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [politeness]\nnice = 100\n",
+    )
+    .unwrap();
+
+    let out = h.qex(&["rerun", &first]);
+    assert!(out.status.success(), "`qex rerun` must still start the job");
+    let again = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    h.ok(&["wait", &again, "--timeout", "45s"]);
+    let status = h.status_json(&again);
+    assert_eq!(
+        status["state"], "completed",
+        "a config file with a fault must not stop the job: {status}"
+    );
+    assert_eq!(
+        h.ok(&["logs", &again, "--stdout"]).trim(),
+        "10",
+        "the job must take the DEFAULT nice value, and not the value with the fault"
+    );
+    let error = status["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("[politeness] nice"),
+        "the record of the job must name the fault: {status}"
+    );
+}

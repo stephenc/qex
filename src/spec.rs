@@ -47,6 +47,11 @@ pub struct JobFile {
     pub locks: Vec<String>,
     /// The number of times to run this job again when it fails.
     pub retries: Option<u32>,
+    /// How politely this job uses the processor, from -20 to 19.
+    ///
+    /// A larger number gives way to everything else. The default comes from
+    /// `[politeness] nice` in the configuration.
+    pub nice: Option<i32>,
     pub resources: Resources,
     pub env: BTreeMap<String, String>,
 }
@@ -128,6 +133,8 @@ pub struct SubmitOptions {
     pub locks: Vec<String>,
     /// The number of times to run the job again when it fails.
     pub retries: Option<u32>,
+    /// How politely this job uses the processor.
+    pub nice: Option<i32>,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -185,6 +192,9 @@ pub struct JobSpec {
     /// The number of times to run the job again when it fails.
     #[serde(default)]
     pub retries: u32,
+    /// How politely this job uses the processor. See `[politeness] nice`.
+    #[serde(default)]
+    pub nice: Option<i32>,
     pub submitted_at: u64,
 }
 
@@ -376,6 +386,30 @@ impl JobSpec {
             );
         }
 
+        // The priority of the job for the processor, from the command line or
+        // from the job file.
+        //
+        // A nice value goes from -20 to 19. qex makes that call between the
+        // fork and the exec of the job, where it has no way to report a fault,
+        // and `setpriority` gives qex nothing to report either. Measured on
+        // Linux from nice 0, with no privilege: `--nice 100` takes 19 and
+        // reports success, and `--nice -21` gives EACCES and leaves the job
+        // where it was. Each one gives a priority that the user did not ask
+        // for. The test belongs here, where qex can still name the value and
+        // the remedy.
+        let nice = opts.nice.or(file.nice);
+        if let Some(n) = nice {
+            if !(-20..=19).contains(&n) {
+                bail!(
+                    "the nice value {n} is outside the range -20 to 19. Use a number from \
+                     -20 to 19. The system takes no other number, and it does not say so: \
+                     above the range it uses 19, and below the range it refuses the change \
+                     on a machine with no privilege. A larger number gives way to the work \
+                     of a person, and 0 asks for the priority of a command that you type."
+                );
+            }
+        }
+
         let mut tags = file.tags;
         tags.extend(opts.tags.iter().cloned());
         tags.sort();
@@ -412,6 +446,7 @@ impl JobSpec {
                     all
                 },
                 retries: opts.retries.or(file.retries).unwrap_or(0),
+                nice,
                 // The CLI changes each name into an id after this function, because
                 // that step needs the coordinator.
                 needs: Vec::new(),
@@ -610,6 +645,73 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The nice value comes from the job file, and the command line replaces
+    /// it.
+    ///
+    /// A job with no value of its own keeps `None`, and the supervisor then
+    /// reads `[politeness] nice`. That is what makes `--nice 0` a real value
+    /// and not "no answer": 0 must reach the job and set 0.
+    #[test]
+    fn the_nice_value_runs_job_file_then_command_line() {
+        let _guard = env_lock();
+        let dir = tmpdir("nice");
+
+        // No value anywhere. The supervisor reads the configuration.
+        let o = opts(&["true"]);
+        assert_eq!(JobSpec::resolve(&o, &Config::default()).unwrap().nice, None);
+
+        // The job file gives the value.
+        let jf = job_file(&dir, "j.toml", "command = [\"true\"]\nnice = 5\n");
+        let mut o = SubmitOptions {
+            job_file: Some(jf.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            JobSpec::resolve(&o, &Config::default()).unwrap().nice,
+            Some(5)
+        );
+
+        // The command line replaces it, and 0 is a value and not an absence.
+        o.nice = Some(0);
+        assert_eq!(
+            JobSpec::resolve(&o, &Config::default()).unwrap().nice,
+            Some(0)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A nice value outside -20 to 19 must be refused at the submission.
+    ///
+    /// qex makes that call between the fork and the exec, where it cannot
+    /// report a fault, and `setpriority` gives it nothing to report. Measured
+    /// on Linux from nice 0, with no privilege:
+    /// `setpriority(PRIO_PROCESS, 0, 100)` gives 0 and leaves the process at
+    /// nice 19, and `setpriority(PRIO_PROCESS, 0, -21)` gives -1 with EACCES
+    /// and leaves it at 0. Without this test `--nice 100` would give a job at
+    /// nice 19, `--nice -21` would give a job at the priority of the
+    /// supervisor, and neither would say so.
+    #[test]
+    fn a_nice_value_outside_the_range_is_refused() {
+        let _guard = env_lock();
+        for n in [-21, 20, 100] {
+            let mut o = opts(&["true"]);
+            o.nice = Some(n);
+            let err = JobSpec::resolve(&o, &Config::default())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("-20 to 19"),
+                "the message must give the range, and it said: {err}"
+            );
+        }
+        for n in [-20, 0, 19] {
+            let mut o = opts(&["true"]);
+            o.nice = Some(n);
+            JobSpec::resolve(&o, &Config::default()).unwrap();
+        }
     }
 
     #[test]
