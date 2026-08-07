@@ -126,6 +126,10 @@ There is no value by default, and the config file has none until you write one. 
 job that qex discards is work that a person wanted, so qex never chooses that for
 you. Write `[defaults] max_queue_time` to get the rule for every job.
 
+A job takes this value at its SUBMISSION. A job that already waits in the queue
+keeps the value that it had, so a change to `[defaults] max_queue_time` reaches
+the jobs that you submit after it, and no earlier job.
+
 ## Resource claims
 
 Give `--cpu` and `--mem`. qex uses these claims to decide how many jobs operate

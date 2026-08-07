@@ -358,6 +358,10 @@ There is no value for this option by default, and there is none in the config
 file until you write one. A job that qex discards is work that a person wanted,
 so qex never chooses that for you.
 
+A job takes this value at its SUBMISSION. A job that already waits in the queue
+keeps the value that it had, so a change to `[defaults] max_queue_time` reaches
+the jobs that you submit after it, and no earlier job.
+
 What qex captures
 -----------------
 

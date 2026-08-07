@@ -92,7 +92,9 @@ BOTH streams. Prefer it: one command gives everything.
 | 127 | There is no job with that id. |
 
 `qex run` gives the exit code of the job when the job RAN, and for every other
-state it gives the same code as the table above. **125 from `qex run` does not
+state it gives the same code as the table above. It never gives 124: that code
+says that YOUR WAIT stopped while the job continued, and `qex run` sets no limit
+on its own wait. **125 from `qex run` does not
 say that your work failed.** A job of `qex run` is a job like any other, so
 another agent on this machine can run `qex kill` or `qex cancel` on it. Read the
 line on stderr before you start the work again.
