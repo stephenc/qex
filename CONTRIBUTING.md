@@ -193,7 +193,7 @@ the directory tree, so a copy of the source inside another repository would
 otherwise report a stranger's commit; `cargo install --git` makes exactly that
 shape.
 
-A coordinator that reports a development build below the support floor gives a
+A coordinator that reports a development build below the capability floor gives a
 WARNING and not a refusal, so a build that you make is usable by its own CLI.
 The capability test still refuses each option that such a coordinator cannot
 obey, and it names the option. See `src/capabilities.rs`.

@@ -32,7 +32,7 @@
 //! The text after `+` is SemVer build metadata, which a comparison of versions
 //! ignores. It never reaches Cargo.toml, so cargo has no opinion about it.
 //! `capabilities::parse` reads the whole string as `(0, 0, 0)`, which is below
-//! the support floor, and `version::is_development` names it a development
+//! the capability floor, and `version::is_development` names it a development
 //! build so that qex warns about it and does not refuse it.
 //!
 //! # Two rules, and the file says which one it is
@@ -110,6 +110,65 @@ use std::process::Command;
 /// The number that `main` holds, and that nothing else holds.
 const DEVELOPMENT: &str = "0.0.0-dev";
 
+/// The first version that answers the capability handshake.
+///
+/// A build below this number cannot say what it is unable to obey, so qex can
+/// make no promise about it. That is the whole meaning of the number: it is not
+/// a statement about which versions somebody wants to support.
+///
+/// This must agree with `capabilities::CAPABILITY_FLOOR`. A build script cannot
+/// read a constant of the crate that it builds, so the number is here as well,
+/// and `main` writes it into the build. The test
+/// `the_floor_of_the_build_agrees_with_the_floor_of_the_code` then holds the
+/// two together, so they cannot go apart in silence.
+const CAPABILITY_FLOOR: (u32, u32, u32) = (0, 6, 0);
+
+/// Stops a build that would give a binary that qex itself refuses.
+///
+/// `capabilities::check_floor` refuses a coordinator below `CAPABILITY_FLOOR`,
+/// because a build below it comes from before the capability handshake and
+/// cannot say what it is unable to do. A binary that carries such a number is
+/// therefore of no use: its own CLI refuses it, and the person who installed it
+/// meets that with no cause.
+///
+/// `0.0.0-dev` is NOT this case. Its numbers are below the floor, and
+/// `version::is_development` names it, so qex warns about such a build and runs
+/// it.
+///
+/// The fault that this prevents is a number that somebody writes into
+/// `Cargo.toml` by hand, and a release that a fault in the version rules makes
+/// too small. It stops at the build, where a person reads the reason, and not
+/// at the first command after an install.
+fn refuse_below_the_floor(version: &str) {
+    let (major, minor, patch) = CAPABILITY_FLOOR;
+    let numbers: Vec<u32> = version.split('.').filter_map(|p| p.parse().ok()).collect();
+
+    if numbers.len() != 3 || version.split('.').count() != 3 {
+        panic!(
+            "the version `{version}` in Cargo.toml is neither three numbers nor \
+             `{DEVELOPMENT}`.\n\n\
+             qex compares this number against the first version that answers the \
+             capability handshake,\
+             and it cannot read this one, so the build would give a binary that qex \
+             refuses.\n\n\
+             Put three numbers in Cargo.toml, such as `{major}.{minor}.{patch}`, or \
+             leave `{DEVELOPMENT}` for a build that is not a release."
+        );
+    }
+
+    if (numbers[0], numbers[1], numbers[2]) < CAPABILITY_FLOOR {
+        panic!(
+            "the version `{version}` in Cargo.toml is below `{major}.{minor}.{patch}`, \
+             which is the first version that answers the capability handshake.\n\n\
+             A coordinator below that number does not say what it can do, so qex refuses \
+             it. This build would therefore give a binary that its own CLI refuses, and \
+             the person who installed it would meet that with no cause.\n\n\
+             Put `{major}.{minor}.{patch}` or a later number in Cargo.toml, or leave \
+             `{DEVELOPMENT}` for a build that is not a release."
+        );
+    }
+}
+
 fn main() {
     let (version, from_git) = version();
 
@@ -118,6 +177,8 @@ fn main() {
     }
 
     println!("cargo:rustc-env=QEX_BUILD_VERSION={version}");
+    let (major, minor, patch) = CAPABILITY_FLOOR;
+    println!("cargo:rustc-env=QEX_BUILD_FLOOR={major}.{minor}.{patch}");
 }
 
 /// The files that change the answer.
@@ -177,6 +238,7 @@ fn version() -> (String, bool) {
     // otherwise.
     let packaged = env!("CARGO_PKG_VERSION");
     if packaged != DEVELOPMENT {
+        refuse_below_the_floor(packaged);
         return (packaged.to_string(), false);
     }
 

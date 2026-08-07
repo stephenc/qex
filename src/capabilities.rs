@@ -19,7 +19,7 @@
 //! then asks the coordinator what it can do.
 //!
 //! Every version that qex supports answers the `Capabilities` request, so there
-//! is one path and no table of earlier versions. `SUPPORT_FLOOR` is what makes
+//! is one path and no table of earlier versions. `CAPABILITY_FLOOR` is what makes
 //! that true: a coordinator below it is refused before any question about one
 //! job.
 //!
@@ -45,9 +45,9 @@
 //! coordinator what it can do, and it refuses a job that the coordinator cannot
 //! obey.
 //!
-//! # The support floor
+//! # The capability floor
 //!
-//! `SUPPORT_FLOOR` is the first version that qex published. A coordinator below
+//! `CAPABILITY_FLOOR` is the first version that qex published. A coordinator below
 //! it comes from a build that no release holds, and qex has no promise about
 //! it. The CLI refuses such a coordinator, and it gives the way to correct the
 //! problem.
@@ -76,14 +76,27 @@
 use crate::spec::JobSpec;
 use crate::version::is_development;
 
-/// The first version that qex published, and thus the earliest version that
-/// qex supports.
+/// The first version that ANSWERS THE CAPABILITY HANDSHAKE.
 ///
-/// A build below this number never reached a release: no version below 0.6.0
-/// went out anywhere. Two agents that share a machine can each hold a different
-/// build, and a coordinator can operate for hours, so a mixture of versions is
-/// normal and qex must say which mixtures it supports. The answer is: this
-/// number and above.
+/// # This number says nothing about which versions get a correction
+///
+/// qex corrects a fault in the NEXT version, and never in an earlier one. So
+/// "the versions that qex supports" is always "the newest one", and no number
+/// could say it.
+///
+/// This number means one thing: **below it, a coordinator does not report what
+/// it can do.** The CLI asks with the `Capabilities` request, and a coordinator
+/// from before this version gives no answer — so the CLI cannot learn whether
+/// that coordinator obeys `--lock`, or `--nice`, or anything else. It must not
+/// let a user believe a rule holds when it may not, so it refuses.
+///
+/// A coordinator AT or ABOVE this number needs no such refusal, whatever its
+/// age. It names what it can do, and `check` then refuses the exact option that
+/// it cannot obey, by name.
+///
+/// A build below this number also never reached a release — no version below
+/// 0.6.0 went out anywhere — so the only programs that report such a number are
+/// ones that somebody built.
 ///
 /// # TWO DIFFERENT PROGRAMS NOW REPORT A NUMBER BELOW THIS ONE
 ///
@@ -101,7 +114,7 @@ use crate::version::is_development;
 /// `(0, 0, 0) < (0, 6, 0)` is true for the second one as well, so the three
 /// numbers cannot tell the two apart. `version::is_development` tells them
 /// apart, and `check_floor` reads it.
-pub const SUPPORT_FLOOR: (u32, u32, u32) = (0, 6, 0);
+pub const CAPABILITY_FLOOR: (u32, u32, u32) = (0, 6, 0);
 
 /// The answer of the floor test.
 ///
@@ -118,7 +131,7 @@ pub enum Floor {
     Below(String),
 }
 
-/// Tests the version of the coordinator against the support floor.
+/// Tests the version of the coordinator against the capability floor.
 ///
 /// Each message gives the remedy, because a user cannot correct a fault that
 /// has no instruction: the coordinator stops when no job operates, and the next
@@ -127,7 +140,7 @@ pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Floor {
     // A development build is not an early build. Read the note at the top of
     // this file for the reason that it gets a warning and not a refusal.
     if is_development(coordinator_version) {
-        if parse(coordinator_version) >= SUPPORT_FLOOR {
+        if parse(coordinator_version) >= CAPABILITY_FLOOR {
             // The number is above the floor already, so the carve-out changes
             // nothing and there is nothing to say.
             return Floor::Supported;
@@ -145,16 +158,16 @@ pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Floor {
         ));
     }
 
-    if parse(coordinator_version) >= SUPPORT_FLOOR {
+    if parse(coordinator_version) >= CAPABILITY_FLOOR {
         return Floor::Supported;
     }
 
-    let (major, minor, patch) = SUPPORT_FLOOR;
+    let (major, minor, patch) = CAPABILITY_FLOOR;
     Floor::Below(format!(
-        "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and qex \
-         supports {major}.{minor}.{patch} and above.\n\n\
-         That coordinator comes from a build that no release holds, so qex gives no promise \
-         about it.\n\n\
+        "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and a \
+         coordinator says what it can do from {major}.{minor}.{patch} and above.\n\n\
+         That coordinator does not answer the question, so qex cannot learn which options it \
+         obeys, and it must not let you believe a rule holds when it may not.\n\n\
          The coordinator stops when no job operates, and the next command then starts one from \
          the program that you have now. To change it now:\n\
          \x20   kill {coordinator_pid}\n\n\
@@ -175,7 +188,7 @@ pub const ALL: &[&str] = &[
 /// Reads a version such as `0.5.1`.
 ///
 /// A version that this function cannot read gives the lowest value. Such a
-/// coordinator is thus below the support floor and the CLI refuses it, which is
+/// coordinator is thus below the capability floor and the CLI refuses it, which is
 /// the safe direction.
 pub fn parse(version: &str) -> (u32, u32, u32) {
     let mut parts = version.trim().split('.').map(|p| {
@@ -399,12 +412,33 @@ mod tests {
     ///
     /// The test fails for a build that is below the floor and is NOT a
     /// development build, which is exactly the state that must not exist.
+    /// `build.rs` holds this number as well, and the two must agree.
+    ///
+    /// A build script cannot read a constant of the crate that it builds, so
+    /// the number is written in both places. `build.rs` refuses a build whose
+    /// `Cargo.toml` holds a release number below its own copy — so if the two
+    /// went apart, that refusal would use one number while `check_floor` used
+    /// another, and a release could be made that qex then refuses.
+    ///
+    /// `build.rs` writes its copy into the build, so this test reads it.
+    #[test]
+    fn the_floor_of_the_build_agrees_with_the_floor_of_the_code() {
+        let written = env!("QEX_BUILD_FLOOR");
+        let (major, minor, patch) = CAPABILITY_FLOOR;
+        assert_eq!(
+            written,
+            format!("{major}.{minor}.{patch}"),
+            "build.rs holds {written} and capabilities.rs holds {major}.{minor}.{patch}"
+        );
+        assert_eq!(parse(written), CAPABILITY_FLOOR);
+    }
+
     #[test]
     fn this_build_is_not_below_the_floor() {
         let mine = crate::version::VERSION;
         assert!(
-            parse(mine) >= SUPPORT_FLOOR || crate::version::is_development(mine),
-            "this build reports `{mine}`, which is below the support floor and is not a \
+            parse(mine) >= CAPABILITY_FLOOR || crate::version::is_development(mine),
+            "this build reports `{mine}`, which is below the capability floor and is not a \
              development build"
         );
 

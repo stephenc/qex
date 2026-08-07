@@ -117,7 +117,7 @@ coordinator ignores in silence — and a job that runs without the lock that you
 asked for is worse than a job that does not run. qex thus asks the coordinator
 what it can do, and it refuses the job with the option and the remedy.
 
-## The support floor
+## The capability floor
 
 qex supports the first published version and above. A coordinator below that
 number comes from a build that no release holds, so no promise covers it, and

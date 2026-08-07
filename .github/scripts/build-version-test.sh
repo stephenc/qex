@@ -125,6 +125,33 @@ check "a tree with changes that nobody committed is marked" \
     "0.0.0-dev+g$commit.dirty" "$(reports "$own")"
 git -C "$own" checkout -q -- src/main.rs
 
+# THE SHAPE OF A RELEASE BUILD, and the one that no other test here reaches.
+#
+# A release checks out the tag. That tree HAS a repository of its own, its root
+# IS the package, and its Cargo.toml holds the real number, because the commit
+# that the tag names wrote it. The answer must come from Cargo.toml, and git
+# must not be consulted at all.
+#
+# Every other test here is either "a real number with no repository of ours" or
+# "a development number with a repository of ours". Neither separates the two
+# rules, because the test of the root of the repository alone gives the right
+# answer for both. Without this test, a change that reads git BEFORE Cargo.toml
+# passes every other test here, and each release binary then reports a commit
+# in place of its version. The release workflow tests the binary as well, and
+# it does so after the tag is public.
+release="$work/release"
+copy_package "$release" "0.8.0"
+(
+    cd "$release"
+    git init -q -b main .
+    git config user.email t@example.com
+    git config user.name Test
+    git add -A
+    git commit -q -m "chore(release): v0.8.0"
+) >/dev/null
+check "a checkout of a tag reports the number in Cargo.toml, and never a hash" \
+    "0.8.0" "$(reports "$release")"
+
 echo "== A git worktree =="
 
 # `--show-toplevel` gives the root of the WORKTREE, and our worktrees hold the

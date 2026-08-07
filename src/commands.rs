@@ -2028,7 +2028,7 @@ fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
     };
 
     // Every version that qex supports answers this request. A coordinator that
-    // does not answer it is below the support floor, and it gets an empty list;
+    // does not answer it is below the capability floor, and it gets an empty list;
     // the floor test then refuses it with the correct words.
     match client.call(&Request::Capabilities) {
         Ok(Response::Capabilities { names }) => (names, version, pid),
