@@ -637,10 +637,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         let note = "the output of this job did not close, so a log file can be missing its \
                     last part. A process of the job kept the pipe open. Read the log file, \
                     and start the job again if you need the full output.";
-        status.error = Some(match status.error.take() {
-            Some(first) => format!("{first}; {note}"),
-            None => note.to_string(),
-        });
+        add_fault(&mut status.error, note.to_string());
         // Say it in the record as well, and not in the text only.
         //
         // The counts here are the counts that arrived. A copy that did not
@@ -839,10 +836,13 @@ const RACE_TIMER: u8 = 2;
 /// to read about it.
 ///
 /// The reader needs every fault, so this function joins them.
+///
+/// The mark between two faults is `; `, which is the mark that the output limit
+/// already used for the same purpose. One mark, and one place that joins.
 fn add_fault(error: &mut Option<String>, message: String) {
     match error {
         Some(already) => {
-            already.push(' ');
+            already.push_str("; ");
             already.push_str(&message);
         }
         None => *error = Some(message),
