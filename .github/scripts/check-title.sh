@@ -25,6 +25,19 @@
 
 set -euo pipefail
 
+# `${#title}` counts characters in a UTF-8 locale, and BYTES in the C locale.
+# A title in a writing system that takes more than one byte for each character
+# would then meet a limit far below the 72 that the message promises.
+#
+# This value replaces the value of the caller, and it does not defer to it. The
+# work of this script is to count characters, so the answer must not change with
+# the machine that runs it.
+#
+# A machine that does not hold `C.UTF-8` falls back and counts bytes. That
+# refuses more titles than it must, which is the safe direction: it stops a
+# merge, and it never lets a title through that the limit refuses.
+export LC_ALL=C.UTF-8
+
 title="${1-}"
 
 if [ -z "$title" ]; then
@@ -38,8 +51,30 @@ pattern="^($types)(\([a-z0-9._/-]+\))?!?: .+"
 bad=0
 
 if [[ ! "$title" =~ $pattern ]]; then
-    echo "the title does not follow Conventional Commits:"
-    echo "    $title"
+    # A capital letter in the type is the fault that hides.
+    #
+    # `next-version.sh` reads the type with `[a-zA-Z]+`, so `Feat: a thing`
+    # matches its pattern. It then compares the type against `feat` in lower
+    # case, that comparison fails, and the release does NOT happen. The title
+    # looks correct, CI would have agreed with it, and the change reaches `main`
+    # with no release and no message.
+    #
+    # This test therefore names the fault, and does not leave the author to find
+    # a capital letter in a title that reads correctly.
+    lower="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$lower" =~ $pattern ]]; then
+        echo "the type of the title holds a capital letter, and it must be all"
+        echo "in small letters:"
+        echo "    $title"
+        echo
+        echo "A type with a capital letter gives NO release. The script that"
+        echo "calculates the version reads the type, compares it against \`feat\`"
+        echo "and \`fix\` in small letters, finds no agreement, and asks for no"
+        echo "release. Nothing else says that this happened."
+    else
+        echo "the title does not follow Conventional Commits:"
+        echo "    $title"
+    fi
     bad=1
 fi
 
@@ -77,7 +112,7 @@ A title starts with a type, and then a colon and a space:
 The type gives the next version number:
 
     feat            the second number goes up   (0.5.3 -> 0.6.0)
-    fix, perf       the third number goes up    (0.5.3 -> 0.5.4)
+    fix, perf, revert  the third number goes up (0.5.3 -> 0.5.4)
     feat!           a break. WHILE THE FIRST NUMBER IS 0, a break moves the
                     SECOND number (0.5.3 -> 0.6.0). It does not go to 1.0.0.
     everything else no release

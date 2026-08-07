@@ -80,27 +80,12 @@ jobs:
           key: msrv-${{ steps.msrv.outputs.version }}
       - run: cargo +${{ steps.msrv.outputs.version }} check --all-targets --locked
 
-  # The title of the pull request is the message of the commit that reaches
-  # `main`, because this repository accepts a squash only. The version number of
-  # a release comes from that message, so this test guards the release.
+  # The form of the title of a pull request is in `pr-title.yml`, and not here.
   #
-  # This job read the commits of the BRANCH until 2026-08-07. Those messages
-  # never reach `main`, so the one message that decides the release was the one
-  # message that nothing tested.
-  title:
-    name: The form of the pull request title
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    if: github.event_name == 'pull_request'
-    steps:
-      - uses: actions/checkout@v5
-      - name: The title must follow Conventional Commits
-        # The title goes through the environment, and never into the text of the
-        # command. A person outside this project can write a title, and text
-        # inside a command becomes part of that command.
-        env:
-          TITLE: ${{ github.event.pull_request.title }}
-        run: .github/scripts/check-title.sh "$TITLE"
+  # That test must run again when a person changes the title, which is an
+  # `edited` event and not a push. This workflow must NOT run on `edited`: it
+  # would build the four release targets and run the tests on three machines
+  # each time a person corrects a word.
 
   # Prove that each target of the release builds, before a merge to main and not
   # after it. A release that fails to build for one machine is a release that
