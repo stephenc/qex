@@ -904,8 +904,10 @@ impl Config {
 
     /// Gives the bytes that qex keeps for each stream of each job.
     ///
-    /// `None` means that no limit operates. The values `0`, `none` and
-    /// `unlimited` give that result.
+    /// `None` means that no limit operates. The values `0`, `none`, `never` and
+    /// `unlimited` give that result. These are the four words that
+    /// [`units::parse_duration`] takes for a time with no limit, so one
+    /// vocabulary covers both.
     pub fn log_max_bytes(&self) -> Result<Option<u64>> {
         let text = self.logs.max_bytes.trim().to_ascii_lowercase();
         if matches!(text.as_str(), "0" | "none" | "never" | "unlimited") {
@@ -919,12 +921,16 @@ impl Config {
         // A limit must hold a head, a tail and the line that says what went. A
         // smaller value gives a file that answers no question, and a user who
         // writes one has an intention that the file cannot satisfy.
+        //
+        // The message gives the RAW BYTE COUNT of both numbers. `format_size`
+        // rounds, so `max_bytes = "16383"` gave "max_bytes is 16KB. Use 16KB or
+        // more", which asks the user for the value that the user wrote.
         if bytes < crate::logcap::MIN_LIMIT {
             anyhow::bail!(
-                "config [logs] max_bytes is {}. Use {} or more, or use \"0\" for no limit. \
-                 A smaller limit does not hold the start of the output, the end of the \
-                 output and the line that says how much went.",
-                units::format_size(bytes),
+                "config [logs] max_bytes is {bytes} bytes. Use {} bytes ({}) or more, or use \
+                 \"0\" for no limit. A smaller limit does not hold the start of the output, \
+                 the end of the output and the line that says how much went.",
+                crate::logcap::MIN_LIMIT,
                 units::format_size(crate::logcap::MIN_LIMIT)
             );
         }
@@ -1412,10 +1418,17 @@ timeout = "0"
         let c: Config = toml::from_str("[logs]\nmax_bytes = \"64MB\"\n").unwrap();
         assert_eq!(c.log_max_bytes().unwrap(), Some(64 << 20));
 
-        for text in ["\"0\"", "\"none\"", "\"unlimited\""] {
+        // These are the four words that a time with no limit takes, so the
+        // documentation of one field is the documentation of the other.
+        for text in ["\"0\"", "\"none\"", "\"never\"", "\"unlimited\""] {
             let c: Config = toml::from_str(&format!("[logs]\nmax_bytes = {text}\n")).unwrap();
             assert_eq!(c.log_max_bytes().unwrap(), None, "for {text}");
             c.validate().unwrap();
+            assert_eq!(
+                units::parse_duration(text.trim_matches('"')).unwrap(),
+                None,
+                "the two fields must take the same words for no limit"
+            );
         }
     }
 
@@ -1452,6 +1465,39 @@ timeout = "0"
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("[logs] max_bytes"), "got: {err}");
         assert!(err.contains("0"), "the message must give the remedy: {err}");
+    }
+
+    /// The refusal must not ask the user for the value that the user wrote.
+    ///
+    /// One byte below the limit is the message that a user meets after the
+    /// first correction. `format_size` rounds, so the message said
+    /// "max_bytes is 16KB. Use 16KB or more", which names one value two times
+    /// and gives the reader no way forward. The raw byte count separates them.
+    #[test]
+    fn the_refusal_of_a_small_limit_gives_the_raw_byte_count() {
+        let one_below = crate::logcap::MIN_LIMIT - 1;
+        let c: Config = toml::from_str(&format!("[logs]\nmax_bytes = {one_below}\n")).unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("is {one_below} bytes")),
+            "the message must give the value that the user wrote: {err}"
+        );
+        assert!(
+            err.contains(&format!("Use {} bytes", crate::logcap::MIN_LIMIT)),
+            "the message must give the value that qex needs: {err}"
+        );
+        assert!(
+            !err.contains("is 16KB. Use 16KB"),
+            "the message names one value two times: {err}"
+        );
+
+        // The value that the message asks for must be accepted.
+        let ok: Config = toml::from_str(&format!(
+            "[logs]\nmax_bytes = {}\n",
+            crate::logcap::MIN_LIMIT
+        ))
+        .unwrap();
+        ok.validate().unwrap();
     }
 
     #[test]

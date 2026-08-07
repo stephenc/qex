@@ -2879,13 +2879,10 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
     // log file that qex opened for writing only, that read gives nothing, the
     // count loses about 8000 lines, and the record then says that the job wrote
     // 492000 lines when it wrote 500000.
-    // A line is a line end. The head stops at a byte and not at a line end, so
-    // its last line is a fragment that qex counts as gone; a count of the text
-    // between the line ends would count that fragment as a line and give 500001.
-    // qex writes one line end of its own before its first note, and each of its
-    // notes is one more.
+    // A line is a line end, so the count is the line ends that are not the line
+    // ends of the notes of qex.
     let notes = text.lines().filter(|l| l.starts_with("[qex]")).count() as u64;
-    let kept = text.matches('\n').count() as u64 - notes - 1;
+    let kept = text.matches('\n').count() as u64 - notes;
     assert_eq!(
         kept + dropped["stdout_lines"].as_u64().unwrap(),
         500_000,
@@ -2893,6 +2890,20 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
          must be the 500000 lines that the job wrote.",
         dropped["stdout_lines"]
     );
+
+    // The head must hold whole lines only. It stops at a byte, so qex moves the
+    // cut back to the last line end. Measured before that change: the head
+    // ended `3498` and then `3`, where the job wrote `3499`, and a reader has
+    // no way to see that `3` is half of a line.
+    let head = &text[..text
+        .find("[qex]")
+        .expect("the file must hold a note of qex")];
+    for line in head.lines() {
+        let n: u64 = line
+            .parse()
+            .unwrap_or_else(|_| panic!("the head holds `{line}`, which is not a whole line"));
+        assert!((1..=500_000).contains(&n), "`{line}` is not in the output");
+    }
 
     // The commands must not present a part of the output as the whole output.
     let logs = h.qex(&["logs", &id, "--stdout", "--tail", "5"]);

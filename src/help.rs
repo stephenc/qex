@@ -719,7 +719,9 @@ the two, qex writes a line that says how many bytes and how many lines went:
 the file is not the whole output. `qex status --json` gives it in the field
 `logs_dropped`.
 
-Use `max_bytes = \"0\"` for no limit. Then a job can fill the disk.
+Use `max_bytes = \"0\"` for no limit. The words \"none\", \"never\" and \"unlimited\"
+do the same, and they are the words that `[defaults] timeout` takes. Then a job
+can fill the disk.
 
 The supervisor of a job reads this field one time, when the job starts. A change
 to the file thus does nothing to a job that already writes, and it controls the
@@ -1004,6 +1006,16 @@ regular file. Almost every program sees no difference. Three things change:
 If a program needs a regular file, give it one:
 
     qex submit -- sh -c 'my-program > out.txt'
+
+A pipe closes when the last process that holds it stops, so a job that leaves a
+process behind (`setsid`, `nohup ... &`, a daemon that a test starts) keeps its
+output open after the job ends. qex waits 30 seconds for the output to close and
+then writes the result: a record that arrives is worth more than a wait with no
+end. The record then says `incomplete` in the field `logs_dropped`, and `error`
+says that a log file can be missing its last part. The wait does not fail the
+job. To get the result at once, give that process an output of its own:
+
+    qex submit -- sh -c 'setsid my-daemon > daemon.log 2>&1 &'
 
 Use `--follow --grep` in place of a pipe to `grep`. A pipe holds the lines in a
 buffer and shows nothing until the buffer fills, because `grep` needs the option

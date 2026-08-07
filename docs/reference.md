@@ -573,7 +573,9 @@ the middle of a line. One JSON document, one base64 block and a progress display
 that uses `\r` all give output with no line end, or with one line end far into
 the file.
 
-Use `max_bytes = "0"` for no limit. A job can then fill the disk.
+Use `max_bytes = "0"` for no limit. The words `"none"`, `"never"` and
+`"unlimited"` do the same, and they are the words that `[defaults] timeout`
+takes. A job can then fill the disk.
 
 ### When a change to the limit takes effect
 
@@ -612,6 +614,35 @@ If a program needs a regular file, give it one:
 
 ```sh
 qex submit -- sh -c 'my-program > out.txt'
+```
+
+### A job that leaves a process with the output open
+
+A pipe closes when the last process that holds it stops. A job that starts a
+process which outlives it therefore keeps the pipe open after the job itself
+ends. `setsid`, `nohup ... &` and a daemon that a test starts all make that
+shape.
+
+**qex waits 30 seconds for the output to close, and then it writes the result.**
+A record that arrives is worth more than a wait with no end. The record of such
+a job says:
+
+* `state` is the state that the job earned. The wait does not fail the job.
+* `error` says that the output did not close, and that a log file can be
+  missing its last part.
+* `logs_dropped.incomplete` is `true`. The counts beside it are the counts that
+  arrived, and not the full quantity, so a program must not read them as
+  complete.
+
+Measured: a job that runs `setsid sh -c "sleep 120" &` and then writes one line
+finished 30 seconds after it started, with `state` `completed`,
+`incomplete: true`, and that `error`.
+
+To get the result at once, stop the process that holds the output, or give that
+process an output of its own:
+
+```sh
+qex submit -- sh -c 'setsid my-daemon > daemon.log 2>&1 &'
 ```
 
 ## More help inside the tool

@@ -220,14 +220,28 @@ impl CapWriter {
         // the file. The limit belongs to the stream and not to the attempt, so
         // those bytes go now. The line count is exact, because this function
         // reads the part that it removes.
+        //
+        // The cut falls at a byte, and the output has lines, so qex moves the
+        // cut back to the last line end. THIS IS THE SAME RULE AS THE TRIM OF
+        // THE LAST PART, at the other end of the same loss. A head that stops
+        // at a byte ends with a fragment of a line: the measured example wrote
+        // the lines `1` to `500000`, and its head ended `3498` and then `3`,
+        // which a reader takes for a line that the job wrote.
+        let mut fragment = false;
         if self.head_len > parts.head {
-            let extra = self.head_len - parts.head;
-            let lines = count_lines_in(&mut self.file, parts.head, extra).unwrap_or(0);
-            match self.file.set_len(parts.head) {
+            // `None` says that the cut back costs too much, in the same way as
+            // the trim of the last part. The head then keeps the fragment, and
+            // the note below says that it is not a whole line.
+            let cut = head_cut(&mut self.file, parts.head).unwrap_or(None);
+            fragment = cut.is_none();
+            let keep = cut.unwrap_or(parts.head);
+            let extra = self.head_len - keep;
+            let lines = count_lines_in(&mut self.file, keep, extra).unwrap_or(0);
+            match self.file.set_len(keep) {
                 Ok(()) => {
                     self.dropped.bytes += extra;
                     self.dropped.lines += lines;
-                    self.head_len = parts.head;
+                    self.head_len = keep;
                 }
                 Err(e) => self.record_fault(&format!("cutting the earlier output: {e}")),
             }
@@ -236,12 +250,21 @@ impl CapWriter {
             }
         }
 
-        let note = format!(
-            "\n{MARK} The output of this job reached the limit `[logs] max_bytes` = {}. \
+        // After the cut back the head ends at a line end, so the note needs no
+        // line end before it. With a fragment, one line end separates the
+        // fragment from the note, and the note says what the fragment is.
+        let mut note = String::new();
+        if fragment {
+            note.push_str(&format!(
+                "\n{MARK} The line above is not complete. qex removed the output after it.\n"
+            ));
+        }
+        note.push_str(&format!(
+            "{MARK} The output of this job reached the limit `[logs] max_bytes` = {}. \
              qex keeps the last part of the output beside this file. It writes that part \
              here when the job stops.\n",
             crate::units::format_size(parts.max)
-        );
+        ));
         if let Err(e) = self.file.write_all(note.as_bytes()) {
             self.record_fault(&format!("writing the note about the limit: {e}"));
         }
@@ -265,6 +288,29 @@ impl CapWriter {
             // a file that is not complete, is worse than no record.
             self.dropped.bytes += self.overflow_bytes;
             self.dropped.lines += self.overflow_lines;
+
+            // THE FILE MUST NOT KEEP A PROMISE THAT IT CANNOT KEEP. The note
+            // that `start_overflow` wrote says that qex holds the last part of
+            // the output beside this file, and that it writes that part here
+            // when the job stops. On this path there is no such file and no
+            // last part, so the reader who stops at the end of this file must
+            // learn it here. Measured with a directory in the place of
+            // `stdout.log.tail`: the file ended with that promise and gave no
+            // count at all.
+            if let Some(parts) = self.parts.filter(|_| self.overflowing) {
+                let note = format!(
+                    "{MARK} ---- {} and {} line(s) of the output are not in this file ----\n\
+                     {MARK} qex could not make the file for the last part of the output, so \
+                     the last part is not here. The limit is `[logs] max_bytes` = {}. Read \
+                     `supervisor.log` in this directory for the fault of the machine.\n",
+                    crate::units::format_size(self.dropped.bytes),
+                    self.dropped.lines,
+                    crate::units::format_size(parts.max),
+                );
+                if let Err(e) = self.file.write_all(note.as_bytes()) {
+                    self.record_fault(&format!("writing the line about the removed output: {e}"));
+                }
+            }
             self.file.flush().ok();
             return self.dropped;
         };
@@ -499,6 +545,36 @@ pub fn tail_path(log: &Path) -> PathBuf {
 
 fn count_lines(data: &[u8]) -> u64 {
     data.iter().filter(|b| **b == b'\n').count() as u64
+}
+
+/// Gives the position that makes the head end at a line end.
+///
+/// The head keeps `head` bytes, and that byte is in the middle of a line. This
+/// function looks back for the last line end before it, so that the head holds
+/// whole lines only.
+///
+/// The result is `None` when there is no line end near the cut. The caller then
+/// keeps the fragment and writes a note, because a cut back would otherwise
+/// remove the whole head of a stream with no line end — one JSON document, one
+/// base64 block, or a progress display that uses `\r`. This is the rule that
+/// [`CapWriter::finish`] uses at the other end of the same loss.
+///
+/// The function reads a window and not the head, so the memory that it uses
+/// does not grow with `max_bytes`. The supervisor is in the cgroup of the job,
+/// so memory that it holds counts against the claim of the job.
+fn head_cut(file: &mut File, head: u64) -> std::io::Result<Option<u64>> {
+    if head == 0 {
+        return Ok(None);
+    }
+    let window = (head / 4).clamp(1, CHUNK as u64);
+    let start = head - window.min(head);
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; (head - start) as usize];
+    file.read_exact(&mut buf)?;
+    Ok(buf
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|i| start + i as u64 + 1))
 }
 
 /// Counts the lines in one part of a file, with no large read.
@@ -920,32 +996,106 @@ mod tests {
     /// A tail that starts in the middle of a line always says so.
     ///
     /// qex removes the bytes between the head and the tail, so the first bytes
-    /// of the tail are the middle of a line. That is true whether the circular
-    /// file returned to its start or not, and an earlier version wrote the
-    /// warning in the first case only: a reader then met `AAAAAAAAAAAAAAA-994`
-    /// and had no reason to doubt it.
+    /// of the tail are the middle of a line. THAT IS TRUE WHETHER THE CIRCULAR
+    /// FILE RETURNED TO ITS START OR NOT. An earlier version tested
+    /// `wrapped && dropped > 0` and thus wrote the warning in the first case
+    /// only: a reader then met `AAAAAAAAAAAAAAA-994` and had no reason to doubt
+    /// it.
+    ///
+    /// The output here passes the limit by a small quantity, so the circular
+    /// file does not return to its start, and `wrapped` alone is false.
+    /// A head with no line end near its cut keeps the fragment AND says so.
+    ///
+    /// qex moves the cut of the head back to the last line end, so that the
+    /// head holds whole lines only. That rule needs the same limit as the trim
+    /// of the last part: with the last line end far back, a cut back removes
+    /// almost all of the head. Measured with the window removed: a head of 4096
+    /// bytes became 6 bytes, and the reader lost the start-up that the head
+    /// exists to keep.
+    ///
+    /// qex therefore keeps the fragment in that case, and the note says that
+    /// the line above it is not complete. In silence the reader takes the
+    /// fragment for a line that the job wrote.
     #[test]
-    fn a_tail_that_starts_in_the_middle_of_a_line_says_so() {
-        let dir = Dir::new("mid-line");
+    fn a_head_that_cannot_cut_back_keeps_its_bytes_and_says_so() {
+        let dir = Dir::new("head-fragment");
         let path = dir.log();
-        // Long lines, and an output that passes the limit by a small quantity.
-        // The circular file does not return to its start in this case.
+        let parts = parts(MIN_LIMIT);
         let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
-        for i in 0..400 {
-            w.write(format!("{}-{i}\n", "A".repeat(59)).as_bytes());
+
+        // One line end at the start, and then one line that never ends. The
+        // last line end is thus far outside the window that qex looks in.
+        w.write(b"the start of the job\n");
+        for _ in 0..40 {
+            w.write(&vec![b'x'; 8 * 1024]);
         }
         w.finish();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        let after = text.rsplit(MARK).next().unwrap_or("");
-        let first = after.lines().nth(1).unwrap_or("");
-        if !first.is_empty() && !first.starts_with(&"A".repeat(59)) {
-            assert!(
-                text.contains("middle of a line"),
-                "the first line of the tail is `{first}`, and the file does not say that it \
-                 is not a whole line"
-            );
+        let head = &text[..text.find(MARK).expect("the file must hold a note of qex")];
+
+        // The head must keep its space. A cut back to the line end at byte 21
+        // would leave the reader with that line only.
+        assert!(
+            head.len() as u64 > parts.head / 2,
+            "the head holds {} bytes of the {} that it must hold, so the cut back removed \
+             the start of the output",
+            head.len(),
+            parts.head
+        );
+        assert!(head.starts_with("the start of the job\n"));
+
+        // The head ends in the middle of a line, so the file must say it.
+        assert!(
+            text.contains("The line above is not complete"),
+            "the head ends with a fragment of a line, and the file does not say so: \
+             {text:.400}"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= MIN_LIMIT);
+    }
+
+    #[test]
+    fn a_tail_that_starts_in_the_middle_of_a_line_says_so() {
+        let dir = Dir::new("mid-line");
+        let path = dir.log();
+        let body = "A".repeat(59);
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
+        let mut written = 0u64;
+        for i in 0..380 {
+            let line = format!("{body}-{i}\n");
+            written += line.len() as u64;
+            w.write(line.as_bytes());
         }
+        w.finish();
+
+        // THE TEST MUST MEASURE THE CASE THAT IT NAMES. The output above the
+        // limit must fit in the circular file, or that file returns to its
+        // start, `wrapped` is true by itself, and this test stops measuring the
+        // fault. An earlier version wrote 400 lines, which is 25490 bytes and
+        // 914 bytes too many.
+        let parts = parts(MIN_LIMIT);
+        assert!(
+            written > parts.fill && written - parts.fill <= parts.tail,
+            "the job wrote {written} bytes; this test needs more than {} and not more \
+             than {}",
+            parts.fill,
+            parts.fill + parts.tail
+        );
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let after = text.rsplit(MARK).next().unwrap_or("");
+        let tail: Vec<&str> = after.lines().skip(1).collect();
+
+        // THE ASSERTION IS NOT CONDITIONAL. A test that asks the question only
+        // when the answer is already wrong measures nothing: it passed against
+        // the code that this test exists to refuse.
+        let first = tail.first().copied().unwrap_or("");
+        let whole = first.starts_with(&body) && first[body.len()..].starts_with('-');
+        assert!(
+            whole || text.contains("middle of a line"),
+            "the first line of the last part is `{first}`, which is the end of a line that \
+             the reader cannot see, and the file does not say so"
+        );
     }
 
     /// A machine that refuses the file for the tail must still stop the output,
@@ -976,33 +1126,59 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size <= MIN_LIMIT, "the file holds {size} bytes");
 
-        // The count must hold EVERY byte that reached no disk, and not the cut
-        // of the head alone. The bytes above the limit went to a file that the
-        // machine refused, so they exist nowhere. A count that leaves them out
-        // says that the file is nearly complete, and a program reads that
-        // number.
+        // THE COUNT MUST BALANCE TO THE BYTE. The bytes above the limit went to
+        // a file that the machine refused, so they exist nowhere; the head is
+        // the only output that a reader can still get. A count that is only
+        // "large enough" hides the whole question: an earlier version of this
+        // test asked for `dropped.bytes >= written - kept`, and the head cut
+        // alone satisfied it, so a count that dropped the overflow, and a count
+        // that multiplied it, both passed.
+        // The head is every byte before the first note of qex. The head ends at
+        // a line end here, because the lines are short, so qex writes no line
+        // end of its own before that note.
         let text = std::fs::read_to_string(&path).unwrap();
-        let kept: u64 = text
-            .lines()
-            .filter(|l| !l.starts_with(MARK))
-            .map(|l| l.len() as u64 + 1)
-            .sum();
+        let kept_text = &text[..text.find(MARK).expect("the file must hold a note of qex")];
         assert!(
-            dropped.bytes >= written - kept,
-            "the count says {} bytes, and {} bytes of {written} reached no disk",
-            dropped.bytes,
-            written - kept
+            kept_text.ends_with('\n'),
+            "the head must end at a line end, and it ends `{}`",
+            &kept_text[kept_text.len().saturating_sub(12)..]
         );
-        assert!(
-            dropped.lines > lines / 2,
-            "the count says {} line(s) of {lines}, and nearly every line went",
+        let kept = kept_text.len() as u64;
+        assert_eq!(
+            dropped.bytes,
+            written - kept,
+            "the file holds {kept} byte(s) of the {written} that the job wrote, so exactly \
+             {} went, and the count says {}",
+            written - kept,
+            dropped.bytes
+        );
+        assert_eq!(
+            dropped.lines,
+            lines - count_lines(kept_text.as_bytes()),
+            "the file holds {} line(s) of the {lines} that the job wrote, and the count says \
+             that {} went",
+            count_lines(kept_text.as_bytes()),
             dropped.lines
         );
-        let text = std::fs::read_to_string(&path).unwrap();
+
         assert_eq!(
             text.matches("reached the limit").count(),
             1,
             "the note must appear one time"
+        );
+
+        // The note that qex wrote when the output passed the limit says that
+        // qex holds the last part beside this file, and that it writes that
+        // part here at the end. There is no such file on this path, so the
+        // file must say what it does hold.
+        assert!(
+            text.contains("are not in this file"),
+            "the file promises a last part that never arrives, and it gives no count: \
+             {text:.600}"
+        );
+        assert!(
+            text.contains("could not make the file for the last part"),
+            "the file must say why the last part is missing: {text:.600}"
         );
     }
 

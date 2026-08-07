@@ -568,6 +568,26 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     //    local, and its time grows with `max_bytes`. A short limit here would
     //    cut the log file of a job that did nothing wrong, on a machine where
     //    the disk is slow or the limit is some gigabytes.
+    //
+    // THE 30 SECOND LIMIT HAS NO AUTOMATED TEST, and this comment records the
+    // reason so that a later reader does not think that nobody tried.
+    //
+    // A test needs a process that holds the pipe after the job stops. The code
+    // above this point stops each such process on purpose: `killpg` reaches the
+    // process group of the job, and `kill_cgroup` reaches a process that left
+    // that group. A holder must therefore escape both, and `setsid` is the only
+    // way that qex leaves open.
+    //
+    // A test built on `setsid` was measured. It passed on the machine of the
+    // author (the record arrived after 30 seconds, with `incomplete` true and
+    // the `error` set) and it failed on the ubuntu-24.04 runner, where the same
+    // job stopped in 0 seconds with `logs_dropped` null. The holder does not
+    // survive there. A test that measures the behaviour on one machine and
+    // measures nothing on another is worse than no test, because it reports a
+    // pass either way.
+    //
+    // The behaviour itself is measured by hand and it is in `docs/reference.md`
+    // and in `qex help output`.
     let mut drops = crate::job::LogsDropped {
         limit: log_limit.unwrap_or(0),
         ..earlier_drops
