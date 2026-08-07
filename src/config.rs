@@ -81,16 +81,235 @@ impl EnforceMode {
     }
 }
 
+/// Reads a value that a person can write as a number or as text.
+///
+/// # The fault that this removes
+///
+/// A field such as `[budget] cpu` takes an integer OR a percentage, so the
+/// field is text in this program. TOML then refused `cpu = 2` with
+/// ``invalid type: integer `2`, expected a string``, while `[defaults] cpu = 1`
+/// accepted an integer in the same file, and `qex help config` shows both
+/// forms. A user who wrote the obvious thing received an error that named a
+/// type in the program and gave no remedy.
+///
+/// A number and its text are the same value here, so this function takes
+/// either. The units module reads a bare number: a size with no unit is bytes,
+/// and a duration with no unit is seconds.
+///
+/// Use this function on a text field that holds a number, a size, a duration or
+/// a percentage. Do not use it on a field that holds a name or a path, because
+/// a number there is a fault that the user must see.
+fn text_or_number<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct Either;
+
+    impl Visitor<'_> for Either {
+        type Value = String;
+
+        // A type that is neither a number nor text stops here, and this text is
+        // the remedy that the user reads. Name the two forms, and not the type
+        // in the program.
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a number such as 2, or text such as \"75%\" or \"8GB\"")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        // An integer ABOVE `i64::MAX`, such as 9223372036854775808. The `toml`
+        // crate reads an integer as i64 where it fits, and it goes to u64 for a
+        // larger one. Without this method such a value gives `invalid type`.
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+        // A whole number that TOML read as a float, such as `2.0`, becomes `2`.
+        // Rust writes a float with no fraction in that form already.
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
+            Ok(v.to_string())
+        }
+    }
+
+    d.deserialize_any(Either)
+}
+
+/// The same as [`text_or_number`], for a field that the user can leave out.
+fn text_or_number_opt<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    text_or_number(d).map(Some)
+}
+
+/// Reads a whole number that a person can write inside quotation marks.
+///
+/// # Why the tolerance goes both ways
+///
+/// [`text_or_number`] lets the user write a number where the field is text.
+/// This function is the mirror: it lets the user write text where the field is
+/// a number. `[defaults] cpu = "1"` refused the file with
+/// `invalid type: string "1", expected u64`, which is the same fault in the
+/// other direction, with the same type name and the same absent remedy.
+///
+/// The two together give one rule that the documentation can state: the
+/// quotation marks make no difference. A user does not have to remember which
+/// direction each field forgives.
+///
+/// A percentage stops here. `[budget] cpu` takes a percentage because it names
+/// a part of the machine. `[defaults] cpu` names the cores for ONE job, so a
+/// percentage there has no meaning that qex can defend, and qex must not choose
+/// one in silence.
+fn whole_number_opt<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct WholeNumber;
+
+    impl Visitor<'_> for WholeNumber {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a whole number such as 1, with or without quotation marks")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(|_| {
+                de::Error::custom(format!(
+                    "the number is {v}, and a count cannot be below zero. qex cannot \
+                     calculate a size from it, and it stops. Write a whole number of \
+                     0 or more."
+                ))
+            })
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            let t = v.trim();
+            if t.ends_with('%') {
+                return Err(de::Error::custom(format!(
+                    "the value is `{v}`, and this field does not take a percentage. It \
+                     gives the cores for ONE job, and a part of the machine names no \
+                     number of cores. Write a whole number, such as 1. To give a part of \
+                     the machine, use `[budget] cpu`, which controls all the jobs \
+                     together."
+                )));
+            }
+            t.parse::<u64>().map_err(|_| {
+                de::Error::custom(format!(
+                    "the value is `{v}`, and qex cannot read a whole number from it. qex \
+                     cannot calculate the size of a job, and it stops. Write a whole \
+                     number, such as 1."
+                ))
+            })
+        }
+    }
+
+    d.deserialize_any(WholeNumber).map(Some)
+}
+
+/// Reads a decimal number that a person can write inside quotation marks.
+///
+/// The mirror of [`text_or_number`] for `[system] max_pressure`,
+/// `[enforce] mem_overcommit` and `[learn] margin`. `margin = "1.5"` refused the
+/// file with `invalid type: string "1.5", expected f64`. See
+/// [`whole_number_opt`] for why the tolerance goes both ways.
+///
+/// A whole number is a decimal number too, so `max_pressure = 20` and
+/// `max_pressure = "20"` and `max_pressure = 20.0` are one value.
+///
+/// # Why `nan` and `inf` stop here
+///
+/// TOML has the values `nan` and `inf`, and each field here is a limit that qex
+/// compares against a measurement. A test against `nan` is false for EVERY
+/// measurement, so the limit never operates: `max_pressure = nan` accepted the
+/// file, passed `validate` (because `nan < 1.0` is false), and then held no job
+/// back. `qex config show --json` wrote it as `null`, because JSON has no such
+/// value. A limit that never operates and does not show itself is worse than a
+/// file that qex refuses.
+///
+/// The text form already stopped, because `"nan"` reaches `visit_str`. The
+/// number form did not, so the two forms disagreed. This function is part of a
+/// change whose rule is that the quotation marks make no difference, so both
+/// forms now stop.
+fn decimal_number<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    /// The message for a value that is not a number that qex can compare.
+    fn refuse<E: de::Error>(wrote: &dyn fmt::Display) -> E {
+        de::Error::custom(format!(
+            "the value is `{wrote}`, and qex cannot read a number from it. A limit that \
+             is not a number is false against every measurement, so it never operates \
+             and qex holds no job back. Write a number, such as 1.5."
+        ))
+    }
+
+    struct DecimalNumber;
+
+    impl Visitor<'_> for DecimalNumber {
+        type Value = f64;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a number such as 1.5, with or without quotation marks")
+        }
+
+        // `nan`, `inf` and `-inf` are TOML values, and they arrive here.
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<f64, E> {
+            if v.is_finite() {
+                Ok(v)
+            } else {
+                Err(refuse(&v))
+            }
+        }
+        // Every i64 and every u64 becomes a finite f64, so these two methods
+        // need no such test. `u64::MAX` becomes 1.8446744073709552e19.
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+        // An integer above `i64::MAX`. See the same method in `text_or_number`.
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<f64, E> {
+            Ok(v as f64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<f64, E> {
+            match v.trim().parse::<f64>() {
+                Ok(n) if n.is_finite() => Ok(n),
+                _ => Err(refuse(&v)),
+            }
+        }
+    }
+
+    d.deserialize_any(DecimalNumber)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     /// The number of cores that qex can use.
     ///
     /// Give an integer, or a percentage of the machine.
+    #[serde(deserialize_with = "text_or_number")]
     pub cpu: String,
     /// The quantity of memory that qex can use.
     ///
     /// Give a size, or a percentage of the machine.
+    #[serde(deserialize_with = "text_or_number")]
     pub mem: String,
 }
 
@@ -111,11 +330,13 @@ pub struct SystemConfig {
     /// qex does not start a job if the job decreases the available memory below
     /// this value. This test finds the load from other users and from programs
     /// that qex does not control.
+    #[serde(deserialize_with = "text_or_number")]
     pub reserve_mem: String,
     /// The maximum permitted memory pressure.
     ///
     /// qex does not start a job while the PSI value is above this limit.
     /// Linux supplies this measurement. macOS does not.
+    #[serde(deserialize_with = "decimal_number")]
     pub max_pressure: f64,
 }
 
@@ -135,6 +356,7 @@ pub struct EnforceConfig {
     /// The multiplier for the second memory limit in the soft mode.
     ///
     /// qex sets `memory.max` to the claim multiplied by this value.
+    #[serde(deserialize_with = "decimal_number")]
     pub mem_overcommit: f64,
     /// Permits qex to start the coordinator in a temporary systemd unit.
     ///
@@ -159,6 +381,7 @@ impl Default for EnforceConfig {
 pub struct PeersConfig {
     pub enabled: bool,
     pub dir: String,
+    #[serde(deserialize_with = "text_or_number")]
     pub stale_after: String,
 }
 
@@ -179,6 +402,7 @@ pub struct QueueConfig {
     /// The time that the queue must stay empty before qex starts a large job.
     ///
     /// This delay prevents a start while the last jobs stop.
+    #[serde(deserialize_with = "text_or_number")]
     pub settle: String,
 }
 
@@ -221,12 +445,15 @@ impl Default for SubmitConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DefaultsConfig {
     /// The number of cores for a job. The default is 1 core.
+    #[serde(default, deserialize_with = "whole_number_opt")]
     pub cpu: Option<u64>,
     /// The quantity of memory for a job.
     ///
     /// The default is the machine memory divided by the number of cores.
+    #[serde(default, deserialize_with = "text_or_number_opt")]
     pub mem: Option<String>,
     /// The time limit for a job. The default is `0`, which sets no limit.
+    #[serde(default, deserialize_with = "text_or_number_opt")]
     pub timeout: Option<String>,
 }
 
@@ -238,6 +465,7 @@ pub struct GcConfig {
     ///
     /// `qex gc` works on every directory, so this value is larger than the one
     /// hour of `qex clean --auto`, which works on one directory tree.
+    #[serde(deserialize_with = "text_or_number")]
     pub keep: String,
 }
 
@@ -258,6 +486,7 @@ pub struct HistoryConfig {
     ///
     /// An agent asks about a job of the last minutes or hours. An id of last
     /// month answers no question, so qex does not keep it.
+    #[serde(deserialize_with = "text_or_number")]
     pub keep: String,
 }
 
@@ -277,6 +506,7 @@ pub struct LearnConfig {
     ///
     /// A measurement is the peak that qex saw. A job can use more with a larger
     /// input, so the claim is larger than the measurement.
+    #[serde(deserialize_with = "decimal_number")]
     pub margin: f64,
 }
 
@@ -556,6 +786,235 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A number must be accepted where the field takes a number or text.
+    ///
+    /// `[budget] cpu = 2` gave ``invalid type: integer `2`, expected a string``
+    /// while `[defaults] cpu = 1` accepted an integer in the same file, and
+    /// `qex help config` shows both forms. A user who writes the obvious thing
+    /// met an error that named a Rust type and gave no remedy.
+    #[test]
+    fn a_budget_accepts_a_number_and_text_alike() {
+        let c: Config = toml::from_str("[budget]\ncpu = 2\nmem = 2147483648\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.budget.cpu, "2");
+        assert_eq!(c.budget_cpu().unwrap(), 2);
+        assert_eq!(c.budget_mem().unwrap(), 2 << 30);
+
+        // The text forms still operate.
+        let c: Config = toml::from_str("[budget]\ncpu = \"75%\"\nmem = \"8GB\"\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.budget_mem().unwrap(), 8 << 30);
+
+        // And the reserve, which has the same shape.
+        let c: Config = toml::from_str("[system]\nreserve_mem = 0\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.reserve_mem().unwrap(), 0);
+    }
+
+    /// Every other field of the same shape must take a number too.
+    ///
+    /// A user who learns that `[budget] cpu = 2` operates writes `settle = 5`
+    /// next. One field that refuses a number keeps the fault, so this test
+    /// reads each of them. A duration with no unit is seconds, which
+    /// `units::parse_duration` gives. `[gc] keep` is a float, because TOML
+    /// reads `3600.0` as a float and the value must still be one hour.
+    #[test]
+    fn each_duration_and_size_field_accepts_a_number() {
+        let c: Config = toml::from_str(
+            "[queue]\nsettle = 5\n\
+             [peers]\nstale_after = 45\n\
+             [gc]\nkeep = 3600.0\n\
+             [history]\nkeep = 7200\n\
+             [defaults]\nmem = 536870912\ntimeout = 90\n",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.settle().unwrap(), std::time::Duration::from_secs(5));
+        assert_eq!(
+            c.peer_stale_after().unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(c.gc_keep().unwrap(), std::time::Duration::from_secs(3600));
+        assert_eq!(
+            c.history_keep().unwrap(),
+            std::time::Duration::from_secs(7200)
+        );
+        assert_eq!(c.default_mem().unwrap(), 512 << 20);
+        assert_eq!(
+            c.default_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    /// A value that means nothing must still give an error that names the
+    /// field, and not the type of the value in the program.
+    #[test]
+    fn a_value_that_means_nothing_gives_an_error_that_names_the_field() {
+        let c: Config = toml::from_str("[budget]\ncpu = \"two\"\n").unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("[budget] cpu"),
+            "the error must name the field: {e}"
+        );
+        assert!(
+            e.contains("integer or a percentage"),
+            "the error must say what to write: {e}"
+        );
+
+        // A type that is neither a number nor text must name the two forms
+        // that the field takes.
+        let e = toml::from_str::<Config>("[budget]\ncpu = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("a number such as 2") && e.contains("75%"),
+            "the error must say which forms the field takes: {e}"
+        );
+    }
+
+    /// An integer above `i64::MAX` must reach `visit_u64` and not stop the file.
+    ///
+    /// The `toml` crate reads an integer as i64 where it fits, and it goes to
+    /// u64 for a larger one. An earlier comment in this file said that TOML
+    /// never calls `visit_u64`. That statement was incorrect, and this test
+    /// holds the measurement that corrects it: with `visit_u64` removed, the
+    /// value below gives `invalid type: integer`.
+    #[test]
+    fn an_integer_above_the_signed_limit_is_read_as_text() {
+        let c: Config = toml::from_str("[budget]\ncpu = 9223372036854775808\n").unwrap();
+        assert_eq!(c.budget.cpu, "9223372036854775808");
+        let c: Config = toml::from_str("[system]\nmax_pressure = 9223372036854775808\n").unwrap();
+        assert_eq!(c.system.max_pressure, 9223372036854775808f64);
+        // `[defaults] cpu` is a u64 field, so the value stays a number.
+        let c: Config = toml::from_str("[defaults]\ncpu = 18446744073709551615\n").unwrap();
+        assert_eq!(c.default_cpu(), u64::MAX);
+    }
+
+    /// The quotation marks must make no difference in EITHER direction.
+    ///
+    /// `[defaults] cpu = "1"` gave `invalid type: string "1", expected u64`,
+    /// and `[learn] margin = "1.5"` gave the same fault for a float. That is
+    /// the fault of this pull request in the mirror direction. The
+    /// documentation states one rule, so the code must obey it for every
+    /// numeric field.
+    #[test]
+    fn a_number_inside_quotation_marks_gives_the_same_value() {
+        let quoted: Config = toml::from_str(
+            "[defaults]\ncpu = \"3\"\n\
+             [system]\nmax_pressure = \"30\"\n\
+             [learn]\nmargin = \"2.5\"\n\
+             [enforce]\nmem_overcommit = \"2.0\"\n",
+        )
+        .unwrap();
+        quoted.validate().unwrap();
+
+        let bare: Config = toml::from_str(
+            "[defaults]\ncpu = 3\n\
+             [system]\nmax_pressure = 30\n\
+             [learn]\nmargin = 2.5\n\
+             [enforce]\nmem_overcommit = 2.0\n",
+        )
+        .unwrap();
+        bare.validate().unwrap();
+
+        assert_eq!(quoted.default_cpu(), bare.default_cpu());
+        assert_eq!(quoted.default_cpu(), 3);
+        assert_eq!(quoted.system.max_pressure, bare.system.max_pressure);
+        assert_eq!(quoted.system.max_pressure, 30.0);
+        assert_eq!(quoted.learn.margin, bare.learn.margin);
+        assert_eq!(quoted.learn.margin, 2.5);
+        assert_eq!(quoted.enforce.mem_overcommit, bare.enforce.mem_overcommit);
+        assert_eq!(quoted.enforce.mem_overcommit, 2.0);
+
+        // A whole number in a decimal field is the same value again.
+        let c: Config = toml::from_str("[learn]\nmargin = 2\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.learn.margin, 2.0);
+    }
+
+    /// A percentage in `[defaults] cpu` must give an error, and not a guess.
+    ///
+    /// `[budget] cpu` takes a percentage because it names a part of the
+    /// machine. `[defaults] cpu` names the cores for ONE job. qex has no
+    /// defensible meaning for a part of the machine there, so it must not
+    /// choose one in silence.
+    #[test]
+    fn a_percentage_is_refused_where_it_has_no_meaning() {
+        let e = toml::from_str::<Config>("[defaults]\ncpu = \"50%\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("does not take a percentage"),
+            "the error must say what happened: {e}"
+        );
+        assert!(
+            e.contains("cores for ONE job"),
+            "the error must say why it matters: {e}"
+        );
+        assert!(
+            e.contains("Write a whole number") && e.contains("[budget] cpu"),
+            "the error must say what to do: {e}"
+        );
+
+        // Text that is not a number at all must also give a remedy.
+        for (text, want) in [
+            ("[defaults]\ncpu = \"many\"\n", "Write a whole number"),
+            ("[defaults]\ncpu = -1\n", "cannot be below zero"),
+            ("[learn]\nmargin = \"one\"\n", "Write a number"),
+        ] {
+            let e = toml::from_str::<Config>(text).unwrap_err().to_string();
+            assert!(e.contains(want), "{text} gave: {e}");
+        }
+
+        // A space around the value is not a fault. A user who writes ` 2` in a
+        // quoted field means 2.
+        let c: Config = toml::from_str("[defaults]\ncpu = \" 2 \"\n").unwrap();
+        assert_eq!(c.default_cpu(), 2);
+        let c: Config = toml::from_str("[learn]\nmargin = \" 2.5 \"\n").unwrap();
+        assert_eq!(c.learn.margin, 2.5);
+    }
+
+    /// A limit that is not a number must stop the file, in EITHER form.
+    ///
+    /// TOML has `nan` and `inf`. A test against `nan` is false for every
+    /// measurement, so the limit never operates: `max_pressure = nan` passed
+    /// `validate`, because `nan < 1.0` is false, and then held no job back.
+    /// `qex config show --json` wrote it as `null`. The text form `"nan"`
+    /// already stopped, so the two forms disagreed, and the rule of this change
+    /// is that the quotation marks make no difference.
+    #[test]
+    fn a_limit_that_is_not_a_number_stops_the_file() {
+        for text in [
+            "[system]\nmax_pressure = nan\n",
+            "[system]\nmax_pressure = \"nan\"\n",
+            "[system]\nmax_pressure = inf\n",
+            "[system]\nmax_pressure = -inf\n",
+            "[learn]\nmargin = nan\n",
+            "[learn]\nmargin = inf\n",
+            "[learn]\nmargin = \"inf\"\n",
+            "[enforce]\nmem_overcommit = nan\n",
+            "[enforce]\nmem_overcommit = inf\n",
+        ] {
+            let e = toml::from_str::<Config>(text)
+                .err()
+                .unwrap_or_else(|| panic!("{text} was accepted, and it must not be"))
+                .to_string();
+            assert!(
+                e.contains("false against every measurement"),
+                "{text} must say why it matters, and it gave: {e}"
+            );
+            assert!(
+                e.contains("Write a number"),
+                "{text} must say what to write, and it gave: {e}"
+            );
+        }
+
+        // A number that a person writes stays acceptable.
+        let c: Config = toml::from_str("[system]\nmax_pressure = 20.5\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.system.max_pressure, 20.5);
+    }
 
     /// A field that qex does not know must give the order of the steps.
     ///
