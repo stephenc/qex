@@ -712,10 +712,20 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     // uses, and a reader who cannot see `export_env` cannot tell whether a job
     // receives GOMAXPROCS. The config file is not the answer, because a machine
     // with no file still has these values.
+    //
+    // READ EVERY CONDITION THAT `export_claim` READS. `[submit] env_capture =
+    // "none"` turns the claim off as completely as `export_env = false` does,
+    // and a line that reported "yes" for that machine was worse than no line:
+    // the owner sets the value, asks this command, and is told the opposite of
+    // what the job receives. The one condition that is NOT here is `--cpu` and
+    // `--mem` together, because that belongs to a submission and not to a
+    // configuration, so the text names it as the remaining requirement.
     println!(
         "claim in job: {}",
         if !cfg.claims.export_env {
             "no; [claims] export_env = false".to_string()
+        } else if cfg.submit.env_capture == config::EnvCapture::None {
+            "no; [submit] env_capture = \"none\" gives a job no variable that qex chose".to_string()
         } else if cfg.claims.also.is_empty() {
             "yes, with --cpu and --mem together".to_string()
         } else {

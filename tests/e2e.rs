@@ -5531,6 +5531,50 @@ fn a_job_is_told_the_size_of_its_claim() {
             "the stage {stage} must give {want}: {out}"
         );
     }
+
+    // `qex run` HAS ITS OWN WIRING, and it needs its own test.
+    //
+    // `commands::run` builds `SubmitOptions` in a second place, so the option
+    // can arrive for `qex submit` and be lost for `qex run`. A mutation that
+    // put `false` in that one line passed every other test in this file.
+    let (child, id) = h.run_bg(&[
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--no-limit-env-hints",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    wait_run(child, "`qex run` with --no-limit-env-hints");
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][]",
+        "`qex run --no-limit-env-hints` must write nothing: {out}"
+    );
+
+    // And `qex run` without the option still receives the claim, or the test
+    // above would pass with the feature removed from `qex run` altogether.
+    let (child, id) = h.run_bg(&[
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    wait_run(child, "`qex run` with a claim");
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[2][2]",
+        "`qex run` must give the claim to the job: {out}"
+    );
 }
 
 /// `[claims]` in the config file controls every job of this machine.
@@ -5575,8 +5619,50 @@ fn the_config_file_controls_the_claim_in_the_environment() {
     // answer: a machine with no file still has these values.
     let shown = h.ok(&["config", "show"]);
     assert!(
-        shown.contains("claim in job: no"),
+        shown.contains("claim in job: no; [claims] export_env = false"),
         "`qex config show` must report that the claim is off: {shown}"
+    );
+
+    // THE LINE MUST READ EVERY CONDITION THAT THE CODE READS.
+    //
+    // `[submit] env_capture = "none"` turns the claim off as completely as
+    // `export_env = false` does. A line that reported "yes" here was worse than
+    // no line at all: the owner of the machine sets the value, asks this
+    // command, and is told the opposite of what the job receives.
+    let h = Harness::new(
+        "claimsnone",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"none\"\n",
+    );
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("claim in job: no; [submit] env_capture"),
+        "`env_capture = none` must report that the claim is off: {shown}"
+    );
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    args.extend_from_slice(&show);
+    let id = h.submit(&args);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][][][]",
+        "and the job must in fact receive nothing: {out}"
+    );
+
+    // The DEFAULT text needs a test too. Without this, a mutation of that one
+    // string passes every other assertion here, because the others read the
+    // `no` branch and the `also` substring only.
+    let h = Harness::new(
+        "claimsdefault",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("claim in job: yes, with --cpu and --mem together"),
+        "the default configuration must report that the claim reaches the job: {shown}"
     );
 
     let h = Harness::new(

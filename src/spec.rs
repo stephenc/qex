@@ -571,6 +571,34 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
     }
 }
 
+/// The smallest heap that qex gives to a runtime, in megabytes.
+///
+/// # Why there is a floor and not a test against zero
+///
+/// A SMALL HEAP IS WORSE THAN NO HEAP. A runtime that receives no heap uses its
+/// own default and operates; a runtime that receives a heap of one or two
+/// megabytes refuses to start. Measured with the runtimes on this machine:
+///
+///     -Xmx1m                  java 11   exit 1, initialization of VM failed
+///     -Xmx2m                  java 11   exit 1, initialization of VM failed
+///     -Xmx3m                  java 11   exit 0
+///     --max-old-space-size=1  node 12   exit 134
+///     --max-old-space-size=2  node 12   exit 134
+///     --max-old-space-size=3  node 12   exit 0
+///
+/// Both runtimes stop at one and at two megabytes, and both operate at three.
+/// THE FLOOR IS FOUR, which is one megabyte above three. Three is the LOWEST
+/// value that worked, so it is the exact edge on these two versions, and a
+/// value at an edge is not a value to choose: another runtime, or another
+/// version of these two, can need more. Four buys that margin and costs
+/// nothing, because a claim that small gets no heap either way.
+///
+/// The heap is three quarters of the claim, and each step rounds down, so a
+/// claim below 6MB gets no heap. Such a claim needs `--mem` with a very small
+/// value, and the job then receives the default heap of its runtime, which is
+/// the behaviour that it has with no qex at all.
+const HEAP_FLOOR_MB: u64 = 4;
+
 /// Writes the size of the claim into the environment of a job.
 ///
 /// # Why
@@ -616,31 +644,6 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 /// `os.cpus().length` is 16, the number of the MACHINE, and node reads no
 /// variable that changes it. (`os.availableParallelism` arrived in node 19 and
 /// was not measured here.)
-/// The smallest heap that qex gives to a runtime, in megabytes.
-///
-/// # Why there is a floor and not a test against zero
-///
-/// A SMALL HEAP IS WORSE THAN NO HEAP. A runtime that receives no heap uses its
-/// own default and operates; a runtime that receives a heap of one or two
-/// megabytes refuses to start. Measured with the runtimes on this machine:
-///
-///     -Xmx1m                  java 11   exit 1, initialization of VM failed
-///     -Xmx2m                  java 11   exit 1, initialization of VM failed
-///     -Xmx3m                  java 11   exit 0
-///     --max-old-space-size=1  node 12   exit 134
-///     --max-old-space-size=2  node 12   exit 134
-///     --max-old-space-size=3  node 12   exit 0
-///
-/// Both runtimes stop below three megabytes and operate at three. The floor is
-/// FOUR, one megabyte above the highest value that failed, because three is the
-/// exact edge on these two versions and another version can need more.
-///
-/// The heap is three quarters of the claim, and each step rounds down, so a
-/// claim below 6MB gets no heap. Such a claim needs `--mem` with a very small
-/// value, and the job then receives the default heap of its runtime, which is
-/// the behaviour that it has with no qex at all.
-const HEAP_FLOOR_MB: u64 = 4;
-
 fn export_claim(
     env: &mut std::collections::BTreeMap<String, String>,
     cpu: u64,
