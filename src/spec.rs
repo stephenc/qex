@@ -407,8 +407,16 @@ impl JobSpec {
         // permanent: qex measures the job that it made single-threaded, learns
         // one core, and writes one core again on the next run.
         //
+        // BOTH HALVES MUST COME FROM THE USER, and `source` alone does not say
+        // that. `source` becomes "explicit" when ONE half is explicit, so
+        // `qex submit --mem 4GB -- sh -c 'echo $GOMAXPROCS'` printed `1` on a
+        // machine of 16 cores: the memory came from the user, the cores came
+        // from `[defaults]`, and the job heard the invented half. This test
+        // reads the two questions that the user answered, and not the summary
+        // of them.
+        //
         // Give `--cpu` and `--mem`, and qex tells the job what you asked for.
-        let chosen = source == "explicit";
+        let chosen = asked_cpu.is_some() && asked_mem.is_some();
 
         if hints && chosen && capture != EnvCapture::None {
             export_claim(&mut env, cpu, mem, &cfg.claims.also);
@@ -691,9 +699,25 @@ mod tests {
 
         // A job of two cores on a machine of sixteen must not start sixteen
         // threads. This was measured with go: GOMAXPROCS=2 gives 2.
-        assert_eq!(env["GOMAXPROCS"], "2");
-        assert_eq!(env["OMP_NUM_THREADS"], "2");
-        assert_eq!(env["RAYON_NUM_THREADS"], "2");
+        //
+        // NAME EVERY VARIABLE HERE. The documentation and `qex help config`
+        // give this list to the reader, so a name that goes away must fail a
+        // test and not a user.
+        for key in [
+            "GOMAXPROCS",
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "RAYON_NUM_THREADS",
+            "JULIA_NUM_THREADS",
+            "DOTNET_PROCESSOR_COUNT",
+            "POLARS_MAX_THREADS",
+            "CARGO_BUILD_JOBS",
+        ] {
+            assert_eq!(env.get(key).map(String::as_str), Some("2"), "{key}");
+        }
         assert_eq!(env["GOMEMLIMIT"], (2u64 << 30).to_string());
 
         // node takes three quarters of the claim for its heap.
@@ -711,6 +735,31 @@ mod tests {
         assert_eq!(env["MAKEFLAGS"], "-j3");
     }
 
+    /// A claim below one megabyte must give NO heap limit.
+    ///
+    /// The heap is a whole number of megabytes, so a claim of 100KB rounds it
+    /// to zero. `--max-old-space-size=0` and `-Xmx0m` are not "no limit": the
+    /// JVM refuses to start with `-Xmx0m`, and qex accepts a claim that small.
+    /// The count of the cores still arrives, because that number is correct.
+    #[test]
+    fn a_claim_below_one_megabyte_gives_no_heap_limit() {
+        use std::collections::BTreeMap;
+
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 100 * 1024, &["java".into()]);
+
+        assert!(
+            !env.contains_key("NODE_OPTIONS"),
+            "a heap of zero is not a limit: {env:?}"
+        );
+        assert_eq!(
+            env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2",
+            "`-Xmx0m` makes the JVM refuse to start"
+        );
+        assert_eq!(env["QEX_MEM_MB"], "0");
+        assert_eq!(env["GOMAXPROCS"], "2");
+    }
+
     /// `--env-capture none` means none, including the claim.
     ///
     /// That option says that the job starts with an empty environment and
@@ -726,10 +775,81 @@ mod tests {
         let mut o = opts(&["true"]);
         o.env_capture = Some(EnvCapture::None);
         o.env = vec![("MINE".into(), "1".into())];
+        // The claim must be a whole claim, or the test passes for the wrong
+        // reason: qex writes nothing for half a claim, whatever the capture is.
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(2 << 30));
         let spec = JobSpec::resolve(&o, &cfg).unwrap();
 
         assert_eq!(spec.env.len(), 1, "got: {:?}", spec.env);
         assert_eq!(spec.env.get("MINE").unwrap(), "1");
+    }
+
+    /// HALF A CLAIM IS NOT A CLAIM.
+    ///
+    /// `--mem 4GB` with no `--cpu` takes the cores from `[defaults]`, and that
+    /// number is one. A job that heard it would run single-threaded on a
+    /// machine of sixteen cores, with no error and no warning. qex writes the
+    /// claim only when the user answered BOTH questions.
+    #[test]
+    fn half_a_claim_tells_the_job_nothing() {
+        let _guard = env_lock();
+        // Turn the learning off. With it on, the missing half comes from the
+        // measurements on this machine, and the result of the test then
+        // depends on the jobs that ran before it.
+        let mut cfg = Config::default();
+        cfg.learn.enabled = false;
+
+        for (cpu, mem) in [
+            (Some(crate::claim::Claim::Exact(2)), None),
+            (None, Some(crate::claim::Claim::Exact(4 << 30))),
+        ] {
+            let mut o = opts(&["true"]);
+            // `minimal` keeps the shell of the test out of the answer.
+            o.env_capture = Some(EnvCapture::Minimal);
+            o.cpu = cpu.clone();
+            o.mem = mem.clone();
+            let spec = JobSpec::resolve(&o, &cfg).unwrap();
+            assert!(
+                !spec.env.contains_key("QEX_CPU") && !spec.env.contains_key("GOMAXPROCS"),
+                "half a claim ({cpu:?}, {mem:?}) must write nothing: {:?}",
+                spec.env
+            );
+        }
+
+        // The whole claim still arrives.
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::Minimal);
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(4 << 30));
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert_eq!(spec.env.get("QEX_CPU").map(String::as_str), Some("2"));
+        assert_eq!(spec.env.get("GOMAXPROCS").map(String::as_str), Some("2"));
+    }
+
+    /// `[claims] export_env = false` turns the claim off for every job.
+    #[test]
+    fn the_config_file_turns_the_claim_off() {
+        let _guard = env_lock();
+        let mut cfg = Config::default();
+        cfg.claims.export_env = false;
+
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::Minimal);
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(4 << 30));
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert!(!spec.env.contains_key("GOMAXPROCS"), "got: {:?}", spec.env);
+
+        // `--no-limit-env-hints` does the same for one job.
+        cfg.claims.export_env = true;
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::Minimal);
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(4 << 30));
+        o.no_limit_env_hints = true;
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert!(!spec.env.contains_key("GOMAXPROCS"), "got: {:?}", spec.env);
     }
 
     /// A value that somebody chose must stay.

@@ -5365,11 +5365,54 @@ fn a_job_is_told_the_size_of_its_claim() {
         "the job must see its own claim: {out}"
     );
 
+    // HALF A CLAIM IS NOT A CLAIM.
+    //
+    // With `--mem` and no `--cpu`, the number of cores comes from
+    // `[defaults]`, and it is one. A job that heard that number would run
+    // single-threaded on a machine of sixteen cores. qex writes the claim only
+    // when the user answered BOTH questions.
+    let id = h.submit(&[
+        "submit",
+        "--mem",
+        "2GB",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][]",
+        "`--mem` with no `--cpu` must write nothing: {out}"
+    );
+
+    // And the same rule for the other half.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][]",
+        "`--cpu` with no `--mem` must write nothing: {out}"
+    );
+
     // A value that somebody chose must stay. `--env` is a decision.
     let id = h.submit(&[
         "submit",
         "--cpu",
         "2",
+        "--mem",
+        "2GB",
         "--env",
         "GOMAXPROCS=9",
         "--",
@@ -5412,7 +5455,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "name = \"off\"\n\
          command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
          no_limit_env_hints = true\n\n\
-         [resources]\ncpu = 2\n",
+         [resources]\ncpu = 2\nmem = \"2GB\"\n",
     )
     .unwrap();
     let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
@@ -5436,5 +5479,88 @@ fn a_job_is_told_the_size_of_its_claim() {
         out.trim(),
         "[2][2]",
         "the job file must get the claim: {out}"
+    );
+
+    // A stage of a pipeline says the same thing as a job file.
+    let pipeline = h.root.join("p.toml");
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"stage-on\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
+         [jobs.resources]\ncpu = 2\nmem = \"2GB\"\n\n\
+         [[jobs]]\nname = \"stage-off\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
+         no_limit_env_hints = true\n\
+         [jobs.resources]\ncpu = 2\nmem = \"2GB\"\n",
+    )
+    .unwrap();
+    let ids_file = h.root.join("stage-ids.json");
+    h.ok(&[
+        "pipeline",
+        pipeline.to_str().unwrap(),
+        "--id-file",
+        ids_file.to_str().unwrap(),
+    ]);
+    let ids: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ids_file).unwrap()).unwrap();
+    for (stage, want) in [("stage-on", "[2][2]"), ("stage-off", "[][]")] {
+        let id = ids["jobs"][stage].as_str().unwrap().to_string();
+        h.ok(&["wait", &id, "--timeout", "60s"]);
+        let out = h.ok(&["logs", &id, "--stdout"]);
+        assert_eq!(
+            out.trim(),
+            want,
+            "the stage {stage} must give {want}: {out}"
+        );
+    }
+}
+
+/// `[claims]` in the config file controls every job of this machine.
+///
+/// `export_env = false` turns the claim off for all of them, and `also` adds
+/// the two variables that qex does not write without a request. Each of those
+/// two has a cost, so neither is a default: `JAVA_TOOL_OPTIONS` makes every JVM
+/// write `Picked up JAVA_TOOL_OPTIONS: ...` to its standard error, and
+/// `MAKEFLAGS` replaces the `-j` of a Makefile that gives one.
+#[test]
+fn the_config_file_controls_the_claim_in_the_environment() {
+    let show = [
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS][$JAVA_TOOL_OPTIONS][$MAKEFLAGS]\"",
+    ];
+
+    let h = Harness::new(
+        "claimsoff",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [claims]\nexport_env = false\n",
+    );
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    args.extend_from_slice(&show);
+    let id = h.submit(&args);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][][][]",
+        "`export_env = false` must write nothing: {out}"
+    );
+
+    let h = Harness::new(
+        "claimsalso",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [claims]\nalso = [\"java\", \"make\"]\n",
+    );
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    args.extend_from_slice(&show);
+    let id = h.submit(&args);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[2][2][-XX:ActiveProcessorCount=2 -Xmx1536m][-j2]",
+        "`also` must add the two variables: {out}"
     );
 }
