@@ -58,6 +58,28 @@ goes into `main` and it stays there. Write it as a commit message:
 Correct the body before you merge, not when you open the pull request. A pull
 request is a conversation while it is open, and a commit message when it lands.
 
+### A checklist goes in a comment, and never in the body
+
+Work that you must complete before the merge goes in a **comment** on the pull
+request, as a list of boxes. Make it the first comment, so that a reader finds
+it before the discussion.
+
+```markdown
+- [ ] Rebase on `main` after #29 lands
+- [ ] CI green after the rebase
+- [ ] An independent review of what the rebase changed
+```
+
+CI has a check, `task-list-completed`, that reads the comments and refuses the
+merge while a box is empty. The checklist is thus a gate and not a note.
+
+Two reasons for a comment and not the body:
+
+- The body becomes the commit message. A list of boxes in `git log` says
+  nothing to a reader in a year, and every box in it is empty for ever.
+- The state of the work changes while the pull request is open. A comment
+  changes with it, and the commit message must not.
+
 **While the first number is 0, a break moves the SECOND number.** A 0.x version
 says that the interface can still change, so an automatic move to 1.0.0 would
 say something that no person decided. To go to 1.0.0, put that number in
