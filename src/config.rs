@@ -1513,15 +1513,37 @@ mod tests {
 
         // A value from which qex can read no whole number must name the remedy
         // and not a type in the program.
+        //
+        // The last one is ABOVE `i64::MAX`. The `toml` crate reads an integer as
+        // i64 where it fits and goes to u64 for a larger one, so that value is
+        // the one form that reaches `visit_u64`. A review called that method
+        // unreachable from TOML; this line is the file that reaches it.
         for text in [
             "[politeness]\nnice = \"ten\"\n",
             "[politeness]\nnice = 10.5\n",
             "[politeness]\noom_score_adj = 9999999999\n",
+            "[politeness]\nnice = 9223372036854775808\n",
         ] {
             let err = toml::from_str::<Config>(text).unwrap_err().to_string();
             assert!(
                 err.contains("Write a whole number"),
                 "the message for `{text}` must give the remedy: {err}"
+            );
+        }
+
+        // A type that is neither a number nor text reaches `expecting`, and
+        // that text is the whole remedy that the user gets. serde writes
+        // "invalid type: boolean `true`, expected <the text of `expecting`>",
+        // so an empty or wrong `expecting` leaves the user with the name of a
+        // type in the program and no answer.
+        for text in [
+            "[politeness]\nnice = true\n",
+            "[politeness]\noom_score_adj = [1, 2]\n",
+        ] {
+            let err = toml::from_str::<Config>(text).unwrap_err().to_string();
+            assert!(
+                err.contains("a whole number such as 10, with or without quotation marks"),
+                "the message for `{text}` must name the two forms that qex takes: {err}"
             );
         }
     }
