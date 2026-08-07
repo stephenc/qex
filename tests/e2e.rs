@@ -5224,6 +5224,15 @@ fn every_politeness_value_reaches_the_job_and_its_children() {
                      echo \"$1 nice=$(awk \"{print \\$19}\" /proc/$2/stat) \
                      oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
                      report child $$'";
+        // `[politeness]` changes the priority of every job, so the text form of
+        // `qex config show` must name the values. A user who asks why a build
+        // is slow reads this text, and not the JSON.
+        let shown = h.ok(&["config", "show"]);
+        assert!(
+            shown.contains("nice 12") && shown.contains(&format!("io {io}")),
+            "`qex config show` must name the politeness values: {shown}"
+        );
+
         let id = h.submit(&["submit", "--", "sh", "-c", probe]);
         h.ok(&["wait", &id, "--timeout", "45s"]);
         let out = h.ok(&["logs", &id, "--stdout"]);
