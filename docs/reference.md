@@ -310,9 +310,10 @@ oom_score_adj = 0     # a larger number offers the job to the OOM killer first
 macOS has no equivalent of either, so qex reads the two values there and does
 nothing with them.
 
-`qex submit --nice 0` for one job that must not give way, and `nice = 0` in the
-configuration to return to the earlier behaviour for every job. A job file and a
-pipeline stage take `nice` as well.
+`qex submit --nice 0` asks that one job does not give way, and `nice = 0` in the
+configuration returns to the earlier behaviour for every job. A job file and a
+pipeline stage take `nice` as well, and `qex config show` names the three values
+that qex uses now.
 
 The value comes from three places, and the last one wins:
 
