@@ -674,6 +674,13 @@ that qex uses now.
     mem = \"2GB\"           # the default is the machine memory / the core count
     timeout = \"0\"         # the default is no limit
 
+Quotation marks around a number
+-------------------------------
+
+A field that takes a number, a size, a time or a percentage accepts the value
+with quotation marks and without them. `cpu = 2` and `cpu = \"2\"` give the same
+budget. A size with no unit is bytes, and a time with no unit is seconds.
+
 Default job size
 ----------------
 

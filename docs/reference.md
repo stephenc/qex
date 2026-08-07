@@ -274,6 +274,10 @@ timeout = "0"         # the default is no limit
 With no `[defaults]` section, a job gets 1 core and an equal part of the machine
 memory. The default job size thus scales with the machine.
 
+A field that takes a number, a size, a time or a percentage accepts the value
+with quotation marks and without them. `cpu = 2` and `cpu = "2"` give the same
+budget. A size with no unit is bytes, and a time with no unit is seconds.
+
 ### Update the coordinator before you use a new option
 
 qex refuses a field that it does not know. That rule finds a name with a

@@ -85,20 +85,20 @@ impl EnforceMode {
 ///
 /// # The fault that this removes
 ///
-/// `[budget] cpu` takes an integer or a percentage, so the field is text. TOML
-/// then refuses `cpu = 2` with `invalid type: integer, expected a string`,
-/// while `[defaults] cpu = 1` accepts an integer in the same file — and
-/// `qex help config` shows both forms. A user who writes the obvious thing gets
-/// an error that names a Rust type and gives no remedy.
+/// A field such as `[budget] cpu` takes an integer OR a percentage, so the
+/// field is text in this program. TOML then refused `cpu = 2` with
+/// `invalid type: integer, expected a string`, while `[defaults] cpu = 1`
+/// accepted an integer in the same file, and `qex help config` shows both
+/// forms. A user who wrote the obvious thing received an error that named a
+/// type in the program and gave no remedy.
 ///
-/// A number and its text are the same value here. This function takes either.
-fn text_or_number_opt<'de, D>(d: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    text_or_number(d).map(Some)
-}
-
+/// A number and its text are the same value here, so this function takes
+/// either. The units module reads a bare number: a size with no unit is bytes,
+/// and a duration with no unit is seconds.
+///
+/// Use this function on a text field that holds a number, a size, a duration or
+/// a percentage. Do not use it on a field that holds a name or a path, because
+/// a number there is a fault that the user must see.
 fn text_or_number<'de, D>(d: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -111,6 +111,9 @@ where
     impl Visitor<'_> for Either {
         type Value = String;
 
+        // A type that is neither a number nor text stops here, and this text is
+        // the remedy that the user reads. Name the two forms, and not the type
+        // in the program.
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("a number such as 2, or text such as \"75%\" or \"8GB\"")
         }
@@ -124,20 +127,28 @@ where
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<String, E> {
             Ok(v.to_string())
         }
+        // A TOML integer is signed, so TOML never calls this method and no test
+        // can reach it. Serde permits a deserializer to give an unsigned
+        // integer, and a visitor that refuses one gives `invalid type`. Keep it.
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<String, E> {
             Ok(v.to_string())
         }
+        // A whole number that TOML read as a float, such as `2.0`, becomes `2`.
+        // Rust writes a float with no fraction in that form already.
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<String, E> {
-            // A whole number that TOML read as a float, such as `2.0`.
-            if v.fract() == 0.0 && v.abs() <= i64::MAX as f64 {
-                Ok((v as i64).to_string())
-            } else {
-                Ok(v.to_string())
-            }
+            Ok(v.to_string())
         }
     }
 
     d.deserialize_any(Either)
+}
+
+/// The same as [`text_or_number`], for a field that the user can leave out.
+fn text_or_number_opt<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    text_or_number(d).map(Some)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -623,6 +634,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// A number must be accepted where the field takes a number or text.
     ///
     /// `[budget] cpu = 2` gave `invalid type: integer, expected a string`
@@ -646,15 +659,68 @@ mod tests {
         let c: Config = toml::from_str("[system]\nreserve_mem = 0\n").unwrap();
         c.validate().unwrap();
         assert_eq!(c.reserve_mem().unwrap(), 0);
-
-        // A value that means nothing must still give an error, and that error
-        // must name the field.
-        let c: Config = toml::from_str("[budget]\ncpu = \"two\"\n").unwrap();
-        let e = c.validate().unwrap_err().to_string();
-        assert!(e.contains("budget"), "the error must name the field: {e}");
     }
 
-    use super::*;
+    /// Every other field of the same shape must take a number too.
+    ///
+    /// A user who learns that `[budget] cpu = 2` operates writes `settle = 5`
+    /// next. One field that refuses a number keeps the fault, so this test
+    /// reads each of them. A duration with no unit is seconds, which
+    /// `units::parse_duration` gives. `[gc] keep` is a float, because TOML
+    /// reads `3600.0` as a float and the value must still be one hour.
+    #[test]
+    fn each_duration_and_size_field_accepts_a_number() {
+        let c: Config = toml::from_str(
+            "[queue]\nsettle = 5\n\
+             [peers]\nstale_after = 45\n\
+             [gc]\nkeep = 3600.0\n\
+             [history]\nkeep = 7200\n\
+             [defaults]\nmem = 536870912\ntimeout = 90\n",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.settle().unwrap(), std::time::Duration::from_secs(5));
+        assert_eq!(
+            c.peer_stale_after().unwrap(),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(c.gc_keep().unwrap(), std::time::Duration::from_secs(3600));
+        assert_eq!(
+            c.history_keep().unwrap(),
+            std::time::Duration::from_secs(7200)
+        );
+        assert_eq!(c.default_mem().unwrap(), 512 << 20);
+        assert_eq!(
+            c.default_timeout().unwrap(),
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    /// A value that means nothing must still give an error that names the
+    /// field, and not the type of the value in the program.
+    #[test]
+    fn a_value_that_means_nothing_gives_an_error_that_names_the_field() {
+        let c: Config = toml::from_str("[budget]\ncpu = \"two\"\n").unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("[budget] cpu"),
+            "the error must name the field: {e}"
+        );
+        assert!(
+            e.contains("integer or a percentage"),
+            "the error must say what to write: {e}"
+        );
+
+        // A type that is neither a number nor text must name the two forms
+        // that the field takes.
+        let e = toml::from_str::<Config>("[budget]\ncpu = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("a number such as 2") && e.contains("75%"),
+            "the error must say which forms the field takes: {e}"
+        );
+    }
 
     /// A field that qex does not know must give the order of the steps.
     ///
