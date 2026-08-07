@@ -134,6 +134,18 @@ mod tests {
     /// not recognise. Its numbers are below the capability floor, so
     /// `capabilities::check_floor` REFUSES every such coordinator in place of
     /// warning about it, and a person cannot use a build of their own tree.
+    ///
+    /// # THIS TEST IS THE SECOND NET, AND NOT THE FIRST
+    ///
+    /// `build.rs::refuse_below_the_floor` stops such a build before a test
+    /// runs, so this test does not see the tree and cannot fail for that
+    /// reason. It accepts a wider set than `build.rs` does — `0.0.0` and
+    /// `0.5.9` pass here and `build.rs` refuses both.
+    ///
+    /// It stays because the two guards answer to different rules. `build.rs`
+    /// holds its own copy of the capability floor and reads only the number;
+    /// this test reads `DEVELOPMENT`, which is the rule that `is_development`
+    /// uses. A change to either one leaves the other in place.
     #[test]
     fn cargo_toml_holds_this_development_version_or_a_release() {
         assert!(

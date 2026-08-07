@@ -291,6 +291,29 @@ new_tree() {
     printf '[[package]]\nname = "qex"\nversion = "%s"\n' "$number" >"$tree/Cargo.lock"
 }
 
+# A DEPENDENCY IN FRONT OF `[package]`.
+#
+# `version = "..."` appears in a dependency as well. A search of the whole file
+# finds whichever comes first, and this script WRITES that line — so a search
+# that found a dependency would rewrite it and leave the package alone.
+#
+# `[package]` comes first in the real Cargo.toml today. That is a habit, and a
+# habit is not a thing to write over a file with, so the test makes the awkward
+# order on purpose.
+evil="$work/evil"
+new_tree "$evil" "0.0.0-dev"
+printf '[dependencies.other]\nversion = "1.2.3"\n\n%s' "$(cat "$evil/Cargo.toml")" \
+    >"$evil/Cargo.toml.new"
+mv "$evil/Cargo.toml.new" "$evil/Cargo.toml"
+"$evil/.github/scripts/set-version.sh" 0.8.0 >/dev/null 2>&1
+check "a dependency in front of [package] does not stop the write" "0" "$?"
+check "the version of the package is the new number" "0.8.0" \
+    "$(awk -F'"' '/^\[/ { t = $0 } t == "[package]" && /^version *= *"/ { print $2; exit }' \
+        "$evil/Cargo.toml")"
+check "and the version of the dependency is untouched" "1.2.3" \
+    "$(awk -F'"' '/^\[/ { t = $0 } t == "[dependencies.other]" && /^version *= *"/ { print $2; exit }' \
+        "$evil/Cargo.toml")"
+
 tree="$work/tree"
 new_tree "$tree" "0.0.0-dev"
 "$tree/.github/scripts/set-version.sh" 0.8.0 >/dev/null 2>&1
