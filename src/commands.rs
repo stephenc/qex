@@ -207,7 +207,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
             None => None,
         };
         match wait_one(&args.id, deadline)? {
-            WaitOutcome::Finished(s) => wait_code = exit_code_for(&s, false),
+            WaitOutcome::Finished(s) => wait_code = exit_code_for(&s, ExitMode::State),
             WaitOutcome::TimedOut => {
                 eprintln!(
                     "qex: the wait for {} reached its time limit. The job continues.",
@@ -500,7 +500,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
             }
         };
 
-        let code = exit_code_for(&status, args.passthrough);
+        let code = exit_code_for(&status, wait_mode(args.passthrough));
         if code != 0 && worst == 0 {
             worst = code;
         }
@@ -559,7 +559,7 @@ fn wait_for_any(args: &cli::WaitArgs, deadline: Option<Instant>) -> Result<i32> 
                         describe_result(&status)
                     );
                 }
-                return Ok(exit_code_for(&status, args.passthrough));
+                return Ok(exit_code_for(&status, wait_mode(args.passthrough)));
             }
         }
 
@@ -1242,8 +1242,54 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     Ok(worst)
 }
 
+/// How a command turns the result of a job into its own exit code.
+///
+/// Every command that waits for a job uses this one function. A second rule in
+/// a second command is how two commands start to answer one question two ways.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitMode {
+    /// The code names the STATE of the job. `qex wait` uses this mode.
+    State,
+    /// The code is the exit code of the job. `qex wait --passthrough` uses it.
+    Passthrough,
+    /// The code is the exit code of the job when the job RAN, and the code of
+    /// the state when the job gave no code of its own. `qex run` uses it.
+    Run,
+}
+
+/// Gives the mode of `qex wait`, with or without `--passthrough`.
+fn wait_mode(passthrough: bool) -> ExitMode {
+    if passthrough {
+        ExitMode::Passthrough
+    } else {
+        ExitMode::State
+    }
+}
+
 /// Gives the exit code for a job result.
-fn exit_code_for(status: &JobStatus, passthrough: bool) -> i32 {
+fn exit_code_for(status: &JobStatus, mode: ExitMode) -> i32 {
+    // `qex run` needs a mode between the other two, because neither of them
+    // alone is correct for it:
+    //
+    // - `qex run` writes the output of the job, so a caller expects the exit
+    //   code of the job when the job ran. `ExitMode::State` gives 1 for every
+    //   job that failed, and it thus loses the code 7 of `sh -c 'exit 7'`.
+    // - A job that something stopped gave no exit code, and
+    //   `ExitMode::Passthrough` gives 1 for it. The caller reads 1, which is
+    //   the most common code of a program that failed, and concludes that its
+    //   own command failed. The true answer is that ANOTHER command on the
+    //   machine stopped the job, and that is an ordinary event on a machine
+    //   that several agents share.
+    //
+    // `ExitMode::Run` thus passes the code of the job through for the two
+    // states in which the job ran to its own end, and it gives the code of the
+    // state for every other state. Those are the codes of `qex wait`.
+    let passthrough = match mode {
+        ExitMode::State => false,
+        ExitMode::Passthrough => true,
+        ExitMode::Run => matches!(status.state, JobState::Completed | JobState::Failed),
+    };
+
     if passthrough {
         // A job that did not run has no exit code of its own. Give the code for
         // the state instead, so the caller still learns that an earlier job is
@@ -1259,6 +1305,11 @@ fn exit_code_for(status: &JobStatus, passthrough: bool) -> i32 {
 
     match status.state {
         JobState::Completed => 0,
+        // A job that `qex cancel` removed from the queue never ran and wrote
+        // nothing, so it has the code of a job that something stopped. The
+        // caller must not read it as a fault in the work: the work did not
+        // start. The code is the same for `qex run` and for `qex wait`,
+        // because one state gives one answer.
         JobState::Killed | JobState::Timeout | JobState::Oom | JobState::Cancelled => EXIT_KILLED,
         // A job that did not run has its own code. A script can then separate
         // "my job failed" from "a job before mine failed", and it does not read
@@ -1895,10 +1946,15 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
 
     let mut handles: Vec<(bool, Option<std::fs::File>)> = vec![(false, None), (true, None)];
     let mut announced_wait = false;
+    // Keep a record of who stopped the job. A user who pressed Ctrl-C knows
+    // already why the job stopped, but a user whose job ANOTHER command stopped
+    // knows nothing, and that user needs the sentence most.
+    let mut stopped_here = false;
 
     loop {
         if RUN_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!("\nqex: stopping the job {id}");
+            stopped_here = true;
             client
                 .call(&Request::Kill {
                     id,
@@ -1955,16 +2011,63 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
         }
 
         if status.state.is_terminal() && !moved {
-            let code = exit_code_for(&status, true);
-            match status.state {
-                JobState::Completed | JobState::Failed => {}
-                other => eprintln!("qex: the job {other}"),
-            }
+            let code = exit_code_for(&status, ExitMode::Run);
+            report_run_stop(&status, stopped_here);
             return Ok(code);
         }
 
         std::thread::sleep(Duration::from_millis(80));
     }
+}
+
+/// Writes why `qex run` stopped, when the job gave no exit code of its own.
+///
+/// The exit code speaks to a script. A person, and an agent that reads the
+/// output, needs the sentence as well. The important case is the job that a
+/// DIFFERENT command stopped: the caller must not read that as a fault in its
+/// own work, so the text says that this command did not stop the job.
+///
+/// `stopped_here` is true when this command sent the kill, after Ctrl-C or
+/// after a SIGTERM. That user knows the cause already, so the text is short.
+fn report_run_stop(status: &JobStatus, stopped_here: bool) {
+    let id = status.id;
+    let text = match status.state {
+        // The job ran and gave its own exit code, and that code is now the exit
+        // code of this command. A signal in the job gives no code, so name it.
+        JobState::Completed => return,
+        JobState::Failed => match (status.exit_code, status.signal) {
+            (Some(_), _) => return,
+            (None, Some(sig)) => format!(
+                "the signal {sig} stopped the job {id}. The job did not stop by itself. Use \
+                 `qex status {id}` to read the record."
+            ),
+            _ => return,
+        },
+        JobState::Killed if stopped_here => {
+            format!("this command stopped the job {id}")
+        }
+        JobState::Killed => format!(
+            "a different command stopped the job {id}. This command did not stop it, and the \
+             work did not fail. Start the work again when you still need it."
+        ),
+        JobState::Cancelled => format!(
+            "a different command removed the job {id} from the queue. The job did not run and \
+             it wrote no output. Start the work again when you still need it."
+        ),
+        JobState::Timeout => format!(
+            "the job {id} reached its time limit, and qex stopped it. Give a longer `--timeout` \
+             when the work needs more time."
+        ),
+        JobState::Oom => format!(
+            "the machine ran out of memory, and the job {id} stopped. The job claimed {} and \
+             used {}. Give a larger `--mem`, or make the work smaller.",
+            format_size(status.mem),
+            format_size(status.usage.max_rss)
+        ),
+        JobState::Skipped => describe_result(status),
+        other => format!("the job {id} is {other}"),
+    };
+    eprintln!("qex: {text}");
 }
 
 /// Submits the same job again, with the same command, environment and claim.
@@ -2449,27 +2552,27 @@ mod tests {
     #[test]
     fn the_exit_codes_follow_the_documentation() {
         assert_eq!(
-            exit_code_for(&status_with(JobState::Completed, Some(0)), false),
+            exit_code_for(&status_with(JobState::Completed, Some(0)), ExitMode::State),
             0
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(1)), false),
+            exit_code_for(&status_with(JobState::Failed, Some(1)), ExitMode::State),
             1
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(42)), false),
+            exit_code_for(&status_with(JobState::Failed, Some(42)), ExitMode::State),
             1
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Killed, None), false),
+            exit_code_for(&status_with(JobState::Killed, None), ExitMode::State),
             EXIT_KILLED
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Timeout, None), false),
+            exit_code_for(&status_with(JobState::Timeout, None), ExitMode::State),
             EXIT_KILLED
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Oom, None), false),
+            exit_code_for(&status_with(JobState::Oom, None), ExitMode::State),
             EXIT_KILLED
         );
     }
@@ -2478,15 +2581,105 @@ mod tests {
     #[test]
     fn the_passthrough_option_gives_the_exit_code_of_the_job() {
         assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(42)), true),
+            exit_code_for(
+                &status_with(JobState::Failed, Some(42)),
+                ExitMode::Passthrough
+            ),
             42
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Completed, Some(0)), true),
+            exit_code_for(
+                &status_with(JobState::Completed, Some(0)),
+                ExitMode::Passthrough
+            ),
             0
         );
         // A signal gives no exit code. The result must still show a failure.
-        assert_eq!(exit_code_for(&status_with(JobState::Killed, None), true), 1);
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Killed, None), ExitMode::Passthrough),
+            1
+        );
+    }
+
+    /// `qex run` writes the output of the job, so it gives the exit code of the
+    /// job. Without this, `qex run -- sh -c 'exit 7'` would give 1, and the
+    /// command that `qex run` goes in front of would change its result.
+    #[test]
+    fn qex_run_gives_the_exit_code_of_a_job_that_ran() {
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Completed, Some(0)), ExitMode::Run),
+            0
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(7)), ExitMode::Run),
+            7
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(1)), ExitMode::Run),
+            1
+        );
+    }
+
+    /// A job that something stopped gave no exit code of its own. `qex run`
+    /// must give the code of the state, and not 1.
+    ///
+    /// 1 is the most common code of a program that failed. With 1, an agent
+    /// cannot separate "my job failed" from "another agent on this machine
+    /// stopped my job", so it starts the work again or it reports a fault that
+    /// the work does not have.
+    #[test]
+    fn qex_run_gives_the_code_of_the_state_when_something_stopped_the_job() {
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Killed, None), ExitMode::Run),
+            EXIT_KILLED
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Cancelled, None), ExitMode::Run),
+            EXIT_KILLED
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Timeout, None), ExitMode::Run),
+            EXIT_KILLED
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Oom, None), ExitMode::Run),
+            EXIT_KILLED
+        );
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Skipped, None), ExitMode::Run),
+            EXIT_SKIPPED
+        );
+    }
+
+    /// `qex run` and `qex wait` must never answer one question two ways. For
+    /// each state in which the job gave no exit code, the two commands give one
+    /// code. The test compares them against each other, so they cannot drift.
+    #[test]
+    fn qex_run_and_qex_wait_agree_for_a_job_that_did_not_give_a_code() {
+        for state in [
+            JobState::Killed,
+            JobState::Cancelled,
+            JobState::Timeout,
+            JobState::Oom,
+            JobState::Skipped,
+        ] {
+            let s = status_with(state, None);
+            assert_eq!(
+                exit_code_for(&s, ExitMode::Run),
+                exit_code_for(&s, ExitMode::State),
+                "the state {state} gives two codes"
+            );
+        }
+    }
+
+    /// A signal that is not a stop command leaves the job in the state `failed`
+    /// with no exit code. `qex run` gives 1 there, and `qex wait` gives 1 too.
+    #[test]
+    fn a_signal_that_the_job_took_gives_one_from_both_commands() {
+        let mut s = status_with(JobState::Failed, None);
+        s.signal = Some(libc::SIGSEGV);
+        assert_eq!(exit_code_for(&s, ExitMode::Run), 1);
+        assert_eq!(exit_code_for(&s, ExitMode::State), 1);
     }
 
     #[test]

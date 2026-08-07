@@ -150,6 +150,12 @@ id.
     short, and you wait for it now    ->  qex run -- ...
     long, or you come back to it      ->  qex submit, then qex status <id> --wait
 
+When something else stops the job, `qex run` gives 125 and not 1. Another agent
+on this machine can run `qex kill` or `qex cancel` on your job, because a job of
+`qex run` is a job like any other. The code 125 says that your work did not
+fail: something stopped it. Do not start the work again before you read the
+line on stderr. Run `qex help exit-codes` for the full table.
+
 The three commands you need
 ---------------------------
 
@@ -1028,6 +1034,27 @@ To get the exit code of the job itself, add `--passthrough`:
 
 `qex wait` then exits with the exit code of the job. Use this option to send the
 result of the job to a script.
+
+`qex run`
+---------
+
+    the exit code of the job    the job ran (0, 7, 1, whatever it gave)
+    125  something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory
+    126  the job did not run, because a job that it needed did not succeed
+    127  there is no job with that id
+
+`qex run` writes the output of the job, so it gives the exit code of the job
+when the job RAN. `qex run -- sh -c 'exit 7'` gives 7.
+
+A job of `qex run` is a job like any other, so `qex kill` and `qex cancel` from
+a DIFFERENT command can stop it. That job gave no exit code of its own, and
+`qex run` then gives 125 and not 1. The two are thus separate: 1 says that your
+work failed, and 125 says that something stopped your work before it could
+finish. `qex run` also writes a line to stderr that says which of the two
+happened, and it says when it did not stop the job itself.
+
+For each state, `qex run` gives the same code as `qex wait`. Two commands must
+not answer one question two ways.
 
 Other commands
 --------------

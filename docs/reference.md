@@ -46,6 +46,26 @@ timeout on `qex wait` stops your wait only. It does not stop the job.
 
 Add `--passthrough` to exit with the exit code of the job.
 
+### Exit codes of `qex run`
+
+| Code | Meaning |
+| ---- | ------- |
+| the exit code of the job | The job ran. `qex run -- sh -c 'exit 7'` gives 7. |
+| 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
+| 126  | The job did not run, because a job that it needed failed. |
+| 127  | There is no job with that id. |
+
+`qex run` writes the output of the job, so it gives the exit code of the job
+when the job RAN.
+
+A job of `qex run` is a job like any other, so `qex kill` and `qex cancel` from
+a different command can stop it. Such a job gave no exit code of its own, and
+`qex run` then gives 125. The code 1 thus keeps one meaning: your work ran and
+it failed. `qex run` also writes a line to stderr that names the cause, and that
+line says when this command did not stop the job.
+
+For each state, `qex run` gives the same code as `qex wait`.
+
 ## Resource claims
 
 Give `--cpu` and `--mem`. qex uses these claims to decide how many jobs operate

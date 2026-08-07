@@ -154,6 +154,8 @@ the last lines of the error output. One command gives everything.
 
 ## The exit codes
 
+These are the codes of `qex wait` and of `qex status --wait`.
+
 | Code | Meaning |
 | ---- | ------- |
 | 0    | The job succeeded. |
@@ -165,6 +167,29 @@ the last lines of the error output. One command gives everything.
 
 The code 124 has the same meaning as the code of the `timeout` command. A
 timeout on `qex wait` stops your wait only. It does not stop the job.
+
+### The exit codes of `qex run`
+
+`qex run` writes the output of the job, so it gives the exit code of the job
+when the job RAN: `qex run -- sh -c 'exit 7'` gives 7.
+
+| Code | Meaning |
+| ---- | ------- |
+| the exit code of the job | The job ran. |
+| 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
+| 126  | The job did not run, because a job that it needed failed. |
+| 127  | There is no job with that id. |
+
+**Read 125 with care.** A job of `qex run` is a job like any other, so a
+different agent on this machine can run `qex kill` or `qex cancel` on it. The
+code 125 says that your work did not fail: something stopped it before it could
+finish. Do not start the work again and do not report a fault in the task. Read
+the line on stderr, which says what stopped the job and whether this command
+stopped it.
+
+The code 1 thus keeps one meaning: your work ran, and it failed.
+
+For each state, `qex run` gives the same code as `qex wait`.
 
 ## Two fields that need care
 
