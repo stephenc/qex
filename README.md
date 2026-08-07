@@ -217,6 +217,10 @@ Simplified Technical English (ASD-STE100).
 See [CONTRIBUTING.md](CONTRIBUTING.md). The title of a pull request gives the
 next version number, so its form is part of the build.
 
+Do not change the version in `Cargo.toml`. `main` holds `0.0.0-dev` for ever;
+the number of a release lives on the tag, and `build.rs` puts the commit into
+the version of your build, such as `0.0.0-dev+g98513e2`.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).

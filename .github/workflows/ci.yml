@@ -60,6 +60,38 @@ jobs:
       - name: The end-to-end tests
         run: cargo test --test e2e -- --test-threads=2
 
+  # The rules that give the version number of every release.
+  #
+  # Those rules live in bash, so no test of the Rust code reaches them. This job
+  # takes a few seconds: it makes small git repositories in a temporary
+  # directory, and it needs no network and no cargo.
+  version:
+    name: The rules for the version number
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - run: .github/actions/compute-version/test.sh
+
+  # What `build.rs` makes a binary report.
+  #
+  # A wrong answer there is invisible until somebody reads a fault report, and
+  # the shapes that break it — a package inside a repository that belongs to
+  # somebody else — appear on the machine of a user and never here. The test
+  # builds a copy of the package in each of those shapes, so it needs cargo and
+  # it does not run in the fast job above.
+  build-version:
+    name: The version that a build reports
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-version
+      - run: .github/scripts/build-version-test.sh
+
   # Cargo.toml names the earliest version of Rust that qex needs. A number that
   # nothing tests is a guess, and a user with that version meets the error.
   msrv:

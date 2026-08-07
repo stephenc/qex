@@ -117,14 +117,16 @@ coordinator ignores in silence — and a job that runs without the lock that you
 asked for is worse than a job that does not run. qex thus asks the coordinator
 what it can do, and it refuses the job with the option and the remedy.
 
-## The support floor
+## The capability floor
 
-qex supports the first published version and above. A coordinator below that
-number comes from a build that no release holds, so no promise covers it, and
-the CLI refuses it and says how to replace it:
+A coordinator says what it can do from the first published version and above.
+One below that number gives no answer, so the CLI cannot learn which options it
+obeys, and it must not let a user believe a rule holds when it may not. It
+refuses such a coordinator and says how to replace it:
 
 ```
-the coordinator (pid 4321) is version 0.5.2, and qex supports 0.6.0 and above.
+the coordinator (pid 4321) is version 0.5.2, and a coordinator says what it can
+do from 0.6.0 and above.
 ...
     kill 4321
 The jobs that operate now continue; a new coordinator reads the same records.
@@ -132,6 +134,22 @@ The jobs that operate now continue; a new coordinator reads the same records.
 
 The jobs are safe in that operation. A coordinator holds no result: the record
 of each job is on the disk, and a new coordinator reads the same records.
+
+### A development build gets a warning, and not a refusal
+
+A build that a person makes reports a version such as `0.0.0-dev+g98513e2`,
+which names the commit that it holds. qex names such a version a development
+build, and a coordinator from one gets a warning only.
+
+The floor is a backstop for a coordinator so early that it came before the
+capability handshake: such a build cannot say what it cannot do, so the only
+safe answer is to refuse it. A development build is not that. It answers the
+`Capabilities` request like every other build, so qex still refuses each option
+that it cannot obey, and it names the option. The floor is the coarse gate, and
+the capability test is the exact one.
+
+A refusal would make every build that a person makes unusable by its own CLI,
+which is a worse fault than the fault that the floor guards against.
 
 ## Three questions that a user asked, with the answers
 

@@ -11,7 +11,9 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "qex",
-    version,
+    // Not the number in Cargo.toml: `main` holds `0.0.0-dev` for ever, and
+    // `build.rs` calculates the number of this build. See `src/version.rs`.
+    version = crate::version::VERSION,
     about = "Queued EXecutor. A job queue for long tasks on this machine.",
     long_about = None,
     disable_help_subcommand = true,

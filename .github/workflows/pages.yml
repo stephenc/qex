@@ -5,23 +5,23 @@ name: Pages
 # # Why this workflow exists
 #
 # GitHub makes a deployment of its own when the source of the site is a
-# directory. That deployment STOPS when a new commit arrives, and the release
-# workflow pushes `chore(release): vX.Y.Z` a few minutes after the commit that
-# started it. Each push thus stopped the deployment of the push before it, and
-# the deployment that survived waited for a deployment that no longer existed
-# and reached its time limit after ten minutes.
+# directory. That deployment STOPS when a new commit arrives. An earlier release
+# workflow pushed `chore(release): vX.Y.Z` to `main` a few minutes after the
+# commit that started it. Each push thus stopped the deployment of the push
+# before it, and the deployment that survived waited for a deployment that no
+# longer existed and reached its time limit after ten minutes.
 #
 # Every build of the site failed in that way, and the site kept the pages of an
 # earlier day while each new page looked as if it had gone out.
 #
-# Two rules below correct it:
+# The release commit no longer reaches `main`: it hangs off `main` and the tag
+# names it. The two rules below stay, because the fault was a queue of
+# deployments and any second push brings it back:
 #
 #   1. `cancel-in-progress: false` — a deployment that operates goes to its end,
 #      and the next one waits. A deployment takes about one minute, so the queue
 #      is short.
-#   2. `paths` — the release commit changes Cargo.toml and Cargo.lock only, and
-#      it thus starts no deployment at all. The site changes when the words
-#      change, and at no other time.
+#   2. `paths` — the site changes when the words change, and at no other time.
 on:
   push:
     branches: [main]

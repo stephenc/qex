@@ -1,28 +1,97 @@
 name: Release
 
-# A merge to main. The commit messages since the last tag give the next version
-# number; see .github/scripts/next-version.sh for the rules.
+# ONE workflow makes the release, from the tag.
+#
+# # Why the release comes from a tag
+#
+# A branch ruleset asks for a pull request on `main`. The GitHub Actions app
+# cannot take a bypass on a repository that a person owns: the API refuses it
+# with "Actor GitHub Actions integration must be part of the ruleset source or
+# owner organization". A workflow can therefore no longer push to `main`.
+#
+# The ruleset covers the default branch only, so a push of a TAG still passes.
+#
+# # Fishbone tagging: the release commit hangs OFF main, and never ON it
+#
+#     main:  A --- B --- C            <- the spine, always 0.0.0-dev
+#                   \     \
+#                    b     c          <- a rib of one commit: chore(release)
+#                    |     |
+#                 v0.7.2  v0.7.3      <- the tag is on the rib
+#
+# The rib holds the real number in Cargo.toml and Cargo.lock, so the tag names a
+# commit that a person can build with no further step, and `cargo publish` works
+# from it. `git push origin vX.Y.Z` sends the tag and the commit that it reaches.
+# MAIN IS NEVER UPDATED, so the ruleset never applies.
+#
+# # Two shapes, and one path out
+#
+# The `decide` job answers two questions for every other job: which tag, and is
+# there a release at all. No other job knows which way the run started. THE REF
+# GIVES THE SHAPE, and there is no input to plumb:
+#
+#   * THE REF IS A TAG — release that tag. A person pushed `v1.0.0` by hand, or
+#     a person dispatched this workflow on a tag to drive a release again. The
+#     two are one case: take the number from the tag, and make no tag.
+#   * THE REF IS `main` — the version rules read the commits. Nothing to
+#     release: the run stops in `decide`. Something to release: `decide` writes
+#     the number, commits it beside `main`, makes the tag and pushes THE TAG
+#     ALONE. THIS PATH REFUSES ANY OTHER BRANCH, because a `workflow_dispatch`
+#     takes any ref and a release from a branch would publish code that no pull
+#     request accepted.
+#
+# ONE workflow, and the events are disjoint, so two runs cannot publish one
+# release. A tag that the default token pushes starts NO workflow, so the tag
+# that `decide` makes does not start a second run of this file.
+#
+# # THE TAG NOW COMES BEFORE THE BUILD, AND A FAILED RELEASE LEAVES IT BEHIND
+#
+# An earlier workflow made the tag after the builds, so a build that failed left
+# no tag. That is no longer true, and it cannot be: the tag is what a build
+# builds. A run that fails after `decide` thus leaves a tag on the repository
+# with no release beside it.
+#
+# "Re-run all jobs" DOES NOT CORRECT THAT. The tag exists by then, so the rules
+# take it as the last release, the range of commits is empty, and the run goes
+# green having released nothing.
+#
+# To drive the release again, dispatch this workflow ON THE TAG:
+#
+#     gh workflow run release.yml --ref v0.8.0
+#
+# The ref is then a tag, so the run takes the second shape above: it skips the
+# calculation and the tag, and it goes to the build.
+#
+# # Why there is no `paths-ignore`
+#
+# An earlier workflow held one, so a push that changed the words only did not
+# start a run at all, and the list of runs held the releases and nothing else.
+#
+# `paths-ignore` belongs to the `push` event and not to one ref, so a single
+# `push` block that covers the branch AND the tags would apply it to a tag as
+# well: a tag on a commit that changed the words only would then release
+# nothing.
+#
+# The filter is gone, and the `decide` job is now the ONE place that answers "is
+# there a release". The version rules answer it already — a `docs:` commit asks
+# for no release — so the filter said the same thing a second time, in another
+# language, where it could come to disagree. The cost is a run of about twenty
+# seconds for a push that changes the words only.
+
 on:
   push:
     branches: [main]
-    # A change to the words only does not make a release.
-    #
-    # A `docs:` commit already gives no release, because the type of the commit
-    # gives the version number. This stops the workflow from STARTING at all for
-    # such a push, so the list of runs holds the releases and not a line of runs
-    # that did nothing.
-    #
-    # GitHub skips the run when EVERY file of the push matches this list. A push
-    # that changes the code and the words together still makes a release.
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - '.github/ISSUE_TEMPLATE/**'
+    # `v[0-9]*` and not `v*`. A tag such as `vendor-x` or `v1.0-beta` names
+    # something that is not a release; the rules refuse it with a message, but a
+    # run that goes red and a notification for `vendor-x` is noise that nobody
+    # asked for.
+    tags: ['v[0-9]*']
+  # No input. A dispatch names a ref, and a ref can be a tag, so the ref says
+  # which release to make.
   workflow_dispatch:
 
-# One release at a time. Two together would compute one version number twice.
-# Do not stop a run that operates: it holds a tag and a release.
+# One release at a time. Two together would calculate one number twice. Do not
+# stop a run that operates: it holds a tag and a release.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -31,37 +100,137 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  version:
-    name: The next version
+  decide:
+    name: The release
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      # The tag that the ref names, and an empty string when the ref is `main`.
+      # This one expression is the whole difference between the two shapes.
+      ENTRY_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     outputs:
-      version: ${{ steps.next.outputs.version }}
-      bump: ${{ steps.next.outputs.bump }}
-      previous: ${{ steps.next.outputs.previous }}
-      release: ${{ steps.next.outputs.bump != 'none' }}
+      tag: ${{ steps.decide.outputs.tag }}
+      version: ${{ steps.decide.outputs.version }}
+      create-release: ${{ steps.decide.outputs.create-release }}
     steps:
+      # The default checkout, and never `fetch-depth: 0`. The action reads the
+      # tags and the commits through the API, so the whole history is not
+      # necessary. The checkout is here for the files of the action and for
+      # `set-version.sh`.
       - uses: actions/checkout@v5
+
+      - id: compute
+        uses: ./.github/actions/compute-version
         with:
-          fetch-depth: 0
-      - id: next
-        run: .github/scripts/next-version.sh | tee -a "$GITHUB_OUTPUT"
-      - name: Say what happens
+          tag: ${{ env.ENTRY_TAG }}
+
+      - id: decide
+        env:
+          REF: ${{ github.ref }}
+          VERSION: ${{ steps.compute.outputs.version }}
+          TAG: ${{ steps.compute.outputs.tag }}
+          BUMP: ${{ steps.compute.outputs.bump }}
+          PREVIOUS: ${{ steps.compute.outputs.previous }}
         run: |
-          if [ "${{ steps.next.outputs.bump }}" = "none" ]; then
-            echo "No commit since ${{ steps.next.outputs.previous }} asks for a release." \
-              >>"$GITHUB_STEP_SUMMARY"
-          else
-            echo "The next release is **v${{ steps.next.outputs.version }}**" \
-              "(${{ steps.next.outputs.bump }})." >>"$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+
+          # The ref is a tag, so there is nothing to calculate and nothing to
+          # make. The action read the number from that tag.
+          if [ -n "${ENTRY_TAG:-}" ]; then
+            {
+              echo "tag=$ENTRY_TAG"
+              echo "version=$VERSION"
+              echo "create-release=true"
+            } >>"$GITHUB_OUTPUT"
+            echo "Releasing **$ENTRY_TAG**, which the ref names." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
+
+          # THE BRANCH PATH RUNS ON `main`, AND NOWHERE ELSE.
+          #
+          # It writes a number, makes a tag and publishes a release. A
+          # `workflow_dispatch` takes any ref, and a branch that never merged
+          # holds `0.0.0-dev` like `main` does, so every guard downstream would
+          # let it through: `set-version.sh` would write, the commit and the tag
+          # would be made, and a release would go out with code that no pull
+          # request accepted. This is the only test that stops it.
+          if [ "$REF" != "refs/heads/main" ]; then
+            echo "This workflow makes a release from \`main\`, and the ref is \`$REF\`." >&2
+            echo >&2
+            echo "A release from a branch would publish code that no pull request" >&2
+            echo "accepted. Merge the work to \`main\` first." >&2
+            echo >&2
+            echo "To make a release from a tag that exists, start this workflow on" >&2
+            echo "that tag:" >&2
+            echo "    gh workflow run release.yml --ref v0.8.0" >&2
+            exit 1
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "create-release=false" >>"$GITHUB_OUTPUT"
+            echo "No commit since $PREVIOUS asks for a release." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The commit that holds the number hangs off this commit of `main`.
+          # `main` itself keeps 0.0.0-dev, and this run never pushes to it.
+          # `set-version.sh` stops unless the file holds exactly `0.0.0-dev`, so
+          # a run against the wrong ref writes nothing.
+          .github/scripts/set-version.sh "$VERSION"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): $TAG"
+          git tag -a "$TAG" -m "qex $VERSION"
+
+          # The tag, and nothing else. Git sends the commit with it, because the
+          # tag reaches that commit.
+          git push origin "refs/tags/$TAG"
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "create-release=true"
+          } >>"$GITHUB_OUTPUT"
+          echo "The next release is **$TAG** ($BUMP)." >>"$GITHUB_STEP_SUMMARY"
+
+      # The number in the tagged commit must be the number of the tag. The two
+      # come apart when a person makes a tag by hand and forgets the commit that
+      # holds the number, and every binary of that release would then report a
+      # number that no release has.
+      #
+      # This is the other end of the guard in `set-version.sh`. That one refuses
+      # to write anywhere but on `main`; this one refuses to build anything but
+      # the commit that the tag names.
+      - if: steps.decide.outputs.create-release == 'true'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.decide.outputs.tag }}
+      - name: The tagged commit holds this number
+        if: steps.decide.outputs.create-release == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          got="$(awk -F'"' '/^version *= *"/ { print $2; exit }' Cargo.toml)"
+          [ "$got" = "$VERSION" ] || {
+            echo "Cargo.toml of $TAG holds \`$got\`, and the tag says \`$VERSION\`." >&2
+            echo "A release tag names a commit that holds its own number." >&2
+            echo "To make a tag by hand, commit \`set-version.sh $VERSION\` first;" >&2
+            echo "CONTRIBUTING.md gives each line." >&2
+            exit 1
+          }
 
   # The tests run again here. The tests of the pull request ran against the
   # branch; this runs against the commit that becomes the release.
   test:
     name: Test on ${{ matrix.os }}
-    needs: version
-    if: needs.version.outputs.release == 'true'
+    needs: [decide]
+    if: needs.decide.outputs.create-release == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -70,6 +239,8 @@ jobs:
         os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.decide.outputs.tag }}
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --bins
@@ -77,7 +248,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.name }}
-    needs: [version, test]
+    needs: [decide, test]
+    if: needs.decide.outputs.create-release == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -100,6 +272,8 @@ jobs:
             os: macos-14
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.decide.outputs.tag }}
       - name: Install Rust for ${{ matrix.target }}
         run: |
           rustup toolchain install stable --profile minimal
@@ -108,31 +282,36 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      # Each build puts the same number in Cargo.toml before it starts. The tag
-      # comes later, after every build is complete, so a build that fails leaves
-      # no tag and no release behind it.
-      - name: Set the version to ${{ needs.version.outputs.version }}
-        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
-
+      # Nothing gives the version to this build. The commit that the tag names
+      # holds it in Cargo.toml, and `build.rs` reads it from there.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
 
-      # The binary must report the number of this release. A binary compares its
-      # own number against the number of the coordinator that operates, and it
-      # gives a warning when the two differ. A wrong number makes that warning
-      # useless. A binary for another machine cannot run here, so this step
-      # tests the binary of this machine only.
+      # THIS STEP TESTS THE FISHBONE PROPERTY, END TO END, ON EVERY RELEASE.
+      #
+      # The number reaches this binary along one path only: the tag names a
+      # commit, that commit holds the number in Cargo.toml, and `build.rs` reads
+      # it. Nothing carries it in through the environment. This test therefore
+      # proves that the whole path is intact, and it would fail for a tag on a
+      # commit that holds another number, or for a `build.rs` that read a
+      # repository instead of the file.
+      #
+      # It matters beyond the number. A binary compares its own version against
+      # the version of the coordinator that operates and warns when the two
+      # differ, and a wrong number makes that warning useless. A binary for
+      # another machine cannot run here, so this step tests the binary of this
+      # machine only.
       - name: The binary reports the version
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
         run: |
           got="$(./target/${{ matrix.target }}/release/qex --version)"
           echo "$got"
-          [ "$got" = "qex ${{ needs.version.outputs.version }}" ] || {
+          [ "$got" = "qex ${{ needs.decide.outputs.version }}" ] || {
             echo "the binary reports \`$got\`, and this release is" \
-                 "\`qex ${{ needs.version.outputs.version }}\`" >&2
+                 "\`qex ${{ needs.decide.outputs.version }}\`" >&2
             exit 1
           }
 
@@ -153,74 +332,46 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Tag and publish
-    needs: [version, build]
+    name: Publish the release
+    needs: [decide, build]
+    if: needs.decide.outputs.create-release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
+      # `release-notes.sh` reads the commits between the two releases, so this
+      # one checkout needs the history and the tags.
       - uses: actions/checkout@v5
         with:
+          ref: ${{ needs.decide.outputs.tag }}
           fetch-depth: 0
-          # The default token cannot start another workflow with its own push,
-          # which is what stops this workflow from starting itself. The commit
-          # below says `chore`, which asks for no release, so the guard is two
-          # deep.
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/download-artifact@v5
         with:
           path: files
           merge-multiple: true
 
-      - name: Write the version into the commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
-          git add Cargo.toml Cargo.lock
-          # A person can put the number in Cargo.toml before the merge, and the
-          # release then agrees with the file already. There is nothing to
-          # commit in that case, and that is a correct state and not a fault.
-          if git diff --cached --quiet; then
-            echo "Cargo.toml holds this number already, so there is no commit to make."
-          else
-            git commit -m "chore(release): v${{ needs.version.outputs.version }}"
-          fi
-          # The tag goes on the commit that the build tested, either way.
-          git tag -a "v${{ needs.version.outputs.version }}" \
-            -m "qex ${{ needs.version.outputs.version }}"
-
-      # Another merge can arrive between the start of this workflow and this
-      # push. Put the release commit on top of that merge, and try again. The
-      # release still describes the commit that this workflow tested, because
-      # the tag holds this commit.
-      - name: Push the commit and the tag
-        run: |
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main --follow-tags; then
-              exit 0
-            fi
-            echo "the push failed. Attempt $attempt of 3."
-            git pull --rebase origin main
-          done
-          echo "three pushes failed. Somebody must look at main." >&2
-          exit 1
-
       - name: Write the notes
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+          TAG: ${{ needs.decide.outputs.tag }}
         run: |
-          .github/scripts/release-notes.sh \
-            "${{ needs.version.outputs.version }}" \
-            "${{ needs.version.outputs.previous }}" >notes.md
+          set -euo pipefail
+          # The release before this one is the next tag down the list. Ask the
+          # rules, so that the order is a version order here as well.
+          previous="$(git for-each-ref --format='%(refname:short)' 'refs/tags/v*' |
+            .github/actions/compute-version/version-rules.sh previous "$TAG" |
+            sed -n 's/^previous=//p')"
+          .github/scripts/release-notes.sh "$VERSION" "$previous" >notes.md
           cat notes.md >>"$GITHUB_STEP_SUMMARY"
 
-      - name: Publish the release
+      - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v${{ needs.version.outputs.version }}" \
-            --title "qex ${{ needs.version.outputs.version }}" \
+          gh release create "${{ needs.decide.outputs.tag }}" \
+            --title "qex ${{ needs.decide.outputs.version }}" \
             --notes-file notes.md \
             files/*
 
@@ -232,13 +383,19 @@ jobs:
   # not exist, so the workflow is complete before the token arrives.
   crate:
     name: Publish to crates.io
-    needs: [version, publish]
+    needs: [decide, publish]
+    if: needs.decide.outputs.create-release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # The tagged commit holds the release number already, so `cargo publish`
+      # reads the correct number from a working tree that nothing changed.
+      #
+      # The tarball that it makes holds no `.git` and no `.github`, so a build
+      # from crates.io takes the number from Cargo.toml. See `build.rs`.
       - uses: actions/checkout@v5
         with:
-          ref: v${{ needs.version.outputs.version }}
+          ref: ${{ needs.decide.outputs.tag }}
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
 

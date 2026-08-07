@@ -16,7 +16,8 @@
 # the one message that nothing tested.
 #
 # The body of the pull request reaches `main` as well, so a `BREAKING CHANGE:`
-# line in the body still asks for a break. `next-version.sh` reads it.
+# line in the body still asks for a break.
+# `.github/actions/compute-version/version-rules.sh` reads it.
 #
 # Usage: check-title.sh <title>
 #
@@ -53,24 +54,30 @@ bad=0
 if [[ ! "$title" =~ $pattern ]]; then
     # A capital letter in the type is the fault that hides.
     #
-    # `next-version.sh` reads the type with `[a-zA-Z]+`, so `Feat: a thing`
-    # matches its pattern. It then compares the type against `feat` in lower
-    # case, that comparison fails, and the release does NOT happen. The title
-    # looks correct, CI would have agreed with it, and the change reaches `main`
-    # with no release and no message.
+    # `version-rules.sh` gives an answer that DEPENDS ON THE `!`, and neither
+    # answer is the one that the author wants:
     #
-    # This test therefore names the fault, and does not leave the author to find
-    # a capital letter in a title that reads correctly.
+    #   `Feat: a thing`  — the type test reads the type with `[a-zA-Z]+`, then
+    #                      compares it against `feat` in small letters. That
+    #                      comparison fails, so there is NO RELEASE.
+    #   `Feat!: a thing` — the break test does not read the type at all, so the
+    #                      `!` alone gives a BREAK, and the second number moves.
+    #
+    # The title looks correct in both cases, and nothing else says which of the
+    # two happened. This test therefore names the fault, and does not leave the
+    # author to find a capital letter in a title that reads correctly.
     lower="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
     if [[ "$lower" =~ $pattern ]]; then
         echo "the type of the title holds a capital letter, and it must be all"
         echo "in small letters:"
         echo "    $title"
         echo
-        echo "A type with a capital letter gives NO release. The script that"
-        echo "calculates the version reads the type, compares it against \`feat\`"
-        echo "and \`fix\` in small letters, finds no agreement, and asks for no"
-        echo "release. Nothing else says that this happened."
+        echo "A type with a capital letter gives the WRONG release, and which"
+        echo "one it gives depends on the \`!\`. The script that calculates the"
+        echo "version reads the type and compares it against \`feat\` and \`fix\`"
+        echo "in small letters, so \`Feat: a thing\` gives NO release. The test"
+        echo "for a break does not read the type, so \`Feat!: a thing\` gives a"
+        echo "BREAK. Nothing else says which of the two happened."
     else
         echo "the title does not follow Conventional Commits:"
         echo "    $title"
@@ -117,7 +124,7 @@ The type gives the next version number:
                     SECOND number (0.5.3 -> 0.6.0). It does not go to 1.0.0.
     everything else no release
 
-A move to 1.0.0 is the decision of a person: put that number in Cargo.toml.
+A move to 1.0.0 is the decision of a person: they make the tag \`v1.0.0\` by hand.
 
 The other types are: $(echo "$types" | tr '|' ' ').
 

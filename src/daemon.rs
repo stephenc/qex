@@ -488,7 +488,7 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
     let (cpu_claimed, mem_claimed) = state.claimed();
     Response::Info {
         pid: std::process::id() as i32,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: crate::version::VERSION.to_string(),
         started_at: state.started_at,
         program_replaced: paths::program_file_changed(),
         jobs_running: state.count_state(|s| s.is_active()),
