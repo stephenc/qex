@@ -1809,7 +1809,10 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// it waits when the machine is busy, and it holds a claim while it operates.
 ///
 /// A job of `qex run` is a job like any other. It has a record, a log file and
-/// an id, and it continues when this command stops.
+/// an id. But this command ties the job to itself: it catches SIGINT and
+/// SIGTERM and it stops the job with them, because a user expects Ctrl-C to
+/// stop the work. Use `qex submit` for work that must live longer than the
+/// command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;

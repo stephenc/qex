@@ -33,8 +33,9 @@ the capacity they claimed. The output arrives as it happens, and the exit code
 is the exit code of the job.
 
 **What you give up.** `qex run` ties the job to that command: Ctrl-C stops the
-job, and if somebody stops your session the job stops with it. That is right for
-work you are waiting for and wrong for work that outlives your attention.
+job, and a harness that stops your agent signals the process group, which stops
+the job too. That is right for work you are waiting for and wrong for work that
+outlives your attention.
 
 | | |
 | --- | --- |
@@ -49,8 +50,9 @@ stop.**
 The job is not a child of your shell, and it is not a child of your agent. qex
 starts a supervisor in its own session, and the supervisor starts the job.
 
-This is about `qex submit`. `qex run` ties the job to the command that waits for
-it; see above.
+This is about `qex submit`. A job of `qex run` has the same record on the disk,
+but the command that waits for it stops the job when somebody stops that
+command; see above.
 
 | What happens to a job of `qex submit` | The job |
 | ------------ | ------- |
