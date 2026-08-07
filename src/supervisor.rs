@@ -383,7 +383,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // start: `qex rerun` needs no config file, and a job can wait in the queue
     // while somebody edits the file. Measured with `[politeness] nice = 100` in
     // the file at the start of the job: the job ran at nice 19, because
-    // `setpriority` moves a number outside the range into the range and reports
+    // `setpriority` takes 19 for any number above the range and reports
     // success, and nothing said so. The coordinator refuses such a file and
     // keeps the values that it had. The supervisor holds no earlier values, so
     // it takes the DEFAULT values and puts the fault in the record of the job.
@@ -395,9 +395,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                  of qex did before."
             );
             log(&message);
-            if status.error.is_none() {
-                status.error = Some(message);
-            }
+            add_fault(&mut status.error, message);
             crate::config::PolitenessConfig::default()
         }
     };
@@ -828,6 +826,29 @@ const RACE_JOB: u8 = 1;
 /// The timer fired first, so the job reached its time limit.
 const RACE_TIMER: u8 = 2;
 
+/// Adds a fault to the record of a job, and keeps the faults that are there.
+///
+/// # The fault that this removes
+///
+/// A job can meet more than one fault before it starts. `error` held ONE of
+/// them, because each writer replaced the field. Measured with
+/// `[enforce] mode = "hard"` on a machine with no cgroup delegation AND
+/// `[politeness] nice = 100`: `qex status --json` gave the memory-limit fault
+/// only. The politeness fault reached `supervisor.log`, which no command reads,
+/// so a user saw a job that ran at a priority nobody asked for and had nothing
+/// to read about it.
+///
+/// The reader needs every fault, so this function joins them.
+fn add_fault(error: &mut Option<String>, message: String) {
+    match error {
+        Some(already) => {
+            already.push(' ');
+            already.push_str(&message);
+        }
+        None => *error = Some(message),
+    }
+}
+
 /// Makes a job give way to the work of a person.
 ///
 /// This function operates in the child, between the fork and the exec. It must
@@ -870,8 +891,14 @@ fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
         const CLASS_IDLE: libc::c_int = 3;
 
         let value = match io_class {
-            // The middle level of the class, which is the level that a process
-            // receives by default.
+            // Level 4, the middle of the eight levels of the class.
+            //
+            // THIS IS NOT NECESSARILY MORE POLITE THAN `none`. The man page of
+            // `ionice` gives the level of a process that asked for nothing as
+            // `(cpu_nice + 20) / 5`, so a job at the default `nice = 10` gets
+            // level 6 with no call at all, and level 4 asks for MORE of the
+            // disk than that. `none` is the default of qex for this reason, and
+            // `idle` is the value that makes a job give way.
             "best-effort" => Some((CLASS_BEST_EFFORT << IOPRIO_CLASS_SHIFT) | 4),
             "idle" => Some(CLASS_IDLE << IOPRIO_CLASS_SHIFT),
             _ => None,
@@ -1115,6 +1142,28 @@ fn read_usage() -> Usage {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// A second fault must not push the first one out of the record.
+    ///
+    /// A job can meet more than one fault before it starts. Measured with
+    /// `[enforce] mode = "hard"` on a machine with no cgroup delegation AND
+    /// `[politeness] nice = 100`: `qex status --json` gave the memory-limit
+    /// fault only, and the politeness fault reached `supervisor.log`, which no
+    /// command reads. The user then had a job at a priority that nobody asked
+    /// for and nothing to read about it.
+    #[test]
+    fn a_job_with_two_faults_keeps_both_of_them() {
+        let mut error = None;
+        add_fault(&mut error, "the memory limit is not active.".into());
+        assert_eq!(error.as_deref(), Some("the memory limit is not active."));
+
+        add_fault(&mut error, "the politeness values have a fault.".into());
+        let both = error.unwrap();
+        assert!(
+            both.contains("memory limit") && both.contains("politeness"),
+            "the record must keep both faults, and it said: {both}"
+        );
+    }
 
     /// The text of the OOM score must fit the buffer for EVERY `i32`.
     ///

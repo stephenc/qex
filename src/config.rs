@@ -1076,9 +1076,12 @@ impl Config {
     /// a job. That code cannot report a fault: it has no lock and no allocation
     /// available, so it gives up in silence. A value with a fault would then
     /// give every job something that nobody asked for, and say nothing.
-    /// Measured on Linux: `nice = 100` gives a job at nice 19, because
-    /// `setpriority` moves the value into the range and reports success;
-    /// `io = "iddle"` reads as `io = "none"`; and the kernel refuses a write of
+    /// Measured on Linux, from nice 0 and with no privilege: `nice = 100` gives
+    /// a job at nice 19, because `setpriority` takes 19 for any number above
+    /// the range and reports success; `nice = -21` gives EACCES and the job
+    /// keeps the priority that it had, because the number is below the range
+    /// AND below the number that the process has; `io = "iddle"` reads as
+    /// `io = "none"`; and the kernel refuses a write of
     /// `oom_score_adj = 90000`, so the job keeps the score that it had.
     ///
     /// The test therefore belongs here, where qex can still name the file, the
@@ -1088,9 +1091,10 @@ impl Config {
         if !(-20..=19).contains(&p.nice) {
             anyhow::bail!(
                 "config [politeness] nice is {}. Use a number from -20 to 19. The system \
-                 takes no other number: it moves the value into that range and reports \
-                 success, so the job gets a priority that you did not ask for and nothing \
-                 says so. Measured on Linux: `nice = 100` gives a job at nice 19.",
+                 takes no other number, and it does not tell qex: above the range it uses \
+                 19 and reports success, and below the range it refuses the change on a \
+                 machine with no privilege. Each job then gets a priority that you did not \
+                 ask for, and nothing says so.",
                 p.nice
             );
         }

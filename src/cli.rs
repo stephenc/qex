@@ -207,8 +207,11 @@ pub struct SubmitArgs {
     /// wants it, so an editor and a video call stay smooth while the queue
     /// operates. The default comes from `[politeness] nice`, and it is 10.
     ///
-    /// A number below zero needs privilege. qex does not ask for it: the job
-    /// then runs at the usual priority.
+    /// qex can only make a job give way MORE than the coordinator does. It asks
+    /// the system for the number that you give, and the system refuses a number
+    /// below the one that the coordinator has unless qex has privilege, which
+    /// qex does not ask for. The job then keeps the priority of the
+    /// coordinator, and it still runs.
     #[arg(long, allow_negative_numbers = true)]
     pub nice: Option<i32>,
 

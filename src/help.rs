@@ -426,7 +426,11 @@ Other useful options
     --nice N           how much the job gives way to the work of a person.
                        -20 to 19, and a larger number gives way. The default
                        comes from `[politeness] nice`, and it is 10. Use
-                       `--nice 0` for a job that must not give way.
+                       `--nice 0` to ask that this job does not give way.
+                       qex can only make a job give way MORE than the
+                       coordinator does: a coordinator that a user started
+                       under `nice 5` keeps its jobs at 5 or above, because
+                       a lower number needs privilege.
 
     --lock NAME        two jobs with one lock name never operate together.
                        Use it for work that shares something that a claim

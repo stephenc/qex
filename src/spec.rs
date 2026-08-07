@@ -391,19 +391,21 @@ impl JobSpec {
         //
         // A nice value goes from -20 to 19. qex makes that call between the
         // fork and the exec of the job, where it has no way to report a fault,
-        // and `setpriority` does not report one either: it moves a number
-        // outside the range INTO the range and reports success. `--nice 100`
-        // would thus give a job at nice 19 and say nothing. The test belongs
-        // here, where qex can still name the value and the remedy.
+        // and `setpriority` gives qex nothing to report either. Measured on
+        // Linux from nice 0, with no privilege: `--nice 100` takes 19 and
+        // reports success, and `--nice -21` gives EACCES and leaves the job
+        // where it was. Each one gives a priority that the user did not ask
+        // for. The test belongs here, where qex can still name the value and
+        // the remedy.
         let nice = opts.nice.or(file.nice);
         if let Some(n) = nice {
             if !(-20..=19).contains(&n) {
                 bail!(
                     "the nice value {n} is outside the range -20 to 19. Use a number from \
-                     -20 to 19. The system moves any other number into that range without a \
-                     word, so the job would take a priority that you did not ask for. A \
-                     larger number gives way to the work of a person, and 0 says that this \
-                     job must not give way."
+                     -20 to 19. The system takes no other number, and it does not say so: \
+                     above the range it uses 19, and below the range it refuses the change \
+                     on a machine with no privilege. A larger number gives way to the work \
+                     of a person, and 0 asks for the priority of a command that you type."
                 );
             }
         }
@@ -684,11 +686,13 @@ mod tests {
     /// A nice value outside -20 to 19 must be refused at the submission.
     ///
     /// qex makes that call between the fork and the exec, where it cannot
-    /// report a fault, and `setpriority` reports none: it moves a number
-    /// outside the range into the range and reports success. Measured on
-    /// Linux, `setpriority(PRIO_PROCESS, 0, 100)` gives 0 and leaves the
-    /// process at nice 19. Without this test `--nice 100` would give a job at
-    /// nice 19 and say nothing.
+    /// report a fault, and `setpriority` gives it nothing to report. Measured
+    /// on Linux from nice 0, with no privilege:
+    /// `setpriority(PRIO_PROCESS, 0, 100)` gives 0 and leaves the process at
+    /// nice 19, and `setpriority(PRIO_PROCESS, 0, -21)` gives -1 with EACCES
+    /// and leaves it at 0. Without this test `--nice 100` would give a job at
+    /// nice 19, `--nice -21` would give a job at the priority of the
+    /// supervisor, and neither would say so.
     #[test]
     fn a_nice_value_outside_the_range_is_refused() {
         let _guard = env_lock();

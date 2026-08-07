@@ -5162,14 +5162,17 @@ fn a_job_gives_way_to_the_work_of_a_person() {
         "a job must be polite by default, and this one was not: {out}"
     );
 
-    // A job that must not give way says so.
+    // A job that asks not to give way says so. The coordinator of this test
+    // runs at nice 0, so qex does not have to LOWER the value here and 0
+    // reaches the job. A coordinator under `nice 5` could not do this.
     let id = h.submit(&["submit", "--nice", "0", "--", "sh", "-c", "ps -o ni= -p $$"]);
     h.ok(&["wait", &id, "--timeout", "45s"]);
     let out = h.ok(&["logs", &id, "--stdout"]);
     assert_eq!(out.trim(), "0", "`--nice 0` must reach the job: {out}");
 
-    // A machine that refuses the change must still run the job. A number below
-    // zero needs privilege, and qex does not ask for it.
+    // A machine that refuses the change must still run the job. The system
+    // refuses a number below the one that the coordinator has, unless qex has
+    // privilege, and qex does not ask for privilege.
     let id = h.submit(&["submit", "--nice", "-5", "--", "true"]);
     h.ok(&["wait", &id, "--timeout", "45s"]);
     assert_eq!(
@@ -5186,46 +5189,63 @@ fn a_job_gives_way_to_the_work_of_a_person() {
 /// io class and the oom score across a fork, so one call between the fork and
 /// the exec covers the whole tree. This test measures the tree, and not the
 /// call, because a later change could set the values on the wrong process.
+///
+/// EVERY io class needs its own run. `ionice_set` takes one number that holds
+/// the class and the level together, so `best-effort` and `idle` share no code
+/// beyond the call. A test of `idle` alone left the whole `best-effort` line
+/// free: a review deleted it, and changed `|` to `&`, to `^`, and `<<` to `>>`,
+/// and every one of the four still passed.
 #[test]
 #[cfg(target_os = "linux")]
 fn every_politeness_value_reaches_the_job_and_its_children() {
-    let h = Harness::new(
-        "polite-all",
-        "[peers]\nenabled = false\n\
-         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
-         [politeness]\nnice = 12\nio = \"idle\"\noom_score_adj = 500\n",
-    );
+    // The name of the class as `ionice -p` gives it, for each name that
+    // `[politeness] io` takes. `best-effort` carries the level, because the
+    // level is half of the number that qex builds.
+    for (io, expect) in [
+        ("idle", "idle"),
+        ("best-effort", "best-effort: prio 4"),
+        ("none", "none: prio 0"),
+    ] {
+        let h = Harness::new(
+            &format!("polite-{io}"),
+            &format!(
+                "[peers]\nenabled = false\n\
+                 [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                 [politeness]\nnice = 12\nio = \"{io}\"\noom_score_adj = 500\n"
+            ),
+        );
 
-    // Field 19 of /proc/<pid>/stat is the nice value. The command reads the
-    // three values for itself, and then again in a child of itself.
-    let probe = "report() { \
-                 echo \"$1 nice=$(awk '{print $19}' /proc/$2/stat) \
-                 oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
-                 report parent $$; sh -c 'report() { \
-                 echo \"$1 nice=$(awk \"{print \\$19}\" /proc/$2/stat) \
-                 oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
-                 report child $$'";
-    let id = h.submit(&["submit", "--", "sh", "-c", probe]);
-    h.ok(&["wait", &id, "--timeout", "45s"]);
-    let out = h.ok(&["logs", &id, "--stdout"]);
+        // Field 19 of /proc/<pid>/stat is the nice value. The command reads the
+        // three values for itself, and then again in a child of itself.
+        let probe = "report() { \
+                     echo \"$1 nice=$(awk '{print $19}' /proc/$2/stat) \
+                     oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
+                     report parent $$; sh -c 'report() { \
+                     echo \"$1 nice=$(awk \"{print \\$19}\" /proc/$2/stat) \
+                     oom=$(cat /proc/$2/oom_score_adj) io=$(ionice -p $2)\"; }; \
+                     report child $$'";
+        let id = h.submit(&["submit", "--", "sh", "-c", probe]);
+        h.ok(&["wait", &id, "--timeout", "45s"]);
+        let out = h.ok(&["logs", &id, "--stdout"]);
 
-    for who in ["parent", "child"] {
-        let line = out
-            .lines()
-            .find(|l| l.starts_with(who))
-            .unwrap_or_else(|| panic!("the job gave no {who} line: {out}"));
-        assert!(
-            line.contains("nice=12"),
-            "the {who} must take `[politeness] nice`: {line}"
-        );
-        assert!(
-            line.contains("oom=500"),
-            "the {who} must take `[politeness] oom_score_adj`: {line}"
-        );
-        assert!(
-            line.contains("idle"),
-            "the {who} must take `[politeness] io`: {line}"
-        );
+        for who in ["parent", "child"] {
+            let line = out
+                .lines()
+                .find(|l| l.starts_with(who))
+                .unwrap_or_else(|| panic!("the job gave no {who} line: {out}"));
+            assert!(
+                line.contains("nice=12"),
+                "the {who} must take `[politeness] nice`: {line}"
+            );
+            assert!(
+                line.contains("oom=500"),
+                "the {who} must take `[politeness] oom_score_adj`: {line}"
+            );
+            assert!(
+                line.contains(expect),
+                "the {who} must take `io = \"{io}\"` as `{expect}`: {line}"
+            );
+        }
     }
 }
 

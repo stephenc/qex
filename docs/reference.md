@@ -320,22 +320,31 @@ The value comes from three places, and the last one wins:
 [politeness] nice   ->   job file or pipeline stage `nice`   ->   --nice N
 ```
 
-`0` is a value and not an absence: `--nice 0` sets 0 against a configuration
+`0` is a value and not an absence: `--nice 0` asks for 0 against a configuration
 that says 10.
+
+**qex can only make a job give way MORE than the coordinator does.** A lower
+number needs privilege, and qex does not ask for privilege. A coordinator that
+you start under `nice 5` therefore keeps every job at 5 or above, and
+`--nice 0` gives a job at nice 5 and says nothing. Start the coordinator at the
+priority that you want as the floor.
 
 qex refuses a `nice` outside -20 to 19, an `io` that is not one of the three
 names, and an `oom_score_adj` outside -1000 to 1000. It applies each of these
 between the fork and the exec of the job, where it cannot report a fault, so a
 value with a fault would give every job something that nobody asked for and say
-nothing. Measured on Linux, with the tests removed: `nice = 100` gave a job at
-nice 19, because `setpriority` moves the number into the range and reports
-success; `io = "iddle"` read as `io = "none"`; and the kernel refused a write of
-`oom_score_adj = 90000`, so the job kept the score that it had.
+nothing. Measured on Linux, from nice 0, with no privilege and with the tests
+removed: `nice = 100` gave a job at nice 19, because `setpriority` takes 19 for
+any number above the range and reports success; `nice = -21` gave EACCES and the
+job kept the priority that it had; `io = "iddle"` read as `io = "none"`; and the
+kernel refused a write of `oom_score_adj = 90000`, so the job kept the score
+that it had.
 
 The supervisor of a job tests these three values again when it starts the job,
 because the file can change after the submission. A file with a fault at that
 moment gives a job with the DEFAULT politeness values, and `qex status` names
-the fault in the `error` field of the job.
+the fault in the `error` field of the job. A job that meets more than one fault
+before it starts gets all of them in that field.
 
 A change to `[politeness]` reaches the jobs that START after it, and it does not
 touch a job that operates. qex sets these values once, between the fork and the
@@ -348,16 +357,24 @@ so a new `[politeness]` reaches the NEXT job and does not wait for the
 coordinator to read the file again.
 
 `io = "idle"` gives the disk to everything else first, which matters when a
-build reads a whole source tree while somebody saves a file.
+build reads a whole source tree while somebody saves a file. **Use `idle`, and
+not `best-effort`, to make a job give way for the disk.** The man page of
+`ionice` gives the level of a process that asked for no class as
+`(cpu_nice + 20) / 5`, so a job at the default `nice = 10` already behaves as
+best-effort level 6. `io = "best-effort"` asks for level 4, which is MORE of the
+disk than the job would take with `io = "none"`.
 
 `oom_score_adj` decides who the kernel stops when the machine runs out of
 memory. A background build should lose that competition before an editor that
-holds an hour of work.
+holds an hour of work. A larger number needs no privilege. A number that LOWERS
+the score does: measured with `oom_score_adj = -500`, the kernel refused the
+write, the job ran with the score 0, and qex said nothing, because the write
+happens between the fork and the exec where qex cannot report a fault.
 
 **Not one of these can stop a job.** A machine that refuses the change runs the
-job at the usual priority, which is what qex did before. A number below zero
-needs privilege that qex usually does not have; qex still makes the call, the
-system refuses it, and the job continues.
+job at the priority that it had, which is what qex did before. Measured:
+`--nice -5` and `oom_score_adj = -500` were both refused by the kernel, and both
+jobs completed.
 
 ### The coordinator reads this file again when it changes
 
