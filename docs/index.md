@@ -24,7 +24,8 @@ cargo install qex
 ## Twenty seconds
 
 Put `qex run` in front of a command. It goes in the queue, this command waits
-for it, and the exit code is the exit code of the job:
+for it, and the exit code is the exit code of the job. When something stops the
+job, `qex run` gives 125 in place of it:
 
 ```console
 $ qex run -- sh -c 'echo building; sleep 2; echo done'

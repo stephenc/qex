@@ -212,6 +212,52 @@ impl Harness {
         self.root.join("state/qex/jobs").join(id)
     }
 
+    /// Starts `qex run` beside this test, and gives the child and the job id.
+    ///
+    /// A test that stops the job of a `qex run` needs the id while the command
+    /// still waits, so the command writes the id to a file with `--id-file`.
+    /// The two output streams go to a pipe, so that the test can read what the
+    /// command said about the reason that the job stopped.
+    ///
+    /// The caller gives the child to `wait_run`, which waits for it. Clippy
+    /// cannot see that, because the wait is in a different function.
+    #[allow(clippy::zombie_processes)]
+    fn run_bg(&self, args: &[&str]) -> (std::process::Child, String) {
+        let id_file = self.root.join(format!(
+            "run-{}.id",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let id_path = id_file.to_str().unwrap().to_string();
+        let mut all: Vec<&str> = vec!["run", "--id-file", &id_path];
+        all.extend_from_slice(args);
+
+        let child = Command::new(env!("CARGO_BIN_EXE_qex"))
+            .args(&all)
+            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("qex run did not start");
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&id_file) {
+                let id = text.trim().to_string();
+                if id.parse::<uuid::Uuid>().is_ok() {
+                    return (child, id);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("`qex run` did not write its id file in 30 seconds");
+    }
+
     /// Writes the config file again, while the installation operates.
     ///
     /// A user does this with an editor. The coordinator that already operates
@@ -2750,3 +2796,257 @@ fn a_config_fault_in_the_record_of_a_job_stays_short() {
 }
 
 fn _unused(_: &Path) {}
+
+/// Waits until a `qex run` that a test started stops, and gives its output.
+///
+/// The test must not wait for ever. A `qex run` that never stops is the fault
+/// that these tests look for, so the wait has a limit and it says what failed.
+fn wait_run(mut child: std::process::Child, what: &str) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None => {
+                if Instant::now() >= deadline {
+                    child.kill().ok();
+                    panic!("`qex run` did not stop in 60 seconds: {what}");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// A DIFFERENT command stopped the job, so `qex run` gives 125 and not 1.
+///
+/// This is the fault that this test prevents. A job of `qex run` is a job like
+/// any other, so another agent on the machine can run `qex kill` on it. With
+/// the code 1 the caller cannot separate "my work failed" from "somebody
+/// stopped my work", so it starts the work again or it reports a fault that the
+/// work does not have. The message on stderr must also say that this command
+/// did not stop the job.
+#[test]
+fn qex_run_gives_125_when_a_different_command_kills_the_job() {
+    let h = Harness::with_default_config("runkill");
+    let (child, id) = h.run_bg(&["--", "sleep", "60"]);
+    h.until(
+        "the job of `qex run` starts",
+        Duration::from_secs(30),
+        || h.has_started(&id),
+    );
+
+    let kill = h.qex(&["kill", &id, "--grace", "1s"]);
+    assert!(kill.status.success(), "`qex kill` failed");
+
+    let out = wait_run(child, "a different command killed the job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex run` must give 125 when something stopped the job: {err}"
+    );
+    assert!(
+        err.contains("did not send it"),
+        "`qex run` must say that it did not stop the job: {err}"
+    );
+}
+
+/// A different command cancelled the queued job, so `qex run` gives 125.
+///
+/// The job never ran and it wrote nothing, so `qex run` has no exit code of the
+/// job to give. It gives the code of the state, and the same code as `qex
+/// wait`, and it says that the job left the queue.
+#[test]
+fn qex_run_gives_125_when_a_different_command_cancels_the_queued_job() {
+    let h = Harness::with_default_config("runcancel");
+
+    // Hold the job of `qex run` in the queue with a dependency, so the test
+    // controls the moment at which the cancel arrives.
+    let blocker = h.submit(&["submit", "--", "sleep", "60"]);
+    let (child, id) = h.run_bg(&["--needs", &blocker, "--", "echo", "never"]);
+    h.until(
+        "the job of `qex run` waits",
+        Duration::from_secs(30),
+        || h.state_of(&id) == "queued",
+    );
+
+    let cancel = h.qex(&["cancel", &id]);
+    assert!(cancel.status.success(), "`qex cancel` failed");
+
+    let out = wait_run(child, "a different command cancelled the job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex run` must give 125 for a job that left the queue: {err}"
+    );
+    assert!(
+        err.contains("removed the job"),
+        "`qex run` must say that the job left the queue: {err}"
+    );
+
+    h.qex(&["kill", &blocker, "--grace", "1s"]);
+}
+
+/// `qex run` writes the output of the job, so it gives the exit code of the
+/// job when the job RAN.
+///
+/// Without this, `qex run` would change the result of the command that it goes
+/// in front of. The test also compares the code against `qex wait
+/// --passthrough`, which answers the same question, so the two cannot drift.
+#[test]
+fn qex_run_gives_the_exit_code_of_a_job_that_ran() {
+    let h = Harness::with_default_config("runcode");
+    for code in [0, 1, 7] {
+        let command = format!("exit {code}");
+        let (child, id) = h.run_bg(&["--", "sh", "-c", &command]);
+        let out = wait_run(child, "the job gives its own exit code");
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "`qex run` must give the exit code {code} of the job: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let wait = h.qex(&["wait", &id, "--passthrough"]);
+        assert_eq!(
+            out.status.code(),
+            wait.status.code(),
+            "`qex run` and `qex wait --passthrough` gave two codes for one job"
+        );
+    }
+}
+
+/// `qex run` and `qex wait` must give one code for one state.
+///
+/// The test compares the two commands against each other, and not against a
+/// number, so a later change cannot move one of them alone. It also proves that
+/// the two cases of the fault are now separate: a job that failed gives 1, and a
+/// job that something stopped does not.
+#[test]
+fn qex_run_and_qex_wait_give_the_same_code_for_the_same_job() {
+    let h = Harness::with_default_config("runagree");
+
+    let (child, killed) = h.run_bg(&["--", "sleep", "60"]);
+    h.until(
+        "the job of `qex run` starts",
+        Duration::from_secs(30),
+        || h.has_started(&killed),
+    );
+    h.qex(&["kill", &killed, "--grace", "1s"]);
+    let stopped = wait_run(child, "the job that a kill stopped");
+
+    let (child, failed) = h.run_bg(&["--", "sh", "-c", "exit 1"]);
+    let ran = wait_run(child, "the job that failed");
+
+    // A time limit is a separate state. Without it, a change that gave the
+    // exit code of the job for the state `timeout` would pass this test.
+    let (child, limited) = h.run_bg(&["--timeout", "1s", "--", "sleep", "60"]);
+    let timed_out = wait_run(child, "the job that reached its time limit");
+
+    assert_eq!(
+        stopped.status.code(),
+        h.qex(&["wait", &killed]).status.code(),
+        "`qex run` and `qex wait` gave two codes for a job that something stopped"
+    );
+    assert_eq!(
+        timed_out.status.code(),
+        h.qex(&["wait", &limited]).status.code(),
+        "`qex run` and `qex wait` gave two codes for a job that reached its time limit"
+    );
+    assert_eq!(
+        ran.status.code(),
+        h.qex(&["wait", &failed]).status.code(),
+        "`qex run` and `qex wait` gave two codes for a job that failed"
+    );
+
+    assert_eq!(ran.status.code(), Some(1), "a job that failed gives 1");
+    assert_ne!(
+        stopped.status.code(),
+        Some(1),
+        "a job that something stopped must not give the code of a job that failed"
+    );
+    assert_ne!(
+        timed_out.status.code(),
+        Some(1),
+        "a job that reached its time limit must not give the code of a job that failed"
+    );
+}
+
+/// `qex run` must say when IT stopped the job, and not blame a different
+/// command.
+///
+/// The branch that writes this sentence is the branch that gives the wrong
+/// blame when it is wrong, so a test must reach it. Without this test, a change
+/// that always blames a different command passes every other test.
+#[test]
+fn qex_run_says_when_this_command_stopped_the_job() {
+    let h = Harness::with_default_config("runctrlc");
+    let (child, id) = h.run_bg(&["--", "sleep", "60"]);
+    h.until(
+        "the job of `qex run` starts",
+        Duration::from_secs(30),
+        || h.has_started(&id),
+    );
+
+    // Ctrl-C sends SIGINT to the process. The test sends the same signal.
+    let pid = child.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let out = wait_run(child, "Ctrl-C stopped the job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a job that Ctrl-C stopped gives 125: {err}"
+    );
+    assert!(
+        err.contains("this command stopped the job"),
+        "`qex run` must say that IT stopped the job: {err}"
+    );
+    assert!(
+        !err.contains("did not send it"),
+        "`qex run` must not blame a different command for its own kill: {err}"
+    );
+}
+
+/// Ctrl-C must take the job out of the queue when the job has not started.
+///
+/// The coordinator refuses to kill a job that waits in the queue, because that
+/// job has no process. Without the cancel, `qex run` waited for a job that
+/// still had to run, and it then said that a different command stopped a job
+/// that this command tried to stop.
+#[test]
+fn ctrl_c_removes_the_job_of_qex_run_from_the_queue() {
+    let h = Harness::with_default_config("runctrlcq");
+
+    let blocker = h.submit(&["submit", "--", "sleep", "60"]);
+    let (child, id) = h.run_bg(&["--needs", &blocker, "--", "echo", "never"]);
+    h.until(
+        "the job of `qex run` waits",
+        Duration::from_secs(30),
+        || h.state_of(&id) == "queued",
+    );
+
+    let pid = child.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let out = wait_run(child, "Ctrl-C removed the job from the queue");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a job that left the queue gives 125: {err}"
+    );
+    assert_eq!(
+        h.state_of(&id),
+        "cancelled",
+        "Ctrl-C must take the job out of the queue: {err}"
+    );
+    assert!(
+        err.contains("this command removed the job"),
+        "`qex run` must say that IT removed the job from the queue: {err}"
+    );
+
+    h.qex(&["kill", &blocker, "--grace", "1s"]);
+}

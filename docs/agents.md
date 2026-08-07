@@ -30,7 +30,8 @@ qex run -- make test
 
 The job goes in the queue, so the other people and agents on the machine keep
 the capacity they claimed. The output arrives as it happens, and the exit code
-is the exit code of the job.
+is the exit code of the job. When something stops the job, `qex run` gives 125
+in place of the exit code of the job. See [The exit codes](#the-exit-codes).
 
 **What you give up.** `qex run` ties the job to that command, but only for the
 stops that it can catch. Ctrl-C stops the job, and a SIGTERM on `qex run` stops
@@ -154,17 +155,51 @@ the last lines of the error output. One command gives everything.
 
 ## The exit codes
 
+These are the codes of `qex wait` and of `qex status --wait`.
+
 | Code | Meaning |
 | ---- | ------- |
 | 0    | The job succeeded. |
 | 1    | The job failed. |
 | 124  | Your wait reached its time limit. The job continues. |
-| 125  | Something stopped the job: kill, timeout or out-of-memory. |
+| 125  | Something stopped the job: kill, cancel, timeout or out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
 | 127  | There is no job with that id. |
 
 The code 124 has the same meaning as the code of the `timeout` command. A
 timeout on `qex wait` stops your wait only. It does not stop the job.
+
+### The exit codes of `qex run`
+
+`qex run` writes the output of the job, so it gives the exit code of the job
+when the job RAN: `qex run -- sh -c 'exit 7'` gives 7.
+
+| Code | Meaning |
+| ---- | ------- |
+| the exit code of the job | The job ran. |
+| 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
+| 126  | The job did not run, because a job that it needed failed. |
+| 127  | There is no job with that id. |
+
+**Read 125 with care.** A job of `qex run` is a job like any other, so a
+different agent on this machine can run `qex kill` or `qex cancel` on it. The
+code 125 says that something stopped the job before it could finish, and it
+does not say that your work failed. Do not start the work again and do not
+report a fault in the task before you read the line on stderr. That line says
+what stopped the job, and whether this command stopped it.
+
+The code 1 has two causes. Your work ran and it gave the exit code 1, or qex
+could not finish its own work: the coordinator stopped while `qex run` waited,
+for example. qex writes the second cause on stderr, and the job can then still
+operate.
+
+For each state in which the job gave NO exit code of its own, `qex run` gives
+the same code as `qex wait`. For a job that RAN, `qex run` gives the exit code
+of the job, and `qex wait` gives 0 or 1 unless you add `--passthrough`.
+
+`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
+while the job continued, and `qex run` waits with no limit of its own. A job
+that reaches the time limit of `--timeout` gives 125.
 
 ## Two fields that need care
 

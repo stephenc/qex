@@ -131,8 +131,8 @@ Use `qex run` for work that is SHORT AND HEAVY and that you wait for now: a test
 suite, a release build, a data conversion. The job goes in the queue, so it
 starts when the machine has room, and the other people and agents on this
 machine keep the capacity that they claimed. The output arrives as it happens,
-on the same two streams, and the exit code is the exit code of the job. Nothing
-else in your script changes.
+on the same two streams, and the exit code is the exit code of the job, or 125
+when something stopped the job. Nothing else in your script changes.
 
 WHAT YOU GIVE UP. `qex run` ties the job to this command, but only for the stops
 that it can catch:
@@ -142,6 +142,9 @@ that it can catch:
     A SIGKILL does NOT stop the job, and neither does the hangup of
     a terminal that closes. The job continues, and `qex list` finds it.
 
+A job that operates receives a SIGTERM. A job that still waits in the queue
+leaves the queue instead, because a job with no process cannot receive a signal.
+
 That is correct for work that you are waiting for, and it is WRONG for work that
 lives longer than your attention. `qex submit` gives the job a life of its own:
 it continues when your session stops, and a later session reaches it with the
@@ -149,6 +152,13 @@ id.
 
     short, and you wait for it now    ->  qex run -- ...
     long, or you come back to it      ->  qex submit, then qex status <id> --wait
+
+When something stops the job, `qex run` gives 125 and not 1. Another agent on
+this machine can run `qex kill` or `qex cancel` on your job, because a job of
+`qex run` is a job like any other. The code 125 says that something stopped the
+job before it could finish, and it does not say that your work failed. Do not
+start the work again before you read the line on stderr. Run
+`qex help exit-codes` for the full table.
 
 The three commands you need
 ---------------------------
@@ -1013,7 +1023,7 @@ qex exit codes
     0    the job succeeded (exit code 0)
     1    the job failed (a different exit code, or a signal)
     124  your wait timed out. The job still operates.
-    125  something stopped the job: kill, timeout or out-of-memory
+    125  something stopped the job: kill, cancel, timeout or out-of-memory
     126  the job did not run, because a job that it needed did not succeed
     127  there is no job with that id
 
@@ -1028,6 +1038,39 @@ To get the exit code of the job itself, add `--passthrough`:
 
 `qex wait` then exits with the exit code of the job. Use this option to send the
 result of the job to a script.
+
+`qex run`
+---------
+
+    the exit code of the job    the job ran (0, 7, 1, whatever it gave)
+    125  something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory
+    126  the job did not run, because a job that it needed did not succeed
+    127  there is no job with that id
+
+`qex run` writes the output of the job, so it gives the exit code of the job
+when the job RAN. `qex run -- sh -c 'exit 7'` gives 7.
+
+A job of `qex run` is a job like any other, so `qex kill` and `qex cancel` from
+a DIFFERENT command can stop it. That job gave no exit code of its own, and
+`qex run` then gives 125 and not 1. The two are thus separate: 125 says that
+something stopped your work before it could finish. `qex run` also writes a line
+to stderr that names the cause, and that line says when this command did not
+stop the job.
+
+The code 1 has two causes. Your work ran and it gave the exit code 1, or qex
+could not finish its own work: the coordinator stopped while `qex run` waited,
+for example. qex writes the second cause on stderr, and the job can then still
+operate.
+
+For each state in which the job gave NO exit code of its own, `qex run` gives
+the same code as `qex wait`. Two commands must not answer one question two ways.
+For a job that RAN, `qex run` gives the exit code of the job, and `qex wait`
+gives 0 or 1 unless you add `--passthrough`.
+
+`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
+while the job continued, and `qex run` waits with no limit of its own. A job
+that reaches the time limit of `--timeout` gives 125, because something stopped
+that job.
 
 Other commands
 --------------

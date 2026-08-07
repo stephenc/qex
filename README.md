@@ -94,7 +94,8 @@ qex kill $ID                                            # stop it
 Put `qex run -- make test` in front of a command when the work is **short and
 heavy** and you wait for it now: it takes its turn in the queue, so everyone
 else on the machine keeps the capacity they claimed, the output arrives as it
-happens, and the exit code is the exit code of the job.
+happens, and the exit code is the exit code of the job. When something stops the
+job, `qex run` gives 125 in place of it.
 
 `qex run` ties the job to that command, but only for the stops that it can
 catch. Ctrl-C stops the job, and a SIGTERM on `qex run` stops the job. A
