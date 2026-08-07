@@ -866,13 +866,18 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
                     // of every new job.
                     None => String::from("starts now"),
                 };
+                // Show the SAFE form of the key. The key is text that another
+                // agent chose, and this sentence goes to the log of the
+                // coordinator and to the terminal of the caller. See
+                // `job::safe_name`. The map keeps the key that the user gave.
+                let shown = crate::job::safe_name(&key);
                 log(&format!(
-                    "a submission with the dedupe key `{key}` gave the job {other}"
+                    "a submission with the dedupe key `{shown}` gave the job {other}"
                 ));
                 return Response::Submitted {
                     id: other,
                     warning: Some(format!(
-                        "this submission started no job. The dedupe key `{key}` gives the job \
+                        "this submission started no job. The dedupe key `{shown}` gives the job \
                          {other}, and that job {doing}.\n\
                          qex gives you the id of that job, so `qex wait` and `qex status` \
                          operate on the work that already exists.\n\

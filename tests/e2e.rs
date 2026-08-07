@@ -441,8 +441,11 @@ fn a_second_submission_with_one_key_gives_the_first_job_and_starts_no_job() {
         message.contains("started no job"),
         "the message must say what happened: {message}"
     );
+    // The SAFE form of the key. A key is text that another agent chose, and it
+    // goes to a terminal here, so it follows the same rule as a job name. See
+    // `job::safe_name`.
     assert!(
-        message.contains("build:/x"),
+        message.contains("build_x"),
         "the message must name the key: {message}"
     );
 
@@ -456,8 +459,21 @@ fn a_second_submission_with_one_key_gives_the_first_job_and_starts_no_job() {
         "qex wrote a second job record"
     );
 
-    // The key is in the record, so a reader can see which key gave the id.
-    assert_eq!(h.status_json(&first)["dedupe_key"], "build:/x");
+    // The key is in the record, so a reader can see which key gave the id. It
+    // reaches the reader in its safe form, like every other name that qex
+    // shows.
+    assert_eq!(h.status_json(&first)["dedupe_key"], "build_x");
+
+    // A key that holds an ESC byte must never reach a terminal as it stands.
+    // Without this rule, `qex status` of a job that a different agent
+    // submitted moves the cursor of the reader and writes over the text
+    // around it.
+    let evil = h.submit(&["submit", "--dedupe-key", "x\u{1b}[2Jy", "--", "true"]);
+    let shown = h.status_json(&evil)["dedupe_key"].as_str().unwrap().to_string();
+    assert!(
+        !shown.contains('\u{1b}'),
+        "the ESC byte reached the reader: {shown:?}"
+    );
 
     h.stop(&first);
 }

@@ -1338,6 +1338,7 @@ result of the job to a script.
 ---------
 
     the exit code of the job    the job ran (0, 7, 1, whatever it gave)
+    124  your wait stopped, and the job continues. See the dedupe key below.
     125  something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory
     126  the job did not run, because a job that it needed did not succeed
     127  there is no job with that id
@@ -1362,10 +1363,15 @@ the same code as `qex wait`. Two commands must not answer one question two ways.
 For a job that RAN, `qex run` gives the exit code of the job, and `qex wait`
 gives 0 or 1 unless you add `--passthrough`.
 
-`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
-while the job continued, and `qex run` waits with no limit of its own. A job
-that reaches the time limit of `--timeout` gives 125, because something stopped
-that job.
+`qex run` gives 124 in ONE case: a dedupe key gave it the job of a different
+caller, and a signal then arrived. This command did not start that job, so
+Ctrl-C stops this wait and the job continues. The code 124 says the same thing
+there as on `qex wait`: YOUR WAIT ended, and the work did not. Run
+`qex status $ID --wait` to wait again, or `qex kill $ID` to stop the job.
+
+`qex run` gives 124 for no other reason. It waits with no limit of its own, and
+a job that reaches the time limit of `--timeout` gives 125, because something
+stopped that job.
 
 Other commands
 --------------

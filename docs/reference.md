@@ -53,6 +53,7 @@ Add `--passthrough` to exit with the exit code of the job.
 | Code | Meaning |
 | ---- | ------- |
 | the exit code of the job | The job ran. `qex run -- sh -c 'exit 7'` gives 7. |
+| 124  | Your wait stopped, and the job continues. See the dedupe key. |
 | 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
 | 127  | There is no job with that id. |
@@ -74,10 +75,13 @@ For each state in which the job gave NO exit code of its own, `qex run` gives
 the same code as `qex wait`. For a job that RAN, `qex run` gives the exit code
 of the job, and `qex wait` gives 0 or 1 unless you add `--passthrough`.
 
-`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
-while the job continued, and `qex run` waits with no limit of its own. A job
-that reaches the time limit of `--timeout` gives 125, because something stopped
-that job.
+`qex run` gives 124 in ONE case: a dedupe key gave it the job of a different
+caller, and a signal then arrived. This command did not start that job, so
+Ctrl-C stops this wait and the job continues. Run `qex status $ID --wait` to
+wait again, or `qex kill $ID` to stop the job.
+
+`qex run` gives 124 for no other reason. It waits with no limit of its own, and
+a job that reaches the time limit of `--timeout` gives 125, because something stopped that job.
 
 ## Resource claims
 

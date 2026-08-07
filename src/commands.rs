@@ -1864,6 +1864,11 @@ fn short_id(id: &uuid::Uuid) -> String {
 fn for_display(mut s: JobStatus) -> JobStatus {
     s.name = safe_name(&s.name);
     s.group_name = s.group_name.as_deref().map(safe_name);
+    // A dedupe key is text that another agent chose, and `qex status` puts it
+    // in front of a reader. It is a LABEL and not a handle: no command finds a
+    // job by its key, so the safe form loses nothing. Without this line, a key
+    // that holds an ESC byte moves the cursor of the reader.
+    s.dedupe_key = s.dedupe_key.as_deref().map(safe_name);
     s
 }
 
