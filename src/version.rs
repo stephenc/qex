@@ -141,12 +141,21 @@ mod tests {
             "the constant must name a development build"
         );
 
-        let cargo = include_str!("../Cargo.toml");
+        // Read the file as TOML, and take `[package] version`.
+        //
+        // A search for a line is not sufficient. `version = "..."` appears in a
+        // dependency as well, so a search finds the first one in the FILE and
+        // not the one that names this package; a comment or a space after the
+        // value defeats it; and the answer then changes when somebody moves a
+        // table. `toml` is already a dependency of qex, so the file costs
+        // nothing to read correctly.
+        let cargo: toml::Value =
+            toml::from_str(include_str!("../Cargo.toml")).expect("Cargo.toml must be TOML");
         let found = cargo
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("version = \""))
-            .and_then(|l| l.strip_suffix('"'))
-            .expect("Cargo.toml must hold a version");
+            .get("package")
+            .and_then(|p| p.get("version"))
+            .and_then(|v| v.as_str())
+            .expect("Cargo.toml must hold `[package] version`");
 
         let release = found.split('.').count() == 3
             && found
