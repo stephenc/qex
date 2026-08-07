@@ -51,29 +51,106 @@
 //! it comes from a build that no release holds, and qex has no promise about
 //! it. The CLI refuses such a coordinator, and it gives the way to correct the
 //! problem.
+//!
+//! # The carve-out for a development build
+//!
+//! A DEVELOPMENT BUILD GETS A WARNING, AND NOT A REFUSAL.
+//!
+//! The floor is a backstop for a coordinator so early that it came before the
+//! capability handshake. Such a build cannot say what it cannot do, so the only
+//! safe answer is to refuse it.
+//!
+//! A development build is not that. It answers `Capabilities` like every other
+//! build, so `check` still refuses an option that the coordinator cannot obey,
+//! by name. The floor is the coarse gate and `check` is the exact one, so a
+//! warning here takes no protection away.
+//!
+//! A refusal would make every build that a person makes unusable by its own
+//! CLI: `main` holds `0.0.0-dev`, and a build with no git and no tag reports
+//! that number. That fault is worse than the fault that the floor guards
+//! against.
+//!
+//! `version::is_development` holds the rule for what a development build is,
+//! and it is the only place that holds it.
 
 use crate::spec::JobSpec;
+use crate::version::is_development;
 
 /// The first version that qex published, and thus the earliest version that
 /// qex supports.
 ///
-/// A build below this number never reached a release. Two agents that share a
-/// machine can each hold a different build, and a coordinator can operate for
-/// hours, so a mixture of versions is normal and qex must say which mixtures it
-/// supports. The answer is: this number and above.
+/// A build below this number never reached a release: no version below 0.6.0
+/// went out anywhere. Two agents that share a machine can each hold a different
+/// build, and a coordinator can operate for hours, so a mixture of versions is
+/// normal and qex must say which mixtures it supports. The answer is: this
+/// number and above.
+///
+/// # TWO DIFFERENT PROGRAMS NOW REPORT A NUMBER BELOW THIS ONE
+///
+/// They need two different answers, and the constant alone does not show that.
+/// Read this before you decide that the carve-out in `check_floor` is a fault:
+///
+///   * A binary that somebody built from a checkout BEFORE 0.6.0 reports a real
+///     number, such as `0.5.2`. It came before the capability handshake and
+///     before `build.rs`, so it cannot say what it cannot do. REFUSE IT.
+///   * A binary that somebody builds from `main` today reports
+///     `0.0.0-dev+g98513e2`, because `main` holds `0.0.0-dev` and `build.rs`
+///     adds the commit. It answers every request that this build answers.
+///     WARN ABOUT IT.
+///
+/// `(0, 0, 0) < (0, 6, 0)` is true for the second one as well, so the three
+/// numbers cannot tell the two apart. `version::is_development` tells them
+/// apart, and `check_floor` reads it.
 pub const SUPPORT_FLOOR: (u32, u32, u32) = (0, 6, 0);
+
+/// The answer of the floor test.
+///
+/// The three answers are separate values, and not a `Result`, because the
+/// middle one is neither. A caller that could only say yes or no would have to
+/// choose between refusing a build that a person made and saying nothing at all
+/// about it.
+pub enum Floor {
+    /// The coordinator is at or above the floor. Say nothing.
+    Supported,
+    /// The coordinator is a development build. Warn the user, and continue.
+    Development(String),
+    /// The coordinator is below the floor. Refuse it, with this message.
+    Below(String),
+}
 
 /// Tests the version of the coordinator against the support floor.
 ///
-/// The message gives the remedy, because a user cannot correct a fault that has
-/// no instruction: the coordinator stops when no job operates, and the next
+/// Each message gives the remedy, because a user cannot correct a fault that
+/// has no instruction: the coordinator stops when no job operates, and the next
 /// command starts a new one from the program that the user has now.
-pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Result<(), String> {
-    if parse(coordinator_version) >= SUPPORT_FLOOR {
-        return Ok(());
+pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Floor {
+    // A development build is not an early build. Read the note at the top of
+    // this file for the reason that it gets a warning and not a refusal.
+    if is_development(coordinator_version) {
+        if parse(coordinator_version) >= SUPPORT_FLOOR {
+            // The number is above the floor already, so the carve-out changes
+            // nothing and there is nothing to say.
+            return Floor::Supported;
+        }
+        return Floor::Development(format!(
+            "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, which is \
+             a development build and not a release.\n\n\
+             qex gives no promise about which options such a coordinator obeys. It still says \
+             what it can do, and qex still refuses a job with an option that it cannot obey, \
+             so this is a warning and not an error.\n\n\
+             The coordinator stops when no job operates, and the next command then starts one \
+             from the program that you have now. `qex info` gives its pid. To change it now:\n\
+             \x20   kill {coordinator_pid}\n\n\
+             The jobs that operate now continue; a new coordinator reads the same records."
+        ));
     }
+
+    if parse(coordinator_version) >= SUPPORT_FLOOR {
+        return Floor::Supported;
+    }
+
     let (major, minor, patch) = SUPPORT_FLOOR;
-    Err(format!(
+    Floor::Below(format!(
         "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and qex \
          supports {major}.{minor}.{patch} and above.\n\n\
          That coordinator comes from a build that no release holds, so qex gives no promise \
@@ -210,6 +287,13 @@ mod tests {
         assert_eq!(parse("0.5.1"), (0, 5, 1));
         assert_eq!(parse("1.0.0"), (1, 0, 0));
         assert_eq!(parse("0.5"), (0, 5, 0));
+
+        // The forms that `build.rs` writes. The text after `-` and after `+`
+        // says which build it is, and it must not change the three numbers.
+        assert_eq!(parse("0.0.0-dev"), (0, 0, 0));
+        assert_eq!(parse("0.0.0-dev+g98513e2"), (0, 0, 0));
+        assert_eq!(parse("0.0.0-dev+g98513e2.dirty"), (0, 0, 0));
+
         // A version that this code cannot read gives the lowest value, so the
         // CLI treats that coordinator as an early one.
         assert_eq!(parse("not-a-version"), (0, 0, 0));
@@ -221,9 +305,30 @@ mod tests {
     /// Two agents on one machine can hold different builds, and a coordinator
     /// operates for hours. qex must therefore say which mixtures of versions it
     /// supports, and the answer is: the first release and above.
+    fn below(version: &str, pid: i32) -> String {
+        match check_floor(version, pid) {
+            Floor::Below(message) => message,
+            Floor::Development(m) => panic!("`{version}` gave a warning and not a refusal: {m}"),
+            Floor::Supported => panic!("`{version}` passed the floor"),
+        }
+    }
+
+    fn supported(version: &str) -> bool {
+        matches!(check_floor(version, 1), Floor::Supported)
+    }
+
+    /// A coordinator below the first published version must be refused.
+    ///
+    /// Two agents on one machine can hold different builds, and a coordinator
+    /// operates for hours. qex must therefore say which mixtures of versions it
+    /// supports, and the answer is: the first release and above.
+    ///
+    /// THIS TEST HOLDS THE RULE THAT THE CARVE-OUT MUST NOT SWALLOW. A build
+    /// that says `0.5.2` came before the capability handshake, so it cannot say
+    /// what it cannot do, and a warning would not be enough.
     #[test]
     fn a_coordinator_below_the_floor_is_refused() {
-        let err = check_floor("0.5.2", 4321).unwrap_err();
+        let err = below("0.5.2", 4321);
         assert!(
             err.contains("0.6.0"),
             "the message must name the floor: {err}"
@@ -233,25 +338,80 @@ mod tests {
             "the message must give the remedy: {err}"
         );
 
-        assert!(
-            check_floor("0.6.0", 1).is_ok(),
-            "the floor itself is supported"
-        );
-        assert!(check_floor("0.7.3", 1).is_ok());
-        assert!(check_floor("1.0.0", 1).is_ok());
+        assert!(supported("0.6.0"), "the floor itself is supported");
+        assert!(supported("0.7.3"));
+        assert!(supported("1.0.0"));
 
         // A version that this code cannot read gives the lowest value, so such
         // a coordinator is refused. That is the safe direction.
-        assert!(check_floor("", 1).is_err());
+        below("", 1);
+        below("not-a-version", 1);
     }
 
-    /// This build must never be below its own floor. A release that qex itself
-    /// would refuse cannot exist.
+    /// A build that a person made must be usable by its own CLI.
+    ///
+    /// It gets a WARNING and not a refusal. `check` still refuses each option
+    /// that such a coordinator cannot obey, by name, so nothing is lost. See
+    /// the note at the top of this file.
+    #[test]
+    fn a_development_build_is_warned_about_and_not_refused() {
+        let warning = match check_floor("0.0.0-dev", 4321) {
+            Floor::Development(message) => message,
+            Floor::Below(m) => panic!("a development build must not be refused: {m}"),
+            Floor::Supported => panic!("a development build below the floor must be named"),
+        };
+        assert!(
+            warning.contains("development build"),
+            "the message must say what happened: {warning}"
+        );
+        assert!(
+            warning.contains("no promise"),
+            "the message must say why it matters: {warning}"
+        );
+        assert!(
+            warning.contains("kill 4321") && warning.contains("qex info"),
+            "the message must give the remedy: {warning}"
+        );
+
+        // Every form that `build.rs` writes gets the same answer.
+        for form in [
+            "0.0.0-dev",
+            "0.0.0-dev+g98513e2",
+            "0.0.0-dev+g98513e2.dirty",
+            "0.0.0-dev+unknown",
+        ] {
+            assert!(
+                matches!(check_floor(form, 1), Floor::Development(_)),
+                "`{form}` must give a warning"
+            );
+        }
+
+        // A release takes its number from Cargo.toml, and it needs no warning
+        // at all.
+        assert!(supported("0.7.3"));
+    }
+
+    /// This build must never be below its own floor without saying so.
+    ///
+    /// A release that qex itself would refuse cannot exist. `main` holds
+    /// `0.0.0-dev`, so a build of `main` with no git IS below the floor, and it
+    /// must then be a build that qex names as a development build.
+    ///
+    /// The test fails for a build that is below the floor and is NOT a
+    /// development build, which is exactly the state that must not exist.
     #[test]
     fn this_build_is_not_below_the_floor() {
+        let mine = crate::version::VERSION;
         assert!(
-            parse(env!("CARGO_PKG_VERSION")) >= SUPPORT_FLOOR,
-            "this build is below the support floor"
+            parse(mine) >= SUPPORT_FLOOR || crate::version::is_development(mine),
+            "this build reports `{mine}`, which is below the support floor and is not a \
+             development build"
+        );
+
+        // The same rule, through the code that a user meets.
+        assert!(
+            !matches!(check_floor(mine, 1), Floor::Below(_)),
+            "this build reports `{mine}`, which its own CLI would refuse"
         );
     }
 

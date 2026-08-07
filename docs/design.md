@@ -133,6 +133,22 @@ The jobs that operate now continue; a new coordinator reads the same records.
 The jobs are safe in that operation. A coordinator holds no result: the record
 of each job is on the disk, and a new coordinator reads the same records.
 
+### A development build gets a warning, and not a refusal
+
+A build that a person makes reports a version such as `0.0.0-dev+g98513e2`,
+which names the commit that it holds. qex names such a version a development
+build, and a coordinator from one gets a warning only.
+
+The floor is a backstop for a coordinator so early that it came before the
+capability handshake: such a build cannot say what it cannot do, so the only
+safe answer is to refuse it. A development build is not that. It answers the
+`Capabilities` request like every other build, so qex still refuses each option
+that it cannot obey, and it names the option. The floor is the coarse gate, and
+the capability test is the exact one.
+
+A refusal would make every build that a person makes unusable by its own CLI,
+which is a worse fault than the fault that the floor guards against.
+
 ## Three questions that a user asked, with the answers
 
 ### Does the memory test understand swap and reclaimable cache?

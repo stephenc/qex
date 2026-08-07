@@ -121,7 +121,7 @@ fn render(
         ));
         // Give both versions. A coordinator can hold the code of an earlier
         // build, and that difference caused a fault that named no cause.
-        let mine = env!("CARGO_PKG_VERSION");
+        let mine = crate::version::VERSION;
         if version != mine {
             out.push_str(&crate::style::warning(&format!(
                 "      WARNING: the coordinator is version {version} and this command is {mine}"

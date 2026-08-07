@@ -243,7 +243,7 @@ dependencies = [
 
 [[package]]
 name = "qex"
-version = "0.7.2"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "clap",

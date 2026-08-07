@@ -86,6 +86,8 @@ mod units;
 #[cfg(unix)]
 mod usage;
 #[cfg(unix)]
+mod version;
+#[cfg(unix)]
 mod watchers;
 
 #[cfg(unix)]

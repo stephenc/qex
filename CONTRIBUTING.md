@@ -3,8 +3,12 @@
 ## The title of your pull request gives the version number
 
 qex has no manual release step. A merge to `main` reads the commit messages
-since the last tag, calculates the next version number, builds the binaries,
-makes the tag and publishes the release.
+since the last release, calculates the next version number, makes the tag, and
+then builds the binaries and publishes the release.
+
+**No pull request changes the version number.** `Cargo.toml` on `main` holds
+`0.0.0-dev` for ever. The number of a release lives on the tag, and on the one
+commit that the tag names.
 
 **A pull request goes to `main` as a squash**, so it makes ONE commit there. The
 title of the pull request becomes the first line of that commit, and the body of
@@ -82,22 +86,117 @@ Two reasons for a comment and not the body:
 
 **While the first number is 0, a break moves the SECOND number.** A 0.x version
 says that the interface can still change, so an automatic move to 1.0.0 would
-say something that no person decided. To go to 1.0.0, put that number in
-`Cargo.toml`: the number in `Cargo.toml` is a floor, and the release is never
-below it.
+say something that no person decided.
 
-## The version number in Cargo.toml
+## How a release happens
 
-The release workflow writes the number, so you do not need to change it.
+The release comes from a TAG, and never from a commit on `main`.
 
-You still can, and there is one case where you must: **a build that you install
-on a machine must not report the same number as a different build.** qex
-compares the version of the CLI against the version of the coordinator that
-operates, and it gives a warning when the two differ. Two different binaries
-that report one number make that warning useless, and a user then meets a fault
-with no cause.
+A branch ruleset asks for a pull request on `main`, and the GitHub Actions app
+cannot take a bypass on a repository that a person owns. A workflow can
+therefore no longer push to `main`. It can still push a tag.
 
-If you build qex and install it while you work, move the number up first.
+`release.yml` runs on each merge to `main`. When the commit messages since the
+last release ask for one, it:
+
+1. writes the number into `Cargo.toml` and `Cargo.lock`,
+2. commits that as `chore(release): vX.Y.Z`, **beside `main` and not on it**,
+3. makes the annotated tag `vX.Y.Z` on that commit,
+4. pushes the tag, and nothing else.
+
+The history thus looks like a fishbone: `main` is the spine, and each release is
+a rib of one commit hanging off it.
+
+```
+main:  A --- B --- C            the spine, always 0.0.0-dev
+              \     \
+               b     c          a rib of one commit: chore(release)
+               |     |
+            v0.7.2  v0.7.3      the tag is on the rib
+```
+
+One workflow does all of it, and it then builds the four binaries from the tag
+and publishes the release. **A tag is not an ancestor of `main`**, so `git
+describe` finds none of them; code that looks for the last release sorts the
+tags instead. The rules are in
+`.github/actions/compute-version/version-rules.sh`, and
+`.github/actions/compute-version/test.sh` holds them.
+
+### A release that failed leaves its tag behind
+
+The tag comes BEFORE the tests and the builds, because the tag is what a build
+builds. A run that fails after the tag thus leaves a tag with no release beside
+it.
+
+**Use "Re-run failed jobs", and never "Re-run all jobs".**
+
+- **"Re-run failed jobs" is correct, and it is the cheaper of the two.** GitHub
+  keeps the outputs of the jobs that already succeeded, so `decide` does not run
+  again and the run keeps the tag that it made.
+- **"Re-run all jobs" goes green having released nothing.** `decide` runs again,
+  the tag exists by then, so the rules take it as the last release, and the
+  range of commits is empty.
+
+You can also start the workflow ON THE TAG, which works from any state:
+
+```sh
+gh workflow run release.yml --ref v0.8.0
+```
+
+The ref is then a tag, so the run takes the number from it, makes no new tag,
+and goes to the build.
+
+### To go to 1.0.0, make the tag
+
+A move to 1.0.0 is the decision of a person, so a person makes the tag:
+
+```sh
+git fetch origin
+git checkout --detach origin/main
+.github/scripts/set-version.sh 1.0.0
+git commit -am "chore(release): v1.0.0"
+git tag -a v1.0.0 -m "qex 1.0.0"
+git push origin v1.0.0
+```
+
+The push of that tag starts `release.yml`, and every release after it counts up
+from 1.0.0.
+
+## The version number that your build reports
+
+**A build that you install on a machine must not report the same number as a
+different build.** qex compares the version of the CLI against the version of
+the coordinator that operates, and it gives a warning when the two differ. Two
+different binaries that report one number make that warning useless, and a user
+then meets a fault with no cause.
+
+You need no action for this, and you must not change `Cargo.toml`. `build.rs`
+puts the commit into the version of each build:
+
+```
+0.0.0-dev+g98513e2          the commit that this build holds
+0.0.0-dev+g98513e2.dirty    the same, with changes that are not committed
+0.0.0-dev+unknown           a build that could not learn its commit
+```
+
+**A development build claims nothing except which commit it is.** That is the
+one thing it can say honestly, and it is the thing that a fault report needs.
+
+A release binary reports the release number, and nothing carries that number in
+through the environment: the commit that the tag names holds it in `Cargo.toml`,
+and `build.rs` reads it from there. A build from crates.io reports it for the
+same reason.
+
+`build.rs` reads git ONLY when `Cargo.toml` says `0.0.0-dev`, and only when the
+repository that git finds is the one whose root holds the package. git walks up
+the directory tree, so a copy of the source inside another repository would
+otherwise report a stranger's commit; `cargo install --git` makes exactly that
+shape.
+
+A coordinator that reports a development build below the support floor gives a
+WARNING and not a refusal, so a build that you make is usable by its own CLI.
+The capability test still refuses each option that such a coordinator cannot
+obey, and it names the option. See `src/capabilities.rs`.
 
 ## Before you open a pull request
 

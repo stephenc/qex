@@ -647,7 +647,7 @@ fn wait_one(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
 /// qex now starts the program that is on the disk, so a job runs. The two
 /// versions can still behave differently, so the user must know.
 fn warn_if_version_differs(client: &mut Client) {
-    let mine = env!("CARGO_PKG_VERSION");
+    let mine = crate::version::VERSION;
     if let Ok(Response::Info {
         version,
         pid,
@@ -655,25 +655,43 @@ fn warn_if_version_differs(client: &mut Client) {
         ..
     }) = client.call(&Request::Info)
     {
-        // A coordinator below the support floor gives an ERROR, with the same
-        // remedy, when the command needs the coordinator. Two messages about
-        // one fact teach a reader to read neither, so this warning stays quiet
-        // in that case.
-        let below_floor = crate::capabilities::parse(&version) < crate::capabilities::SUPPORT_FLOOR;
-        if below_floor {
-            // Say nothing. The error gives this fact and the same remedy.
-        } else if version != mine {
-            eprintln!(
-                "qex: the coordinator (pid {pid}) is version {version}, and this command is \
-                 version {mine}. The coordinator stops when no job operates, and the next \
-                 command starts one with this version. Stop it now with `kill {pid}` if you \
-                 need this version immediately."
-            );
-        } else if program_replaced {
-            eprintln!(
-                "qex: something replaced the qex program after the coordinator (pid {pid}) \
-                 started. The coordinator stops when no job operates."
-            );
+        // Each message below covers one fact, and one command writes one
+        // message at the most. Two messages about one fact teach a reader to
+        // read neither.
+        match crate::capabilities::check_floor(&version, pid) {
+            // A coordinator below the floor gives an ERROR, with the same
+            // remedy, when the command needs the coordinator. Say nothing here.
+            crate::capabilities::Floor::Below(_) => {}
+
+            // A development build is not refused, so this warning is the only
+            // place that the user hears about it.
+            //
+            // It stays quiet while the coordinator reports the SAME version as
+            // this command: the two are then one build, the user made it, and
+            // there is nothing that they do not know already. A build of qex
+            // that runs the tests of qex would otherwise write this line for
+            // every command.
+            crate::capabilities::Floor::Development(message) if version != mine => {
+                eprintln!("qex: {message}");
+            }
+
+            _ if version != mine => {
+                eprintln!(
+                    "qex: the coordinator (pid {pid}) is version {version}, and this command is \
+                     version {mine}. The coordinator stops when no job operates, and the next \
+                     command starts one with this version. Stop it now with `kill {pid}` if you \
+                     need this version immediately."
+                );
+            }
+
+            _ if program_replaced => {
+                eprintln!(
+                    "qex: something replaced the qex program after the coordinator (pid {pid}) \
+                     started. The coordinator stops when no job operates."
+                );
+            }
+
+            _ => {}
         }
     }
 }
@@ -1418,7 +1436,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "version": version,
                         "started_at": started_at,
                         "program_replaced": program_replaced,
-                        "cli_version": env!("CARGO_PKG_VERSION"),
+                        "cli_version": crate::version::VERSION,
                         "jobs_running": jobs_running,
                         "jobs_queued": jobs_queued,
                         "cpu_budget": cpu_budget,
@@ -1432,7 +1450,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             println!("coordinator pid: {pid}");
             println!(
                 "version:         {version} (this command: {})",
-                env!("CARGO_PKG_VERSION")
+                crate::version::VERSION
             );
             if program_replaced {
                 // Say this clearly. A user that replaces the program during
@@ -1585,7 +1603,7 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
 /// long form also gives the version of the coordinator, because a coordinator
 /// that holds an earlier build behaves differently.
 pub fn version(args: cli::VersionArgs) -> Result<i32> {
-    let mine = env!("CARGO_PKG_VERSION");
+    let mine = crate::version::VERSION;
 
     // Do not start a coordinator. A question about a version must not change
     // the machine.
@@ -2028,7 +2046,15 @@ fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
 
     // The floor first. A coordinator below it comes from a build that no
     // release holds, so no promise covers it, whatever the job asks for.
-    crate::capabilities::check_floor(&version, pid).map_err(|e| anyhow::anyhow!("{e}"))?;
+    //
+    // A development build passes here and takes a warning instead, which
+    // `warn_if_version_differs` writes. The test below still refuses each
+    // option that such a coordinator cannot obey, and it names the option.
+    if let crate::capabilities::Floor::Below(message) =
+        crate::capabilities::check_floor(&version, pid)
+    {
+        return Err(anyhow::anyhow!("{message}"));
+    }
 
     if crate::capabilities::required_by(spec).is_empty() {
         return Ok(());
