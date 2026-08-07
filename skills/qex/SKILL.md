@@ -92,6 +92,9 @@ BOTH streams. Prefer it: one command gives everything.
 
 ## Your session can stop, and the work continues
 
+This is about `qex submit`. A job of `qex run` differs in one case only: Ctrl-C
+or a SIGTERM on the waiting `qex run` stops the job; see above.
+
 The job is not a child of your shell and not a child of you. A person can stop
 you at any moment: the job continues, it writes its result, and any later session
 attaches to it with the id.

@@ -205,6 +205,9 @@ things follow, and all three matter:
     The coordinator stops or is replaced the job continues, and it still writes
                                         its result.
 
+Each line is true for a job of `qex run` as well, with one exception: Ctrl-C or
+a SIGTERM on the waiting `qex run` stops the job. See WHAT YOU GIVE UP above.
+
 Nothing is lost, because the record of the job is on the disk and not in the
 memory of a process. Your wait is the only thing that stops.
 

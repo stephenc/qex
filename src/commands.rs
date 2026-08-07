@@ -1814,8 +1814,8 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// This command stops the job when it receives SIGINT (Ctrl-C) or SIGTERM,
 /// because a user expects Ctrl-C to stop the work. It stops the job with a
 /// `Kill` request to the coordinator, and NOT with a signal: the supervisor
-/// gives the job its own session and its own process group, so a signal to the
-/// process group of this command never reaches the job.
+/// gives the job its own process group, inside the session of the supervisor,
+/// so a signal to the process group of this command never reaches the job.
 ///
 /// A hangup, such as a terminal that closes, and a SIGKILL therefore do not
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for

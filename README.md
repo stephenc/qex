@@ -117,7 +117,9 @@ supervisor holds it in its own session, and the record of the job is on the disk
 
 Somebody can therefore stop your agent, close the terminal, or replace the qex
 binary. The job continues and it still writes its result. Your wait is the only
-thing that stops, and any later session attaches to the same job with the id:
+thing that stops, and any later session attaches to the same job with the id.
+This is about `qex submit`; a job of `qex run` also stops when Ctrl-C or a
+SIGTERM stops the command that waits for it.
 
 ```sh
 qex submit --id-file build.id -- make    # session 1

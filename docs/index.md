@@ -189,6 +189,9 @@ person can stop it at any moment: the build continues, and the next session
 attaches to the same job with the id. A watch script holds the answer in its own
 memory, and a stop loses that answer.
 
+That is a property of `qex submit`. A job of `qex run` also stops when Ctrl-C or
+a SIGTERM stops the command that waits for it.
+
 ## Install
 
 ```sh
