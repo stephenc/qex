@@ -284,6 +284,85 @@ takes a percentage, because it gives a part of the machine to all the jobs
 together. `[defaults] cpu` gives the cores for one job, so it takes a whole
 number only, and a percentage there gives an error.
 
+### The coordinator reads this file again when it changes
+
+A coordinator operates for hours. It reads the configuration file again when the
+content of the file changes, so `qex config show` and `qex info` no longer
+disagree about the budget of qex. Measured: the new values arrive in 0.52s to
+0.56s on a busy coordinator, and in 0.68s to 1.01s on one with nothing to do.
+
+The new values apply to the jobs that START after the change. A job that
+operates keeps the claim that it made, and the coordinator keeps that claim
+against the budget until the job stops.
+
+**qex compares the CONTENT of the file, and not its time.** Linux takes the time
+of a file from a coarse clock with the granularity of one tick, which is 4
+milliseconds on a usual machine. Two writes inside one tick give a file the same
+time, so a test of the time misses the second write, and it misses it for ever.
+
+**qex looks at the file about ten times in half a second, and it takes the
+content when every look gave the same content.** A shell `>` and a redirect, and
+every program that writes one line at a time, leave a file that stops in the
+middle for a moment, and a file that stops in the middle is still valid TOML. It
+parses, and it is wrong in two ways:
+
+- Every key that the writer did not reach yet takes its DEFAULT value. That is
+  the one road by which a budget of 2 cores CAN become the default budget of 12.
+- A stop in the MIDDLE OF A LINE gives a wrong value that is not a default
+  value. A file that was becoming `cpu = 16` reads as `cpu = 1`, and `qex config
+  show` then reports `budget: 1 cores`.
+
+qex says nothing in either case, because it CAN read such a file. This is why
+qex looks more than one time, and why the new values take about one second and
+not half a second.
+
+**The wait is a TIME, and not a count of turns of the scheduler.** The scheduler
+waits 500 milliseconds for a change, but every request wakes it, so a
+coordinator with work in the queue turns much faster. Measured with a mark on
+each turn: the median gap was 500.7ms with nothing to do, and 17.0ms with a loop
+of `qex submit` running. While the file settles, qex looks at it every 50
+milliseconds.
+
+**A file that changes back and forth in step with those looks can still be
+taken.** qex LOOKS at the file; it does not get a message when the file changes.
+A writer that puts two different whole files at the path in turn, at a period
+near the period of the looks, gives every look the same content while the file
+was never that content for longer than one period. Measured: a writer that
+changed the file every 25 milliseconds made the coordinator take a half-written
+file in 3 trials of 5.
+
+No number of looks removes that. A sampler always has a frequency that walks
+past it; more looks only move which frequency. A writer with that regularity is
+not a shell `>` and not an editor, because those write the file one time: a
+shell loop with its usual jitter could not do it in 5 trials of 5, and only a
+writer with an exact period could. Write the file in one step — write a
+temporary file and rename it over this one — and none of this applies.
+
+**The path must be a regular file, or a link to one.** qex opens this path on
+every turn of the scheduler. A FIFO stops that open until somebody writes to
+the FIFO, and the coordinator would then answer nothing at all. Every command
+that reads this file applies the same rule, so `qex config show` and `qex
+submit` give an error at once in place of a wait with no end.
+
+**A file that qex cannot read does not become the default values.** The
+coordinator keeps the values that it had and says so. The same holds for a file
+that is empty, for a file that is gone, and for a path that is not a regular
+file:
+
+```
+qex: WARNING: the configuration file changed, and qex cannot read it:
+qex:   config [budget] cpu: invalid core count `two`; expected an integer or a percentage
+qex:   The coordinator keeps the values that it had, and they are the values below.
+qex:   Correct the file. The coordinator reads it again by itself. Run `qex config show` for the full message.
+```
+
+`qex info` gives that warning, and `qex info --json` gives the same text in the
+field `config_error`. Correct the file, and the coordinator reads it again with
+no other step: the warning then goes away.
+
+The reload tests the values in the same way as the start of a coordinator, so a
+value that stops qex from starting cannot arrive by an edit.
+
 ### Update the coordinator before you use a new option
 
 qex refuses a field that it does not know. That rule finds a name with a
@@ -301,10 +380,12 @@ qex info                # the new version now
 ```
 
 **The program on the disk is not sufficient.** A coordinator operates for hours,
-it holds the code that started it, and it reads the config file once, when it
-starts. A new option that you write before that moment has no effect, and qex
-ignores it in silence. The coordinator stops by itself when no job operates,
-and `kill <pid>` changes it at once.
+and it holds the code that started it. It reads the config file again when the
+file changes, but it reads that file with the code that it holds, and that code
+does not know the new option. The coordinator therefore refuses the file, keeps
+the values that it had, and `qex info` reports the fault. The new option has no
+effect until a NEW coordinator reads it. The coordinator stops by itself when no
+job operates, and `kill <pid>` changes it at once.
 
 **Install the new qex before you kill the coordinator.** While the old qex is
 the program on the disk, no coordinator can start from a file that holds the new

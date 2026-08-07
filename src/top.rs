@@ -429,6 +429,7 @@ mod tests {
 
     fn info() -> Response {
         Response::Info {
+            config_error: None,
             pid: 1,
             version: "test".into(),
             started_at: 0,

@@ -80,6 +80,12 @@ pub enum Response {
         jobs_queued: usize,
         cpu_budget: u64,
         mem_budget: u64,
+        /// The fault in the configuration file, if the coordinator met one.
+        ///
+        /// The coordinator keeps the values that it had, so a reader must be
+        /// told that the file and the coordinator no longer agree.
+        #[serde(default)]
+        config_error: Option<String>,
         cpu_claimed: u64,
         mem_claimed: u64,
     },

@@ -20,6 +20,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One isolated qex installation.
@@ -2731,7 +2733,7 @@ fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
 /// A unit test on the message alone cannot hold this. The message is a pure
 /// function of its arguments, so a test of it passes whichever form the
 /// supervisor asks for. `src/supervisor.rs` calling `Config::load()` instead of
-/// `Config::load_for_job_record()` brings the fault back, and only a test that
+/// `Config::load_short()` brings the fault back, and only a test that
 /// reads a real `qex status` sees it.
 ///
 /// # Why the job starts in this state at all
@@ -3049,4 +3051,591 @@ fn ctrl_c_removes_the_job_of_qex_run_from_the_queue() {
     );
 
     h.qex(&["kill", &blocker, "--grace", "1s"]);
+}
+/// A change to the configuration must reach a coordinator that operates.
+///
+/// # The fault that this test holds
+///
+/// The coordinator read the file one time, at its start, and it then operates
+/// for hours. A user who changed `[budget] cpu` saw `qex config show` report
+/// the NEW value, because that command reads the file, and `qex info` report
+/// the OLD one, because that command asks the coordinator. The two commands of
+/// qex disagreed about the budget of qex, and neither said that one was old.
+#[test]
+fn a_change_to_the_configuration_reaches_the_coordinator() {
+    let h = Harness::new(
+        "reload",
+        "[budget]\ncpu = \"8\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    // Start the coordinator, and read the budget that it holds.
+    h.ok(&["list"]);
+    let info = h.ok(&["info"]);
+    assert!(info.contains("of 8 in use"), "the budget must be 8: {info}");
+
+    // Change the file while the coordinator operates.
+    std::fs::write(
+        h.root.join("cfg/qex.toml"),
+        "[budget]\ncpu = \"2\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    )
+    .unwrap();
+
+    h.until(
+        "the coordinator reads the file again",
+        Duration::from_secs(45),
+        || h.ok(&["info"]).contains("of 2 in use"),
+    );
+
+    // A file that qex cannot read must NOT become the default values. The
+    // default budget is far larger than 2 cores, so a silent fall back would
+    // give this coordinator a budget that nobody asked for.
+    //
+    // THE VALUE HERE IS VALID TOML. It is the reload that must refuse it, in
+    // the same way as the start of a coordinator: an earlier version of this
+    // work installed `cpu = "two"` and gave every job a budget of 0 cores with
+    // no word to anybody.
+    std::fs::write(h.root.join("cfg/qex.toml"), "[budget]\ncpu = \"two\"\n").unwrap();
+
+    h.until("qex reports the fault", Duration::from_secs(45), || {
+        let out = h.qex(&["info"]);
+        String::from_utf8_lossy(&out.stderr).contains("cannot read it")
+    });
+
+    let info = h.ok(&["info"]);
+    assert!(
+        info.contains("of 2 in use"),
+        "the coordinator must keep the values that it had: {info}"
+    );
+
+    // The fault travels as DATA as well. An agent reads the JSON, and a number
+    // with no word about its age is worse than no number.
+    let json: serde_json::Value =
+        serde_json::from_slice(&h.qex(&["info", "--json"]).stdout).unwrap();
+    assert!(
+        json["config_error"].is_string(),
+        "`qex info --json` must carry the fault: {json}"
+    );
+
+    // A FAULT OF THE FORM OF THE FILE gives a message of several lines, with a
+    // caret under the column. Every line must carry the `qex:` prefix, or the
+    // lines after the first read as output of the command.
+    std::fs::write(h.root.join("cfg/qex.toml"), "[budget\n").unwrap();
+
+    h.until(
+        "qex reports the fault of the form",
+        Duration::from_secs(45),
+        || String::from_utf8_lossy(&h.qex(&["info"]).stderr).contains("TOML parse error"),
+    );
+    let err = String::from_utf8_lossy(&h.qex(&["info"]).stderr).to_string();
+    for line in err.lines() {
+        assert!(
+            line.starts_with("qex:"),
+            "every line of the warning must carry the prefix: {err}"
+        );
+    }
+
+    // CORRECT THE FILE, AND THE WARNING GOES AWAY. A warning that stays after
+    // the remedy teaches the reader to ignore every warning of qex.
+    std::fs::write(
+        h.root.join("cfg/qex.toml"),
+        "[budget]\ncpu = \"5\"\nmem = \"4GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    )
+    .unwrap();
+
+    h.until(
+        "the coordinator takes the corrected file",
+        Duration::from_secs(45),
+        || h.ok(&["info"]).contains("of 5 in use"),
+    );
+    let err = String::from_utf8_lossy(&h.qex(&["info"]).stderr).to_string();
+    assert!(
+        !err.contains("cannot read it"),
+        "the warning must go away when the file is correct: {err}"
+    );
+}
+
+/// The states that an EDITOR leaves behind must not change the budget.
+///
+/// # The fault that this test holds
+///
+/// A file that qex cannot read must never become the DEFAULT values. The
+/// default budget is 75% of the machine, so a coordinator that took the
+/// defaults would turn a budget of 2 cores into a budget of 12, with no word to
+/// anybody. An empty file and a file that is gone are the two states that a
+/// write leaves for a moment, so the reload meets them by itself and not by a
+/// fault of the user.
+///
+/// The rename is the third state. An editor writes a temporary file and renames
+/// it over the old one, so the name then points at a different file.
+#[test]
+fn an_empty_or_missing_configuration_does_not_become_the_default_values() {
+    let file = "[budget]\ncpu = \"2\"\nmem = \"4GB\"\n\
+                [peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n";
+    let h = Harness::new("reload-gone", file);
+    let path = h.root.join("cfg/qex.toml");
+
+    h.ok(&["list"]);
+    let info = h.ok(&["info"]);
+    assert!(info.contains("of 2 in use"), "the budget must be 2: {info}");
+
+    // An empty file, which is the state that a truncate leaves.
+    std::fs::write(&path, "").unwrap();
+    h.until(
+        "qex reports the empty file",
+        Duration::from_secs(45),
+        || String::from_utf8_lossy(&h.qex(&["info"]).stderr).contains("the file is empty"),
+    );
+    let info = h.ok(&["info"]);
+    assert!(
+        info.contains("of 2 in use"),
+        "an empty file must not change the budget: {info}"
+    );
+
+    // A file that is gone, which is the state that a rename leaves.
+    std::fs::remove_file(&path).unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let info = h.ok(&["info"]);
+    assert!(
+        info.contains("of 2 in use"),
+        "a file that is gone must not change the budget: {info}"
+    );
+
+    // A RENAME OVER THE FILE. The name then points at a different file, so a
+    // watch of the name would hold a file that nobody reads again.
+    let temp = h.root.join("cfg/.qex.toml.new");
+    std::fs::write(&temp, file.replace("cpu = \"2\"", "cpu = \"6\"")).unwrap();
+    std::fs::rename(&temp, &path).unwrap();
+
+    h.until(
+        "the coordinator reads the file that the rename put there",
+        Duration::from_secs(45),
+        || h.ok(&["info"]).contains("of 6 in use"),
+    );
+}
+
+/// A WRITE THAT IS NOT FINISHED must not become the default budget.
+///
+/// # The fault that this test holds
+///
+/// A shell `>` and a redirect, and every program that writes one line at a
+/// time, make the file empty and then fill it. The guard for an empty file is
+/// not sufficient, because A FILE THAT STOPS IN THE MIDDLE IS STILL VALID
+/// TOML: `[budget]` with no line under it parses, it validates, and every key
+/// takes its DEFAULT value.
+///
+/// A review measured that on the first form of this work. The budget went from
+/// 2 cores to 12 — 12 is 75% of that machine — and 10 jobs started together in
+/// place of 2. The coordinator said nothing, because it could read the file.
+/// That is worse than the fault this branch removes, because it STARTS WORK.
+///
+/// The test writes the SAME content each time, so the budget has no reason to
+/// change at all. Every value that `qex info` gives must be the value in the
+/// file.
+#[test]
+fn a_write_that_is_not_finished_does_not_change_the_budget() {
+    // `mem` is the LAST value, and 1GB is a value that no machine gives by
+    // default: the default is 75% of the memory of the machine. A file that
+    // stops before this line thus shows itself at once.
+    let file = "[peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                [budget]\ncpu = \"2\"\nmem = \"1GB\"\n";
+    let h = Harness::new("reload-partial", file);
+    let path = h.root.join("cfg/qex.toml");
+
+    h.ok(&["list"]);
+    let info: serde_json::Value =
+        serde_json::from_slice(&h.qex(&["info", "--json"]).stdout).unwrap();
+    assert_eq!(info["mem_budget"].as_u64(), Some(1024 * 1024 * 1024));
+
+    // Write the file line by line, again and again, for as long as the reader
+    // looks. Each round leaves the same content.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (path, stop, file) = (path.clone(), stop.clone(), file.to_string());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let mut f = std::fs::File::create(&path).unwrap();
+                for line in file.lines() {
+                    use std::io::Write;
+                    writeln!(f, "{line}").unwrap();
+                    f.flush().unwrap();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                drop(f);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut looks = 0;
+    while Instant::now() < deadline {
+        let info: serde_json::Value =
+            serde_json::from_slice(&h.qex(&["info", "--json"]).stdout).unwrap();
+        looks += 1;
+        assert_eq!(
+            info["mem_budget"].as_u64(),
+            Some(1024 * 1024 * 1024),
+            "a write that is not finished must never give the default budget: {info}"
+        );
+        assert_eq!(
+            info["cpu_budget"].as_u64(),
+            Some(2),
+            "a write that is not finished must never give the default budget: {info}"
+        );
+        assert!(
+            info["config_error"].is_null(),
+            "the file is correct each time it is complete: {info}"
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        looks > 20,
+        "the test must look many times, and it looked {looks}"
+    );
+}
+
+/// A writer that goes BACK AND FORTH between two whole files.
+///
+/// # The fault that this test holds
+///
+/// qex looks at the file about ten times in half a second and takes the content
+/// when every look gave the same content. With one look every 500ms the window
+/// holds TWO looks, and two looks cannot separate "the file did not change"
+/// from "the file changed and changed back between them".
+///
+/// A writer that puts a half-written file and the whole file at the path in
+/// turn, 300ms each, with a rename, gives a period of 600ms against a sampler
+/// of 500ms. The two walk past each other, so a pair of looks lands on the same
+/// half-written file, and a coordinator that looks twice takes a budget that
+/// was never in the file for more than 300ms.
+///
+/// # Why the test above cannot find this
+///
+/// The writer above puts a file down one line at a time with 2ms between the
+/// lines. It passes through seven states, each for 2ms, so no single one of
+/// them holds a pair of looks. That test passed 8 runs of 8 against the fault
+/// that this one finds first time. A test that cannot fail proves nothing, and
+/// "no test can find this" was an assertion that nobody had tried.
+///
+/// The RENAME matters: each look then gives one whole file or the other, and
+/// never a file that a write is inside.
+#[test]
+fn a_file_that_goes_back_and_forth_does_not_change_the_budget() {
+    let whole = "[peers]\nenabled = false\n\
+                 [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                 [budget]\ncpu = \"2\"\nmem = \"1GB\"\n";
+    // The same file, stopped before `mem`. It parses, it validates, and `mem`
+    // takes its default value: 75% of the memory of the machine.
+    let half = whole.strip_suffix("mem = \"1GB\"\n").unwrap().to_string();
+
+    let h = Harness::new("reload-alternating", whole);
+    let path = h.root.join("cfg/qex.toml");
+
+    h.ok(&["list"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&h.qex(&["info", "--json"]).stdout).unwrap()
+            ["mem_budget"]
+            .as_u64(),
+        Some(1024 * 1024 * 1024)
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (path, stop, whole) = (path.clone(), stop.clone(), whole.to_string());
+        let temp = h.root.join("cfg/.qex.toml.new");
+        std::thread::spawn(move || {
+            let mut turn = false;
+            while !stop.load(Ordering::Relaxed) {
+                let text = if turn { &whole } else { &half };
+                std::fs::write(&temp, text).unwrap();
+                std::fs::rename(&temp, &path).unwrap();
+                turn = !turn;
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            // Leave the whole file behind, whatever the turn.
+            std::fs::write(&temp, &whole).unwrap();
+            std::fs::rename(&temp, &path).unwrap();
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut looks = 0;
+    let mut fault = None;
+    while Instant::now() < deadline {
+        let out = h.qex(&["info", "--json"]);
+        if let Ok(info) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            looks += 1;
+            if info["mem_budget"].as_u64() != Some(1024 * 1024 * 1024) {
+                fault = Some(format!("{} looks, then {info}", looks));
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+
+    assert!(
+        fault.is_none(),
+        "a file that goes back and forth must not change the budget: {}",
+        fault.unwrap_or_default()
+    );
+    assert!(
+        looks > 20,
+        "the test must look many times, and it looked {looks}"
+    );
+}
+
+/// The same fault, on a coordinator that HAS WORK TO DO.
+///
+/// # The fault that this test holds
+///
+/// The first form of this guard counted two TURNS of the scheduler, and the
+/// words around it said half a second. A turn is not half a second. The
+/// scheduler waits on a condition variable with a timeout of 500ms, and every
+/// request thread wakes it, so a coordinator with work in the queue turns much
+/// faster. A mark on each turn measured a median gap of 500.7ms with nothing to
+/// do and 17.0ms with a loop of `qex submit` running, with a minimum of 1.2ms.
+///
+/// A review then made a partial write with a pause of 300ms in the middle,
+/// under load, and `qex info` gave `cpu_budget: 12` — the default of that
+/// machine — while the file said 2, with `config_error: null`. The test above
+/// cannot find this, because an idle coordinator never shows it.
+///
+/// The guard is now a TIME. This test holds the words and the guard together.
+#[test]
+fn a_write_that_is_not_finished_does_not_change_the_budget_under_load() {
+    let file = "[peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+                [budget]\ncpu = \"2\"\nmem = \"1GB\"\n";
+    let h = Harness::new("reload-partial-load", file);
+    let path = h.root.join("cfg/qex.toml");
+
+    h.ok(&["list"]);
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // THE LOAD. Each submission wakes the scheduler, so the turns become
+    // short. Without this the guard cannot be measured at all.
+    let load = {
+        let (root, stop) = (h.root.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                Command::new(env!("CARGO_BIN_EXE_qex"))
+                    .args(["submit", "--", "true"])
+                    .env("XDG_CONFIG_HOME", root.join("cfg"))
+                    .env("XDG_STATE_HOME", root.join("state"))
+                    .env("XDG_RUNTIME_DIR", root.join("run"))
+                    .env("QEX_IDLE_EXIT_SECS", "120")
+                    .output()
+                    .ok();
+            }
+        })
+    };
+
+    // THE WRITER. It stops in the middle for 300ms, which is less than the
+    // guard and far more than a turn under this load.
+    let writer = {
+        let (path, stop, file) = (path.clone(), stop.clone(), file.to_string());
+        std::thread::spawn(move || {
+            let half = file.find("[budget]").unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                std::fs::write(&path, &file[..half]).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::write(&path, &file).unwrap();
+                std::thread::sleep(Duration::from_millis(700));
+            }
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut looks = 0;
+    let mut fault = None;
+    while Instant::now() < deadline {
+        let out = h.qex(&["info", "--json"]);
+        if let Ok(info) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            looks += 1;
+            if info["mem_budget"].as_u64() != Some(1024 * 1024 * 1024)
+                || info["cpu_budget"].as_u64() != Some(2)
+            {
+                fault = Some(info.to_string());
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    load.join().unwrap();
+
+    assert!(
+        fault.is_none(),
+        "a write that is not finished must never change the budget, and a busy \
+         coordinator is where that fault lives: {}",
+        fault.unwrap_or_default()
+    );
+    assert!(
+        looks > 20,
+        "the test must look many times, and it looked {looks}"
+    );
+}
+
+/// A command that reads the config file must not wait for ever either.
+///
+/// # The fault that this test holds
+///
+/// The coordinator refuses a path that is not a regular file. `qex config show`
+/// and `qex submit` read the file for THEMSELVES, so the guard must be in the
+/// reader that they share. A review measured both of them with no answer at all
+/// with a FIFO at the config path.
+///
+/// The warning of `qex info` names `qex config show` as the way to see the whole
+/// message. Without this guard, that advice walks the reader into the wait that
+/// this branch exists to remove.
+#[test]
+fn a_command_refuses_a_configuration_path_that_is_not_a_regular_file() {
+    let file = "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+                [peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n";
+    let h = Harness::new("client-not-a-file", file);
+    let path = h.root.join("cfg/qex.toml");
+
+    assert!(h.ok(&["config", "show"]).contains("2 cores"));
+
+    std::fs::remove_file(&path).unwrap();
+    let made = Command::new("mkfifo").arg(&path).status();
+    if !made.map(|s| s.success()).unwrap_or(false) {
+        // No `mkfifo` on this machine. A directory has the same type test,
+        // although it is not the case that waits.
+        std::fs::create_dir(&path).unwrap();
+    }
+
+    for args in [vec!["config", "show"], vec!["submit", "--", "true"]] {
+        let child = Command::new(env!("CARGO_BIN_EXE_qex"))
+            .args(&args)
+            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+            .env("XDG_STATE_HOME", h.root.join("state"))
+            .env("XDG_RUNTIME_DIR", h.root.join("run"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = wait_for_child(
+            child,
+            Duration::from_secs(20),
+            "a path that is not a regular file",
+        );
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            !out.status.success(),
+            "`qex {}` must stop: {err}",
+            args.join(" ")
+        );
+        assert!(
+            err.contains("not a regular file"),
+            "`qex {}` must name the cause: {err}",
+            args.join(" ")
+        );
+    }
+}
+
+/// A path that is NOT A REGULAR FILE must not stop the coordinator.
+///
+/// # The fault that this test holds
+///
+/// The coordinator opens this path on every turn of the scheduler. A FIFO
+/// stops the OPEN until somebody writes to the FIFO. A review measured `qex
+/// info` with no answer in 15 seconds: the scheduler waited in the open while
+/// it held the state mutex, and the three other threads waited for that mutex.
+/// A write to the FIFO did not end it, and a delete of the FIFO did not end it.
+/// Only `kill -9` did. A network file system that stops answering does the
+/// same thing by a different road.
+///
+/// The coordinator read this file one time before this work, so this fault
+/// arrived with the reload.
+#[test]
+fn a_configuration_path_that_is_not_a_regular_file_does_not_stop_the_coordinator() {
+    let file = "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+                [peers]\nenabled = false\n\
+                [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n";
+    let h = Harness::new("reload-not-a-file", file);
+    let path = h.root.join("cfg/qex.toml");
+
+    h.ok(&["list"]);
+    assert!(h.ok(&["info"]).contains("of 2 in use"));
+
+    // A DIRECTORY at the path. A read gives an error at once, so this case
+    // tests the answer and not the wait.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    h.until(
+        "qex reports the type of the path",
+        Duration::from_secs(45),
+        || String::from_utf8_lossy(&h.qex(&["info"]).stderr).contains("not a regular file"),
+    );
+    assert!(
+        h.ok(&["info"]).contains("of 2 in use"),
+        "a path that is not a regular file must not change the budget"
+    );
+    std::fs::remove_dir(&path).unwrap();
+
+    // A FIFO at the path, which is the case that stopped the coordinator.
+    // `qex info` runs as a child with a limit on the wait, so a coordinator
+    // that stops gives a failure of this test and not a test that never ends.
+    let made = Command::new("mkfifo").arg(&path).status();
+    if made.map(|s| s.success()).unwrap_or(false) {
+        for _ in 0..6 {
+            let child = Command::new(env!("CARGO_BIN_EXE_qex"))
+                .args(["info"])
+                .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+                .env("XDG_STATE_HOME", h.root.join("state"))
+                .env("XDG_RUNTIME_DIR", h.root.join("run"))
+                .env("QEX_IDLE_EXIT_SECS", "120")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let out = wait_for_child(child, Duration::from_secs(20), "a FIFO at the config path");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("of 2 in use"),
+                "the coordinator must answer and keep its budget: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    // The file comes back, and the coordinator takes it again.
+    std::fs::write(&path, file.replace("cpu = \"2\"", "cpu = \"4\"")).unwrap();
+    h.until(
+        "the coordinator takes the file that replaced the FIFO",
+        Duration::from_secs(45),
+        || h.ok(&["info"]).contains("of 4 in use"),
+    );
+}
+
+/// Waits for a child with a limit, and fails rather than waiting for ever.
+fn wait_for_child(mut child: std::process::Child, limit: Duration, what: &str) -> Output {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None => {
+                if Instant::now() >= deadline {
+                    child.kill().ok();
+                    panic!("`qex info` gave no answer in {limit:?}: {what}");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }

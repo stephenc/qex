@@ -291,7 +291,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // would fill the `error:` field of a job that ran with advice, and it would
     // hide the words that matter — that no limit operates.
     let mut config_fault: Option<String> = None;
-    let cfg = match crate::config::Config::load_for_job_record() {
+    let cfg = match crate::config::Config::load_short() {
         Ok(cfg) => cfg,
         Err(e) => {
             let message = format!(

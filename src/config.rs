@@ -585,11 +585,13 @@ enum Detail {
 ///
 /// The order matters, and the message gives it. A new option belongs in the
 /// config file only after the COORDINATOR is the new build. The program on the
-/// disk is not sufficient: a coordinator operates for hours, it holds the code
-/// that started it, and it reads the config file ONCE, when it starts
-/// (`daemon::run`, and then `State.cfg` for ever). A new option in the file thus
-/// has no effect until a new coordinator reads it, and qex ignores it in
-/// silence, which is the fault that this message must stop.
+/// disk is not sufficient: a coordinator operates for hours, and it holds the
+/// code that started it. `daemon::reload_config` reads the file again when the
+/// content changes, but it reads that file with the code that the coordinator
+/// holds, and that code does not know the new option. The read gives this same
+/// error, the coordinator keeps `State.cfg`, and `qex info` reports the fault.
+/// The new option thus has no effect until a NEW coordinator reads it, which is
+/// the fault that this message must stop.
 fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) -> anyhow::Error {
     let short = anyhow::anyhow!("parsing config file {}: {error}", path.display());
     if detail == Detail::Short || !error.message().contains("unknown field") {
@@ -608,9 +610,11 @@ fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) 
          while a coordinator operates. Read `qex help config`.\n\n\
          Put a new option in the config file only AFTER the coordinator is the new \
          build. The program on the disk is not sufficient: a coordinator operates for \
-         hours, it holds the code that started it, and it reads this file once, when \
-         it starts. A new option that you write before that moment has no effect, and \
-         qex ignores it in silence.\n\n\
+         hours, and it holds the code that started it. A coordinator reads this file \
+         again when it changes, but it reads the file with the code that it holds. It \
+         gives this same error, it keeps the values that it had, and `qex info` reports \
+         the fault. A new option that you write before that moment thus has no \
+         effect.\n\n\
          To correct it now:\n\
          \x20   1. Install the new qex. Do this FIRST: while the old qex is the \
          program on the disk, no coordinator can start from this file.\n\
@@ -628,34 +632,148 @@ fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) 
     )
 }
 
+/// What one look at the configuration file gave.
+pub enum ConfigFile {
+    /// The bytes of the file. An empty file gives an empty value here.
+    Text(Vec<u8>),
+    /// The file does not exist. That is not a fault: every field is optional.
+    Missing,
+    /// The path is there, and it is not a regular file.
+    NotRegular,
+    /// The path is there, and the read of it failed.
+    Unreadable(std::io::Error),
+}
+
+/// Looks at the configuration file, and reads it when it is a regular file.
+///
+/// # Call this WITHOUT the state mutex
+///
+/// The scheduler runs this on every turn. A read of a file can take any length
+/// of time — a network file system that stops answering holds it for minutes —
+/// and the mutex of the state must stay free, or `qex info`, `qex list` and
+/// `qex submit` all wait with it.
+///
+/// # Why the type of the file matters
+///
+/// A FIFO at this path stops the OPEN until somebody writes to the FIFO. A
+/// review measured that: `qex info` gave no answer in 15 seconds, three threads
+/// waited for the mutex that the fourth held, and only `kill -9` ended it. A
+/// device node can do the same.
+///
+/// The test is `stat` and then `open`, and not `open` with `O_NOFOLLOW`. A
+/// SYMLINK to a regular file must continue to work, because a user who keeps
+/// the file in a repository puts a link at this path. `stat` follows the link
+/// and gives the type of the target, and it gives that answer at once even for
+/// a FIFO.
+///
+/// # Why the file that the OPEN gave is tested as well
+///
+/// The second test is not for a FIFO: the open of a FIFO waits, so this code
+/// never reaches the test. It is for a path that becomes a device node or a
+/// directory between the `stat` and the `open`. The open of `/dev/zero`
+/// succeeds at once, and `read_to_end` on it NEVER ENDS. One `fstat` bounds an
+/// unbounded read, which is the right trade in a change whose whole subject is
+/// unbounded reads.
+pub fn read_config_file() -> ConfigFile {
+    let Ok(path) = paths::config_file() else {
+        return ConfigFile::Missing;
+    };
+    match std::fs::metadata(&path) {
+        Ok(m) if !m.is_file() => return ConfigFile::NotRegular,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ConfigFile::Missing,
+        Err(e) => return ConfigFile::Unreadable(e),
+    }
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ConfigFile::Missing,
+        Err(e) => return ConfigFile::Unreadable(e),
+    };
+    match file.metadata() {
+        Ok(m) if !m.is_file() => return ConfigFile::NotRegular,
+        Ok(_) => {}
+        Err(e) => return ConfigFile::Unreadable(e),
+    }
+    let mut bytes = Vec::new();
+    match std::io::Read::read_to_end(&mut { file }, &mut bytes) {
+        Ok(_) => ConfigFile::Text(bytes),
+        Err(e) => ConfigFile::Unreadable(e),
+    }
+}
+
 impl Config {
     /// Reads `~/.config/qex.toml`.
     ///
     /// If the file does not exist, this function gives the default values.
     ///
     /// A fault gives the long message, for a person at a terminal. Use
-    /// `load_for_job_record` where the message goes into a record.
+    /// `load_short` where the message goes into a record or over the wire.
     pub fn load() -> Result<Self> {
         Self::read(Detail::Full)
     }
 
-    /// Reads the config file for the supervisor of a job.
+    /// Reads the config file where the message becomes DATA.
     ///
-    /// The supervisor puts the fault in the record of the job, and `qex status`
-    /// prints that record. The long message is advice about an upgrade, so in
-    /// an `error:` field it reads as a fault in qex. This form gives the answer
-    /// of the parser only; `qex config show` gives the long message to the
-    /// person who asks for it.
-    pub fn load_for_job_record() -> Result<Self> {
+    /// Two callers need this form. The supervisor of a job puts the fault in
+    /// the record of the job, and `qex status` prints that record. The
+    /// coordinator puts the fault of a reload in `config_error`, and every
+    /// `qex info` then carries it, in the text form and in the JSON form.
+    ///
+    /// The long message is advice about an upgrade. In an `error:` field it
+    /// reads as a fault in qex, and in a warning of 20 lines it hides the one
+    /// line that matters. This form gives the answer of the parser only, and
+    /// `qex config show` gives the long message to the person who asks for it.
+    pub fn load_short() -> Result<Self> {
         Self::read(Detail::Short)
+    }
+
+    /// Takes the values from text that the CALLER read.
+    ///
+    /// The coordinator reads the file itself, for two reasons: it must test
+    /// the type of the file before it opens it, and it must not hold the state
+    /// mutex while it reads. It must then take the values from the bytes that
+    /// IT read. A second read of the same path can give different bytes, and
+    /// the coordinator would record the name of bytes that it never installed.
+    ///
+    /// The message is the short form, because it becomes the value of
+    /// `config_error` and travels to every client.
+    pub fn parse_short(path: &std::path::Path, text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|e| config_error(path, e, Detail::Short))
     }
 
     fn read(detail: Detail) -> Result<Self> {
         let path = paths::config_file()?;
-        match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| config_error(&path, e, detail)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
+        match read_config_file() {
+            ConfigFile::Text(bytes) => {
+                let text = String::from_utf8(bytes).map_err(|_| {
+                    anyhow::anyhow!(
+                        "the configuration file {} is not text. qex cannot take any value \
+                         from it. Write the file again as UTF-8 text.",
+                        path.display()
+                    )
+                })?;
+                toml::from_str(&text).map_err(|e| config_error(&path, e, detail))
+            }
+            ConfigFile::Missing => Ok(Self::default()),
+            // EVERY CALLER GETS THIS GUARD, and not the coordinator only.
+            //
+            // `qex config show` and `qex submit` read this file for
+            // themselves. A review put a FIFO at this path and measured both
+            // of them with no answer at all, because the OPEN of a FIFO waits
+            // for a writer. The warning of `qex info` names `qex config show`
+            // as the way to see the whole message, so without this guard that
+            // advice walks the reader into the same wait.
+            ConfigFile::NotRegular => Err(anyhow::anyhow!(
+                "the configuration file {} is not a regular file. qex takes no value \
+                 from a path of another kind, because such a path can stop qex for \
+                 ever: the open of a FIFO waits for a writer, and a read of a device \
+                 gives bytes without end. Put a regular file at that path, or a link \
+                 to one.",
+                path.display()
+            )),
+            ConfigFile::Unreadable(e) => {
+                Err(e).with_context(|| format!("reading config file {}", path.display()))
+            }
         }
     }
 
