@@ -113,23 +113,52 @@ mod tests {
         assert!(!is_development("1.0.0-dev"));
     }
 
-    /// The text in `Cargo.toml` and the text in this file must agree.
+    /// `Cargo.toml` holds this development version or a release number, and
+    /// never a third thing.
     ///
-    /// `Cargo.toml` holds `0.0.0-dev` on `main`, and `set-version.sh` refuses
-    /// to write a release number over anything else. If the two ever differ, a
-    /// build of `main` reports a version that this file refuses to recognise,
-    /// and every such coordinator is refused instead of warned about.
+    /// # THIS TEST RUNS WHERE TWO DIFFERENT NUMBERS ARE CORRECT
+    ///
+    /// On `main`, `Cargo.toml` holds `0.0.0-dev`. On the commit that a tag
+    /// names, `set-version.sh` has written the release number into it, and the
+    /// release BUILDS AND TESTS THAT COMMIT. A test that demands `0.0.0-dev`
+    /// thus passes on `main` and stops every release.
+    ///
+    /// The rule below holds in both places: the number is this development
+    /// version exactly, or it is three numbers and nothing else.
+    ///
+    /// # What it catches
+    ///
+    /// A third form in `Cargo.toml`, such as `0.0.0-devel` or `0.1.0-dev`,
+    /// while `DEVELOPMENT` stays as it is. `is_development` names one form
+    /// exactly, so a build of such a tree reports a version that this file does
+    /// not recognise. Its numbers are below the capability floor, so
+    /// `capabilities::check_floor` REFUSES every such coordinator in place of
+    /// warning about it, and a person cannot use a build of their own tree.
     #[test]
-    fn the_development_version_agrees_with_cargo_toml() {
+    fn cargo_toml_holds_this_development_version_or_a_release() {
         assert!(
             is_development(DEVELOPMENT),
             "the constant must name a development build"
         );
+
         let cargo = include_str!("../Cargo.toml");
-        let line = format!("version = \"{DEVELOPMENT}\"");
+        let found = cargo
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("version = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .expect("Cargo.toml must hold a version");
+
+        let release = found.split('.').count() == 3
+            && found
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+
         assert!(
-            cargo.lines().any(|l| l.trim() == line),
-            "Cargo.toml must hold `{line}`, and it does not"
+            found == DEVELOPMENT || release,
+            "Cargo.toml holds `{found}`. It must hold `{DEVELOPMENT}`, which is what \
+             `main` holds, or three numbers, which is what the commit that a tag names \
+             holds. Any other text gives a build that qex refuses in place of warning \
+             about it."
         );
     }
 
