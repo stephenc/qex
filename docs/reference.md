@@ -103,6 +103,18 @@ The job does not start after that time. Its state becomes `expired`, `qex wait`
 gives the code 123, and the `error` field says what the job waited for and how
 long it waited.
 
+The remedy in that field fits the cause, because the three causes take three
+different corrections. A job that waited for CAPACITY takes a smaller claim, a
+quiet machine or a longer limit. A job that waited for a job in `--needs` takes
+a limit that covers the whole pipeline, because a smaller claim changes nothing
+for it. A job that waited for a `--lock` takes a limit that covers the longest
+job with the same lock, or two different lock names, because qex gives a lock to
+one job at a time whatever the machine has free.
+
+A job that needs this job gets its answer at the same moment. `qex wait` on such
+a job returns with the code 126 and the state `skipped`: measured at 3.5 seconds
+with a limit of 3 seconds.
+
 `--timeout` limits the time that the job **runs**. `--max-queue-time` limits the
 time that the job **waits**. A job that reaches the first has output to read; a
 job that reaches the second has none.

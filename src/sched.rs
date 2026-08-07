@@ -219,11 +219,12 @@ pub fn run(coord: Arc<Coordinator>) {
         // Signal the waiters when a job started, when a supervisor wrote a new
         // status, AND when this turn moved a job to a final state on its own.
         //
-        // The third case is the one that is easy to lose. An expired job has no
-        // supervisor and no request thread to announce it, so a turn that
-        // forgets it leaves `qex wait` asleep until the 30 second fallback in
-        // `handle_wait`. Measured before this line existed: a 3s queue limit
-        // gave the record at 3s and `qex wait` returned at 30.0s.
+        // The third case is the one that is easy to lose. An expired job and a
+        // skipped job have no supervisor and no request thread to announce
+        // them, so a turn that forgets them leaves `qex wait` asleep until the
+        // 30 second fallback in `handle_wait`. Measured before this line
+        // existed: a 3s queue limit gave the record at 3s and `qex wait`
+        // returned at 30.0s.
         match step(&coord) {
             Ok((started, finished)) if started > 0 || finished > 0 || changed => coord.notify(),
             Ok(_) => {}
@@ -426,18 +427,33 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
     ));
 }
 
+/// What a job waited for when its queue limit ended.
+///
+/// Each value takes a different remedy, so the caller must give the cause and
+/// not let `expire` guess it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Waited {
+    /// The machine had no free capacity, or the claim was larger than the
+    /// budget.
+    Capacity,
+    /// A job in `needs` or `after` had not stopped.
+    AJob,
+    /// A different job held a lock that this job asks for.
+    ALock,
+}
+
 /// Removes a job that waited more time than its `--max-queue-time` value.
 ///
 /// The reason names what the job waited for and how long it waited. A reader
 /// that gets `expired` and no other text cannot act: the machine was busy, the
 /// claim was too large, or a lock was held, and each of those needs a different
-/// correction.
+/// correction. [`Waited`] carries which one it was.
 fn expire(
     state: &mut crate::daemon::State,
     id: uuid::Uuid,
     waited: u64,
     last_reason: &str,
-    waited_for_a_job: bool,
+    cause: Waited,
 ) {
     let Some(job) = state.jobs.get_mut(&id) else {
         return;
@@ -477,20 +493,32 @@ fn expire(
     // Give the remedy that fits the cause.
     //
     // A job that waited for a job that it needs did not wait for capacity, and
-    // a smaller claim changes nothing for it. A remedy that does not fit sends
-    // the reader to make a change that cannot help.
+    // a smaller claim changes nothing for it. A job that waited for a lock did
+    // not wait for capacity either: qex gives the lock to one job at a time,
+    // whatever the machine has free. A remedy that does not fit sends the
+    // reader to make a change that cannot help.
     //
-    // The caller decides this, from `depends`. DO NOT read it out of the prose
-    // of `last_reason`: the pure-capacity text "waits for the job <id> at the
-    // front of the queue" holds the same words as a dependency wait, and a job
-    // with no `needs` then got the remedy for a pipeline that it does not have.
-    let remedy = if waited_for_a_job {
-        "The job waited for a job that it needs, and not for capacity. Give a \
-         --max-queue-time that covers the whole pipeline, or give no value on a stage \
-         that waits for an earlier stage."
-    } else {
-        "Give the job a smaller claim, wait until the machine is quiet, or give a longer \
-         --max-queue-time, then submit the job again."
+    // The caller decides this, from `depends` and from `lock_conflict`. DO NOT
+    // read it out of the prose of `last_reason`: the pure-capacity text "waits
+    // for the job <id> at the front of the queue" holds the same words as a
+    // dependency wait, and a job with no `needs` then got the remedy for a
+    // pipeline that it does not have.
+    let remedy = match cause {
+        Waited::AJob => {
+            "The job waited for a job that it needs, and not for capacity. Give a \
+             --max-queue-time that covers the whole pipeline, or give no value on a stage \
+             that waits for an earlier stage."
+        }
+        Waited::ALock => {
+            "The job waited for a lock, and not for capacity. qex gives a lock to one job \
+             at a time, whatever the machine has free. Give a --max-queue-time that covers \
+             the longest job that takes the same lock, or give the two jobs different lock \
+             names if they can operate together."
+        }
+        Waited::Capacity => {
+            "Give the job a smaller claim, wait until the machine is quiet, or give a longer \
+             --max-queue-time, then submit the job again."
+        }
     };
     job.status.error = Some(format!(
         "the job did not start. It waited {} in the queue, and its --max-queue-time is {}. \
@@ -550,13 +578,19 @@ struct Choice {
     /// The number of jobs that this pass moved to a final state ON ITS OWN.
     ///
     /// A waiter sleeps on the condition variable, and the scheduler signals it
-    /// when a job changes state. Every OTHER final state has a messenger: a
-    /// supervisor writes the status file and `refresh_active` sees it, or a
-    /// request thread makes the change and signals the variable itself. An
-    /// expired job has neither, because nothing outside this pass happened. A
-    /// pass that did not report this count would leave `qex wait` asleep until
-    /// its 30 second fallback, and the answer that the option promises would
-    /// arrive up to 30 seconds late.
+    /// when a job changes state. TWO final states have no messenger outside
+    /// this pass: `expired`, which `expire` writes, and `skipped`, which `skip`
+    /// writes for a job whose dependency did not succeed. Neither job ever had
+    /// a supervisor, so `refresh_active` sees nothing, and no request thread
+    /// made the change, so nothing signals the variable. Every other final
+    /// state comes from a supervisor that writes the status file, or from a
+    /// request thread that signals the variable itself.
+    ///
+    /// This count must therefore hold BOTH. A pass that reported one of them
+    /// only would leave `qex wait` asleep until its 30 second fallback.
+    /// Measured with the skipped jobs left out: `qex wait` on a job whose
+    /// dependency expired at 3s returned at 33.0s, and on a job whose
+    /// dependency was cancelled at 1s returned at 31.0s.
     finished: usize,
 }
 
@@ -572,14 +606,15 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     let mut chosen = None;
     let mut reasons: Vec<(uuid::Uuid, Option<String>)> = Vec::new();
     let mut to_skip: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
-    // The jobs that wait for a DIFFERENT JOB, and not for capacity.
+    // What each job waits for, when it is not capacity.
     //
-    // `depends` is the one place that knows this, so the remedy of an expired
-    // job comes from here. An earlier version of this code read the prose of
-    // the queue reason instead, and the pure-capacity text "waits for the job
-    // <id> at the front of the queue" holds the same words as a dependency
-    // wait. A job with no `needs` at all then got the remedy for a pipeline.
-    let mut waits_for_a_job: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+    // `depends` and `lock_conflict` are the two places that know this, so the
+    // remedy of an expired job comes from here. An earlier version of this code
+    // read the prose of the queue reason instead, and the pure-capacity text
+    // "waits for the job <id> at the front of the queue" holds the same words
+    // as a dependency wait. A job with no `needs` at all then got the remedy
+    // for a pipeline.
+    let mut waits_for: std::collections::BTreeMap<uuid::Uuid, Waited> = Default::default();
 
     // Pass 1: test the dependencies of EVERY job in the queue.
     //
@@ -604,7 +639,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         match depends(state, id) {
             Depends::Ready => ready.push(id),
             Depends::Waiting(reason) => {
-                waits_for_a_job.insert(id);
+                waits_for.insert(id, Waited::AJob);
                 reasons.push((id, Some(reason)));
             }
             Depends::Broken { reason, root } => to_skip.push((id, reason, root)),
@@ -624,6 +659,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         // not hold capacity, in the same way as a job that waits for a
         // different job, so the loop continues to the next job.
         if let Some(reason) = lock_conflict(state, &job.spec) {
+            waits_for.insert(id, Waited::ALock);
             reasons.push((id, Some(reason)));
             continue;
         }
@@ -694,6 +730,12 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
 
     // Mark each job whose dependency did not succeed. Do this step before the
     // reasons, so a skipped job does not also get a queue reason.
+    //
+    // COUNT THESE JOBS. A skipped job is a final state that this pass wrote on
+    // its own, so nothing else tells the waiters. Measured before this count
+    // existed: `qex wait` on a job whose dependency expired returned at 33.0s
+    // with a 3s limit, and on a job whose dependency was cancelled at 31.0s.
+    let mut finished = to_skip.len();
     for (id, reason, root) in to_skip {
         skip(state, id, reason, root);
     }
@@ -715,14 +757,14 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
 
     // Remove each job that waited more time than its limit. This step is last,
     // so the text of the job holds the newest queue reason.
-    let mut finished = 0usize;
     for (id, waited) in overdue(state, chosen) {
         let reason = state
             .jobs
             .get(&id)
             .and_then(|j| j.status.blocked_reason.clone())
             .unwrap_or_else(|| "the job waited for free capacity".to_string());
-        expire(state, id, waited, &reason, waits_for_a_job.contains(&id));
+        let cause = waits_for.get(&id).copied().unwrap_or(Waited::Capacity);
+        expire(state, id, waited, &reason, cause);
         finished += 1;
     }
 
@@ -1122,6 +1164,81 @@ mod tests {
         );
     }
 
+    /// A JOB THAT WAITED FOR A LOCK MUST GET THE REMEDY FOR A LOCK.
+    ///
+    /// `expire` says that the machine, the claim and a lock each need a
+    /// different correction. Measured before this branch existed: a job with
+    /// `--lock shared` behind a job that held the same lock expired with the
+    /// text "Give the job a smaller claim, wait until the machine is quiet".
+    /// A smaller claim gives a lock to nobody, so that text sends the reader to
+    /// make a change that cannot help.
+    ///
+    /// This test covers the WIRING. `lock_conflict` is the one place that knows
+    /// that a lock stopped the job, in the same way as `depends` for a
+    /// dependency.
+    #[test]
+    fn a_job_that_waited_for_a_lock_gets_the_remedy_for_a_lock() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+
+        // One job of one core operates and holds the lock. Three cores stay
+        // free, so capacity is not the cause.
+        let holder = add_job(&mut state, JobState::Running, 1, None, 0);
+        state.jobs.get_mut(&holder).unwrap().spec.locks = vec!["shared".to_string()];
+
+        // A job that asks for the same lock, and that passed its limit.
+        let blocked = add_job(&mut state, JobState::Queued, 1, Some(5), 600);
+        state.jobs.get_mut(&blocked).unwrap().spec.locks = vec!["shared".to_string()];
+
+        let choice = choose(&mut state);
+        assert_eq!(choice.start, None, "the lock stops the only queued job");
+        assert_eq!(choice.finished, 1, "the job that waited must give up");
+
+        let text = state.jobs[&blocked].status.error.clone().unwrap();
+        assert!(
+            text.contains("lock"),
+            "the remedy must name the lock: {text}"
+        );
+        assert!(
+            !text.contains("smaller claim"),
+            "the machine had three free cores; a smaller claim changes nothing: {text}"
+        );
+    }
+
+    /// A SKIPPED JOB MUST WAKE THE WAITERS, IN THE SAME PASS.
+    ///
+    /// `skip` writes a final state that no supervisor and no request thread
+    /// announces, exactly as `expire` does. A pass that counted the expired
+    /// jobs only left `qex wait` asleep until its 30 second fallback. Measured
+    /// with the count of the skipped jobs left out: `qex wait` on a job whose
+    /// dependency expired at 3s returned at 33.0s, and on a job whose
+    /// dependency was cancelled at 1s returned at 31.0s. With the count, both
+    /// return inside a second of the event.
+    #[test]
+    fn a_pass_that_skips_a_job_reports_it_to_the_waiters() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+
+        // A job that failed, and a queued job that needed it.
+        let root = add_job(&mut state, JobState::Failed, 1, None, 0);
+        let after = add_job(&mut state, JobState::Queued, 1, None, 0);
+        state.jobs.get_mut(&after).unwrap().spec.needs = vec![root];
+
+        let choice = choose(&mut state);
+        assert_eq!(
+            state.jobs[&after].status.state,
+            JobState::Skipped,
+            "the job that needed a failed job must be skipped"
+        );
+        assert_eq!(
+            choice.finished, 1,
+            "a skipped job is a final state that this pass wrote, so the pass \
+             must report it and wake the waiters"
+        );
+    }
+
     /// A job that waits more time than its limit must give up and say so.
     ///
     /// Without this rule, an agent that waits for a job which the budget can
@@ -1139,7 +1256,7 @@ mod tests {
             id,
             overdue[0].1,
             "waits for cores: 4 of 4 are in use",
-            false,
+            Waited::Capacity,
         );
 
         let job = &state.jobs[&id];
@@ -1186,7 +1303,7 @@ mod tests {
             id,
             61,
             "waits for cores: 4 of 4 are in use",
-            false,
+            Waited::Capacity,
         );
         let text = state.jobs[&id].status.error.clone().unwrap();
         assert!(
@@ -1203,7 +1320,7 @@ mod tests {
             id,
             61,
             "waits for the job 1a2b3c4d at the front of the queue",
-            false,
+            Waited::Capacity,
         );
         let text = state.jobs[&id].status.error.clone().unwrap();
         assert!(
@@ -1223,7 +1340,7 @@ mod tests {
             id,
             61,
             "waits for the job 1a2b3c4d (build), which is running",
-            true,
+            Waited::AJob,
         );
         let text = state.jobs[&id].status.error.clone().unwrap();
         assert!(
@@ -1233,6 +1350,31 @@ mod tests {
         assert!(
             !text.contains("smaller claim"),
             "a smaller claim changes nothing for a job that waits for a job: {text}"
+        );
+
+        // A wait for a LOCK. qex gives a lock to one job at a time, so neither
+        // a smaller claim nor a quiet machine changes anything.
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        let id = state.queue[0];
+        expire(
+            &mut state,
+            id,
+            61,
+            "waits for the lock `shared`, which the job 1a2b3c4d (build) holds",
+            Waited::ALock,
+        );
+        let text = state.jobs[&id].status.error.clone().unwrap();
+        assert!(
+            text.contains("lock"),
+            "a job that waited for a lock must be told about the lock: {text}"
+        );
+        assert!(
+            !text.contains("smaller claim"),
+            "a smaller claim gives a lock to nobody: {text}"
+        );
+        assert!(
+            !text.contains("whole pipeline"),
+            "a lock is not a pipeline: {text}"
         );
     }
 
@@ -1282,7 +1424,7 @@ mod tests {
         let id = state.queue[0];
         state.jobs.get_mut(&id).unwrap().status.started_at = Some(sys::now_secs() - 3000);
 
-        expire(&mut state, id, 3600, "waits for cores", false);
+        expire(&mut state, id, 3600, "waits for cores", Waited::Capacity);
         assert_eq!(
             state.jobs[&id].status.state,
             JobState::Queued,
@@ -1323,7 +1465,7 @@ mod tests {
             );
 
             // The second guard, for the moment between the two locks.
-            expire(&mut state, id, 3600, "waits for cores", false);
+            expire(&mut state, id, 3600, "waits for cores", Waited::Capacity);
             assert_eq!(
                 state.jobs[&id].status.state, started,
                 "a job in the state {started} must keep it"

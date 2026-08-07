@@ -1926,6 +1926,72 @@ fn a_wait_returns_when_the_job_reaches_its_queue_limit() {
     );
 }
 
+/// A WAIT ON A JOB WHOSE DEPENDENCY EXPIRED MUST RETURN AT THE SAME MOMENT.
+///
+/// This is the configuration that `docs/reference.md` recommends: a limit on
+/// the first stage, and no limit on the stage that waits for it. Turn N expires
+/// the first job. Turn N+1 sees that the first job stopped without success and
+/// makes the second job `skipped`.
+///
+/// The fault that this test holds: a scheduling pass counted the EXPIRED jobs
+/// only. A skipped job also has no supervisor and no request thread to announce
+/// it, so the pass signalled nobody and every waiter slept on the 30 second
+/// fallback in `handle_wait`. Measured with that count: `qex wait` on the
+/// second job returned at 33.0s, 3 of 3 runs, with a limit of 3s. With the
+/// count it returned at 3.5s.
+///
+/// THE TEST MEASURES THE PROMISE, AND NOT THE RECORD. A test that waits for the
+/// status file to say `skipped` passes while `qex wait` sleeps, because the
+/// file holds the answer that the waiter did not receive.
+#[test]
+fn a_wait_returns_when_the_job_that_it_needs_gives_up_in_the_queue() {
+    let h = Harness::new(
+        "queuedep",
+        "[budget]\ncpu = \"2\"\nmem = \"8GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    // This claim is larger than the budget, and the config file keeps such a
+    // job in the queue, so the first job can never start.
+    let first = h.submit(&[
+        "submit",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+    let second = h.submit(&["submit", "--needs", &first, "--", "echo", "after"]);
+
+    // Wait from HERE, while both jobs are still in the queue.
+    let start = std::time::Instant::now();
+    let out = h.qex(&["wait", &second, "--timeout", "60s"]);
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(126),
+        "a job that did not run because a job that it needs failed gives 126. \
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The limit is 3s. Ten seconds is far above every measured run and far
+    // below the 30 second fallback, so a failure here names the fault and not
+    // the speed of the machine.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "`qex wait` returned after {elapsed:?}, and the limit of the job that \
+         this job needs is 3s. The scheduler skipped this job and signalled no \
+         waiter."
+    );
+}
+
 /// A JOB THAT STARTED MUST NEVER GET THE STATE `expired`.
 ///
 /// The scheduler chooses a job, releases the lock, and the start of that job
