@@ -78,8 +78,11 @@ The type gives the next version number:
 
     feat            the second number goes up   (0.5.3 -> 0.6.0)
     fix, perf       the third number goes up    (0.5.3 -> 0.5.4)
-    a ! before the : while the first number is 0, the second number goes up
+    feat!           a break. WHILE THE FIRST NUMBER IS 0, a break moves the
+                    SECOND number (0.5.3 -> 0.6.0). It does not go to 1.0.0.
     everything else no release
+
+A move to 1.0.0 is the decision of a person: put that number in Cargo.toml.
 
 The other types are: $(echo "$types" | tr '|' ' ').
 
