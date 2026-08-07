@@ -1809,7 +1809,17 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// it waits when the machine is busy, and it holds a claim while it operates.
 ///
 /// A job of `qex run` is a job like any other. It has a record, a log file and
-/// an id, and it continues when this command stops.
+/// an id.
+///
+/// This command stops the job when it receives SIGINT (Ctrl-C) or SIGTERM,
+/// because a user expects Ctrl-C to stop the work. It stops the job with a
+/// `Kill` request to the coordinator, and NOT with a signal: the supervisor
+/// gives the job its own process group, inside the session of the supervisor,
+/// so a signal to the process group of this command never reaches the job.
+///
+/// A hangup, such as a terminal that closes, and a SIGKILL therefore do not
+/// stop the job. It continues, and `qex list` finds it. Use `qex submit` for
+/// work that must live longer than the command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;

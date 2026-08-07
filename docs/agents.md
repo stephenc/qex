@@ -21,13 +21,27 @@ qex logs $ID
 `qex submit` writes the id to stdout and writes nothing else, so `ID=$(qex
 submit ...)` is correct. A warning goes to stderr.
 
-For work that you wait for now, put `qex run` in front of the command instead:
+For work that is **short and heavy** and that you wait for now — a test suite, a
+release build, a data conversion — put `qex run` in front instead:
 
 ```sh
 qex run -- make test
 ```
 
-The output arrives as it happens, and the exit code is the exit code of the job.
+The job goes in the queue, so the other people and agents on the machine keep
+the capacity they claimed. The output arrives as it happens, and the exit code
+is the exit code of the job.
+
+**What you give up.** `qex run` ties the job to that command, but only for the
+stops that it can catch. Ctrl-C stops the job, and a SIGTERM on `qex run` stops
+the job. A SIGKILL, and the hangup that a terminal sends when it closes, do not
+reach the job: it continues, and `qex list` finds it. That is right for work you
+are waiting for and wrong for work that outlives your attention.
+
+| | |
+| --- | --- |
+| short, and you wait for it now | `qex run -- ...` |
+| long, or you come back to it | `qex submit`, then `qex status <id> --wait` |
 
 ## Your session can stop, and the work continues
 
@@ -37,7 +51,11 @@ stop.**
 The job is not a child of your shell, and it is not a child of your agent. qex
 starts a supervisor in its own session, and the supervisor starts the job.
 
-| What happens | The job |
+Each row below is true for a job of `qex run` as well, with one exception:
+Ctrl-C or a SIGTERM on the waiting `qex run` stops the job. That is the only
+difference between the two commands; see above.
+
+| What happens to a job of `qex submit` | The job |
 | ------------ | ------- |
 | Somebody stops your agent | continues |
 | Your terminal closes | continues |

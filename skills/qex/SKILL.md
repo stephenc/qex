@@ -49,18 +49,29 @@ qex logs "$ID" --tail 100
 `qex submit` writes the id to stdout and nothing else, so `ID=$(...)` is safe. A
 warning goes to stderr.
 
-For work that you wait for right now, put `qex run` in front instead. The output
-arrives as it happens and the exit code is the exit code of the job:
+For work that is **short and heavy** and that you wait for right now, put
+`qex run` in front instead. The output arrives as it happens and the exit code
+is the exit code of the job:
 
 ```sh
 qex run -- cargo test
 ```
 
+**`qex run` ties the job to that command, but only for the stops that it can
+catch.** Ctrl-C stops the job, and a SIGTERM on `qex run` stops the job. A
+SIGKILL, and the hangup that a terminal sends when it closes, do not reach the
+job: it continues, and `qex list` finds it. That is right for work you are
+waiting for, and wrong for work that outlives your attention — use `qex submit`
+for anything you might come back to.
+
+**If your harness stopped you hard, look for the job.** `qex list` shows a job
+of `qex run` that continued, and `qex kill <id>` stops it.
+
 ## Which command to wait with
 
 | Your situation | Use |
 | --- | --- |
-| You wait now, in this command | `qex run -- CMD` |
+| You wait now, in this command, and the work is short | `qex run -- CMD` (Ctrl-C or SIGTERM stops the job; a SIGKILL does not) |
 | Your harness reports background commands | `qex status <id> --wait` in the background |
 | A script needs the exit code only | `qex wait <id>` |
 
@@ -80,6 +91,9 @@ BOTH streams. Prefer it: one command gives everything.
 | 127 | There is no job with that id. |
 
 ## Your session can stop, and the work continues
+
+This is about `qex submit`. A job of `qex run` differs in one case only: Ctrl-C
+or a SIGTERM on the waiting `qex run` stops the job; see above.
 
 The job is not a child of your shell and not a child of you. A person can stop
 you at any moment: the job continues, it writes its result, and any later session

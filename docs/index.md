@@ -32,6 +32,9 @@ building
 done
 ```
 
+Use `qex run` for work that you wait for now. Ctrl-C stops the job with it. See
+[the page for agents](agents.md) for the stops that do not reach the job.
+
 Or submit it, walk away, and ask later:
 
 ```console
@@ -185,6 +188,9 @@ Stop the coordinator, close the terminal, or replace the qex program:
 person can stop it at any moment: the build continues, and the next session
 attaches to the same job with the id. A watch script holds the answer in its own
 memory, and a stop loses that answer.
+
+That is a property of `qex submit`. A job of `qex run` also stops when Ctrl-C or
+a SIGTERM stops the command that waits for it.
 
 ## Install
 

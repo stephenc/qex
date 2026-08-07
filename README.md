@@ -91,9 +91,16 @@ qex logs $ID --tail 50                                  # the output
 qex kill $ID                                            # stop it
 ```
 
-Put `qex run -- make test` in front of a command instead when you wait for it
-now: the output arrives as it happens, and the exit code is the exit code of the
-job.
+Put `qex run -- make test` in front of a command when the work is **short and
+heavy** and you wait for it now: it takes its turn in the queue, so everyone
+else on the machine keeps the capacity they claimed, the output arrives as it
+happens, and the exit code is the exit code of the job.
+
+`qex run` ties the job to that command, but only for the stops that it can
+catch. Ctrl-C stops the job, and a SIGTERM on `qex run` stops the job. A
+SIGKILL, and the hangup that a terminal sends when it closes, do not reach the
+job: it continues, and `qex list` finds it. Use `qex submit` for anything you
+might come back to.
 
 A pipeline gives each stage its own log, its own exit code and its own claim:
 
@@ -110,7 +117,9 @@ supervisor holds it in its own session, and the record of the job is on the disk
 
 Somebody can therefore stop your agent, close the terminal, or replace the qex
 binary. The job continues and it still writes its result. Your wait is the only
-thing that stops, and any later session attaches to the same job with the id:
+thing that stops, and any later session attaches to the same job with the id.
+This is about `qex submit`; a job of `qex run` also stops when Ctrl-C or a
+SIGTERM stops the command that waits for it.
 
 ```sh
 qex submit --id-file build.id -- make    # session 1
