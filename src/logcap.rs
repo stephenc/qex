@@ -962,15 +962,41 @@ mod tests {
         // file, in the same way as a disk that is full or a mode that stops it.
         std::fs::create_dir_all(tail_path(&path)).unwrap();
 
+        let mut written = 0u64;
+        let mut lines = 0u64;
         let mut w = CapWriter::new(&path, open(&path), 0, Some(MIN_LIMIT));
-        write_lines(&mut w, 1, 20000);
+        for i in 1..=20000 {
+            let line = format!("line-{i}\n");
+            written += line.len() as u64;
+            lines += 1;
+            w.write(line.as_bytes());
+        }
         let dropped = w.finish();
 
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size <= MIN_LIMIT, "the file holds {size} bytes");
+
+        // The count must hold EVERY byte that reached no disk, and not the cut
+        // of the head alone. The bytes above the limit went to a file that the
+        // machine refused, so they exist nowhere. A count that leaves them out
+        // says that the file is nearly complete, and a program reads that
+        // number.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kept: u64 = text
+            .lines()
+            .filter(|l| !l.starts_with(MARK))
+            .map(|l| l.len() as u64 + 1)
+            .sum();
         assert!(
-            dropped.bytes > 0 && dropped.lines > 0,
-            "the record must say that the output is not complete: {dropped:?}"
+            dropped.bytes >= written - kept,
+            "the count says {} bytes, and {} bytes of {written} reached no disk",
+            dropped.bytes,
+            written - kept
+        );
+        assert!(
+            dropped.lines > lines / 2,
+            "the count says {} line(s) of {lines}, and nearly every line went",
+            dropped.lines
         );
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -978,6 +1004,53 @@ mod tests {
             1,
             "the note must appear one time"
         );
+    }
+
+    /// With short lines, the last part must start at a WHOLE line.
+    ///
+    /// qex removes the bytes between the head and the last part, so the first
+    /// bytes of that part are the end of a line that the reader cannot see. For
+    /// the usual output — short lines — that fragment is a few bytes, so qex
+    /// removes it and the reader meets whole lines only. Without that
+    /// operation, the first line of the last part reads as a true line, and a
+    /// reader takes `-1234` for a value or `rror: no such file` for a message.
+    ///
+    /// The rule has a limit, and the two tests above hold the other side of it:
+    /// a fragment that is a large part of the space must stay.
+    #[test]
+    fn the_last_part_of_short_lines_starts_at_a_whole_line() {
+        let dir = Dir::new("trim");
+        let path = dir.log();
+        let mut w = CapWriter::new(&path, open(&path), 0, Some(64 * 1024));
+        write_lines(&mut w, 1, 20000);
+        w.finish();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The last note of qex is the last line before the tail.
+        let tail = text
+            .rsplit_once(&format!("{MARK} The limit is"))
+            .expect("the file must hold the note about the limit")
+            .1;
+        let first = tail.lines().nth(1).expect("the last part is empty");
+        assert!(
+            first.starts_with("line-"),
+            "the last part starts with `{first}`, which is the end of a line and not a \
+             whole line"
+        );
+        assert!(
+            !text.contains("middle of a line"),
+            "qex removed the fragment, so the file must not say that one stayed"
+        );
+
+        // Every line of the last part is a line that the job wrote.
+        for line in tail.lines().skip(1).filter(|l| !l.is_empty()) {
+            let n: u64 = line
+                .strip_prefix("line-")
+                .unwrap_or("")
+                .parse()
+                .unwrap_or_else(|_| panic!("`{line}` is not a line that the job wrote"));
+            assert!((1..=20000).contains(&n), "`{line}` is not in the output");
+        }
     }
 
     /// The parts of the limit must never be larger than the limit itself. The

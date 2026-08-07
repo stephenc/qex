@@ -575,6 +575,24 @@ the file.
 
 Use `max_bytes = "0"` for no limit. A job can then fill the disk.
 
+### When a change to the limit takes effect
+
+The supervisor of a job reads `[logs] max_bytes` one time, when the job starts.
+A change to the file therefore:
+
+* does **nothing** to a job that already writes. That job keeps the limit that
+  it started with, to the end of its last attempt.
+* controls the **next job to start**, immediately. The supervisor is a new
+  process and it reads the file itself, so this change does not wait for the
+  coordinator to read the file again.
+
+Measured: with `max_bytes = "64KB"`, a job that writes 4000 lines kept a file of
+63848 bytes although the file changed to `"1MB"` while the job wrote. The next
+job kept 1046928 bytes.
+
+To give a new limit to a job that already operates, stop the job and start it
+again with `qex rerun $ID`.
+
 ### What the job sees
 
 The standard output and the standard error of a job are a **pipe**, and not a

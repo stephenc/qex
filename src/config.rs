@@ -504,6 +504,11 @@ pub struct LogsConfig {
     ///
     /// qex keeps the first part and the last part of the output, and it writes
     /// a line between them that says how much went. Use `"0"` for no limit.
+    ///
+    /// A size with no unit is a count of bytes, so `max_bytes = 65536` and
+    /// `max_bytes = "64KB"` are one value. See [`text_or_number`] for why the
+    /// field accepts a number and text.
+    #[serde(deserialize_with = "text_or_number")]
     pub max_bytes: String,
 }
 
@@ -1412,6 +1417,30 @@ timeout = "0"
             assert_eq!(c.log_max_bytes().unwrap(), None, "for {text}");
             c.validate().unwrap();
         }
+    }
+
+    /// The quotation marks make no difference on this field, as on each other
+    /// size field.
+    ///
+    /// The name of the field says `bytes`, so a user writes `max_bytes = 65536`
+    /// without the quotation marks. Measured before the fix: the file stopped
+    /// with `invalid type: integer 65536, expected a string`, which names a type
+    /// in the program and gives no remedy. A size with no unit is a count of
+    /// bytes, so the two forms give one value.
+    #[test]
+    fn the_limit_on_the_output_reads_a_number_as_bytes() {
+        let quoted: Config = toml::from_str("[logs]\nmax_bytes = \"65536\"\n").unwrap();
+        let bare: Config = toml::from_str("[logs]\nmax_bytes = 65536\n").unwrap();
+        assert_eq!(bare.log_max_bytes().unwrap(), Some(65536));
+        assert_eq!(
+            bare.log_max_bytes().unwrap(),
+            quoted.log_max_bytes().unwrap()
+        );
+
+        // `0` with no quotation marks removes the limit, as `"0"` does.
+        let none: Config = toml::from_str("[logs]\nmax_bytes = 0\n").unwrap();
+        assert_eq!(none.log_max_bytes().unwrap(), None);
+        none.validate().unwrap();
     }
 
     /// A limit that is too small to hold a head, a tail and the note must give

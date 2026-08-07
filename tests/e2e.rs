@@ -2870,6 +2870,30 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
     );
     assert_eq!(dropped["limit"].as_u64().unwrap(), 64 * 1024);
 
+    // THE COUNT MUST BALANCE. The lines that the file holds and the lines that
+    // the record says went are together the lines that the job wrote.
+    //
+    // A count that is only "large" hides a part that qex does not count. The
+    // measured example: qex cuts the head back when the output passes the
+    // limit, and it reads the log file to count the lines in that cut. With a
+    // log file that qex opened for writing only, that read gives nothing, the
+    // count loses about 8000 lines, and the record then says that the job wrote
+    // 492000 lines when it wrote 500000.
+    // A line is a line end. The head stops at a byte and not at a line end, so
+    // its last line is a fragment that qex counts as gone; a count of the text
+    // between the line ends would count that fragment as a line and give 500001.
+    // qex writes one line end of its own before its first note, and each of its
+    // notes is one more.
+    let notes = text.lines().filter(|l| l.starts_with("[qex]")).count() as u64;
+    let kept = text.matches('\n').count() as u64 - notes - 1;
+    assert_eq!(
+        kept + dropped["stdout_lines"].as_u64().unwrap(),
+        500_000,
+        "the file holds {kept} line(s) and the record says that {} went. Together they \
+         must be the 500000 lines that the job wrote.",
+        dropped["stdout_lines"]
+    );
+
     // The commands must not present a part of the output as the whole output.
     let logs = h.qex(&["logs", &id, "--stdout", "--tail", "5"]);
     let notice = String::from_utf8_lossy(&logs.stderr);
@@ -3020,6 +3044,51 @@ fn follow_does_not_lose_the_output_of_a_job_that_passes_the_limit() {
     assert!(
         notice.contains("removed"),
         "the follower must say that qex removed output. It said: {notice}"
+    );
+}
+
+/// A follower that starts AFTER the limit must still learn what went.
+///
+/// The test above starts before the limit, so the follower sees the log file
+/// become shorter and it says so from that event. A follower that starts after
+/// that moment never sees a shorter file: the file grows only, and the record
+/// still says nothing, because the supervisor writes the count when the job
+/// stops. Without the last read of the record, that follower gets the head, the
+/// tail, and no word at all about the millions of lines between them.
+///
+/// The `.tail` file exists between the two moments, and only then, so the test
+/// waits for it and starts the follower inside that window.
+#[test]
+fn a_follower_that_starts_after_the_limit_still_learns_what_went() {
+    let h = Harness::new(
+        "logcap-late",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [logs]\nmax_bytes = \"64KB\"\n",
+    );
+    // The job passes the limit at once, and then it waits. The follower thus
+    // starts after the file became shorter, and before the job stops.
+    let id = h.submit(&["submit", "--", "sh", "-c", "seq 1 500000; sleep 5"]);
+    let tail = h.job_dir(&id).join("stdout.log.tail");
+    h.until(
+        "the output passes the limit",
+        Duration::from_secs(60),
+        || tail.exists(),
+    );
+
+    let out = h.qex(&["logs", &id, "--stdout", "--follow"]);
+    assert_eq!(out.status.code(), Some(0));
+    let lines = String::from_utf8_lossy(&out.stdout).into_owned();
+    let notice = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    assert!(
+        lines.contains("\n500000\n"),
+        "the follower lost the end of the output: {:.400}",
+        lines
+    );
+    assert!(
+        notice.contains("from the middle of this stream"),
+        "the follower must give the count of the output that went, and it said: {notice}"
     );
 }
 

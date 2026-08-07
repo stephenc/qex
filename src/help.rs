@@ -721,6 +721,12 @@ the file is not the whole output. `qex status --json` gives it in the field
 
 Use `max_bytes = \"0\"` for no limit. Then a job can fill the disk.
 
+The supervisor of a job reads this field one time, when the job starts. A change
+to the file thus does nothing to a job that already writes, and it controls the
+next job to start. The supervisor reads the file itself, so the new value does
+not wait for the coordinator to read the file again. To give a new limit to a
+job that operates, stop it and use `qex rerun`.
+
 Enforcement
 -----------
 
