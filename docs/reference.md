@@ -332,9 +332,11 @@ priority that you want as the floor.
 
 qex refuses a `nice` outside -20 to 19, an `io` that is not one of the three
 names, and an `oom_score_adj` outside -1000 to 1000. It applies each of these
-between the fork and the exec of the job, where it cannot report a fault, so a
-value with a fault would give every job something that nobody asked for and say
-nothing. Measured on Linux, from nice 0, with no privilege and with the tests
+between the fork and the exec of the job. The only fault that this code can
+report there is one that STOPS THE JOB, and a job that gives way at the wrong
+priority is better than no job, so each of these steps gives up in silence
+instead. A value with a fault would thus give every job something that nobody
+asked for and say nothing. Measured on Linux, from nice 0, with no privilege and with the tests
 removed: `nice = 100` gave a job at nice 19, because `setpriority` takes 19 for
 any number above the range and reports success; `nice = -21` gave EACCES and the
 job kept the priority that it had; `io = "iddle"` read as `io = "none"`; and the
