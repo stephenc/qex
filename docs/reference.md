@@ -37,7 +37,7 @@ Every command that reads data accepts `--json`.
 | 0    | The job succeeded. |
 | 1    | The job failed. |
 | 124  | Your wait reached its time limit. The job continues. |
-| 125  | Something stopped the job: kill, timeout or out-of-memory. |
+| 125  | Something stopped the job: kill, cancel, timeout or out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
 | 127  | There is no job with that id. |
 
@@ -60,11 +60,22 @@ when the job RAN.
 
 A job of `qex run` is a job like any other, so `qex kill` and `qex cancel` from
 a different command can stop it. Such a job gave no exit code of its own, and
-`qex run` then gives 125. The code 1 thus keeps one meaning: your work ran and
-it failed. `qex run` also writes a line to stderr that names the cause, and that
-line says when this command did not stop the job.
+`qex run` then gives 125. `qex run` also writes a line to stderr that names the
+cause, and that line says when this command did not stop the job.
 
-For each state, `qex run` gives the same code as `qex wait`.
+The code 1 has two causes. Your work ran and it gave the exit code 1, or qex
+could not finish its own work: the coordinator stopped while `qex run` waited,
+for example. qex writes the second cause on stderr, and the job can then still
+operate.
+
+For each state in which the job gave NO exit code of its own, `qex run` gives
+the same code as `qex wait`. For a job that RAN, `qex run` gives the exit code
+of the job, and `qex wait` gives 0 or 1 unless you add `--passthrough`.
+
+`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
+while the job continued, and `qex run` waits with no limit of its own. A job
+that reaches the time limit of `--timeout` gives 125, because something stopped
+that job.
 
 ## Resource claims
 

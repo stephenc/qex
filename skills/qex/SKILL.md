@@ -51,7 +51,7 @@ warning goes to stderr.
 
 For work that is **short and heavy** and that you wait for right now, put
 `qex run` in front instead. The output arrives as it happens and the exit code
-is the exit code of the job:
+is the exit code of the job, or 125 when something stopped the job:
 
 ```sh
 qex run -- cargo test
@@ -86,13 +86,13 @@ BOTH streams. Prefer it: one command gives everything.
 | 0 | The job succeeded. |
 | 1 | The job failed. |
 | 124 | Your wait reached its time limit. **The job continues.** |
-| 125 | Something stopped the job: a kill, a timeout, or out of memory. |
+| 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
 | 126 | The job did not run, because a job that it needed failed. |
 | 127 | There is no job with that id. |
 
 `qex run` gives the exit code of the job when the job RAN, and for every other
-state it gives the same code as the table above. **125 from `qex run` is not a
-failure of your work.** A job of `qex run` is a job like any other, so another
+state it gives the same code as the table above. **125 from `qex run` does not
+say that your work failed.** A job of `qex run` is a job like any other, so another
 agent on this machine can run `qex kill` or `qex cancel` on it. Read the line on
 stderr before you start the work again.
 

@@ -1940,6 +1940,46 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     stream_until_done(&mut client, id, &dir)
 }
 
+/// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
+///
+/// Gives `true` when qex stopped the job. `qex run` then knows that IT stopped
+/// the job, and it does not tell the user that a different command did.
+///
+/// A job that still waits in the queue has no process, so the coordinator
+/// refuses to kill it. This function cancels such a job, because Ctrl-C must
+/// stop the WORK: a job that stays in the queue starts later, and no command
+/// then reads its output.
+fn stop_own_job(client: &mut Client, id: uuid::Uuid) -> bool {
+    let answer = client.call(&Request::Kill {
+        id,
+        signal: libc::SIGTERM,
+        grace_secs: 10,
+    });
+
+    let answer = match answer {
+        Ok(Response::Error {
+            kind: ErrorKind::WrongState,
+            ..
+        }) => client.call(&Request::Cancel { id }),
+        other => other,
+    };
+
+    match answer {
+        Ok(Response::Error { message, .. }) => {
+            eprintln!("qex: qex could not stop the job {id}: {message}");
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "qex: qex could not ask the coordinator to stop the job {id}: {e}. The job can \
+                 still operate. Use `qex kill {id}` when the coordinator answers again."
+            );
+            false
+        }
+        Ok(_) => true,
+    }
+}
+
 /// Writes the output of a job as it arrives, until the job stops.
 fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -1954,15 +1994,11 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
     loop {
         if RUN_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!("\nqex: stopping the job {id}");
-            stopped_here = true;
-            client
-                .call(&Request::Kill {
-                    id,
-                    signal: libc::SIGTERM,
-                    grace_secs: 10,
-                })
-                .ok();
             RUN_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+            // Set the flag from the ANSWER, and not from the attempt. A stop
+            // that failed leaves the job for a different command to stop, and
+            // this command must then not tell the user that it stopped the job.
+            stopped_here = stop_own_job(client, id) || stopped_here;
         }
 
         // Open each log file when the supervisor makes it.
@@ -1995,7 +2031,19 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
             }
         }
 
-        let status = match client.call(&Request::Status { id })? {
+        // Name the job in a transport failure.
+        //
+        // A coordinator that stops while `qex run` waits gives an error here,
+        // and `qex run` then exits with the code 1. The job can still operate,
+        // so the message must give the reader the id and the next command.
+        // Without them the reader has the code of a job that failed and no
+        // way to learn that the job continues.
+        let status = match client.call(&Request::Status { id }).with_context(|| {
+            format!(
+                "qex could not read the state of the job {id}. The job can still operate. Use \
+                 `qex status {id}` when the coordinator answers again."
+            )
+        })? {
             Response::Status { status } => status,
             other => return report(other),
         };
@@ -2038,18 +2086,34 @@ fn report_run_stop(status: &JobStatus, stopped_here: bool) {
         JobState::Failed => match (status.exit_code, status.signal) {
             (Some(_), _) => return,
             (None, Some(sig)) => format!(
-                "the signal {sig} stopped the job {id}. The job did not stop by itself. Use \
-                 `qex status {id}` to read the record."
+                "the signal {sig} stopped the job {id}, so the job gave no exit code of its \
+                 own. Use `qex status {id}` to read the record."
             ),
             _ => return,
         },
         JobState::Killed if stopped_here => {
             format!("this command stopped the job {id}")
         }
-        JobState::Killed => format!(
-            "a different command stopped the job {id}. This command did not stop it, and the \
-             work did not fail. Start the work again when you still need it."
-        ),
+        // Say what the RECORD holds, and no more.
+        //
+        // The record holds the signal that stopped the job. It does not hold
+        // the sender, so this text must not name one: a job that sends itself
+        // a SIGTERM reaches this same state, and a sentence that blames a
+        // different command would then be wrong.
+        JobState::Killed => match status.signal {
+            Some(sig) => format!(
+                "the signal {sig} stopped the job {id}, and this command did not send it. A \
+                 different command, or the job itself, sent it. Use `qex status {id}` to read \
+                 the record."
+            ),
+            None => format!(
+                "something stopped the job {id}, and this command did not stop it. Use \
+                 `qex status {id}` to read the record."
+            ),
+        },
+        JobState::Cancelled if stopped_here => {
+            format!("this command removed the job {id} from the queue, and the job did not run")
+        }
         JobState::Cancelled => format!(
             "a different command removed the job {id} from the queue. The job did not run and \
              it wrote no output. Start the work again when you still need it."

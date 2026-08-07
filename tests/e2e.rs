@@ -2846,7 +2846,7 @@ fn qex_run_gives_125_when_a_different_command_kills_the_job() {
         "`qex run` must give 125 when something stopped the job: {err}"
     );
     assert!(
-        err.contains("a different command stopped the job"),
+        err.contains("did not send it"),
         "`qex run` must say that it did not stop the job: {err}"
     );
 }
@@ -2939,10 +2939,20 @@ fn qex_run_and_qex_wait_give_the_same_code_for_the_same_job() {
     let (child, failed) = h.run_bg(&["--", "sh", "-c", "exit 1"]);
     let ran = wait_run(child, "the job that failed");
 
+    // A time limit is a separate state. Without it, a change that gave the
+    // exit code of the job for the state `timeout` would pass this test.
+    let (child, limited) = h.run_bg(&["--timeout", "1s", "--", "sleep", "60"]);
+    let timed_out = wait_run(child, "the job that reached its time limit");
+
     assert_eq!(
         stopped.status.code(),
         h.qex(&["wait", &killed]).status.code(),
         "`qex run` and `qex wait` gave two codes for a job that something stopped"
+    );
+    assert_eq!(
+        timed_out.status.code(),
+        h.qex(&["wait", &limited]).status.code(),
+        "`qex run` and `qex wait` gave two codes for a job that reached its time limit"
     );
     assert_eq!(
         ran.status.code(),
@@ -2956,4 +2966,87 @@ fn qex_run_and_qex_wait_give_the_same_code_for_the_same_job() {
         Some(1),
         "a job that something stopped must not give the code of a job that failed"
     );
+    assert_ne!(
+        timed_out.status.code(),
+        Some(1),
+        "a job that reached its time limit must not give the code of a job that failed"
+    );
+}
+
+/// `qex run` must say when IT stopped the job, and not blame a different
+/// command.
+///
+/// The branch that writes this sentence is the branch that gives the wrong
+/// blame when it is wrong, so a test must reach it. Without this test, a change
+/// that always blames a different command passes every other test.
+#[test]
+fn qex_run_says_when_this_command_stopped_the_job() {
+    let h = Harness::with_default_config("runctrlc");
+    let (child, id) = h.run_bg(&["--", "sleep", "60"]);
+    h.until(
+        "the job of `qex run` starts",
+        Duration::from_secs(30),
+        || h.has_started(&id),
+    );
+
+    // Ctrl-C sends SIGINT to the process. The test sends the same signal.
+    let pid = child.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let out = wait_run(child, "Ctrl-C stopped the job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a job that Ctrl-C stopped gives 125: {err}"
+    );
+    assert!(
+        err.contains("this command stopped the job"),
+        "`qex run` must say that IT stopped the job: {err}"
+    );
+    assert!(
+        !err.contains("did not send it"),
+        "`qex run` must not blame a different command for its own kill: {err}"
+    );
+}
+
+/// Ctrl-C must take the job out of the queue when the job has not started.
+///
+/// The coordinator refuses to kill a job that waits in the queue, because that
+/// job has no process. Without the cancel, `qex run` waited for a job that
+/// still had to run, and it then said that a different command stopped a job
+/// that this command tried to stop.
+#[test]
+fn ctrl_c_removes_the_job_of_qex_run_from_the_queue() {
+    let h = Harness::with_default_config("runctrlcq");
+
+    let blocker = h.submit(&["submit", "--", "sleep", "60"]);
+    let (child, id) = h.run_bg(&["--needs", &blocker, "--", "echo", "never"]);
+    h.until(
+        "the job of `qex run` waits",
+        Duration::from_secs(30),
+        || h.state_of(&id) == "queued",
+    );
+
+    let pid = child.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+
+    let out = wait_run(child, "Ctrl-C removed the job from the queue");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "a job that left the queue gives 125: {err}"
+    );
+    assert_eq!(
+        h.state_of(&id),
+        "cancelled",
+        "Ctrl-C must take the job out of the queue: {err}"
+    );
+    assert!(
+        err.contains("this command removed the job"),
+        "`qex run` must say that IT removed the job from the queue: {err}"
+    );
+
+    h.qex(&["kill", &blocker, "--grace", "1s"]);
 }
