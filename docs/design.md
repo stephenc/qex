@@ -119,12 +119,14 @@ what it can do, and it refuses the job with the option and the remedy.
 
 ## The capability floor
 
-qex supports the first published version and above. A coordinator below that
-number comes from a build that no release holds, so no promise covers it, and
-the CLI refuses it and says how to replace it:
+A coordinator says what it can do from the first published version and above.
+One below that number gives no answer, so the CLI cannot learn which options it
+obeys, and it must not let a user believe a rule holds when it may not. It
+refuses such a coordinator and says how to replace it:
 
 ```
-the coordinator (pid 4321) is version 0.5.2, and qex supports 0.6.0 and above.
+the coordinator (pid 4321) is version 0.5.2, and a coordinator says what it can
+do from 0.6.0 and above.
 ...
     kill 4321
 The jobs that operate now continue; a new coordinator reads the same records.

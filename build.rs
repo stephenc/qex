@@ -99,10 +99,17 @@
 //! `-dev`, and everything after that is build metadata. Such a build is thus
 //! warned about, and never refused.
 //!
-//! # It must never stop a build
+//! # The version it CALCULATES must never stop a build
 //!
-//! git can be absent and the directory can hold no repository. Every path below
-//! gives an answer, and none of them fails.
+//! git can be absent and the directory can hold no repository. Every path that
+//! looks for a commit gives an answer, and none of them fails.
+//!
+//! `refuse_below_the_floor` is the one deliberate exception, and it is not one
+//! of those paths. It reads the number that a person put in `Cargo.toml`, and
+//! it stops a build that would give a binary that qex itself refuses. Read it
+//! for the reason. **Do not take that panic away on the strength of this
+//! heading**: the rule here is about the commit that this file looks for, and
+//! not about a number that somebody wrote by hand.
 
 use std::path::Path;
 use std::process::Command;
@@ -148,9 +155,8 @@ fn refuse_below_the_floor(version: &str) {
             "the version `{version}` in Cargo.toml is neither three numbers nor \
              `{DEVELOPMENT}`.\n\n\
              qex compares this number against the first version that answers the \
-             capability handshake,\
-             and it cannot read this one, so the build would give a binary that qex \
-             refuses.\n\n\
+             capability handshake, and it cannot read this one, so the build would \
+             give a binary that qex refuses.\n\n\
              Put three numbers in Cargo.toml, such as `{major}.{minor}.{patch}`, or \
              leave `{DEVELOPMENT}` for a build that is not a release."
         );

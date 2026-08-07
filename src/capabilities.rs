@@ -47,10 +47,14 @@
 //!
 //! # The capability floor
 //!
-//! `CAPABILITY_FLOOR` is the first version that qex published. A coordinator below
-//! it comes from a build that no release holds, and qex has no promise about
-//! it. The CLI refuses such a coordinator, and it gives the way to correct the
-//! problem.
+//! `CAPABILITY_FLOOR` is the first version that ANSWERS the question above. A
+//! coordinator below it gives no answer, so the CLI cannot learn which options
+//! it obeys, and it must not let a user believe a rule holds when it may not.
+//! The CLI refuses such a coordinator and gives the way to correct it.
+//!
+//! The number says nothing about which versions get a correction: qex corrects
+//! a fault in the NEXT version and never in an earlier one. Read the constant
+//! itself for the whole of the reasoning.
 //!
 //! # The carve-out for a development build
 //!

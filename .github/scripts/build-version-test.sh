@@ -59,6 +59,32 @@ copy_package() {
     fi
 }
 
+# `check_holds <name> <words> <text>` — for an answer that is a whole message.
+check_holds() {
+    case "$3" in
+    *"$2"*) pass=$((pass + 1)) ;;
+    *)
+        fail=$((fail + 1))
+        echo "FAIL: $1"
+        echo "      expected to hold: \`$2\`"
+        echo "      got:              \`$3\`"
+        ;;
+    esac
+}
+
+# `refused <directory>` — the words that a build gives when it stops.
+#
+# `build.rs` stops a build whose number qex itself would refuse. A test of that
+# rule must read the message, because the message is the whole value of the
+# rule: a build that stops with no reason is worse than one that does not stop.
+refused() {
+    if (cd "$1" && cargo build -q 2>"$work/refuse.log"); then
+        echo "THE BUILD SUCCEEDED"
+        return 0
+    fi
+    tr '\n' ' ' <"$work/refuse.log"
+}
+
 # `reports <directory>` — the version that a build in that directory writes.
 reports() {
     if ! (cd "$1" && cargo build -q 2>"$work/build.log"); then
@@ -177,6 +203,30 @@ bare="$work/bare"
 copy_package "$bare" "0.0.0-dev"
 check "a development tree with no git says unknown" \
     "0.0.0-dev+unknown" "$(reports "$bare")"
+
+echo "== A number that qex itself would refuse =="
+
+# `build.rs` stops such a build. A binary that carries a number below the
+# capability floor is refused by its own CLI, so it can do nothing for the
+# person who installed it, and the fault must stop where a person reads the
+# reason and not at the first command after an install.
+#
+# The message matters as much as the refusal. A build that stops and says why
+# is a correction; one that stops and says nothing is a puzzle.
+too_old="$work/too-old"
+copy_package "$too_old" "0.5.9"
+answer="$(refused "$too_old")"
+check_holds "a number below the capability floor stops the build" \
+    "is below \`0.6.0\`" "$answer"
+check_holds "and the message says what to put there instead" \
+    "or leave \`0.0.0-dev\`" "$answer"
+
+# The floor itself must build. A test of a refusal that also refused the first
+# number that is allowed would hide the fault that it exists to find.
+floor="$work/floor"
+copy_package "$floor" "0.6.0"
+check "the first version that answers the handshake builds" \
+    "0.6.0" "$(reports "$floor")"
 
 git -C "$own" worktree remove --force "$work/worktree" >/dev/null 2>&1
 
