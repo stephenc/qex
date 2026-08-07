@@ -229,12 +229,36 @@ where
 ///
 /// A whole number is a decimal number too, so `max_pressure = 20` and
 /// `max_pressure = "20"` and `max_pressure = 20.0` are one value.
+///
+/// # Why `nan` and `inf` stop here
+///
+/// TOML has the values `nan` and `inf`, and each field here is a limit that qex
+/// compares against a measurement. A test against `nan` is false for EVERY
+/// measurement, so the limit never operates: `max_pressure = nan` accepted the
+/// file, passed `validate` (because `nan < 1.0` is false), and then held no job
+/// back. `qex config show --json` wrote it as `null`, because JSON has no such
+/// value. A limit that never operates and does not show itself is worse than a
+/// file that qex refuses.
+///
+/// The text form already stopped, because `"nan"` reaches `visit_str`. The
+/// number form did not, so the two forms disagreed. This function is part of a
+/// change whose rule is that the quotation marks make no difference, so both
+/// forms now stop.
 fn decimal_number<'de, D>(d: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::{self, Visitor};
     use std::fmt;
+
+    /// The message for a value that is not a number that qex can compare.
+    fn refuse<E: de::Error>(wrote: &dyn fmt::Display) -> E {
+        de::Error::custom(format!(
+            "the value is `{wrote}`, and qex cannot read a number from it. A limit that \
+             is not a number is false against every measurement, so it never operates \
+             and qex holds no job back. Write a number, such as 1.5."
+        ))
+    }
 
     struct DecimalNumber;
 
@@ -245,9 +269,16 @@ where
             f.write_str("a number such as 1.5, with or without quotation marks")
         }
 
+        // `nan`, `inf` and `-inf` are TOML values, and they arrive here.
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<f64, E> {
-            Ok(v)
+            if v.is_finite() {
+                Ok(v)
+            } else {
+                Err(refuse(&v))
+            }
         }
+        // Every i64 and every u64 becomes a finite f64, so these two methods
+        // need no such test. `u64::MAX` becomes 1.8446744073709552e19.
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<f64, E> {
             Ok(v as f64)
         }
@@ -257,14 +288,9 @@ where
         }
 
         fn visit_str<E: de::Error>(self, v: &str) -> Result<f64, E> {
-            let t = v.trim();
-            match t.parse::<f64>() {
+            match v.trim().parse::<f64>() {
                 Ok(n) if n.is_finite() => Ok(n),
-                _ => Err(de::Error::custom(format!(
-                    "the value is `{v}`, and qex cannot read a number from it. qex cannot \
-                     read the config file, so each command that needs it stops. Write a \
-                     number, such as 1.5."
-                ))),
+                _ => Err(refuse(&v)),
             }
         }
     }
@@ -860,6 +886,9 @@ mod tests {
         assert_eq!(c.budget.cpu, "9223372036854775808");
         let c: Config = toml::from_str("[system]\nmax_pressure = 9223372036854775808\n").unwrap();
         assert_eq!(c.system.max_pressure, 9223372036854775808f64);
+        // `[defaults] cpu` is a u64 field, so the value stays a number.
+        let c: Config = toml::from_str("[defaults]\ncpu = 18446744073709551615\n").unwrap();
+        assert_eq!(c.default_cpu(), u64::MAX);
     }
 
     /// The quotation marks must make no difference in EITHER direction.
@@ -937,6 +966,54 @@ mod tests {
             let e = toml::from_str::<Config>(text).unwrap_err().to_string();
             assert!(e.contains(want), "{text} gave: {e}");
         }
+
+        // A space around the value is not a fault. A user who writes ` 2` in a
+        // quoted field means 2.
+        let c: Config = toml::from_str("[defaults]\ncpu = \" 2 \"\n").unwrap();
+        assert_eq!(c.default_cpu(), 2);
+        let c: Config = toml::from_str("[learn]\nmargin = \" 2.5 \"\n").unwrap();
+        assert_eq!(c.learn.margin, 2.5);
+    }
+
+    /// A limit that is not a number must stop the file, in EITHER form.
+    ///
+    /// TOML has `nan` and `inf`. A test against `nan` is false for every
+    /// measurement, so the limit never operates: `max_pressure = nan` passed
+    /// `validate`, because `nan < 1.0` is false, and then held no job back.
+    /// `qex config show --json` wrote it as `null`. The text form `"nan"`
+    /// already stopped, so the two forms disagreed, and the rule of this change
+    /// is that the quotation marks make no difference.
+    #[test]
+    fn a_limit_that_is_not_a_number_stops_the_file() {
+        for text in [
+            "[system]\nmax_pressure = nan\n",
+            "[system]\nmax_pressure = \"nan\"\n",
+            "[system]\nmax_pressure = inf\n",
+            "[system]\nmax_pressure = -inf\n",
+            "[learn]\nmargin = nan\n",
+            "[learn]\nmargin = inf\n",
+            "[learn]\nmargin = \"inf\"\n",
+            "[enforce]\nmem_overcommit = nan\n",
+            "[enforce]\nmem_overcommit = inf\n",
+        ] {
+            let e = toml::from_str::<Config>(text)
+                .err()
+                .unwrap_or_else(|| panic!("{text} was accepted, and it must not be"))
+                .to_string();
+            assert!(
+                e.contains("false against every measurement"),
+                "{text} must say why it matters, and it gave: {e}"
+            );
+            assert!(
+                e.contains("Write a number"),
+                "{text} must say what to write, and it gave: {e}"
+            );
+        }
+
+        // A number that a person writes stays acceptable.
+        let c: Config = toml::from_str("[system]\nmax_pressure = 20.5\n").unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.system.max_pressure, 20.5);
     }
 
     /// A field that qex does not know must give the order of the steps.
