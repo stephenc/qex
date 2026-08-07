@@ -616,6 +616,31 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 /// `os.cpus().length` is 16, the number of the MACHINE, and node reads no
 /// variable that changes it. (`os.availableParallelism` arrived in node 19 and
 /// was not measured here.)
+/// The smallest heap that qex gives to a runtime, in megabytes.
+///
+/// # Why there is a floor and not a test against zero
+///
+/// A SMALL HEAP IS WORSE THAN NO HEAP. A runtime that receives no heap uses its
+/// own default and operates; a runtime that receives a heap of one or two
+/// megabytes refuses to start. Measured with the runtimes on this machine:
+///
+///     -Xmx1m                  java 11   exit 1, initialization of VM failed
+///     -Xmx2m                  java 11   exit 1, initialization of VM failed
+///     -Xmx3m                  java 11   exit 0
+///     --max-old-space-size=1  node 12   exit 134
+///     --max-old-space-size=2  node 12   exit 134
+///     --max-old-space-size=3  node 12   exit 0
+///
+/// Both runtimes stop below three megabytes and operate at three. The floor is
+/// FOUR, one megabyte above the highest value that failed, because three is the
+/// exact edge on these two versions and another version can need more.
+///
+/// The heap is three quarters of the claim, and each step rounds down, so a
+/// claim below 6MB gets no heap. Such a claim needs `--mem` with a very small
+/// value, and the job then receives the default heap of its runtime, which is
+/// the behaviour that it has with no qex at all.
+const HEAP_FLOOR_MB: u64 = 4;
+
 fn export_claim(
     env: &mut std::collections::BTreeMap<String, String>,
     cpu: u64,
@@ -665,14 +690,8 @@ fn export_claim(
 
     // A heap needs room for the rest of the process, so node receives three
     // quarters of the claim.
-    //
-    // A claim below one megabyte rounds the heap to zero, and zero is not a
-    // limit. `-Xmx0m` makes the JVM refuse to start (measured on java 11:
-    // `Invalid maximum heap size: -Xmx0m`, exit code 1), and node 12 ignores
-    // `--max-old-space-size=0` and takes its default heap of 2096MB. Neither
-    // form says what qex means, so qex writes no heap at all.
     let heap_mb = (mem / (1 << 20)) * 3 / 4;
-    if heap_mb > 0 {
+    if heap_mb >= HEAP_FLOOR_MB {
         set("NODE_OPTIONS", &format!("--max-old-space-size={heap_mb}"));
     }
 
@@ -689,9 +708,9 @@ fn export_claim(
                 // the error output fails because of it. This is why `java` is
                 // not a default.
                 //
-                // Below one megabyte of heap, give the count of the cores and
-                // no heap. See the note above `heap_mb`.
-                if heap_mb > 0 {
+                // Below the floor, give the count of the cores and no heap.
+                // See `HEAP_FLOOR_MB`.
+                if heap_mb >= HEAP_FLOOR_MB {
                     set(
                         "JAVA_TOOL_OPTIONS",
                         &format!("-XX:ActiveProcessorCount={cores} -Xmx{heap_mb}m"),
@@ -778,29 +797,46 @@ mod tests {
         assert_eq!(env["MAKEFLAGS"], "-j3");
     }
 
-    /// A claim below one megabyte must give NO heap limit.
+    /// A claim too small for a usable heap must give NO heap.
     ///
-    /// The heap is a whole number of megabytes, so a claim of 100KB rounds it
-    /// to zero. `--max-old-space-size=0` and `-Xmx0m` are not "no limit": the
-    /// JVM refuses to start with `-Xmx0m`, and qex accepts a claim that small.
-    /// The count of the cores still arrives, because that number is correct.
+    /// A SMALL HEAP IS WORSE THAN NO HEAP: java 11 exits 1 with `-Xmx1m` and
+    /// `-Xmx2m`, and node 12 exits 134 with `--max-old-space-size` of 1 or 2.
+    /// A runtime that receives no heap uses its own default and operates. The
+    /// count of the cores still arrives, because that number is correct.
     #[test]
-    fn a_claim_below_one_megabyte_gives_no_heap_limit() {
+    fn a_claim_too_small_for_a_heap_gives_no_heap() {
         use std::collections::BTreeMap;
+
+        // EVERY VALUE BELOW THE FLOOR, and not the round numbers only. The
+        // fault that this test holds was a guard of `> 0`, which let a claim
+        // of 2MB write `-Xmx1m` and stop the JVM.
+        for mem_mb in 0..=5u64 {
+            let mut env = BTreeMap::new();
+            export_claim(&mut env, 2, mem_mb << 20, &[ClaimHint::Java]);
+            assert!(
+                !env.contains_key("NODE_OPTIONS"),
+                "a claim of {mem_mb}MB gives a heap below the floor: {env:?}"
+            );
+            assert_eq!(
+                env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2",
+                "a claim of {mem_mb}MB must give no -Xmx"
+            );
+            assert_eq!(env["GOMAXPROCS"], "2");
+        }
+
+        // 6MB is the first claim that reaches the floor: it gives a heap of
+        // exactly 4MB, and that heap arrives.
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 6 << 20, &[ClaimHint::Java]);
+        assert_eq!(env["NODE_OPTIONS"], "--max-old-space-size=4");
+        assert_eq!(
+            env["JAVA_TOOL_OPTIONS"],
+            "-XX:ActiveProcessorCount=2 -Xmx4m"
+        );
 
         let mut env = BTreeMap::new();
         export_claim(&mut env, 2, 100 * 1024, &[ClaimHint::Java]);
-
-        assert!(
-            !env.contains_key("NODE_OPTIONS"),
-            "a heap of zero is not a limit: {env:?}"
-        );
-        assert_eq!(
-            env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2",
-            "`-Xmx0m` makes the JVM refuse to start"
-        );
         assert_eq!(env["QEX_MEM_MB"], "0");
-        assert_eq!(env["GOMAXPROCS"], "2");
         // 100KB is above zero, so `GOMEMLIMIT` still holds the true claim.
         assert_eq!(env["GOMEMLIMIT"], (100u64 * 1024).to_string());
 

@@ -5570,6 +5570,15 @@ fn the_config_file_controls_the_claim_in_the_environment() {
         "`export_env = false` must write nothing: {out}"
     );
 
+    // `qex config show` MUST SAY SO. A reader who cannot see this value cannot
+    // tell whether a job receives GOMAXPROCS, and the config file is not the
+    // answer: a machine with no file still has these values.
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("claim in job: no"),
+        "`qex config show` must report that the claim is off: {shown}"
+    );
+
     let h = Harness::new(
         "claimsalso",
         "[peers]\nenabled = false\n\
@@ -5586,6 +5595,11 @@ fn the_config_file_controls_the_claim_in_the_environment() {
         out.trim(),
         "[2][2][-XX:ActiveProcessorCount=2 -Xmx1536m][-j2]",
         "`also` must add the two variables: {out}"
+    );
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("also java, make"),
+        "`qex config show` must name the hints that operate: {shown}"
     );
 
     // A NAME WITH A SPELLING FAULT MUST STOP THE COMMAND.

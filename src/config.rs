@@ -589,6 +589,16 @@ pub enum ClaimHint {
     Make,
 }
 
+impl ClaimHint {
+    /// The name that the config file uses. `qex config show` prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Java => "java",
+            Self::Make => "make",
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for ClaimHint {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;

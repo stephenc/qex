@@ -708,5 +708,23 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     println!("peers:        {}", peers::describe(cfg));
     println!("oversized:    {:?}", cfg.queue.oversized);
     println!("environment:  capture {:?}", cfg.submit.env_capture);
+    // SHOW `[claims]` HERE TOO. This command prints the configuration that qex
+    // uses, and a reader who cannot see `export_env` cannot tell whether a job
+    // receives GOMAXPROCS. The config file is not the answer, because a machine
+    // with no file still has these values.
+    println!(
+        "claim in job: {}",
+        if !cfg.claims.export_env {
+            "no; [claims] export_env = false".to_string()
+        } else if cfg.claims.also.is_empty() {
+            "yes, with --cpu and --mem together".to_string()
+        } else {
+            let names: Vec<&str> = cfg.claims.also.iter().map(|h| h.name()).collect();
+            format!(
+                "yes, with --cpu and --mem together; also {}",
+                names.join(", ")
+            )
+        }
+    );
     Ok(())
 }
