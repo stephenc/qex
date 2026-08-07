@@ -114,8 +114,8 @@ wait.
 **qex counts the wait in whole seconds.** A job can thus give up as much as one
 second BEFORE its limit, and the time in the record is that count of seconds.
 Give a limit of a minute or more, where one second changes nothing. With a limit
-of `3s`, measured runs stopped the job between 2.5 seconds and 3.1 seconds after
-the submission.
+of `3s`, 65 measured runs of `qex wait` returned between 2.0 and 3.1 seconds
+after the submission, on an idle machine and on a busy one alike.
 
 The wait for a job in `--needs` counts also, because the option answers one
 question: does this id give an answer inside this time? A clock that stopped for

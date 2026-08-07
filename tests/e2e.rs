@@ -1871,6 +1871,61 @@ fn a_job_that_stops_at_its_time_limit_keeps_its_result() {
     }
 }
 
+/// `qex wait` MUST RETURN WHEN THE JOB GIVES UP, AND NOT 30 SECONDS LATER.
+///
+/// This test starts the wait BEFORE the limit ends. That order is the whole
+/// point: a wait that begins after the job expired returns at once, whatever
+/// the coordinator signalled, so it proves nothing.
+///
+/// The fault that this test holds: the scheduler wrote the state `expired` and
+/// signalled no waiter. Every waiter then slept on the 30 second fallback in
+/// `handle_wait`. The record said 3s and `qex wait` returned at 30.0s, so the
+/// promise "this gives an answer inside 30 minutes" was false by 30 seconds for
+/// every user of the option.
+#[test]
+fn a_wait_returns_when_the_job_reaches_its_queue_limit() {
+    let h = Harness::new(
+        "queuewait",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+
+    // Wait from HERE, while the job is still in the queue.
+    let start = std::time::Instant::now();
+    let out = h.qex(&["wait", &id, "--timeout", "60s"]);
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(123),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The limit is 3s. Ten seconds is far above every measured run and far
+    // below the 30 second fallback, so a failure here names the fault and not
+    // the speed of the machine.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "`qex wait` returned after {elapsed:?}, and the limit is 3s. The \
+         scheduler expired the job and signalled no waiter."
+    );
+}
+
 /// A JOB THAT STARTED MUST NEVER GET THE STATE `expired`.
 ///
 /// The scheduler chooses a job, releases the lock, and the start of that job

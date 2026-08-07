@@ -3884,16 +3884,22 @@ mod tests {
         );
         // A job that never started has its own code. It must not be 125: a job
         // with the code 125 ran and wrote output, and this job did neither.
+        //
+        // Pin the LITERAL, and not the constant alone. The documents, the skill
+        // file and every script of a user name the number 123, so a change to
+        // the constant is a change to a published interface. A test that reads
+        // the constant on both sides agrees with itself and with nothing else.
+        assert_eq!(EXIT_EXPIRED, 123);
         assert_eq!(
             exit_code_for(&status_with(JobState::Expired, None), ExitMode::State),
-            EXIT_EXPIRED
+            123
         );
         // `--passthrough` gives the code of the state here as well. A job that
         // never started has no exit code of its own, so the alternative is 1,
         // and 1 says that the work ran and failed.
         assert_eq!(
             exit_code_for(&status_with(JobState::Expired, None), ExitMode::Passthrough),
-            EXIT_EXPIRED
+            123
         );
     }
 

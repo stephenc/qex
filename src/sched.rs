@@ -216,8 +216,16 @@ pub fn run(coord: Arc<Coordinator>) {
         // those files, so this is how the coordinator learns that a job started.
         let changed = coord.state.lock().unwrap().refresh_active();
 
+        // Signal the waiters when a job started, when a supervisor wrote a new
+        // status, AND when this turn moved a job to a final state on its own.
+        //
+        // The third case is the one that is easy to lose. An expired job has no
+        // supervisor and no request thread to announce it, so a turn that
+        // forgets it leaves `qex wait` asleep until the 30 second fallback in
+        // `handle_wait`. Measured before this line existed: a 3s queue limit
+        // gave the record at 3s and `qex wait` returned at 30.0s.
         match step(&coord) {
-            Ok(started) if started > 0 || changed => coord.notify(),
+            Ok((started, finished)) if started > 0 || finished > 0 || changed => coord.notify(),
             Ok(_) => {}
             Err(e) => log(&format!("the scheduler failed: {e:#}")),
         }
@@ -261,9 +269,13 @@ pub fn run(coord: Arc<Coordinator>) {
     }
 }
 
-/// Starts each job that can start now. Gives the number of jobs that started.
-fn step(coord: &Arc<Coordinator>) -> anyhow::Result<usize> {
+/// Starts each job that can start now.
+///
+/// Gives the number of jobs that started, and the number that this turn moved
+/// to a final state on its own. A waiter must learn of BOTH.
+fn step(coord: &Arc<Coordinator>) -> anyhow::Result<(usize, usize)> {
     let mut started = 0usize;
+    let mut finished = 0usize;
 
     loop {
         // Choose one job, then release the lock. The start of a job forks a
@@ -281,7 +293,9 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<usize> {
             choose(&mut state)
         };
 
-        match choice {
+        finished += choice.finished;
+
+        match choice.start {
             Some(id) => {
                 start_job(coord, id)?;
                 started += 1;
@@ -290,7 +304,7 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<usize> {
         }
     }
 
-    Ok(started)
+    Ok((started, finished))
 }
 
 /// The result of the test of the dependencies of one job.
@@ -418,7 +432,13 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
 /// that gets `expired` and no other text cannot act: the machine was busy, the
 /// claim was too large, or a lock was held, and each of those needs a different
 /// correction.
-fn expire(state: &mut crate::daemon::State, id: uuid::Uuid, waited: u64, last_reason: &str) {
+fn expire(
+    state: &mut crate::daemon::State,
+    id: uuid::Uuid,
+    waited: u64,
+    last_reason: &str,
+    waited_for_a_job: bool,
+) {
     let Some(job) = state.jobs.get_mut(&id) else {
         return;
     };
@@ -434,6 +454,20 @@ fn expire(state: &mut crate::daemon::State, id: uuid::Uuid, waited: u64, last_re
         return;
     }
 
+    // A job that ALREADY RAN must never get this state either.
+    //
+    // This guard is defensive, and no test here reproduces the state that it
+    // refuses. The reading behind it: a job between two attempts of `--retries`
+    // is `queued` and holds the `started_at` of the attempt that failed, and a
+    // coordinator that starts again puts every `queued` record back in the
+    // queue. A job in that gap would otherwise be able to expire, and its
+    // record would then say `expired` and hold a start time and an exit code at
+    // the same time. The state alone cannot separate the two cases; the start
+    // time can.
+    if job.status.started_at.is_some() {
+        return;
+    }
+
     let limit = job.spec.max_queue_time.unwrap_or(0);
     job.status.state = JobState::Expired;
     job.status.finished_at = Some(sys::now_secs());
@@ -445,7 +479,11 @@ fn expire(state: &mut crate::daemon::State, id: uuid::Uuid, waited: u64, last_re
     // A job that waited for a job that it needs did not wait for capacity, and
     // a smaller claim changes nothing for it. A remedy that does not fit sends
     // the reader to make a change that cannot help.
-    let waited_for_a_job = last_reason.contains("waits for the job");
+    //
+    // The caller decides this, from `depends`. DO NOT read it out of the prose
+    // of `last_reason`: the pure-capacity text "waits for the job <id> at the
+    // front of the queue" holds the same words as a dependency wait, and a job
+    // with no `needs` then got the remedy for a pipeline that it does not have.
     let remedy = if waited_for_a_job {
         "The job waited for a job that it needs, and not for capacity. Give a \
          --max-queue-time that covers the whole pipeline, or give no value on a stage \
@@ -505,8 +543,25 @@ fn overdue(state: &crate::daemon::State, chosen: Option<uuid::Uuid>) -> Vec<(uui
         .collect()
 }
 
+/// What one pass of the scheduler decided.
+struct Choice {
+    /// The job to start now.
+    start: Option<uuid::Uuid>,
+    /// The number of jobs that this pass moved to a final state ON ITS OWN.
+    ///
+    /// A waiter sleeps on the condition variable, and the scheduler signals it
+    /// when a job changes state. Every OTHER final state has a messenger: a
+    /// supervisor writes the status file and `refresh_active` sees it, or a
+    /// request thread makes the change and signals the variable itself. An
+    /// expired job has neither, because nothing outside this pass happened. A
+    /// pass that did not report this count would leave `qex wait` asleep until
+    /// its 30 second fallback, and the answer that the option promises would
+    /// arrive up to 30 seconds late.
+    finished: usize,
+}
+
 /// Chooses the next job to start.
-fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
+fn choose(state: &mut crate::daemon::State) -> Choice {
     let (cpu_used, mem_used) = state.claimed();
     let cfg = state.cfg.clone();
     let active = state.count_state(|s| s.is_active());
@@ -517,6 +572,14 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
     let mut chosen = None;
     let mut reasons: Vec<(uuid::Uuid, Option<String>)> = Vec::new();
     let mut to_skip: Vec<(uuid::Uuid, String, uuid::Uuid)> = Vec::new();
+    // The jobs that wait for a DIFFERENT JOB, and not for capacity.
+    //
+    // `depends` is the one place that knows this, so the remedy of an expired
+    // job comes from here. An earlier version of this code read the prose of
+    // the queue reason instead, and the pure-capacity text "waits for the job
+    // <id> at the front of the queue" holds the same words as a dependency
+    // wait. A job with no `needs` at all then got the remedy for a pipeline.
+    let mut waits_for_a_job: std::collections::BTreeSet<uuid::Uuid> = Default::default();
 
     // Pass 1: test the dependencies of EVERY job in the queue.
     //
@@ -540,7 +603,10 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
 
         match depends(state, id) {
             Depends::Ready => ready.push(id),
-            Depends::Waiting(reason) => reasons.push((id, Some(reason))),
+            Depends::Waiting(reason) => {
+                waits_for_a_job.insert(id);
+                reasons.push((id, Some(reason)));
+            }
             Depends::Broken { reason, root } => to_skip.push((id, reason, root)),
         }
     }
@@ -649,16 +715,21 @@ fn choose(state: &mut crate::daemon::State) -> Option<uuid::Uuid> {
 
     // Remove each job that waited more time than its limit. This step is last,
     // so the text of the job holds the newest queue reason.
+    let mut finished = 0usize;
     for (id, waited) in overdue(state, chosen) {
         let reason = state
             .jobs
             .get(&id)
             .and_then(|j| j.status.blocked_reason.clone())
             .unwrap_or_else(|| "the job waited for free capacity".to_string());
-        expire(state, id, waited, &reason);
+        expire(state, id, waited, &reason, waits_for_a_job.contains(&id));
+        finished += 1;
     }
 
-    chosen
+    Choice {
+        start: chosen,
+        finished,
+    }
 }
 
 /// Starts the supervisor of one job.
@@ -980,6 +1051,77 @@ mod tests {
         }
     }
 
+    /// Puts one job in a state, with a claim, a state and a queue limit.
+    fn add_job(
+        state: &mut crate::daemon::State,
+        job_state: JobState,
+        cpu: u64,
+        max_queue_time: Option<u64>,
+        waited: u64,
+    ) -> uuid::Uuid {
+        let mut spec = spec_with(cpu, 1 << 20);
+        spec.max_queue_time = max_queue_time;
+        let id = spec.id;
+
+        let mut status = crate::job::JobStatus::new(&spec);
+        status.state = job_state;
+        status.submitted_at = sys::now_secs().saturating_sub(waited);
+
+        state.jobs.insert(
+            id,
+            crate::daemon::Job {
+                spec,
+                status,
+                supervisor_pid: None,
+            },
+        );
+        if job_state == JobState::Queued {
+            state.queue.push(id);
+        }
+        id
+    }
+
+    /// A JOB BEHIND A LARGE JOB WAITED FOR CAPACITY, AND `choose` MUST SAY SO.
+    ///
+    /// This test covers the WIRING, and `the_remedy_fits_the_reason_for_the_wait`
+    /// covers the text. The fault that a review found lived here, and not in
+    /// `expire`: `choose` decided the remedy by reading the words "waits for
+    /// the job" out of the queue reason, and the pure-capacity text "waits for
+    /// the job <id> at the front of the queue" holds those same words. A job
+    /// with an empty `needs` was told to cover a pipeline that it has none of.
+    ///
+    /// The remedy must come from `depends`, which is the one place that knows.
+    #[test]
+    fn a_job_behind_a_large_job_gets_the_remedy_for_capacity() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+
+        // A job of three cores operates, so one core of the four is free.
+        add_job(&mut state, JobState::Running, 3, None, 0);
+        // A job of two cores is at the front of the queue. It cannot fit now,
+        // and it holds the capacity for itself.
+        add_job(&mut state, JobState::Queued, 2, None, 0);
+        // A job of one core waits behind it, and it passed its limit.
+        let behind = add_job(&mut state, JobState::Queued, 1, Some(5), 600);
+
+        let choice = choose(&mut state);
+        assert_eq!(choice.start, None, "no job can start with one core free");
+        assert_eq!(choice.finished, 1, "the job behind must give up");
+
+        let job = &state.jobs[&behind];
+        assert_eq!(job.status.state, JobState::Expired);
+        let text = job.status.error.clone().unwrap();
+        assert!(
+            text.contains("smaller claim"),
+            "this job waited for CAPACITY, and it has no `needs` at all: {text}"
+        );
+        assert!(
+            !text.contains("whole pipeline"),
+            "this job has no pipeline to cover: {text}"
+        );
+    }
+
     /// A job that waits more time than its limit must give up and say so.
     ///
     /// Without this rule, an agent that waits for a job which the budget can
@@ -997,12 +1139,20 @@ mod tests {
             id,
             overdue[0].1,
             "waits for cores: 4 of 4 are in use",
+            false,
         );
 
         let job = &state.jobs[&id];
         assert_eq!(job.status.state, JobState::Expired);
         assert!(job.status.finished_at.is_some());
         assert!(state.queue.is_empty(), "an expired job leaves the queue");
+        // A job that stopped waits for nothing. `qex top` and `qex list` print
+        // this field first, so a reason that stayed would tell a reader that a
+        // job which gave up is still waiting for cores.
+        assert_eq!(
+            job.status.blocked_reason, None,
+            "an expired job must hold no queue reason"
+        );
 
         // The text must name the wait and the time. A reader that gets the state
         // alone cannot act.
@@ -1015,22 +1165,57 @@ mod tests {
         );
     }
 
-    /// THE REMEDY MUST FIT THE CAUSE.
+    /// THE REMEDY MUST FIT THE CAUSE, AND THE PROSE MUST NOT DECIDE IT.
     ///
     /// A job that waited for a job that it needs did not wait for capacity, so
     /// "give the job a smaller claim" sends the reader to make a change that
     /// cannot help. The two causes give two texts.
+    ///
+    /// The third case is the one that a review found. An earlier version read
+    /// the words "waits for the job" out of the queue reason, and the PURE
+    /// CAPACITY text "waits for the job <id> at the front of the queue" holds
+    /// those same words. A job with no `needs` at all was then told to give a
+    /// value that covers a pipeline that it does not have.
     #[test]
     fn the_remedy_fits_the_reason_for_the_wait() {
+        // A wait for capacity, in the plain form.
         let mut state = state_with(JobState::Queued, Some(60), 61);
         let id = state.queue[0];
-        expire(&mut state, id, 61, "waits for cores: 4 of 4 are in use");
+        expire(
+            &mut state,
+            id,
+            61,
+            "waits for cores: 4 of 4 are in use",
+            false,
+        );
         let text = state.jobs[&id].status.error.clone().unwrap();
         assert!(
             text.contains("smaller claim"),
             "a job that waited for capacity needs the claim remedy: {text}"
         );
 
+        // A wait for capacity BEHIND A LARGE JOB. This text names a job, and
+        // the remedy must still be the one for capacity.
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        let id = state.queue[0];
+        expire(
+            &mut state,
+            id,
+            61,
+            "waits for the job 1a2b3c4d at the front of the queue",
+            false,
+        );
+        let text = state.jobs[&id].status.error.clone().unwrap();
+        assert!(
+            text.contains("smaller claim"),
+            "a job behind a large job waited for CAPACITY: {text}"
+        );
+        assert!(
+            !text.contains("whole pipeline"),
+            "this job has no pipeline to cover: {text}"
+        );
+
+        // A wait for a job that this job needs.
         let mut state = state_with(JobState::Queued, Some(60), 61);
         let id = state.queue[0];
         expire(
@@ -1038,6 +1223,7 @@ mod tests {
             id,
             61,
             "waits for the job 1a2b3c4d (build), which is running",
+            true,
         );
         let text = state.jobs[&id].status.error.clone().unwrap();
         assert!(
@@ -1060,6 +1246,47 @@ mod tests {
         assert!(
             overdue(&state, None).is_empty(),
             "a job with no limit must wait"
+        );
+    }
+
+    /// THE LIMIT IS REACHED AT THE LIMIT, AND NOT ONE SECOND AFTER IT.
+    ///
+    /// The test is `waited >= limit`. With `>`, every job would give up a full
+    /// second later than each document states, and no other test would see it,
+    /// because each of them uses a wait that is well past the limit.
+    #[test]
+    fn a_job_expires_in_the_second_that_it_reaches_its_limit() {
+        let state = state_with(JobState::Queued, Some(60), 59);
+        assert!(
+            overdue(&state, None).is_empty(),
+            "a job one second below its limit must wait"
+        );
+
+        let state = state_with(JobState::Queued, Some(60), 60);
+        assert_eq!(
+            overdue(&state, None).len(),
+            1,
+            "a job that reached its limit exactly must give up"
+        );
+    }
+
+    /// A JOB THAT ALREADY RAN MUST NEVER GET THE STATE `expired`.
+    ///
+    /// This guard is defensive. A job between two attempts of `--retries` is
+    /// `queued` and holds the `started_at` of the attempt that failed, and a
+    /// coordinator that starts again puts every `queued` record back in the
+    /// queue. The state alone cannot separate that job from one that never ran.
+    #[test]
+    fn a_job_that_holds_a_start_time_never_expires() {
+        let mut state = state_with(JobState::Queued, Some(1), 3600);
+        let id = state.queue[0];
+        state.jobs.get_mut(&id).unwrap().status.started_at = Some(sys::now_secs() - 3000);
+
+        expire(&mut state, id, 3600, "waits for cores", false);
+        assert_eq!(
+            state.jobs[&id].status.state,
+            JobState::Queued,
+            "a job that already ran must keep its state"
         );
     }
 
@@ -1096,7 +1323,7 @@ mod tests {
             );
 
             // The second guard, for the moment between the two locks.
-            expire(&mut state, id, 3600, "waits for cores");
+            expire(&mut state, id, 3600, "waits for cores", false);
             assert_eq!(
                 state.jobs[&id].status.state, started,
                 "a job in the state {started} must keep it"
