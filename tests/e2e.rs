@@ -2891,6 +2891,29 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
         dropped["stdout_lines"]
     );
 
+    // THE BYTES MUST BALANCE IN THE SAME WAY, and for a stronger reason: this
+    // is the number that `qex status` prints to a person, as "qex removed
+    // 3.2MB". An assertion of `> 0` beside a line count that balances exactly
+    // left `stdout_bytes` with no exact test anywhere: a change that multiplied
+    // that count in place of adding it passed every unit test and every
+    // end-to-end test.
+    //
+    // The bytes of the notes of qex are not output of the job, so they come
+    // off. Each note is one line and it ends with one line end.
+    let note_bytes: u64 = text
+        .lines()
+        .filter(|l| l.starts_with("[qex]"))
+        .map(|l| l.len() as u64 + 1)
+        .sum();
+    let kept_bytes = text.len() as u64 - note_bytes;
+    assert_eq!(
+        kept_bytes + dropped["stdout_bytes"].as_u64().unwrap(),
+        3_388_895,
+        "the file holds {kept_bytes} byte(s) of the job and the record says that {} went. \
+         Together they must be the 3388895 bytes that `seq 1 500000` writes.",
+        dropped["stdout_bytes"]
+    );
+
     // The head must hold whole lines only. It stops at a byte, so qex moves the
     // cut back to the last line end. Measured before that change: the head
     // ended `3498` and then `3`, where the job wrote `3499`, and a reader has
@@ -2904,6 +2927,25 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
             .unwrap_or_else(|_| panic!("the head holds `{line}`, which is not a whole line"));
         assert!((1..=500_000).contains(&n), "`{line}` is not in the output");
     }
+
+    // THE CUT BACK MUST COST ONE LINE, AND NOT A QUARTER OF THE HEAD. qex looks
+    // back from the cut for the LAST line end, inside a window. A search that
+    // takes the FIRST line end of that window gives a head that is still a true
+    // prefix and still ends at a line end, so every assertion above holds, and
+    // the reader silently loses 4090 of the 16383 bytes.
+    //
+    // The cost is therefore the length of ONE line, and the lines here are the
+    // numbers 1 to 500000, so no line is longer than seven bytes. A window is
+    // 4096 bytes, so this test separates the two rules by a wide margin.
+    let head_budget: u64 = 64 * 1024 / 4;
+    let cut_cost = head_budget - head.len() as u64;
+    assert!(
+        cut_cost < 64,
+        "the cut back to a line end removed {cut_cost} bytes of the head budget of \
+         {head_budget}. No line of this output is longer than seven bytes, so the cut back \
+         must move to the LAST line end before the cut, and not to the first one of the \
+         window."
+    );
 
     // The commands must not present a part of the output as the whole output.
     let logs = h.qex(&["logs", &id, "--stdout", "--tail", "5"]);

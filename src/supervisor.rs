@@ -569,57 +569,18 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     //    cut the log file of a job that did nothing wrong, on a machine where
     //    the disk is slow or the limit is some gigabytes.
     //
-    // THE 30 SECOND LIMIT HAS NO AUTOMATED TEST, and this comment records the
-    // reason so that a later reader does not think that nobody tried.
-    //
-    // A test needs a process that holds the pipe after the job stops. The code
-    // above this point stops each such process on purpose: `killpg` reaches the
-    // process group of the job, and `kill_cgroup` reaches a process that left
-    // that group. A holder must therefore escape both, and `setsid` is the only
-    // way that qex leaves open.
-    //
-    // A test built on `setsid` was measured. It passed on the machine of the
-    // author (the record arrived after 30 seconds, with `incomplete` true and
-    // the `error` set) and it failed on the ubuntu-24.04 runner, where the same
-    // job stopped in 0 seconds with `logs_dropped` null. The holder does not
-    // survive there. A test that measures the behaviour on one machine and
-    // measures nothing on another is worse than no test, because it reports a
-    // pass either way.
-    //
-    // The behaviour itself is measured by hand and it is in `docs/reference.md`
-    // and in `qex help output`.
+    // The decision itself is in `drain_copies`, so that a test can drive it.
     let mut drops = crate::job::LogsDropped {
         limit: log_limit.unwrap_or(0),
         ..earlier_drops
     };
-    let mut open = copies;
-    let mut waiting_for_eof = copies;
-    let mut incomplete = false;
-    let eof_limit = std::time::Instant::now() + Duration::from_secs(30);
-    while open > 0 {
-        let wait = if waiting_for_eof > 0 {
-            eof_limit.saturating_duration_since(std::time::Instant::now())
-        } else {
-            Duration::from_secs(600)
-        };
-        match rx.recv_timeout(wait) {
-            Ok((_, crate::logcap::Report::Eof)) => waiting_for_eof -= 1,
-            Ok((is_err, crate::logcap::Report::Done(d))) => {
-                open -= 1;
-                if is_err {
-                    drops.stderr_bytes += d.bytes;
-                    drops.stderr_lines += d.lines;
-                } else {
-                    drops.stdout_bytes += d.bytes;
-                    drops.stdout_lines += d.lines;
-                }
-            }
-            Err(_) => {
-                incomplete = true;
-                break;
-            }
-        }
-    }
+    let incomplete = drain_copies(
+        &rx,
+        copies,
+        &mut drops,
+        std::time::Instant::now() + EOF_LIMIT,
+        COPY_LIMIT,
+    );
 
     if incomplete {
         // Something still holds a pipe of this job, or the copy did not
@@ -724,6 +685,81 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     crate::usage::record(&spec, &status);
 
     Ok(code.unwrap_or(0))
+}
+
+/// How long the supervisor waits for the output of the job to close.
+///
+/// A pipe closes when the last process that holds it stops. A job that leaves a
+/// process behind (`setsid`, `nohup ... &`, a daemon that a test starts) thus
+/// keeps its output open after the job itself ends. The record of a job that
+/// stopped must not wait for such a process, so the wait has a limit.
+const EOF_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long the supervisor waits for the copy of the last part to complete.
+///
+/// This work is local and it follows the end of the output. Its time grows with
+/// `[logs] max_bytes`, so this limit is long: a short one would cut the log file
+/// of a job that did nothing wrong, on a machine where the disk is slow or the
+/// limit is some gigabytes.
+const COPY_LIMIT: Duration = Duration::from_secs(600);
+
+/// Waits for each copy of a stream to report, and says if one did not.
+///
+/// The result is `true` when the supervisor gave up waiting. The counts that DID
+/// arrive stay in `drops`, because a count that arrived is true even when
+/// another one is missing.
+///
+/// # Why the two limits are different
+///
+/// The END OF THE OUTPUT has a short limit ([`EOF_LIMIT`]), because a process
+/// that left the process group can hold the pipe open for ever. The COPY OF THE
+/// LAST PART that follows has a long limit ([`COPY_LIMIT`]), because that work
+/// is local. A copy that already reached the end of the output is thus never cut
+/// short, and a job that never closes its output never blocks the record.
+///
+/// # Why this is a function
+///
+/// A test of the limit through a real job needs a process that holds the pipe
+/// after the job stops, and the supervisor stops each such process on purpose:
+/// `killpg` reaches the process group of the job, and `kill_cgroup` reaches a
+/// process that left that group. A test built on `setsid` passed on one machine
+/// and failed on the ubuntu-24.04 runner, where the holder does not survive, and
+/// a test that measures nothing on a machine reports a pass there.
+///
+/// Whether such a process survives is a property of the operating system. The
+/// DECISION is the property of qex, it is this loop, and a test drives it with a
+/// channel that it makes itself.
+fn drain_copies(
+    rx: &std::sync::mpsc::Receiver<(bool, crate::logcap::Report)>,
+    copies: usize,
+    drops: &mut crate::job::LogsDropped,
+    eof_limit: std::time::Instant,
+    copy_limit: Duration,
+) -> bool {
+    let mut open = copies;
+    let mut waiting_for_eof = copies;
+    while open > 0 {
+        let wait = if waiting_for_eof > 0 {
+            eof_limit.saturating_duration_since(std::time::Instant::now())
+        } else {
+            copy_limit
+        };
+        match rx.recv_timeout(wait) {
+            Ok((_, crate::logcap::Report::Eof)) => waiting_for_eof -= 1,
+            Ok((is_err, crate::logcap::Report::Done(d))) => {
+                open -= 1;
+                if is_err {
+                    drops.stderr_bytes += d.bytes;
+                    drops.stderr_lines += d.lines;
+                } else {
+                    drops.stdout_bytes += d.bytes;
+                    drops.stdout_lines += d.lines;
+                }
+            }
+            Err(_) => return true,
+        }
+    }
+    false
 }
 
 /// Makes a file that the other users of the machine cannot read.
@@ -940,6 +976,149 @@ mod tests {
         assert!(supervisor_log_tail(&dir).unwrap().contains("bad"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A copy that reports both events gives a complete record and no flag.
+    #[test]
+    fn a_copy_that_completes_gives_a_complete_record() {
+        use crate::logcap::{Dropped, Report};
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((false, Report::Eof)).unwrap();
+        tx.send((
+            false,
+            Report::Done(Dropped {
+                bytes: 4096,
+                lines: 20,
+            }),
+        ))
+        .unwrap();
+        tx.send((true, Report::Eof)).unwrap();
+        tx.send((
+            true,
+            Report::Done(Dropped {
+                bytes: 16,
+                lines: 1,
+            }),
+        ))
+        .unwrap();
+
+        let mut drops = crate::job::LogsDropped::default();
+        let incomplete = drain_copies(
+            &rx,
+            2,
+            &mut drops,
+            std::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(600),
+        );
+
+        assert!(!incomplete, "each copy reported, so the record is complete");
+        assert_eq!(drops.stdout_bytes, 4096);
+        assert_eq!(drops.stdout_lines, 20);
+        assert_eq!(drops.stderr_bytes, 16);
+        assert_eq!(drops.stderr_lines, 1);
+    }
+
+    /// AN OUTPUT THAT NEVER CLOSES MUST NOT HOLD THE RECORD OF THE JOB.
+    ///
+    /// A pipe closes when the last process that holds it stops, so a job that
+    /// leaves a process behind keeps its output open for as long as that process
+    /// lives. Without the limit the supervisor waits with it: `qex wait` blocks,
+    /// and every rule that asks "did this job stop?" receives no answer.
+    ///
+    /// The counts that DID arrive must stay. A count that arrived is true even
+    /// when another one is missing, and `qex status` shows it.
+    #[test]
+    fn an_output_that_never_closes_stops_the_wait_and_keeps_what_arrived() {
+        use crate::logcap::{Dropped, Report};
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // One stream completed. The other never reports at all, in the same way
+        // as a stream that a process of the job still holds.
+        tx.send((false, Report::Eof)).unwrap();
+        tx.send((
+            false,
+            Report::Done(Dropped {
+                bytes: 1024,
+                lines: 8,
+            }),
+        ))
+        .unwrap();
+        // The sender stays alive, so the channel does not close and the wait
+        // ends because of the limit and not because of a broken channel.
+
+        // The limit for the COPY is 10 seconds here, and not the 600 seconds of
+        // the supervisor. A change that uses the copy limit for the end of the
+        // output must FAIL this test and not hold it: with 600 seconds such a
+        // change gives a test that waits ten minutes and reports nothing, which
+        // a reader takes for a machine that stopped.
+        let mut drops = crate::job::LogsDropped::default();
+        let start = std::time::Instant::now();
+        let incomplete = drain_copies(
+            &rx,
+            2,
+            &mut drops,
+            start + Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let took = start.elapsed();
+
+        assert!(
+            incomplete,
+            "the record must say that a log file is not complete"
+        );
+        assert!(
+            took < Duration::from_secs(5),
+            "the wait took {took:?}; the limit did not operate"
+        );
+        assert_eq!(drops.stdout_bytes, 1024, "a count that arrived must stay");
+        assert_eq!(drops.stdout_lines, 8, "a count that arrived must stay");
+        drop(tx);
+    }
+
+    /// A copy that reached the end of the output must never be cut short.
+    ///
+    /// The limit on the END of the output is short, because a process can hold
+    /// the pipe for ever. The copy of the last part that follows is local work,
+    /// and its time grows with `[logs] max_bytes`. A limit that used one time
+    /// for both would cut the log file of a job that did nothing wrong, on a
+    /// machine where the disk is slow or the limit is some gigabytes.
+    ///
+    /// The deadline for the end of the output is already past here, and the copy
+    /// reports after it. The record must still be complete.
+    #[test]
+    fn a_copy_that_reached_the_end_of_the_output_is_not_cut_short() {
+        use crate::logcap::{Dropped, Report};
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((false, Report::Eof)).unwrap();
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            tx.send((
+                false,
+                Report::Done(Dropped {
+                    bytes: 77,
+                    lines: 3,
+                }),
+            ))
+            .ok();
+        });
+
+        let mut drops = crate::job::LogsDropped::default();
+        let incomplete = drain_copies(
+            &rx,
+            1,
+            &mut drops,
+            // The end of the output already arrived, so this deadline is spent.
+            std::time::Instant::now(),
+            Duration::from_secs(600),
+        );
+
+        assert!(
+            !incomplete,
+            "the copy reached the end of the output, so the long limit applies to it"
+        );
+        assert_eq!(drops.stdout_bytes, 77);
+        assert_eq!(drops.stdout_lines, 3);
     }
 
     fn spec() -> JobSpec {

@@ -556,12 +556,22 @@ fn count_lines(data: &[u8]) -> u64 {
 /// The result is `None` when there is no line end near the cut. The caller then
 /// keeps the fragment and writes a note, because a cut back would otherwise
 /// remove the whole head of a stream with no line end — one JSON document, one
-/// base64 block, or a progress display that uses `\r`. This is the rule that
-/// [`CapWriter::finish`] uses at the other end of the same loss.
+/// base64 block, or a progress display that uses `\r`.
 ///
-/// The function reads a window and not the head, so the memory that it uses
-/// does not grow with `max_bytes`. The supervisor is in the cgroup of the job,
-/// so memory that it holds counts against the claim of the job.
+/// [`CapWriter::finish`] follows the SAME PRINCIPLE at the other end of the same
+/// loss: it removes the incomplete line only while that costs a small part of
+/// the space, and it says so when it keeps one. **The two limits are not the
+/// same number.** The last part uses a quarter of itself, and this function uses
+/// a quarter of the head OR 64KB, whichever is smaller. At the default limit of
+/// 32MB that is 6MB against 64KB.
+///
+/// The cap is here and not there because of the memory. This function reads its
+/// window into memory in one piece, and `finish` reads the last part in 64KB
+/// parts and holds no more than one of them. The supervisor is in the cgroup of
+/// the job, so memory that it holds counts against the claim of the job: a job
+/// that operates at its claim must not meet the out-of-memory killer because qex
+/// looked for a line end. A line longer than 64KB thus keeps its fragment, and
+/// the note says so.
 fn head_cut(file: &mut File, head: u64) -> std::io::Result<Option<u64>> {
     if head == 0 {
         return Ok(None);
