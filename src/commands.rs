@@ -128,17 +128,33 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     if let Some(group) = &args.group {
         // A group takes its id or its name. A name is easier to type, and the
         // names of a pipeline belong to one submission.
-        jobs.retain(|j| {
-            j.group
-                .map(|g| g.to_string().starts_with(group))
-                .unwrap_or(false)
-                // The name that the user gave, AND the name that qex shows.
-                // `qex list --json` gives the safe form, so a script that reads
-                // that value and gives it back here must find the jobs. See
-                // `job::safe_name`.
-                || j.group_name.as_deref() == Some(group.as_str())
-                || j.group_name.as_deref().map(safe_name).as_deref() == Some(group.as_str())
-        });
+        jobs.retain(|j| names_group(j, group));
+
+        // Say when the word gives more than one run.
+        //
+        // A pipeline takes its name from its file, so a second run of that
+        // file has the same name. This command reads and deletes nothing, so
+        // it shows every run; but a reader who does not know that the table
+        // holds two runs reads one pipeline that ran each stage two times.
+        //
+        // The commands that stop or delete work REFUSE such a word. This one
+        // is where a user looks after that refusal, so it must give the group
+        // id of each run.
+        let mut runs: Vec<uuid::Uuid> = jobs.iter().filter_map(|j| j.group).collect();
+        runs.sort();
+        runs.dedup();
+        if runs.len() > 1 && !args.json {
+            eprintln!(
+                "qex: `{group}` names {} pipelines, and this table holds all of them. \
+                 A pipeline takes its name from its file, so a second run of that file \
+                 has the same name. Use a group id for one run: {}",
+                runs.len(),
+                runs.iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     // Show the jobs in the order of submission. A pipeline then reads from the
     // first stage to the last stage.
@@ -195,13 +211,16 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     // Use one exit code for every "no such job" result. Without this test, a
     // name that is not a UUID gives the code 1 and a UUID gives the code 127,
     // for the same fault. A script cannot use two codes for one condition.
-    let id = match resolve_id(&mut client, &args.id) {
-        Ok(id) => id,
+    // A pipeline gives every one of its stages, in the order of submission.
+    let found = match resolve_targets(&mut client, &args.id) {
+        Ok(found) => found,
         Err(e) => {
             eprintln!("qex: {e}");
             return Ok(EXIT_NO_SUCH_JOB);
         }
     };
+    let is_pipeline = found.group.is_some();
+    let ids = found.ids;
 
     // Wait for the job first, if the user asked for that.
     //
@@ -216,95 +235,128 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                 .map(|d| Instant::now() + d),
             None => None,
         };
-        match wait_one(&args.id, deadline)? {
-            WaitOutcome::Finished(s) => wait_code = exit_code_for(&s, ExitMode::State),
-            WaitOutcome::TimedOut => {
-                eprintln!(
-                    "qex: the wait for {} reached its time limit. The job continues.",
-                    args.id
-                );
-                wait_code = EXIT_TIMEOUT;
-            }
-            WaitOutcome::NoSuchJob => {
-                eprintln!("qex: there is no job with the id {}", args.id);
-                return Ok(EXIT_NO_SUCH_JOB);
+        // The deadline is one moment, and not a limit for each job, so a
+        // pipeline of ten stages does not get ten times the time of the user.
+        for id in &ids {
+            match wait_one(&id.to_string(), deadline)? {
+                WaitOutcome::Finished(s) => {
+                    // Report the FIRST fault. A later stage that qex skipped
+                    // would otherwise hide the stage that failed.
+                    let code = exit_code_for(&s, ExitMode::State);
+                    if code != 0 && wait_code == 0 {
+                        wait_code = code;
+                    }
+                }
+                WaitOutcome::TimedOut => {
+                    eprintln!("qex: the wait for {id} reached its time limit. The job continues.");
+                    wait_code = EXIT_TIMEOUT;
+                    break;
+                }
+                WaitOutcome::NoSuchJob => {
+                    eprintln!("qex: there is no job with the id {id}");
+                    return Ok(EXIT_NO_SUCH_JOB);
+                }
             }
         }
     }
 
-    match client.call(&Request::Status { id })? {
-        Response::Status { status } => {
-            // From here the record is for a READER. See `for_display`.
-            let status = Box::new(for_display(*status));
-            // Read the output of the job in the same call.
-            //
-            // A reader of a job that failed always wants the last lines of its
-            // standard error. Without this, every failure costs two commands
-            // and two answers, and the reader is frequently an agent with a
-            // limited context.
-            let excerpt = job_excerpt(&status, &args)?;
+    let mut values: Vec<serde_json::Value> = Vec::new();
+    for (n, id) in ids.iter().enumerate() {
+        let id = *id;
+        let status = match client.call(&Request::Status { id })? {
+            Response::Status { status } => status,
+            other => return report(other),
+        };
+        // From here the record is for a READER. See `for_display`.
+        let status = Box::new(for_display(*status));
 
-            if args.json {
-                let mut value = serde_json::to_value(&*status)?;
-                if args.show_env {
-                    // The environment can hold secrets, so qex adds it only
-                    // when the user asks for it.
-                    if let Ok(spec) = crate::job::read_spec(&paths::job_dir(&id)?) {
-                        value["env"] = serde_json::to_value(&spec.env)?;
-                    }
+        // Read the output of the job in the same call.
+        //
+        // A reader of a job that failed always wants the last lines of its
+        // standard error. Without this, every failure costs two commands and
+        // two answers, and the reader is frequently an agent with a limited
+        // context.
+        let excerpt = job_excerpt(&status, &args)?;
+
+        if args.json {
+            let mut value = serde_json::to_value(&*status)?;
+            if args.show_env {
+                // The environment can hold secrets, so qex adds it only when
+                // the user asks for it.
+                if let Ok(spec) = crate::job::read_spec(&paths::job_dir(&id)?) {
+                    value["env"] = serde_json::to_value(&spec.env)?;
                 }
-                if !excerpt.is_empty() {
-                    // One field for each stream. A reader that wants the result
-                    // of a test program needs the standard output, and a reader
-                    // that wants the cause needs the standard error.
-                    let mut logs = serde_json::Map::new();
-                    for (name, selected) in &excerpt {
-                        let mut one = serde_json::Map::new();
-                        one.insert(
-                            "text".into(),
-                            serde_json::Value::from(selected.text.clone()),
-                        );
-                        if let Some(found) = selected.matches {
-                            one.insert("matches".into(), serde_json::Value::from(found));
-                        }
-                        if selected.truncated {
-                            one.insert(
-                                "hidden_lines".into(),
-                                serde_json::Value::from(selected.hidden),
-                            );
-                        }
-                        // The lines that the LIMIT removed are different from
-                        // the lines that this selection did not show. The file
-                        // itself does not hold them, and no option gives them.
-                        if let Some((bytes, lines)) =
-                            status.logs_dropped.and_then(|d| d.of(name.as_str()))
-                        {
-                            one.insert("dropped_bytes".into(), serde_json::Value::from(bytes));
-                            one.insert("dropped_lines".into(), serde_json::Value::from(lines));
-                        }
-                        logs.insert(name.clone(), serde_json::Value::Object(one));
-                    }
-                    value["logs"] = serde_json::Value::Object(logs);
-                }
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                print_status(&status, args.show_env)?;
+            }
+            if !excerpt.is_empty() {
+                // One field for each stream. A reader that wants the result of
+                // a test program needs the standard output, and a reader that
+                // wants the cause needs the standard error.
+                let mut logs = serde_json::Map::new();
                 for (name, selected) in &excerpt {
-                    println!();
-                    println!("--- {name} ---");
-                    if let Some(notice) = dropped_notice(&status, name) {
-                        println!("{notice}");
+                    let mut one = serde_json::Map::new();
+                    one.insert(
+                        "text".into(),
+                        serde_json::Value::from(selected.text.clone()),
+                    );
+                    if let Some(found) = selected.matches {
+                        one.insert("matches".into(), serde_json::Value::from(found));
                     }
-                    if let Some(notice) = selected.notice() {
-                        println!("{notice}");
+                    if selected.truncated {
+                        one.insert(
+                            "hidden_lines".into(),
+                            serde_json::Value::from(selected.hidden),
+                        );
                     }
-                    print!("{}", selected.text);
+                    // The lines that the LIMIT removed are different from the
+                    // lines that this selection did not show. The file itself
+                    // does not hold them, and no option gives them.
+                    if let Some((bytes, lines)) =
+                        status.logs_dropped.and_then(|d| d.of(name.as_str()))
+                    {
+                        one.insert("dropped_bytes".into(), serde_json::Value::from(bytes));
+                        one.insert("dropped_lines".into(), serde_json::Value::from(lines));
+                    }
+                    logs.insert(name.clone(), serde_json::Value::Object(one));
                 }
+                value["logs"] = serde_json::Value::Object(logs);
             }
-            Ok(wait_code)
+            values.push(value);
+        } else {
+            if n > 0 {
+                println!();
+            }
+            print_status(&status, args.show_env)?;
+            for (name, selected) in &excerpt {
+                println!();
+                println!("--- {name} ---");
+                if let Some(notice) = dropped_notice(&status, name) {
+                    println!("{notice}");
+                }
+                if let Some(notice) = selected.notice() {
+                    println!("{notice}");
+                }
+                print!("{}", selected.text);
+            }
         }
-        other => report(other),
     }
+
+    if args.json {
+        // One job gives an object, as before. A pipeline gives an array. A
+        // script that reads one job must not become a script that reads an
+        // array because qex learned about pipelines.
+        //
+        // The shape comes from what the user NAMED, and not from the number of
+        // jobs. A pipeline of one stage must still give an array, or a script
+        // that reads `.[0]` of a group breaks on the day a pipeline has one
+        // stage, or on the day `qex clean` removes all the stages but one.
+        if is_pipeline {
+            println!("{}", serde_json::to_string_pretty(&values)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&values[0])?);
+        }
+    }
+
+    Ok(wait_code)
 }
 
 /// Chooses the parts of the output of a job to show with its status.
@@ -577,17 +629,37 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         None => None,
     };
 
+    // A pipeline gives every one of its stages. `qex wait $GROUP` thus waits
+    // for the whole pipeline, and the group id that `qex pipeline` writes is a
+    // handle that works.
+    //
+    // A value that the resolver refuses gives its own message here, with the
+    // code for "no such job". An earlier version kept the value and let the
+    // wait fail later, and the user then read "there is no job with the id x"
+    // for a value that named a job AND a pipeline.
+    let ids = match expand_ids(&args.ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            // Keep the silence of `--json`, in the same way as the two answers
+            // below. A reader that asked for JSON reads the exit code.
+            if !args.json {
+                eprintln!("qex: {e}");
+            }
+            return Ok(EXIT_NO_SUCH_JOB);
+        }
+    };
+
     // With `--any`, give control back when the FIRST job stops. An agent that
     // started several jobs can then read a result as soon as it arrives, in
     // place of the order of submission.
     if args.any {
-        return wait_for_any(&args, deadline);
+        return wait_for_any(&args, &ids, deadline);
     }
 
     let mut results: Vec<JobStatus> = Vec::new();
     let mut worst = 0i32;
 
-    for raw_id in &args.ids {
+    for raw_id in &ids {
         let status = match wait_one(raw_id, deadline)? {
             WaitOutcome::Finished(s) => s,
             WaitOutcome::TimedOut => {
@@ -632,11 +704,11 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
 /// This function tests each job in turn with a short limit, so no job holds the
 /// wait while a different job is ready. It is the one place where qex polls,
 /// and it polls its own records, which always answer.
-fn wait_for_any(args: &cli::WaitArgs, deadline: Option<Instant>) -> Result<i32> {
+fn wait_for_any(args: &cli::WaitArgs, ids: &[String], deadline: Option<Instant>) -> Result<i32> {
     let mut delay = Duration::from_millis(50);
 
     loop {
-        for raw in &args.ids {
+        for raw in ids {
             let status = match Client::connect_existing() {
                 Some(mut client) => match resolve_id(&mut client, raw) {
                     Ok(id) => match client.call(&Request::Status { id })? {
@@ -809,6 +881,9 @@ fn warn_if_version_differs(client: &mut Client) {
 ///
 /// Each name must give a job that exists now. A name that gives no job is an
 /// error at the submission.
+///
+/// A name that gives a pipeline gives every stage of it, so `--needs $GROUP`
+/// waits for the whole pipeline.
 fn resolve_dependencies(
     client: &mut Client,
     names: &[String],
@@ -816,55 +891,126 @@ fn resolve_dependencies(
 ) -> Result<Vec<uuid::Uuid>> {
     let mut ids = Vec::new();
     for name in names {
-        let id = resolve_id(client, name).map_err(|e| {
+        let found = resolve_targets(client, name).map_err(|e| {
             anyhow::anyhow!(
                 "{option}: {e}\n\n\
                  A job can wait for the jobs that you started before it. Start the \
                  first job, keep its id, then give that id here."
             )
         })?;
-
-        // A dependency given by NAME must still be in the queue or operate.
-        //
-        // A name is the value that can be wrong in silence. An agent runs a
-        // script a second time and writes `--needs test`, but it forgot to
-        // start a new test job. The name gives the test job of the FIRST run,
-        // which already stopped. The new stage then waits for nothing, and the
-        // pipeline reports success although the order was wrong.
-        //
-        // An id does not have that risk. An id names one job for ever, and the
-        // agent read it from the `qex submit` of this run. An id thus needs the
-        // existence test only, which `resolve_id` already made.
-        //
-        // This difference also keeps a pipeline script correct. A script that
-        // keeps each id can submit its last stage even when the first stage
-        // already failed, and that stage then becomes `skipped` with the
-        // correct cause.
-        let by_name = name.parse::<uuid::Uuid>().is_err();
-        if by_name {
-            if let Response::Status { status } = client.call(&Request::Status { id })? {
-                if status.state.is_terminal() {
-                    bail!(
-                        "{option}: the name `{name}` gives the job {}, which already stopped. \
-                         Its state is `{}`.\n\n\
-                         A name can give a job of an earlier run. Did you forget to start a \
-                         new `{name}` job?\n\n\
-                         Use the id that `qex submit` wrote for this run:\n\
-                         \x20   ID=$(qex submit --name {name} -- ...)\n\
-                         \x20   qex submit {option} $ID -- ...\n\n\
-                         An id always names one job, so qex accepts an id whatever its state.",
-                        &id.to_string()[..8],
-                        status.state
-                    );
-                }
+        if found.group.is_some() {
+            // A pipeline is one unit of work, so the test for an earlier run
+            // applies to the pipeline and not to each stage.
+            //
+            // The stages of a pipeline stop in order, so a pipeline that
+            // operates almost always holds stages that already stopped. A test
+            // of each stage would refuse `--needs $PIPELINE` for the ordinary
+            // case, and the documentation says that it waits for the whole
+            // pipeline.
+            pipeline_dependency(client, name, &found.ids, option, &mut ids)?;
+        } else {
+            for id in found.ids {
+                resolve_one_dependency(client, name, id, option, &mut ids)?;
             }
-        }
-
-        if !ids.contains(&id) {
-            ids.push(id);
         }
     }
     Ok(ids)
+}
+
+/// Tests a dependency that names a whole pipeline, and adds every stage.
+///
+/// A pipeline that a NAME gives must still hold work. A name gives the newest
+/// pipeline of that file, and a pipeline whose every stage stopped is a run of
+/// an earlier day: the new job would then wait for nothing, and it would report
+/// success although the order was wrong.
+fn pipeline_dependency(
+    client: &mut Client,
+    name: &str,
+    stages: &[uuid::Uuid],
+    option: &str,
+    ids: &mut Vec<uuid::Uuid>,
+) -> Result<()> {
+    let by_name = name.parse::<uuid::Uuid>().is_err();
+    if by_name {
+        let mut all_stopped = true;
+        for id in stages {
+            if let Response::Status { status } = client.call(&Request::Status { id: *id })? {
+                if !status.state.is_terminal() {
+                    all_stopped = false;
+                    break;
+                }
+            }
+        }
+        if all_stopped {
+            bail!(
+                "{option}: the name `{name}` gives a pipeline of {} stage(s), and every \
+                 stage already stopped.\n\n\
+                 A name can give a pipeline of an earlier run. Did you forget to start a \
+                 new `{name}` pipeline?\n\n\
+                 Use the group id that `qex pipeline` wrote for this run:\n\
+                 \x20   GROUP=$(qex pipeline your-file)\n\
+                 \x20   qex submit {option} $GROUP -- ...\n\n\
+                 A group id always names one run, so qex accepts it whatever its state.",
+                stages.len()
+            );
+        }
+    }
+
+    for id in stages {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    Ok(())
+}
+
+/// Tests one dependency, and adds it to the list.
+fn resolve_one_dependency(
+    client: &mut Client,
+    name: &str,
+    id: uuid::Uuid,
+    option: &str,
+    ids: &mut Vec<uuid::Uuid>,
+) -> Result<()> {
+    // A dependency given by NAME must still be in the queue or operate.
+    //
+    // A name is the value that can be wrong in silence. An agent runs a script
+    // a second time and writes `--needs test`, but it forgot to start a new
+    // test job. The name gives the test job of the FIRST run, which already
+    // stopped. The new stage then waits for nothing, and the pipeline reports
+    // success although the order was wrong.
+    //
+    // An id does not have that risk. An id names one job for ever, and the
+    // agent read it from the `qex submit` of this run. An id thus needs the
+    // existence test only, which the resolver already made.
+    //
+    // This difference also keeps a pipeline script correct. A script that keeps
+    // each id can submit its last stage even when the first stage already
+    // failed, and that stage then becomes `skipped` with the correct cause.
+    let by_name = name.parse::<uuid::Uuid>().is_err();
+    if by_name {
+        if let Response::Status { status } = client.call(&Request::Status { id })? {
+            if status.state.is_terminal() {
+                bail!(
+                    "{option}: the name `{name}` gives the job {}, which already stopped. \
+                     Its state is `{}`.\n\n\
+                     A name can give a job of an earlier run. Did you forget to start a \
+                     new `{name}` job?\n\n\
+                     Use the id that `qex submit` wrote for this run:\n\
+                     \x20   ID=$(qex submit --name {name} -- ...)\n\
+                     \x20   qex submit {option} $ID -- ...\n\n\
+                     An id always names one job, so qex accepts an id whatever its state.",
+                    &id.to_string()[..8],
+                    status.state
+                );
+            }
+        }
+    }
+
+    if !ids.contains(&id) {
+        ids.push(id);
+    }
+    Ok(())
 }
 
 /// Tests if a socket fault is the time limit of the read.
@@ -1250,41 +1396,127 @@ pub fn kill(args: cli::KillArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     let mut worst = 0;
     for raw in &args.ids {
-        let id = match resolve_id(&mut client, raw) {
-            Ok(id) => id,
+        let (found, states) = match resolve_with_states(&mut client, raw) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("qex: {e}");
                 worst = EXIT_NO_SUCH_JOB;
                 continue;
             }
         };
-        match client.call(&Request::Kill {
-            id,
-            signal,
-            grace_secs: grace,
-        })? {
-            Response::Ok => println!("{id} received the signal"),
-            other => worst = report(other)?,
+        let whole_pipeline = found.group.is_some();
+        for id in found.ids {
+            // A stage that already stopped needs nothing.
+            //
+            // The stages of a pipeline stop in order, so at the moment a user
+            // stops a pipeline the early stages have usually finished. An
+            // early version gave the code 1 for that ordinary case, and the
+            // documentation says that the command stops every stage.
+            if whole_pipeline && stopped(&states, id) {
+                println!("{id} already stopped");
+                continue;
+            }
+
+            // `qex kill $GROUP` says "stop every stage", so a stage that waits
+            // in the queue leaves the queue.
+            //
+            // A user who names ONE job that waits gets the fault and the
+            // instruction to use `qex cancel`, because that user asked about
+            // that one job. A user who named the pipeline asked for the whole
+            // of it to stop, and a stage that qex left in the queue would
+            // START after the command said that it stopped everything.
+            let waiting = matches!(states.get(&id), Some(JobState::Queued));
+            let answer = if whole_pipeline && waiting {
+                match client.call(&Request::Cancel { id })? {
+                    Response::Ok => {
+                        println!("{id} left the queue");
+                        continue;
+                    }
+                    other => other,
+                }
+            } else {
+                match client.call(&Request::Kill {
+                    id,
+                    signal,
+                    grace_secs: grace,
+                })? {
+                    Response::Ok => {
+                        println!("{id} received the signal");
+                        continue;
+                    }
+                    other => other,
+                }
+            };
+
+            // Every other answer is a fault, and it keeps its code. A refusal
+            // that this command reported as a success would tell a script that
+            // the work stopped while the work continued.
+            let code = report(answer)?;
+            if code != 0 && worst == 0 {
+                worst = code;
+            }
         }
     }
     Ok(worst)
+}
+
+/// Tells whether this job already stopped.
+///
+/// A job that the list does not hold counts as stopped. `qex clean` can remove
+/// a record between the list and the command, and a record that went away is
+/// not work that continues.
+fn stopped(states: &std::collections::HashMap<uuid::Uuid, JobState>, id: uuid::Uuid) -> bool {
+    states.get(&id).map(|s| s.is_terminal()).unwrap_or(true)
+}
+
+/// Reads the text of the user, and keeps the state of each job.
+///
+/// A command that stops work must know the state before it acts. Without it,
+/// `qex kill $GROUP` cannot tell a stage that already stopped from a stage that
+/// waits in the queue, and those two need opposite answers.
+fn resolve_with_states(
+    client: &mut Client,
+    raw: &str,
+) -> Result<(Targets, std::collections::HashMap<uuid::Uuid, JobState>)> {
+    let Response::Jobs { jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    let found = resolve_targets_in(&jobs, raw)?;
+    let states = jobs.iter().map(|j| (j.id, j.state)).collect();
+    Ok((found, states))
 }
 
 pub fn cancel(args: cli::CancelArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     let mut worst = 0;
     for raw in &args.ids {
-        let id = match resolve_id(&mut client, raw) {
-            Ok(id) => id,
+        let (found, states) = match resolve_with_states(&mut client, raw) {
+            Ok(pair) => pair,
             Err(e) => {
                 eprintln!("qex: {e}");
                 worst = EXIT_NO_SUCH_JOB;
                 continue;
             }
         };
-        match client.call(&Request::Cancel { id })? {
-            Response::Ok => println!("{id} left the queue"),
-            other => worst = report(other)?,
+        let whole_pipeline = found.group.is_some();
+        for id in found.ids {
+            // A stage that already stopped needs nothing. Every other refusal
+            // keeps its code: a stage that OPERATES cannot leave the queue,
+            // and a command that reported that as a success would tell a
+            // script that the work stopped while the work continues.
+            if whole_pipeline && stopped(&states, id) {
+                println!("{id} already stopped");
+                continue;
+            }
+            match client.call(&Request::Cancel { id })? {
+                Response::Ok => println!("{id} left the queue"),
+                other => {
+                    let code = report(other)?;
+                    if code != 0 && worst == 0 {
+                        worst = code;
+                    }
+                }
+            }
         }
     }
     Ok(worst)
@@ -1369,18 +1601,31 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         // Accept a state name in place of a job id, so `qex clean completed`
         // operates in the same way as `qex clean --state completed`.
         //
-        // A job can have the name of a state. Test the jobs first, and give an
-        // error when the word gives both a job and a state.
-        let is_job = jobs.iter().any(|j| {
-            j.id.to_string().starts_with(raw) || j.name == *raw || safe_name(&j.name) == *raw
-        });
-        match (is_job, StateFilter::parse(raw)) {
-            (true, Ok(_)) => bail!(
-                "`{raw}` is the name of a job and the name of a state. \
-                 Use the job id, or use `--state {raw}`."
-            ),
+        // A job or a pipeline can have the name of a state. Test them first,
+        // and give an error when the word gives both. A command that deletes
+        // must never choose one of two readings.
+        let names_work = jobs.iter().any(|j| names_job(j, raw));
+        let names_pipeline = jobs.iter().any(|j| names_group(j, raw));
+        match (names_work || names_pipeline, StateFilter::parse(raw)) {
+            (true, Ok(_)) => {
+                let what = if names_work { "a job" } else { "a pipeline" };
+                eprintln!(
+                    "qex: `{raw}` is the name of {what} and the name of a state. Give the \
+                     id of the {} that you want, or use `--state {raw}` for the state.",
+                    if names_work { "job" } else { "pipeline" }
+                );
+                return Ok(EXIT_NO_SUCH_JOB);
+            }
             (false, Ok(f)) => word_filters.push(f),
-            _ => targets.push(resolve_id(&mut client, raw)?),
+            _ => match resolve_targets_in(&jobs, raw) {
+                Ok(found) => targets.extend(found.ids),
+                Err(e) => {
+                    // Use the same code as every other command for the same
+                    // fault. `qex clean` gave 1 where `qex kill` gave 127.
+                    eprintln!("qex: {e}");
+                    return Ok(EXIT_NO_SUCH_JOB);
+                }
+            },
         }
     }
 
@@ -1600,14 +1845,118 @@ fn all_for_display(jobs: Vec<JobStatus>) -> Vec<JobStatus> {
     jobs.into_iter().map(for_display).collect()
 }
 
-/// Reads a job id from the text that the user wrote.
+/// Tells whether the text names this job.
 ///
-/// The user can write the full id, or the start of the id. A short id is easier
-/// to copy from the output of `qex list`.
-fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
-    let Response::Jobs { jobs } = client.call(&Request::List)? else {
-        bail!("the coordinator did not give the job list");
-    };
+/// The user can write the full id, or the start of the id, or the name. A short
+/// id is easier to copy from the output of `qex list`.
+///
+/// The name has two accepted forms: the name that the user gave, AND the safe
+/// name that qex shows. `qex list` and `qex status --json` give the safe form,
+/// so a script that reads a name from qex and gives it back must find the job.
+/// See `job::safe_name`.
+fn names_job(job: &JobStatus, raw: &str) -> bool {
+    job.id.to_string().starts_with(raw) || job.name == raw || safe_name(&job.name) == raw
+}
+
+/// Tells whether the text names the group of this job.
+///
+/// A group takes its id, the start of its id, or its name, in the same way as a
+/// job. `qex list --group` already accepts these three forms.
+fn names_group(job: &JobStatus, raw: &str) -> bool {
+    job.group
+        .map(|g| g.to_string().starts_with(raw))
+        .unwrap_or(false)
+        // The name that the user gave, AND the name that qex shows. `qex list
+        // --json` gives the safe form, so a script that reads that value and
+        // gives it back here must find the jobs. See `job::safe_name`.
+        || job.group_name.as_deref() == Some(raw)
+        || job.group_name.as_deref().map(safe_name).as_deref() == Some(raw)
+}
+
+/// Puts the jobs in the order of submission.
+///
+/// A pipeline then reads from the first stage to the last stage. Two stages can
+/// start in the same second, so the sequence separates them.
+fn in_submission_order(mut jobs: Vec<&JobStatus>) -> Vec<uuid::Uuid> {
+    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+    jobs.iter().map(|j| j.id).collect()
+}
+
+/// What the text of the user named.
+///
+/// The caller needs more than the ids. A command that stops a job treats a stage
+/// that already stopped as a fault when the user named that one job, and as
+/// normal when the user named the whole pipeline. `qex status --json` also
+/// chooses its shape from this, and not from the number of jobs: a pipeline of
+/// one stage must still give an array.
+#[derive(Debug)]
+struct Targets {
+    ids: Vec<uuid::Uuid>,
+    /// The pipeline, when the text named one.
+    group: Option<uuid::Uuid>,
+}
+
+impl Targets {
+    fn one(id: uuid::Uuid) -> Self {
+        Self {
+            ids: vec![id],
+            group: None,
+        }
+    }
+}
+
+/// Makes the result for a text that named a pipeline.
+///
+/// The jobs must belong to ONE pipeline. A pipeline takes its name from its
+/// file, so a second run of the same file carries the same name, and `qex
+/// pipeline ci.toml` twice gives two pipelines that the word `ci` both names.
+/// Without this test `qex kill ci` stopped the work of two runs, and the user
+/// named one. A short group id has the same fault, because two ids can start
+/// with the same characters.
+fn group_targets(by_group: &[&JobStatus], raw: &str) -> Result<Targets> {
+    let mut groups: Vec<uuid::Uuid> = by_group.iter().filter_map(|j| j.group).collect();
+    groups.sort();
+    groups.dedup();
+
+    if groups.len() > 1 {
+        let lines: Vec<String> = groups
+            .iter()
+            .map(|g| {
+                let count = by_group.iter().filter(|j| j.group == Some(*g)).count();
+                format!("  {g}  {count} stage(s)")
+            })
+            .collect();
+        bail!(
+            "`{raw}` names {} pipelines. A pipeline takes its name from its file, so a \
+             second run of that file has the same name. Give the group id of the run \
+             that you want:\n{}",
+            groups.len(),
+            lines.join("\n")
+        );
+    }
+
+    Ok(Targets {
+        ids: in_submission_order(by_group.to_vec()),
+        group: groups.first().copied(),
+    })
+}
+
+/// Reads one or more job ids from the text that the user wrote.
+///
+/// A value that names a job gives that job. A value that names a pipeline gives
+/// EVERY job of that pipeline, in the order of submission.
+///
+/// `qex pipeline` writes the group id to stdout, so that value is the handle
+/// that a user keeps. Before this function, every command except `qex list
+/// --group` refused it and gave "there is no job with the id ...", and the user
+/// had to find the last stage by hand.
+fn resolve_targets_in(jobs: &[JobStatus], raw: &str) -> Result<Targets> {
+    if raw.is_empty() {
+        bail!("give the id or the name of a job or a pipeline.");
+    }
+
+    let by_job: Vec<&JobStatus> = jobs.iter().filter(|j| names_job(j, raw)).collect();
+    let by_group: Vec<&JobStatus> = jobs.iter().filter(|j| names_group(j, raw)).collect();
 
     // Test each name in the same way, including a full id.
     //
@@ -1618,37 +1967,133 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
     // code 0, so a reader could not separate "this job wrote nothing" from
     // "this job does not exist".
     if let Ok(id) = raw.parse::<uuid::Uuid>() {
-        return if jobs.iter().any(|j| j.id == id) {
-            Ok(id)
-        } else {
-            // Say whether qex ever saw this id. An agent must be able to tell
-            // "the record was deleted, and the work happened" from "this job
-            // never existed, so submit it".
-            bail!("{}", crate::history::describe_missing(id))
-        };
+        if jobs.iter().any(|j| j.id == id) {
+            return Ok(Targets::one(id));
+        }
+        if !by_group.is_empty() {
+            return group_targets(&by_group, raw);
+        }
+        // Say whether qex ever saw this id. An agent must be able to tell "the
+        // record was deleted, and the work happened" from "this job never
+        // existed, so submit it".
+        bail!("{}", crate::history::describe_missing(id));
     }
 
-    // The stored name AND the safe name of it. A shell offers the safe name,
-    // so a user who pressed TAB gives that word to the command; a user who
-    // knows the real name still gives that one. See `safe_name`.
-    let matches: Vec<&JobStatus> = jobs
-        .iter()
-        .filter(|j| j.id.to_string().starts_with(raw) || j.name == raw || safe_name(&j.name) == raw)
-        .collect();
+    // The two sets can hold the same one job, because a short id can be the
+    // start of the id of the job AND of the id of its group. That is not an
+    // ambiguity: both readings give the same job.
+    let same = !by_job.is_empty()
+        && by_job.len() == by_group.len()
+        && by_job.iter().all(|j| by_group.iter().any(|g| g.id == j.id));
 
-    match matches.len() {
-        1 => Ok(matches[0].id),
-        0 => bail!("there is no job with the id or the name `{raw}`"),
+    if !by_job.is_empty() && !by_group.is_empty() && !same {
+        let mut groups: Vec<uuid::Uuid> = by_group.iter().filter_map(|j| j.group).collect();
+        groups.sort();
+        groups.dedup();
+        bail!(
+            "`{raw}` is the name of a job and the name of a pipeline. Give the \
+             full id of the one that you want.\n  job:      {}\n  pipeline: {}",
+            by_job
+                .iter()
+                .map(|j| j.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            groups
+                .iter()
+                .map(|g| g.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    if !by_group.is_empty() && by_job.is_empty() {
+        return group_targets(&by_group, raw);
+    }
+
+    match by_job.len() {
+        1 => Ok(Targets::one(by_job[0].id)),
+        0 => bail!("there is no job or pipeline with the id or the name `{raw}`"),
         n => bail!(
             "`{raw}` names {n} jobs. Give the id of the job that you want, or delete \
              the old jobs with `qex clean done` and start again.\n{}",
-            matches
+            by_job
                 .iter()
                 .map(|j| format!("  {} {}", j.id, j.display_name()))
                 .collect::<Vec<_>>()
                 .join("\n")
         ),
     }
+}
+
+/// Expands each value that the user wrote into the jobs that it names.
+///
+/// A value that names a pipeline gives every stage of it. The result holds each
+/// job once, in the order that the user gave, because a user who names a
+/// pipeline AND one of its stages wants that job waited for one time.
+///
+/// When no coordinator operates there is no job list, so every value goes
+/// through unchanged and the caller reads the state directory. That directory
+/// holds the jobs of a coordinator that retired, and it holds no group, so a
+/// pipeline needs a coordinator.
+///
+/// An error from the resolver comes back to the caller. An earlier version kept
+/// the value instead, and `qex wait` then reported "there is no job with the id
+/// x" for a value that named a job AND a pipeline. The user read that the value
+/// named nothing, and it named two things.
+fn expand_ids(raws: &[String]) -> Result<Vec<String>> {
+    let jobs = Client::connect_existing().and_then(|mut c| match c.call(&Request::List) {
+        Ok(Response::Jobs { jobs }) => Some(jobs),
+        _ => None,
+    });
+    let Some(jobs) = jobs else {
+        return Ok(raws.to_vec());
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    for raw in raws {
+        for id in resolve_targets_in(&jobs, raw)?.ids {
+            let text = id.to_string();
+            if !out.contains(&text) {
+                out.push(text);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Asks the coordinator for the jobs, and reads the text of the user.
+fn resolve_targets(client: &mut Client, raw: &str) -> Result<Targets> {
+    let Response::Jobs { jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    resolve_targets_in(&jobs, raw)
+}
+
+/// Reads the text of the user, for a command that operates on ONE job.
+///
+/// `qex logs` reads one job. A pipeline gives an error that names the stages,
+/// because qex must not choose a stage for the reader.
+fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
+    let Response::Jobs { jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    let found = resolve_targets_in(&jobs, raw)?;
+    if found.group.is_none() && found.ids.len() == 1 {
+        return Ok(found.ids[0]);
+    }
+    bail!(
+        "`{raw}` is a pipeline of {} job(s), and this command takes one job. Name \
+         the stage that you want:\n{}",
+        found.ids.len(),
+        found
+            .ids
+            .iter()
+            .filter_map(|id| jobs.iter().find(|j| j.id == *id))
+            // qex SHOWS the safe name only. See `job::safe_name`.
+            .map(|j| format!("  {} {}", j.id, j.display_name()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 /// Finds a job id in the state directory, without a coordinator.
@@ -2988,6 +3433,302 @@ mod tests {
         // A file that is complete, with nothing removed, gives no notice.
         s.logs_dropped = None;
         assert_eq!(dropped_notice(&s, "stdout"), None);
+    }
+
+    /// Makes one pipeline of three stages, with the given group and name.
+    ///
+    /// The stages come back in an order that is NOT the order of submission.
+    /// A test of the order must fail when the sort goes away, and a fixture
+    /// that is already in order tests nothing.
+    fn a_pipeline_named(group: uuid::Uuid, group_name: &str) -> Vec<JobStatus> {
+        let mut jobs = Vec::new();
+        // build is stage 0, test is stage 1, ship is stage 2. The vector holds
+        // them as ship, build, test.
+        for (name, sequence) in [("ship", 2u64), ("build", 0), ("test", 1)] {
+            let mut j = status_with(JobState::Completed, Some(0));
+            j.name = name.into();
+            j.group = Some(group);
+            j.group_name = Some(group_name.to_string());
+            // The three stages arrive in the same second, so the sequence is
+            // the only thing that gives their order.
+            j.submitted_at = 100;
+            j.sequence = sequence;
+            jobs.push(j);
+        }
+        jobs
+    }
+
+    /// Makes a pipeline of three stages, and one job that belongs to no
+    /// pipeline.
+    fn a_pipeline() -> (Vec<JobStatus>, uuid::Uuid) {
+        let group = uuid::Uuid::new_v4();
+        let mut jobs = a_pipeline_named(group, "release");
+
+        let mut alone = status_with(JobState::Completed, Some(0));
+        alone.name = "alone".into();
+        alone.submitted_at = 50;
+        jobs.push(alone);
+        (jobs, group)
+    }
+
+    /// The id of a pipeline names every stage of it, in the order of
+    /// submission.
+    ///
+    /// `qex pipeline` writes that id to stdout, so it is the value that a user
+    /// keeps. Before this, `qex wait $GROUP` answered "there is no job with the
+    /// id ..." with the code 127, and the documented way to use a pipeline
+    /// ended with the user finding the last stage by hand.
+    #[test]
+    fn the_id_of_a_pipeline_names_every_stage() {
+        let (jobs, group) = a_pipeline();
+        let id_of = |name: &str| jobs.iter().find(|j| j.name == name).unwrap().id;
+        // The order of the stages, and not the order of the vector.
+        let want = vec![id_of("build"), id_of("test"), id_of("ship")];
+
+        // The full id, the start of the id, and the name all give the stages.
+        for raw in [
+            group.to_string(),
+            group.to_string()[..8].to_string(),
+            "release".to_string(),
+        ] {
+            let found = resolve_targets_in(&jobs, &raw).unwrap();
+            assert_eq!(found.ids, want, "`{raw}` must give every stage, in order");
+            assert_eq!(
+                found.group,
+                Some(group),
+                "`{raw}` must report that it named a pipeline"
+            );
+        }
+    }
+
+    /// One word must never reach two pipelines.
+    ///
+    /// A pipeline takes its name from its file, so a second run of the same
+    /// file carries the same name. `qex kill ci` stopped the work of two
+    /// separate runs, and the user named one. A short group id has the same
+    /// fault, because two ids can start with the same characters.
+    #[test]
+    fn a_word_that_names_two_pipelines_gives_an_error() {
+        let mut jobs = a_pipeline_named(uuid::Uuid::new_v4(), "ci");
+        jobs.extend(a_pipeline_named(uuid::Uuid::new_v4(), "ci"));
+
+        let err = resolve_targets_in(&jobs, "ci").unwrap_err().to_string();
+        assert!(
+            err.contains("2 pipelines"),
+            "the message must say how many runs the word names: {err}"
+        );
+        assert!(
+            err.contains("group id"),
+            "the message must give the remedy: {err}"
+        );
+
+        // One of the two group ids still gives that one run only.
+        let first = jobs[0].group.unwrap();
+        let found = resolve_targets_in(&jobs, &first.to_string()).unwrap();
+        assert_eq!(found.ids.len(), 3);
+        assert_eq!(found.group, Some(first));
+    }
+
+    /// The message must give the stage count OF EACH run, beside the group id
+    /// of that run.
+    ///
+    /// The count is how the reader separates the run that they want from the
+    /// run that they do not want. A count that belongs to the other run reads
+    /// as correct and sends the reader to the wrong group id. The two runs
+    /// therefore hold a different number of stages here: a fixture in which
+    /// both runs are the same size cannot see this fault.
+    #[test]
+    fn the_two_pipelines_each_give_their_own_stage_count() {
+        let big = uuid::Uuid::new_v4();
+        let small = uuid::Uuid::new_v4();
+        let mut jobs = a_pipeline_named(big, "ci");
+        let mut only = status_with(JobState::Completed, Some(0));
+        only.name = "only".into();
+        only.group = Some(small);
+        only.group_name = Some("ci".into());
+        jobs.push(only);
+
+        let err = resolve_targets_in(&jobs, "ci").unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("{big}  3 stage(s)")),
+            "the run of three stages must show 3: {err}"
+        );
+        assert!(
+            err.contains(&format!("{small}  1 stage(s)")),
+            "the run of one stage must show 1: {err}"
+        );
+    }
+
+    /// One job still gives one job, by id, by short id and by name.
+    #[test]
+    fn a_job_still_gives_one_job() {
+        let (jobs, _) = a_pipeline();
+        let build = jobs.iter().find(|j| j.name == "build").unwrap();
+        for raw in [
+            build.id.to_string(),
+            build.id.to_string()[..8].to_string(),
+            "build".to_string(),
+        ] {
+            let found = resolve_targets_in(&jobs, &raw).unwrap();
+            assert_eq!(found.ids, vec![build.id]);
+            // The caller uses this to choose the shape of its JSON, and to
+            // decide whether a job that already stopped is a fault.
+            assert_eq!(found.group, None, "`{raw}` names one job, not a pipeline");
+        }
+    }
+
+    /// A pipeline of one stage is still a pipeline.
+    ///
+    /// `qex status --json` chooses an array or an object from this, so a shape
+    /// that came from the NUMBER of stages would change on the day a pipeline
+    /// has one stage, and `jq '.[0]'` would stop working.
+    #[test]
+    fn a_pipeline_of_one_stage_is_still_a_pipeline() {
+        let group = uuid::Uuid::new_v4();
+        let mut only = status_with(JobState::Completed, Some(0));
+        only.name = "solo".into();
+        only.group = Some(group);
+        only.group_name = Some("one".into());
+        let jobs = vec![only];
+
+        let found = resolve_targets_in(&jobs, "one").unwrap();
+        assert_eq!(found.ids.len(), 1);
+        assert_eq!(found.group, Some(group));
+    }
+
+    /// A value that names nothing must say that it names no pipeline either.
+    #[test]
+    fn a_value_that_names_nothing_gives_an_error() {
+        let (jobs, _) = a_pipeline();
+        let err = resolve_targets_in(&jobs, "nothing")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("pipeline"),
+            "the message must say that a pipeline is also a handle: {err}"
+        );
+
+        // An empty value must not give every job. A command that deletes would
+        // then delete everything.
+        assert!(resolve_targets_in(&jobs, "").is_err());
+    }
+
+    /// A word that names a job AND a pipeline must give an error.
+    ///
+    /// qex must not choose one of the two for the user. A command that kills
+    /// would kill the wrong work.
+    #[test]
+    fn a_word_that_names_a_job_and_a_pipeline_gives_an_error() {
+        let (mut jobs, _) = a_pipeline();
+        // The job that belongs to no pipeline takes the name of the pipeline.
+        jobs.last_mut().unwrap().name = "release".into();
+
+        let err = resolve_targets_in(&jobs, "release")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("job") && err.contains("pipeline"),
+            "the message must name both readings: {err}"
+        );
+
+        // The pipeline is ONE run, so its group id appears one time. The three
+        // stages share that id, and a list that repeats it for each stage
+        // reads as three pipelines.
+        let group = jobs[0].group.unwrap().to_string();
+        assert_eq!(
+            err.matches(&group).count(),
+            1,
+            "the group id of one run must appear one time: {err}"
+        );
+    }
+
+    /// Makes a uuid whose text starts with these four bytes.
+    fn id_starting(prefix: [u8; 4], last: u8) -> uuid::Uuid {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&prefix);
+        bytes[15] = last;
+        uuid::Uuid::from_bytes(bytes)
+    }
+
+    /// A short id that starts the id of a job AND the id of its own group is
+    /// not an ambiguity.
+    ///
+    /// Both readings give the SAME job, so qex must answer with that job. An
+    /// error here would refuse a value that has one meaning, and the user
+    /// copied that value out of `qex list`.
+    #[test]
+    fn a_short_id_that_starts_a_job_and_its_own_group_gives_that_job() {
+        let mut job = status_with(JobState::Completed, Some(0));
+        job.id = id_starting([0x12, 0x34, 0x56, 0x78], 1);
+        job.group = Some(id_starting([0x12, 0x34, 0x56, 0x78], 2));
+        job.group_name = Some("shared".into());
+        let want = job.id;
+        let jobs = vec![job];
+
+        let found = resolve_targets_in(&jobs, "12345678").expect("both readings give one job");
+        assert_eq!(found.ids, vec![want]);
+        // The user named a job, and not a pipeline. `qex status --json` reads
+        // this to choose an object over an array.
+        assert_eq!(found.group, None);
+    }
+
+    /// The same short id, where the pipeline holds a SECOND stage, is an
+    /// ambiguity.
+    ///
+    /// The word then means "this one job" or "this pipeline of two stages",
+    /// and those are different work. The two readings hold the same job, so a
+    /// test that asks only whether one side is inside the other calls them the
+    /// same and deletes or kills the second stage with no word to the user.
+    #[test]
+    fn a_short_id_that_starts_a_job_and_a_group_of_two_stages_gives_an_error() {
+        let group = id_starting([0x12, 0x34, 0x56, 0x78], 2);
+
+        let mut first = status_with(JobState::Completed, Some(0));
+        first.id = id_starting([0x12, 0x34, 0x56, 0x78], 1);
+        first.group = Some(group);
+        first.group_name = Some("shared".into());
+
+        // The second stage does NOT carry the short id in its own id.
+        let mut second = status_with(JobState::Completed, Some(0));
+        second.id = id_starting([0x77, 0x77, 0x77, 0x77], 3);
+        second.group = Some(group);
+        second.group_name = Some("shared".into());
+
+        let jobs = vec![first, second];
+        let err = resolve_targets_in(&jobs, "12345678")
+            .expect_err("one job and a pipeline of two stages is an ambiguity")
+            .to_string();
+        assert!(
+            err.contains("name of a job") && err.contains("name of a pipeline"),
+            "the message must name both readings: {err}"
+        );
+    }
+
+    /// A word that gives one job and a DIFFERENT pipeline of one stage is an
+    /// ambiguity, and the count of each side is the same.
+    ///
+    /// The two readings must be compared by identity, and not by how many jobs
+    /// each holds. A comparison of the counts alone calls this pair the same
+    /// job, and qex would then kill or delete the wrong work.
+    #[test]
+    fn one_job_and_a_one_stage_pipeline_of_the_same_size_still_give_an_error() {
+        let mut alone = status_with(JobState::Completed, Some(0));
+        alone.id = id_starting([0xaa, 0xbb, 0xcc, 0xdd], 1);
+        alone.name = "alone".into();
+
+        let mut staged = status_with(JobState::Completed, Some(0));
+        staged.id = id_starting([0x99, 0x99, 0x99, 0x99], 2);
+        staged.group = Some(id_starting([0xaa, 0xbb, 0xcc, 0xdd], 3));
+        staged.group_name = Some("staged".into());
+
+        let jobs = vec![alone, staged];
+        let err = resolve_targets_in(&jobs, "aabbccdd")
+            .expect_err("one job and one pipeline is an ambiguity")
+            .to_string();
+        assert!(
+            err.contains("name of a job") && err.contains("name of a pipeline"),
+            "the message must name both readings: {err}"
+        );
     }
 
     /// These codes are a contract with the agents. The help text gives them.

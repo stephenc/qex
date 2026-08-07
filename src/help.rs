@@ -1197,10 +1197,26 @@ the two runs never meet.
 One command for the whole pipeline
 ----------------------------------
 
-Every job of one submission shares a group id:
+Every job of one submission shares a group id, and that id names every stage:
 
     GROUP=$(qex pipeline ci.toml)
+
+    qex wait $GROUP                 # wait for every stage
+    qex status $GROUP               # the state of every stage
+    qex kill $GROUP                 # stop every stage
+    qex clean $GROUP                # delete every record
     qex list --group $GROUP
+
+The name of the pipeline works in the same way as its id, with one limit: a
+pipeline takes its name from its file, so a second run of that file has the same
+name. qex refuses a name that gives two runs, and it shows the group id of each.
+Use the group id in a script.
+
+`qex status --json` gives an array for a pipeline and one object for one job,
+so a script that reads one job does not change. A pipeline of one stage still
+gives an array, because the shape comes from what you named.
+
+`qex logs` reads one job, so it refuses a pipeline and names the stages.
 
 Use `--id-file` to keep every id in a file:
 
