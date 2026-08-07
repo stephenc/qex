@@ -5312,3 +5312,410 @@ fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
         "the record of the job must name the fault: {status}"
     );
 }
+
+/// A job must be told how large its claim is.
+///
+/// A claim controls the queue and not the job. A job that asks the machine how
+/// many cores it has receives the number of the MACHINE, so a job with a claim
+/// of two cores on a machine of sixteen starts sixteen threads and takes the
+/// capacity that qex gave to the other jobs.
+///
+/// THIS TEST USES `env_capture = "minimal"`, and the reason is not secrecy.
+/// With the default `all`, the shell of the developer reaches the job, and an
+/// ambient `GOMAXPROCS` or `MAKEFLAGS` defeats every assertion here: qex fills
+/// a value that nobody chose, so a value that the shell chose stays and the
+/// test reads it. Measured: `GOMAXPROCS=4 cargo test` gave `[][4][]` where the
+/// test asks for `[][][]`.
+///
+/// `cargo mutants` makes this certain and not merely possible. It starts a
+/// jobserver and gives the child cargo `MAKEFLAGS=--jobserver-auth=...`, so
+/// the UNMUTATED baseline fails and no mutant is ever reached. The same is
+/// true for anybody who runs `cargo test` under a `make -j` wrapper.
+#[test]
+fn a_job_is_told_the_size_of_its_claim() {
+    let h = Harness::new(
+        "claimenv",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"minimal\"\n",
+    );
+
+    // A JOB THAT MADE NO CLAIM IS TOLD NOTHING.
+    //
+    // The default claim is one core. A job with no claim that heard "one core"
+    // would run sixteen times slower on a machine of sixteen cores, with no
+    // error and no warning. A node job would receive a SMALLER heap than it
+    // receives with no qex at all: measured on this machine, the default claim
+    // of 1805MB gives node a heap of 1353MB, and node 12 takes 2096MB by
+    // itself. qex tells a job the claim that SOMEBODY CHOSE, and never the
+    // claim that qex invented.
+    let id = h.submit(&[
+        "submit",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS][$NODE_OPTIONS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][][]",
+        "a job that made no claim must be told nothing: {out}"
+    );
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--",
+        "sh",
+        "-c",
+        "echo \"$QEX_CPU $QEX_MEM_MB $GOMAXPROCS $OMP_NUM_THREADS\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "2 2048 2 2",
+        "the job must see its own claim: {out}"
+    );
+
+    // HALF A CLAIM IS NOT A CLAIM.
+    //
+    // With `--mem` and no `--cpu`, the number of cores comes from
+    // `[defaults]`, and it is one. A job that heard that number would run
+    // single-threaded on a machine of sixteen cores. qex writes the claim only
+    // when the user answered BOTH questions.
+    let id = h.submit(&[
+        "submit",
+        "--mem",
+        "2GB",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][]",
+        "`--mem` with no `--cpu` must write nothing: {out}"
+    );
+
+    // And the same rule for the other half.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][]",
+        "`--cpu` with no `--mem` must write nothing: {out}"
+    );
+
+    // A value that somebody chose must stay. `--env` is a decision.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--env",
+        "GOMAXPROCS=9",
+        "--",
+        "sh",
+        "-c",
+        "echo \"$GOMAXPROCS $OMP_NUM_THREADS\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "9 2",
+        "`--env` must win, and the rest must still arrive: {out}"
+    );
+
+    // `--no-limit-env-hints` is the answer for a job that must see the machine
+    // as it is.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--no-limit-env-hints",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(out.trim(), "[][]", "the option must write nothing: {out}");
+
+    // A job file must be able to say the same thing. Without the field, the
+    // file is refused, because a job file rejects a name that qex does not
+    // know.
+    let file = h.root.join("off.toml");
+    std::fs::write(
+        &file,
+        "name = \"off\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
+         no_limit_env_hints = true\n\n\
+         [resources]\ncpu = 2\nmem = \"2GB\"\n",
+    )
+    .unwrap();
+    let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(out.trim(), "[][]", "the job file must turn it off: {out}");
+
+    // And the same file without that line gets the claim.
+    let file = h.root.join("on.toml");
+    std::fs::write(
+        &file,
+        "name = \"on\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\n\
+         [resources]\ncpu = 2\nmem = \"2GB\"\n",
+    )
+    .unwrap();
+    let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[2][2]",
+        "the job file must get the claim: {out}"
+    );
+
+    // A stage of a pipeline says the same thing as a job file.
+    let pipeline = h.root.join("p.toml");
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"stage-on\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
+         [jobs.resources]\ncpu = 2\nmem = \"2GB\"\n\n\
+         [[jobs]]\nname = \"stage-off\"\n\
+         command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
+         no_limit_env_hints = true\n\
+         [jobs.resources]\ncpu = 2\nmem = \"2GB\"\n",
+    )
+    .unwrap();
+    let ids_file = h.root.join("stage-ids.json");
+    h.ok(&[
+        "pipeline",
+        pipeline.to_str().unwrap(),
+        "--id-file",
+        ids_file.to_str().unwrap(),
+    ]);
+    let ids: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ids_file).unwrap()).unwrap();
+    for (stage, want) in [("stage-on", "[2][2]"), ("stage-off", "[][]")] {
+        let id = ids["jobs"][stage].as_str().unwrap().to_string();
+        h.ok(&["wait", &id, "--timeout", "60s"]);
+        let out = h.ok(&["logs", &id, "--stdout"]);
+        assert_eq!(
+            out.trim(),
+            want,
+            "the stage {stage} must give {want}: {out}"
+        );
+    }
+
+    // `qex run` HAS ITS OWN WIRING, and it needs its own test.
+    //
+    // `commands::run` builds `SubmitOptions` in a second place, so the option
+    // can arrive for `qex submit` and be lost for `qex run`. A mutation that
+    // put `false` in that one line passed every other test in this file.
+    let (child, id) = h.run_bg(&[
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--no-limit-env-hints",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    wait_run(child, "`qex run` with --no-limit-env-hints");
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][]",
+        "`qex run --no-limit-env-hints` must write nothing: {out}"
+    );
+
+    // And `qex run` without the option still receives the claim, or the test
+    // above would pass with the feature removed from `qex run` altogether.
+    let (child, id) = h.run_bg(&[
+        "--cpu",
+        "2",
+        "--mem",
+        "2GB",
+        "--",
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS]\"",
+    ]);
+    wait_run(child, "`qex run` with a claim");
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[2][2]",
+        "`qex run` must give the claim to the job: {out}"
+    );
+}
+
+/// `[claims]` in the config file controls every job of this machine.
+///
+/// `export_env = false` turns the claim off for all of them, and `also` adds
+/// the two variables that qex does not write without a request. Each of those
+/// two has a cost, so neither is a default: every JVM writes `Picked up
+/// JAVA_TOOL_OPTIONS: ...` to its standard error, and `MAKEFLAGS` makes a
+/// build parallel that its author never ran in parallel.
+///
+/// `env_capture = "minimal"` for the same reason as the test above: a
+/// `MAKEFLAGS` in the shell of the developer otherwise reaches the job and
+/// defeats the assertion. `cargo mutants` sets exactly that variable.
+#[test]
+fn the_config_file_controls_the_claim_in_the_environment() {
+    let show = [
+        "sh",
+        "-c",
+        "echo \"[$QEX_CPU][$GOMAXPROCS][$JAVA_TOOL_OPTIONS][$MAKEFLAGS]\"",
+    ];
+
+    let h = Harness::new(
+        "claimsoff",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"minimal\"\n\
+         [claims]\nexport_env = false\n",
+    );
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    args.extend_from_slice(&show);
+    let id = h.submit(&args);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][][][]",
+        "`export_env = false` must write nothing: {out}"
+    );
+
+    // `qex config show` MUST SAY SO. A reader who cannot see this value cannot
+    // tell whether a job receives GOMAXPROCS, and the config file is not the
+    // answer: a machine with no file still has these values.
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("claim in job: no; [claims] export_env = false"),
+        "`qex config show` must report that the claim is off: {shown}"
+    );
+
+    // THE LINE MUST READ EVERY CONDITION THAT THE CODE READS.
+    //
+    // `[submit] env_capture = "none"` turns the claim off as completely as
+    // `export_env = false` does. A line that reported "yes" here was worse than
+    // no line at all: the owner of the machine sets the value, asks this
+    // command, and is told the opposite of what the job receives.
+    let h = Harness::new(
+        "claimsnone",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"none\"\n",
+    );
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("claim in job: no; [submit] env_capture"),
+        "`env_capture = none` must report that the claim is off: {shown}"
+    );
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    args.extend_from_slice(&show);
+    let id = h.submit(&args);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[][][][]",
+        "and the job must in fact receive nothing: {out}"
+    );
+
+    // The DEFAULT text needs a test too. Without this, a mutation of that one
+    // string passes every other assertion here, because the others read the
+    // `no` branch and the `also` substring only.
+    let h = Harness::new(
+        "claimsdefault",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("claim in job: yes, with --cpu and --mem together"),
+        "the default configuration must report that the claim reaches the job: {shown}"
+    );
+
+    let h = Harness::new(
+        "claimsalso",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [submit]\nenv_capture = \"minimal\"\n\
+         [claims]\nalso = [\"java\", \"make\"]\n",
+    );
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    args.extend_from_slice(&show);
+    let id = h.submit(&args);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+    let out = h.ok(&["logs", &id, "--stdout"]);
+    assert_eq!(
+        out.trim(),
+        "[2][2][-XX:ActiveProcessorCount=2 -Xmx1536m][-j2]",
+        "`also` must add the two variables: {out}"
+    );
+    let shown = h.ok(&["config", "show"]);
+    assert!(
+        shown.contains("also java, make"),
+        "`qex config show` must name the hints that operate: {shown}"
+    );
+
+    // A NAME WITH A SPELLING FAULT MUST STOP THE COMMAND.
+    //
+    // A silent no-op is the wrong answer for a feature whose purpose is to
+    // stop a job from taking more than it claimed: the user reads the config
+    // file, believes the JVM is limited, and it is not.
+    let h = Harness::new(
+        "claimsbad",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [claims]\nalso = [\"jvm\"]\n",
+    );
+    let out = h.qex(&["submit", "--cpu", "2", "--mem", "2GB", "--", "true"]);
+    assert!(
+        !out.status.success(),
+        "an unknown name must stop the submit"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    // The three parts: what happened, why it matters, what the reader must do.
+    assert!(
+        err.contains("jvm"),
+        "the message must name the value: {err}"
+    );
+    assert!(
+        err.contains("size of the machine"),
+        "the message must say why it matters: {err}"
+    );
+    assert!(
+        err.contains("`java`") && err.contains("`make`"),
+        "the message must give the remedy: {err}"
+    );
+}

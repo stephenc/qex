@@ -5,7 +5,7 @@
 
 use crate::{paths, sys, units};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Selects the quantity of the environment that a job receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -546,6 +546,85 @@ impl Default for PolitenessConfig {
     }
 }
 
+/// Tells the job how large its claim is.
+///
+/// A claim controls the QUEUE. It does not control the job, and a job that
+/// asks the machine how large it is gets the size of the MACHINE. A build with
+/// a claim of 2 cores on a machine of 16 then starts 16 threads, and the claim
+/// that qex made becomes a promise that the job breaks.
+///
+/// Most runtimes read a variable in place of the machine, so qex writes those
+/// variables from the claim. This is the nearest thing to a limit that operates
+/// on macOS as well as on Linux, and it needs no cgroup and no privilege.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClaimsConfig {
+    /// Write the size of the claim into the environment of the job.
+    pub export_env: bool,
+    /// The variables that qex does not write without a request.
+    ///
+    /// `java` writes `JAVA_TOOL_OPTIONS`, and each JVM then writes a line to
+    /// ITS STANDARD ERROR: `Picked up JAVA_TOOL_OPTIONS: ...`. That line goes
+    /// into the log of the job, and a test that compares the error output
+    /// fails because of it.
+    ///
+    /// `make` writes `MAKEFLAGS=-jN`. This changes only a Makefile that gives
+    /// no `-j` of its own, because the Makefile wins. It thus makes a Makefile
+    /// parallel that its author never ran in parallel, and a Makefile with an
+    /// incomplete dependency graph then fails.
+    pub also: Vec<ClaimHint>,
+}
+
+/// A variable of `[claims] also`.
+///
+/// This is an enumeration and not text, so a name with a spelling fault gives
+/// an error from the config file. A silent no-op is the wrong answer for a
+/// feature whose purpose is to stop a job from taking more than it claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimHint {
+    /// `JAVA_TOOL_OPTIONS`, for the JVM.
+    Java,
+    /// `MAKEFLAGS`, for GNU Make.
+    Make,
+}
+
+impl ClaimHint {
+    /// The name that the config file uses. `qex config show` prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Java => "java",
+            Self::Make => "make",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaimHint {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "java" => Ok(Self::Java),
+            "make" => Ok(Self::Make),
+            // The three parts: what happened, why it matters, what to do.
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown name `{s}` in `[claims] also`. qex writes no variable \
+                 for that name, so each job of a build receives the size of the \
+                 machine and not the size of its claim. Give `java`, or `make`, \
+                 or both."
+            ))),
+        }
+    }
+}
+
+impl Default for ClaimsConfig {
+    fn default() -> Self {
+        Self {
+            export_env: true,
+            also: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SubmitConfig {
@@ -693,6 +772,7 @@ pub struct Config {
     pub queue: QueueConfig,
     pub submit: SubmitConfig,
     pub politeness: PolitenessConfig,
+    pub claims: ClaimsConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
     pub history: HistoryConfig,

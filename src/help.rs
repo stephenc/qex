@@ -589,6 +589,7 @@ A full file
     after = [\"cleanup\"]           # wait for these jobs, whatever the result
     env_capture = \"all\"           # all, minimal or none
     nice = 10                     # -20 to 19; a larger number gives way
+    no_limit_env_hints = false    # true: do not tell the job its claim size
 
     [resources]
     cpu = 3
@@ -675,6 +676,10 @@ that qex uses now.
     env_capture = \"all\"           # all, minimal or none
     minimal_env = [\"PATH\", \"HOME\", \"USER\", \"LOGNAME\", \"SHELL\", \"LANG\", \"TZ\"]
 
+    [claims]
+    export_env = true     # tell the job how large its claim is
+    also = []             # \"java\", \"make\", or both
+
     [learn]
     enabled = true        # use the earlier jobs of a command as the claim
     margin = 1.5          # the multiplier for a measurement
@@ -744,6 +749,46 @@ to the file thus does nothing to a job that already writes, and it controls the
 next job to start. The supervisor reads the file itself, so the new value does
 not wait for the coordinator to read the file again. To give a new limit to a
 job that operates, stop it and use `qex rerun`.
+
+The claim in the job
+--------------------
+
+A claim controls the queue. It does not control the job: a job that asks the
+machine how many cores it has receives the number of the MACHINE. qex therefore
+writes the claim into the environment of the job, and most runtimes read those
+variables in place of the machine.
+
+    QEX_CPU, QEX_MEM, QEX_MEM_MB           your own script: make -j\"$QEX_CPU\"
+    GOMAXPROCS, GOMEMLIMIT                 Go
+    OMP_NUM_THREADS                        OpenMP: C, C++ and Fortran
+    OPENBLAS_NUM_THREADS, MKL_NUM_THREADS  numpy, pandas and the libraries
+    NUMEXPR_NUM_THREADS                      below them
+    VECLIB_MAXIMUM_THREADS                 Accelerate, on macOS
+    RAYON_NUM_THREADS, CARGO_BUILD_JOBS    Rust
+    JULIA_NUM_THREADS                      Julia
+    DOTNET_PROCESSOR_COUNT                 .NET
+    POLARS_MAX_THREADS                     Polars
+    NODE_OPTIONS                           node, at 3/4 of the claim
+
+qex writes these ONLY when you gave both `--cpu` and `--mem`. A default claim
+and a learned claim are not a decision that you made, and a job that heard
+`one core` would run single-threaded. qex never replaces a value that is
+already there.
+
+`[claims] also` adds two more. Each of the two has a cost, so neither is a
+default:
+
+    java   JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=N -XmxMm
+           Every JVM then writes `Picked up JAVA_TOOL_OPTIONS: ...` to its
+           standard error, and that line goes into the log of the job.
+    make   MAKEFLAGS=-jN
+           A Makefile that gives its own `-j` wins, so this changes a Makefile
+           that gives none. It thus makes a build parallel that its author
+           never ran in parallel, and a Makefile with an incomplete dependency
+           graph then fails.
+
+Turn it all off with `export_env = false`, or for one job with
+`qex submit --no-limit-env-hints`.
 
 Enforcement
 -----------

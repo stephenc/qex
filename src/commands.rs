@@ -57,6 +57,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         locks: args.locks,
         retries: args.retries,
         nice: args.nice,
+        no_limit_env_hints: args.no_limit_env_hints,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -2216,6 +2217,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         locks: args.submit.locks,
         retries: args.submit.retries,
         nice: args.submit.nice,
+        no_limit_env_hints: args.submit.no_limit_env_hints,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;

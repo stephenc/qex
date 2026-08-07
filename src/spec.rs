@@ -8,7 +8,7 @@
 //! own directory are thus not correct for the job. The specification that the
 //! coordinator receives is complete. It does not use any external values.
 
-use crate::config::{Config, EnvCapture};
+use crate::config::{ClaimHint, Config, EnvCapture};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -32,6 +32,18 @@ pub struct JobFile {
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<EnvCapture>,
+    /// Do not tell the job how large its claim is.
+    ///
+    /// qex writes the claim into the environment of the job (`GOMAXPROCS`,
+    /// `OMP_NUM_THREADS`, `GOMEMLIMIT` and more), so a runtime sizes its thread
+    /// pool to the claim and not to the machine. Give `true` here for a job
+    /// that must see the machine as it is.
+    ///
+    /// This field is the same as `--no-limit-env-hints`. It does not REPLACE
+    /// the command line, and the command line does not replace it: `true` from
+    /// any source turns the claim off, and no source turns it on again. There
+    /// is no `--limit-env-hints`.
+    pub no_limit_env_hints: Option<bool>,
     /// The jobs that must succeed before this job starts.
     ///
     /// Give an id or a name. If one of these jobs does not succeed, this job
@@ -135,6 +147,8 @@ pub struct SubmitOptions {
     pub retries: Option<u32>,
     /// How politely this job uses the processor.
     pub nice: Option<i32>,
+    /// Do not write the claim into the environment of the job.
+    pub no_limit_env_hints: bool,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -355,6 +369,66 @@ impl JobSpec {
             },
         };
 
+        // Tell the job how large its claim is.
+        //
+        // This happens after the claim is a number, so the variables hold the
+        // RESOLVED claim: `--cpu guess` gives the number that qex chose, and
+        // not the word.
+        //
+        // `--env-capture none` is the exception. That mode says that the job
+        // starts with an empty environment and receives the values of `[env]`
+        // and `--env` ONLY. A user who asks for that asked for it deliberately,
+        // and sixteen variables that qex chose would break the promise of the
+        // option. `none` means none.
+        //
+        // THIS IS NOT THE USUAL ORDER OF THE SOURCES. Most values here take
+        // the command line, then the job file, then the configuration, and a
+        // later source REPLACES an earlier one. These three sources are an
+        // AND: `[claims] export_env = false`, `--no-limit-env-hints` and
+        // `no_limit_env_hints = true` each turn the claim off on their own, and
+        // no source turns it on again. There is no `--limit-env-hints`, so a
+        // job file that says `true` stands, and a machine whose configuration
+        // says `export_env = false` stays off for every job.
+        let hints = cfg.claims.export_env
+            && !opts.no_limit_env_hints
+            && !file.no_limit_env_hints.unwrap_or(false);
+
+        // WRITE THE CLAIM ONLY WHEN SOMEBODY CHOSE IT.
+        //
+        // The rule of this function is that a value somebody chose is a
+        // decision. A claim that QEX invented is not such a decision, and the
+        // default claim is ONE CORE.
+        //
+        // Without this test, `qex submit -- cargo test` on a machine of sixteen
+        // cores writes GOMAXPROCS=1 and CARGO_BUILD_JOBS=1, and the job becomes
+        // sixteen times slower with no error and no warning.
+        //
+        // A node job meets something worse: it receives a SMALLER heap than it
+        // receives with no qex at all. Measured on this machine, the default
+        // claim is 1805MB, which gives node a heap of 1353MB, and node 12 takes
+        // 2096MB by itself. A job that goes above the heap stops. Measured with
+        // a heap of 32MB: `FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed -
+        // JavaScript heap out of memory`, exit code 134.
+        //
+        // A learned claim is not a decision either, and it makes the fault
+        // permanent: qex measures the job that it made single-threaded, learns
+        // one core, and writes one core again on the next run.
+        //
+        // BOTH HALVES MUST COME FROM THE USER, and `source` alone does not say
+        // that. `source` becomes "explicit" when ONE half is explicit, so
+        // `qex submit --mem 4GB -- sh -c 'echo $GOMAXPROCS'` printed `1` on a
+        // machine of 16 cores: the memory came from the user, the cores came
+        // from `[defaults]`, and the job heard the invented half. This test
+        // reads the two questions that the user answered, and not the summary
+        // of them.
+        //
+        // Give `--cpu` and `--mem`, and qex tells the job what you asked for.
+        let chosen = asked_cpu.is_some() && asked_mem.is_some();
+
+        if hints && chosen && capture != EnvCapture::None {
+            export_claim(&mut env, cpu, mem, &cfg.claims.also);
+        }
+
         let timeout = match opts.timeout.as_ref().or(file.timeout.as_ref()) {
             Some(s) => {
                 crate::units::parse_duration(s).map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
@@ -497,8 +571,407 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
     }
 }
 
+/// The smallest heap that qex gives to a runtime, in megabytes.
+///
+/// # Why there is a floor and not a test against zero
+///
+/// A SMALL HEAP IS WORSE THAN NO HEAP. A runtime that receives no heap uses its
+/// own default and operates; a runtime that receives a heap of one or two
+/// megabytes refuses to start. Measured with the runtimes on this machine:
+///
+///     -Xmx1m                  java 11   exit 1, initialization of VM failed
+///     -Xmx2m                  java 11   exit 1, initialization of VM failed
+///     -Xmx3m                  java 11   exit 0
+///     --max-old-space-size=1  node 12   exit 134
+///     --max-old-space-size=2  node 12   exit 134
+///     --max-old-space-size=3  node 12   exit 0
+///
+/// Both runtimes stop at one and at two megabytes, and both operate at three.
+/// THE FLOOR IS FOUR, which is one megabyte above three. Three is the LOWEST
+/// value that worked, so it is the exact edge on these two versions, and a
+/// value at an edge is not a value to choose: another runtime, or another
+/// version of these two, can need more. Four buys that margin and costs
+/// nothing, because a claim that small gets no heap either way.
+///
+/// The heap is three quarters of the claim, and each step rounds down, so a
+/// claim below 6MB gets no heap. Such a claim needs `--mem` with a very small
+/// value, and the job then receives the default heap of its runtime, which is
+/// the behaviour that it has with no qex at all.
+const HEAP_FLOOR_MB: u64 = 4;
+
+/// Writes the size of the claim into the environment of a job.
+///
+/// # Why
+///
+/// A claim controls the queue, and it does not control the job. A job that asks
+/// the machine how many cores it has receives the number of the MACHINE, so a
+/// job with a claim of two cores on a machine of sixteen starts sixteen
+/// threads. It then takes the capacity that qex gave to the other jobs, and the
+/// promise of the queue is broken by the job that made it.
+///
+/// Most runtimes read a variable in place of the machine. qex writes those
+/// variables from the resolved claim. This is the nearest thing to a limit that
+/// operates on macOS as well as on Linux, and it needs no cgroup and no
+/// privilege.
+///
+/// # The rule about a value that exists
+///
+/// qex NEVER REPLACES A VALUE THAT IS ALREADY THERE. A value can come from the
+/// shell of the user, from the job file or from `--env`, and each of those is a
+/// decision that somebody made. This function fills the values that nobody
+/// chose.
+///
+/// # What was measured
+///
+/// One machine of 16 cores and 28GB. A claim of 2 cores and 2GB, for which qex
+/// writes `GOMAXPROCS=2` and `--max-old-space-size=1536`. Each runtime was
+/// asked for its own value:
+///
+///     go 1.22.2   GOMAXPROCS=2                gives runtime.GOMAXPROCS(0) == 2
+///     node 12     --max-old-space-size=1536   gives a heap limit of 1584MB
+///     java 11     -XX:ActiveProcessorCount=2 -Xmx1536m
+///                                             gives availableProcessors() == 2
+///                                             and maxMemory() == 1536MB
+///
+/// Two results changed this list:
+///
+/// `-XX:MaxRAMPercentage` does NOT limit the heap to the claim, because the JVM
+/// takes that percentage of the memory of the MACHINE. Measured: `java` with no
+/// option at all gave a maximum heap of 7224MB on this 28GB machine, and
+/// `-XX:MaxRAMPercentage=25` gave the same 7224MB. A limit needs `-Xmx`.
+///
+/// qex writes no core count for node. Measured on node 12:
+/// `os.cpus().length` is 16, the number of the MACHINE, and node reads no
+/// variable that changes it. (`os.availableParallelism` arrived in node 19 and
+/// was not measured here.)
+fn export_claim(
+    env: &mut std::collections::BTreeMap<String, String>,
+    cpu: u64,
+    mem: u64,
+    also: &[ClaimHint],
+) {
+    let cores = cpu.to_string();
+    let mut set = |key: &str, value: &str| {
+        // The rule above: fill, and never replace.
+        env.entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    };
+
+    // The claim itself. A script reads these and needs no other tool:
+    // `make -j"$QEX_CPU"`.
+    set("QEX_CPU", &cores);
+    set("QEX_MEM", &mem.to_string());
+    set("QEX_MEM_MB", &(mem / (1 << 20)).to_string());
+
+    // The runtimes that take a number of threads from the environment.
+    for key in [
+        "GOMAXPROCS",             // Go
+        "OMP_NUM_THREADS",        // OpenMP: C, C++ and Fortran
+        "OPENBLAS_NUM_THREADS",   // OpenBLAS, under numpy and others
+        "MKL_NUM_THREADS",        // Intel MKL
+        "NUMEXPR_NUM_THREADS",    // numexpr, under pandas
+        "VECLIB_MAXIMUM_THREADS", // Accelerate, on macOS
+        "RAYON_NUM_THREADS",      // rayon, under many Rust tools
+        "JULIA_NUM_THREADS",      // Julia
+        "DOTNET_PROCESSOR_COUNT", // .NET
+        "POLARS_MAX_THREADS",     // Polars
+        "CARGO_BUILD_JOBS",       // cargo
+    ] {
+        set(key, &cores);
+    }
+
+    // Memory. `GOMEMLIMIT` is a soft limit: Go collects more frequently as the
+    // job comes near it, and it does not stop the job.
+    //
+    // ZERO IS A LIMIT OF ZERO, and not "no limit". qex accepts `--mem 0`, and
+    // Go then collects for ever. Measured on go 1.22.2, with a program that
+    // allocates 32MB: 7 collections with no GOMEMLIMIT, 6 with
+    // GOMEMLIMIT=2147483648, and 248 with GOMEMLIMIT=0.
+    if mem > 0 {
+        set("GOMEMLIMIT", &mem.to_string());
+    }
+
+    // A heap needs room for the rest of the process, so node receives three
+    // quarters of the claim.
+    let heap_mb = (mem / (1 << 20)) * 3 / 4;
+    if heap_mb >= HEAP_FLOOR_MB {
+        set("NODE_OPTIONS", &format!("--max-old-space-size={heap_mb}"));
+    }
+
+    // The two that qex writes only when the configuration asks for them.
+    //
+    // `ClaimHint` holds the names, so an unknown name in `[claims] also` is an
+    // error from the config file and never a silent no-op here.
+    for name in also {
+        match name {
+            ClaimHint::Java => {
+                // Each JVM writes a line to its STANDARD ERROR. Measured on
+                // java 11: `Picked up JAVA_TOOL_OPTIONS: -XX:Active...`. That
+                // line goes into the log of the job, and a test that compares
+                // the error output fails because of it. This is why `java` is
+                // not a default.
+                //
+                // Below the floor, give the count of the cores and no heap.
+                // See `HEAP_FLOOR_MB`.
+                if heap_mb >= HEAP_FLOOR_MB {
+                    set(
+                        "JAVA_TOOL_OPTIONS",
+                        &format!("-XX:ActiveProcessorCount={cores} -Xmx{heap_mb}m"),
+                    );
+                } else {
+                    set(
+                        "JAVA_TOOL_OPTIONS",
+                        &format!("-XX:ActiveProcessorCount={cores}"),
+                    );
+                }
+            }
+            ClaimHint::Make => {
+                // THE MAKEFILE WINS, so this changes only a Makefile that gives
+                // no `-j` of its own. Measured on GNU Make 4.3, with eight
+                // targets of 0.4 seconds:
+                //
+                //     Makefile          MAKEFLAGS in the environment   time
+                //     MAKEFLAGS += -j8  (none), -j2 and -j8            0.40s
+                //     MAKEFLAGS  = -j1  (none), -j2 and -j8            3.21s
+                //     (no -j)           (none) 3.21s, -j2 1.61s, -j8   0.40s
+                //
+                // The cost is therefore the opposite of a replacement: it makes
+                // a Makefile parallel that its author never ran in parallel. A
+                // Makefile with an incomplete dependency graph then fails.
+                // Measured: one such Makefile gave the exit code 0 with no
+                // `MAKEFLAGS`, and the exit code 2 with `MAKEFLAGS=-j8`. This
+                // is why `make` is not a default.
+                set("MAKEFLAGS", &format!("-j{cores}"));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The claim must reach the job, and it must never replace a decision.
+    #[test]
+    fn the_claim_reaches_the_job_and_replaces_nothing() {
+        use std::collections::BTreeMap;
+
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 2 << 30, &[]);
+
+        // A script reads the claim with no other tool: `make -j"$QEX_CPU"`.
+        assert_eq!(env["QEX_CPU"], "2");
+        assert_eq!(env["QEX_MEM"], (2u64 << 30).to_string());
+        assert_eq!(env["QEX_MEM_MB"], "2048");
+
+        // A job of two cores on a machine of sixteen must not start sixteen
+        // threads. This was measured with go: GOMAXPROCS=2 gives 2.
+        //
+        // NAME EVERY VARIABLE HERE. The documentation and `qex help config`
+        // give this list to the reader, so a name that goes away must fail a
+        // test and not a user.
+        for key in [
+            "GOMAXPROCS",
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "RAYON_NUM_THREADS",
+            "JULIA_NUM_THREADS",
+            "DOTNET_PROCESSOR_COUNT",
+            "POLARS_MAX_THREADS",
+            "CARGO_BUILD_JOBS",
+        ] {
+            assert_eq!(env.get(key).map(String::as_str), Some("2"), "{key}");
+        }
+        assert_eq!(env["GOMEMLIMIT"], (2u64 << 30).to_string());
+
+        // node takes three quarters of the claim for its heap.
+        assert_eq!(env["NODE_OPTIONS"], "--max-old-space-size=1536");
+
+        // The two that need a request. Each has a cost, so neither is a
+        // default.
+        assert!(!env.contains_key("JAVA_TOOL_OPTIONS"));
+        assert!(!env.contains_key("MAKEFLAGS"));
+
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 3, 4 << 30, &[ClaimHint::Java, ClaimHint::Make]);
+        assert!(env["JAVA_TOOL_OPTIONS"].contains("-XX:ActiveProcessorCount=3"));
+        assert!(env["JAVA_TOOL_OPTIONS"].contains("-Xmx3072m"));
+        assert_eq!(env["MAKEFLAGS"], "-j3");
+    }
+
+    /// A claim too small for a usable heap must give NO heap.
+    ///
+    /// A SMALL HEAP IS WORSE THAN NO HEAP: java 11 exits 1 with `-Xmx1m` and
+    /// `-Xmx2m`, and node 12 exits 134 with `--max-old-space-size` of 1 or 2.
+    /// A runtime that receives no heap uses its own default and operates. The
+    /// count of the cores still arrives, because that number is correct.
+    #[test]
+    fn a_claim_too_small_for_a_heap_gives_no_heap() {
+        use std::collections::BTreeMap;
+
+        // EVERY VALUE BELOW THE FLOOR, and not the round numbers only. The
+        // fault that this test holds was a guard of `> 0`, which let a claim
+        // of 2MB write `-Xmx1m` and stop the JVM.
+        for mem_mb in 0..=5u64 {
+            let mut env = BTreeMap::new();
+            export_claim(&mut env, 2, mem_mb << 20, &[ClaimHint::Java]);
+            assert!(
+                !env.contains_key("NODE_OPTIONS"),
+                "a claim of {mem_mb}MB gives a heap below the floor: {env:?}"
+            );
+            assert_eq!(
+                env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2",
+                "a claim of {mem_mb}MB must give no -Xmx"
+            );
+            assert_eq!(env["GOMAXPROCS"], "2");
+        }
+
+        // 6MB is the first claim that reaches the floor: it gives a heap of
+        // exactly 4MB, and that heap arrives.
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 6 << 20, &[ClaimHint::Java]);
+        assert_eq!(env["NODE_OPTIONS"], "--max-old-space-size=4");
+        assert_eq!(
+            env["JAVA_TOOL_OPTIONS"],
+            "-XX:ActiveProcessorCount=2 -Xmx4m"
+        );
+
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 100 * 1024, &[ClaimHint::Java]);
+        assert_eq!(env["QEX_MEM_MB"], "0");
+        // 100KB is above zero, so `GOMEMLIMIT` still holds the true claim.
+        assert_eq!(env["GOMEMLIMIT"], (100u64 * 1024).to_string());
+
+        // A CLAIM OF ZERO GETS NO GOMEMLIMIT AT ALL, and `qex submit --mem 0`
+        // gives exactly that. `GOMEMLIMIT=0` is a limit of zero and not "no
+        // limit": measured on go 1.22.2, a program that allocates 32MB
+        // collected 248 times with it, and 7 times without it.
+        let mut env = BTreeMap::new();
+        export_claim(&mut env, 2, 0, &[ClaimHint::Java]);
+        assert!(
+            !env.contains_key("GOMEMLIMIT"),
+            "a claim of zero must give no memory limit: {env:?}"
+        );
+        assert!(!env.contains_key("NODE_OPTIONS"), "{env:?}");
+        assert_eq!(env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2");
+        // The claim itself still arrives, because zero IS what the user asked
+        // for. A script reads it and decides for itself.
+        assert_eq!(env["QEX_MEM"], "0");
+        assert_eq!(env["GOMAXPROCS"], "2");
+    }
+
+    /// `--env-capture none` means none, including the claim.
+    ///
+    /// That option says that the job starts with an empty environment and
+    /// receives `[env]` and `--env` only. Sixteen variables that qex chose
+    /// would break the promise of the option, and a user who asks for `none`
+    /// asked for it deliberately.
+    #[test]
+    fn capture_none_receives_no_claim_either() {
+        let _guard = env_lock();
+        let cfg = Config::default();
+        assert!(cfg.claims.export_env, "the default writes the claim");
+
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::None);
+        o.env = vec![("MINE".into(), "1".into())];
+        // The claim must be a whole claim, or the test passes for the wrong
+        // reason: qex writes nothing for half a claim, whatever the capture is.
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(2 << 30));
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+
+        assert_eq!(spec.env.len(), 1, "got: {:?}", spec.env);
+        assert_eq!(spec.env.get("MINE").unwrap(), "1");
+    }
+
+    /// HALF A CLAIM IS NOT A CLAIM.
+    ///
+    /// `--mem 4GB` with no `--cpu` takes the cores from `[defaults]`, and that
+    /// number is one. A job that heard it would run single-threaded on a
+    /// machine of sixteen cores, with no error and no warning. qex writes the
+    /// claim only when the user answered BOTH questions.
+    #[test]
+    fn half_a_claim_tells_the_job_nothing() {
+        let _guard = env_lock();
+        // Turn the learning off. With it on, the missing half comes from the
+        // measurements on this machine, and the result of the test then
+        // depends on the jobs that ran before it.
+        let mut cfg = Config::default();
+        cfg.learn.enabled = false;
+
+        for (cpu, mem) in [
+            (Some(crate::claim::Claim::Exact(2)), None),
+            (None, Some(crate::claim::Claim::Exact(4 << 30))),
+        ] {
+            let mut o = opts(&["true"]);
+            // `minimal` keeps the shell of the test out of the answer.
+            o.env_capture = Some(EnvCapture::Minimal);
+            o.cpu = cpu.clone();
+            o.mem = mem.clone();
+            let spec = JobSpec::resolve(&o, &cfg).unwrap();
+            assert!(
+                !spec.env.contains_key("QEX_CPU") && !spec.env.contains_key("GOMAXPROCS"),
+                "half a claim ({cpu:?}, {mem:?}) must write nothing: {:?}",
+                spec.env
+            );
+        }
+
+        // The whole claim still arrives.
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::Minimal);
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(4 << 30));
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert_eq!(spec.env.get("QEX_CPU").map(String::as_str), Some("2"));
+        assert_eq!(spec.env.get("GOMAXPROCS").map(String::as_str), Some("2"));
+    }
+
+    /// `[claims] export_env = false` turns the claim off for every job.
+    #[test]
+    fn the_config_file_turns_the_claim_off() {
+        let _guard = env_lock();
+        let mut cfg = Config::default();
+        cfg.claims.export_env = false;
+
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::Minimal);
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(4 << 30));
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert!(!spec.env.contains_key("GOMAXPROCS"), "got: {:?}", spec.env);
+
+        // `--no-limit-env-hints` does the same for one job.
+        cfg.claims.export_env = true;
+        let mut o = opts(&["true"]);
+        o.env_capture = Some(EnvCapture::Minimal);
+        o.cpu = Some(crate::claim::Claim::Exact(2));
+        o.mem = Some(crate::claim::Claim::Exact(4 << 30));
+        o.no_limit_env_hints = true;
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert!(!spec.env.contains_key("GOMAXPROCS"), "got: {:?}", spec.env);
+    }
+
+    /// A value that somebody chose must stay.
+    ///
+    /// The value can come from the shell, from the job file or from `--env`.
+    /// Each of those is a decision, and qex fills the values that nobody chose.
+    #[test]
+    fn the_claim_never_replaces_a_value_that_exists() {
+        use std::collections::BTreeMap;
+
+        let mut env = BTreeMap::new();
+        env.insert("GOMAXPROCS".to_string(), "9".to_string());
+        env.insert("QEX_CPU".to_string(), "mine".to_string());
+        export_claim(&mut env, 2, 1 << 30, &[]);
+
+        assert_eq!(env["GOMAXPROCS"], "9", "an explicit value must stay");
+        assert_eq!(env["QEX_CPU"], "mine");
+        // The values that nobody set still arrive.
+        assert_eq!(env["OMP_NUM_THREADS"], "2");
+    }
+
     use super::*;
 
     use crate::testutil::{env_lock, EnvVar};

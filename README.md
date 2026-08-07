@@ -154,6 +154,13 @@ There is no share for each agent.
 **qex controls one machine.** Two machines that farm work to each other are not
 coordinated.
 
+**A claim is a promise — but the job is told what it promised.** Give both
+`--cpu` and `--mem`, and qex writes the claim into the environment
+(`GOMAXPROCS`, `OMP_NUM_THREADS`, `GOMEMLIMIT`, `NODE_OPTIONS`, `QEX_CPU` and
+more), so a runtime sizes its thread pool to the claim instead of to the
+machine. It never replaces a value you set yourself. A program that asks the
+operating system directly still sees the whole machine.
+
 **A claim is a promise, and not a measurement.** A job that claims 2GB and uses
 20GB can still fill the machine. qex tests the free memory before each start,
 which limits the damage, but an accurate claim is better. qex measures each job
