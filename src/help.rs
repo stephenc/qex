@@ -679,7 +679,13 @@ Quotation marks around a number
 
 A field that takes a number, a size, a time or a percentage accepts the value
 with quotation marks and without them. `cpu = 2` and `cpu = \"2\"` give the same
-budget. A size with no unit is bytes, and a time with no unit is seconds.
+budget, and `margin = 1.5` and `margin = \"1.5\"` give the same margin. A size
+with no unit is bytes, and a time with no unit is seconds.
+
+The quotation marks do not change WHICH values a field takes. `[budget] cpu`
+takes a percentage, because it gives a part of the machine to all the jobs
+together. `[defaults] cpu` gives the cores for ONE job, so it takes a whole
+number only, and a percentage there gives an error.
 
 Default job size
 ----------------
