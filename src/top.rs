@@ -462,6 +462,29 @@ mod tests {
         assert!(page.contains("4GB"), "the memory claim is missing");
     }
 
+    /// EVERY STATE THAT A JOB STOPS IN MUST GIVE A NOTE.
+    ///
+    /// A reader of `qex top` sees the state and the note together. A note that
+    /// is empty makes that reader open a second command to learn the cause,
+    /// and `expired` is the state with the least in the record: no exit code,
+    /// no output and no log file.
+    #[test]
+    fn each_final_state_gives_a_note() {
+        for state in [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Killed,
+            JobState::Timeout,
+            JobState::Expired,
+            JobState::Oom,
+            JobState::Cancelled,
+            JobState::Skipped,
+        ] {
+            let note = note_for(&job(state, 1, 1 << 30));
+            assert!(!note.is_empty(), "the state {state} gives no note");
+        }
+    }
+
     /// The first refresh cannot give a CPU value, because there is no earlier
     /// measurement to compare with. The second refresh gives one.
     #[test]

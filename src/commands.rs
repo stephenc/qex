@@ -3882,6 +3882,19 @@ mod tests {
             exit_code_for(&status_with(JobState::Oom, None), ExitMode::State),
             EXIT_KILLED
         );
+        // A job that never started has its own code. It must not be 125: a job
+        // with the code 125 ran and wrote output, and this job did neither.
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Expired, None), ExitMode::State),
+            EXIT_EXPIRED
+        );
+        // `--passthrough` gives the code of the state here as well. A job that
+        // never started has no exit code of its own, so the alternative is 1,
+        // and 1 says that the work ran and failed.
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Expired, None), ExitMode::Passthrough),
+            EXIT_EXPIRED
+        );
     }
 
     /// The option `--passthrough` gives the exit code of the job.
@@ -3969,6 +3982,7 @@ mod tests {
             JobState::Timeout,
             JobState::Oom,
             JobState::Skipped,
+            JobState::Expired,
         ] {
             let s = status_with(state, None);
             assert_eq!(
@@ -4001,6 +4015,18 @@ mod tests {
         // The text must give the claim and the true use. An agent then corrects
         // its claim from this line.
         assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
+
+        // A job that never started has no log file, so this line is the only
+        // text that the reader gets. It must carry the queue reason.
+        let mut s = status_with(JobState::Expired, None);
+        s.error = Some("the job did not start. It waited 5s in the queue".into());
+        assert_eq!(
+            describe_result(&s),
+            "the job did not start. It waited 5s in the queue"
+        );
+        // A record with no text must still say what happened.
+        let s = status_with(JobState::Expired, None);
+        assert!(!describe_result(&s).is_empty());
     }
 
     #[test]

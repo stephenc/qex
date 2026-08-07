@@ -111,6 +111,12 @@ The clock starts at the submission. A coordinator that stops and starts again
 continues the same count, so a restart does not give a queued job a new full
 wait.
 
+**qex counts the wait in whole seconds.** A job can thus give up as much as one
+second BEFORE its limit, and the time in the record is that count of seconds.
+Give a limit of a minute or more, where one second changes nothing. With a limit
+of `3s`, measured runs stopped the job between 2.5 seconds and 3.1 seconds after
+the submission.
+
 The wait for a job in `--needs` counts also, because the option answers one
 question: does this id give an answer inside this time? A clock that stopped for
 a dependency could not answer it. Give a stage of a pipeline a value that covers

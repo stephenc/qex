@@ -973,6 +973,9 @@ mod tests {
             idle_since: None,
             next_sequence: 1,
             started_at: sys::now_secs(),
+            config_seen: 0,
+            config_settling: None,
+            config_error: None,
             stop: false,
         }
     }
@@ -1009,6 +1012,41 @@ mod tests {
         assert!(
             reason.contains("did not start"),
             "the text must say that the job never ran: {reason}"
+        );
+    }
+
+    /// THE REMEDY MUST FIT THE CAUSE.
+    ///
+    /// A job that waited for a job that it needs did not wait for capacity, so
+    /// "give the job a smaller claim" sends the reader to make a change that
+    /// cannot help. The two causes give two texts.
+    #[test]
+    fn the_remedy_fits_the_reason_for_the_wait() {
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        let id = state.queue[0];
+        expire(&mut state, id, 61, "waits for cores: 4 of 4 are in use");
+        let text = state.jobs[&id].status.error.clone().unwrap();
+        assert!(
+            text.contains("smaller claim"),
+            "a job that waited for capacity needs the claim remedy: {text}"
+        );
+
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        let id = state.queue[0];
+        expire(
+            &mut state,
+            id,
+            61,
+            "waits for the job 1a2b3c4d (build), which is running",
+        );
+        let text = state.jobs[&id].status.error.clone().unwrap();
+        assert!(
+            text.contains("whole pipeline"),
+            "a job that waited for a dependency needs the pipeline remedy: {text}"
+        );
+        assert!(
+            !text.contains("smaller claim"),
+            "a smaller claim changes nothing for a job that waits for a job: {text}"
         );
     }
 

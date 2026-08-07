@@ -347,6 +347,10 @@ so there is no output to read.
 The clock starts at the submission. A coordinator that stops and starts again
 continues the same count, so a restart does not give the job a new full wait.
 
+qex counts the wait in whole seconds. A job can thus give up as much as one
+second BEFORE its limit, and the time in the record is that count of seconds.
+Give a limit of a minute or more, where one second changes nothing.
+
 The wait for a job in `--needs` counts also. Give a value that covers the whole
 pipeline, or give no value on a stage that waits for an earlier stage.
 
