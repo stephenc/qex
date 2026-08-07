@@ -4,7 +4,7 @@ name = "qex"
 # request changes it. The number of a release lives on the tag, and on the one
 # commit that the tag names; `build.rs` gives a build its own name. Read
 # CONTRIBUTING.md and `src/version.rs`.
-version = "0.0.0-dev"
+version = "0.9.2"
 edition = "2021"
 description = "Queued EXecutor — a resource-aware local job queue for long-running tasks"
 license = "Apache-2.0"
