@@ -384,8 +384,9 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // while somebody edits the file. Measured with `[politeness] nice = 100` in
     // the file at the start of the job: the job ran at nice 19, because
     // `setpriority` moves a number outside the range into the range and reports
-    // success. The coordinator refuses such a file and keeps the values that it
-    // had, so the supervisor must do the same.
+    // success, and nothing said so. The coordinator refuses such a file and
+    // keeps the values that it had. The supervisor holds no earlier values, so
+    // it takes the DEFAULT values and puts the fault in the record of the job.
     let politeness = match cfg.politeness_values() {
         Ok(()) => cfg.politeness.clone(),
         Err(e) => {
@@ -922,6 +923,7 @@ fn write_oom_score(value: i32) {
 /// The space that the text of any `i32` needs.
 ///
 /// `-2147483648` is 11 characters: 10 digits and the sign.
+#[cfg(target_os = "linux")]
 const OOM_TEXT: usize = 11;
 
 /// Writes the text of a whole number into a buffer, and gives its length.

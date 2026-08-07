@@ -479,9 +479,12 @@ impl Default for QueueConfig {
 
 /// The names that `[politeness] io` accepts.
 ///
-/// `none` leaves the class of the job as it is. The supervisor holds the same
-/// three names, because it reads them between the fork and the exec, where a
-/// comparison against this list would allocate.
+/// `none` leaves the class of the job as it is.
+///
+/// The supervisor names the same three classes again, because it needs the
+/// NUMBER of each class for `ioprio_set` and this list holds the names only.
+/// Keep the two together: a name here that the supervisor does not know would
+/// leave every job in the usual class in silence.
 pub const IO_CLASSES: [&str; 3] = ["none", "best-effort", "idle"];
 
 /// How politely a job uses the machine.
@@ -503,10 +506,12 @@ pub struct PolitenessConfig {
     /// A larger number gives the job less of the processor when something else
     /// wants it. 0 is the value of a command that you type.
     ///
-    /// A user cannot give a number BELOW zero without privilege. qex still
-    /// makes the call; the system refuses it; and the job then runs at the
-    /// priority that it already had. A negative value on a machine where qex
-    /// has no privilege thus costs nothing and gives nothing.
+    /// A user cannot LOWER this number without privilege, and the usual
+    /// `RLIMIT_NICE` of 0 makes every number below zero such a number. qex
+    /// still makes the call; the system refuses it; and the job then runs at
+    /// the priority that it already had. Measured on Linux:
+    /// `setpriority(PRIO_PROCESS, 0, -5)` from nice 0 gives EACCES, and a job
+    /// submitted with `--nice -5` ran at nice 0 and completed.
     #[serde(deserialize_with = "signed_number")]
     pub nice: i32,
     /// The class of the job for the disk, on Linux.

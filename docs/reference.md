@@ -327,10 +327,10 @@ qex refuses a `nice` outside -20 to 19, an `io` that is not one of the three
 names, and an `oom_score_adj` outside -1000 to 1000. It applies each of these
 between the fork and the exec of the job, where it cannot report a fault, so a
 value with a fault would give every job something that nobody asked for and say
-nothing. Measured on Linux: `nice = 100` runs a job at nice 19, because
-`setpriority` moves the number into the range and reports success; `io =
-"iddle"` reads as `io = "none"`; and the kernel refuses a write of
-`oom_score_adj = 90000`, so the job keeps the score that it had.
+nothing. Measured on Linux, with the tests removed: `nice = 100` gave a job at
+nice 19, because `setpriority` moves the number into the range and reports
+success; `io = "iddle"` read as `io = "none"`; and the kernel refused a write of
+`oom_score_adj = 90000`, so the job kept the score that it had.
 
 The supervisor of a job tests these three values again when it starts the job,
 because the file can change after the submission. A file with a fault at that
@@ -339,7 +339,13 @@ the fault in the `error` field of the job.
 
 A change to `[politeness]` reaches the jobs that START after it, and it does not
 touch a job that operates. qex sets these values once, between the fork and the
-exec, and it never sets them again.
+exec, and it never sets them again. Measured: a job at `nice 10` that operated
+stayed at 10 when the file changed to `nice 0`, and a job submitted immediately
+after a change to `nice 17` ran at 17.
+
+The supervisor of a job reads the file for itself, as it does for `[enforce]`,
+so a new `[politeness]` reaches the NEXT job and does not wait for the
+coordinator to read the file again.
 
 `io = "idle"` gives the disk to everything else first, which matters when a
 build reads a whole source tree while somebody saves a file.
