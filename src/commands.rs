@@ -1957,25 +1957,39 @@ fn stop_own_job(client: &mut Client, id: uuid::Uuid) -> bool {
     });
 
     let answer = match answer {
+        // The coordinator refuses a kill for four reasons, and only ONE of them
+        // wants a cancel: the job waits in the queue, so it has no process.
+        // The other three are short moments in the life of a job — the job
+        // stopped, the job starts now, or its process left between the two
+        // calls. Read the state, and cancel the queued job only.
+        //
+        // Without this test, a Ctrl-C at the end of a job that succeeded gave
+        // the user the message of a cancel that the coordinator refused, which
+        // named a job that had already stopped.
         Ok(Response::Error {
             kind: ErrorKind::WrongState,
             ..
-        }) => client.call(&Request::Cancel { id }),
+        }) => match client.call(&Request::Status { id }) {
+            Ok(Response::Status { status }) if status.state == JobState::Queued => {
+                client.call(&Request::Cancel { id })
+            }
+            // Say nothing here. The next turn of the loop reads the state of
+            // the job and reports it, and one true sentence is enough.
+            _ => return false,
+        },
         other => other,
     };
 
     match answer {
-        Ok(Response::Error { message, .. }) => {
-            eprintln!("qex: qex could not stop the job {id}: {message}");
-            false
-        }
         Err(e) => {
             eprintln!(
-                "qex: qex could not ask the coordinator to stop the job {id}: {e}. The job can \
-                 still operate. Use `qex kill {id}` when the coordinator answers again."
+                "qex: the coordinator did not answer, so the job {id} received no stop: {e}. The \
+                 job can still operate. Use `qex kill {id}`, or `qex cancel {id}` for a job that \
+                 waits, when the coordinator answers again."
             );
             false
         }
+        Ok(Response::Error { .. }) => false,
         Ok(_) => true,
     }
 }
@@ -2038,14 +2052,17 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
         // so the message must give the reader the id and the next command.
         // Without them the reader has the code of a job that failed and no
         // way to learn that the job continues.
-        let status = match client.call(&Request::Status { id }).with_context(|| {
-            format!(
-                "qex could not read the state of the job {id}. The job can still operate. Use \
-                 `qex status {id}` when the coordinator answers again."
-            )
-        })? {
-            Response::Status { status } => status,
-            other => return report(other),
+        // Put the cause INSIDE the message, and do not add a context that
+        // anyhow writes before it. A context that ends in a full stop gives
+        // `...answers again.: Broken pipe`, and the remedy then stands before
+        // the fault that it corrects.
+        let status = match client.call(&Request::Status { id }) {
+            Ok(Response::Status { status }) => status,
+            Ok(other) => return report(other),
+            Err(e) => bail!(
+                "the coordinator did not give the state of the job {id}: {e:#}. The job can \
+                 still operate. Use `qex status {id}` when the coordinator answers again."
+            ),
         };
 
         // Say why nothing happens yet. A user of `qex run` sees no output while
@@ -2075,8 +2092,10 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
 /// DIFFERENT command stopped: the caller must not read that as a fault in its
 /// own work, so the text says that this command did not stop the job.
 ///
-/// `stopped_here` is true when this command sent the kill, after Ctrl-C or
-/// after a SIGTERM. That user knows the cause already, so the text is short.
+/// `stopped_here` is true when this command stopped the job itself, after
+/// Ctrl-C or after a SIGTERM: it sent the kill, or it cancelled a job that
+/// still waited in the queue. That user knows the cause already, so the text
+/// is short.
 fn report_run_stop(status: &JobStatus, stopped_here: bool) {
     let id = status.id;
     let text = match status.state {

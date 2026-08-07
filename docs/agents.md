@@ -183,10 +183,10 @@ when the job RAN: `qex run -- sh -c 'exit 7'` gives 7.
 
 **Read 125 with care.** A job of `qex run` is a job like any other, so a
 different agent on this machine can run `qex kill` or `qex cancel` on it. The
-code 125 says that your work did not fail: something stopped it before it could
-finish. Do not start the work again and do not report a fault in the task. Read
-the line on stderr, which says what stopped the job and whether this command
-stopped it.
+code 125 says that something stopped the job before it could finish, and it
+does not say that your work failed. Do not start the work again and do not
+report a fault in the task before you read the line on stderr. That line says
+what stopped the job, and whether this command stopped it.
 
 The code 1 has two causes. Your work ran and it gave the exit code 1, or qex
 could not finish its own work: the coordinator stopped while `qex run` waited,

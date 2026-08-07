@@ -153,11 +153,12 @@ id.
     short, and you wait for it now    ->  qex run -- ...
     long, or you come back to it      ->  qex submit, then qex status <id> --wait
 
-When something else stops the job, `qex run` gives 125 and not 1. Another agent
-on this machine can run `qex kill` or `qex cancel` on your job, because a job of
-`qex run` is a job like any other. The code 125 says that your work did not
-fail: something stopped it. Do not start the work again before you read the
-line on stderr. Run `qex help exit-codes` for the full table.
+When something stops the job, `qex run` gives 125 and not 1. Another agent on
+this machine can run `qex kill` or `qex cancel` on your job, because a job of
+`qex run` is a job like any other. The code 125 says that something stopped the
+job before it could finish, and it does not say that your work failed. Do not
+start the work again before you read the line on stderr. Run
+`qex help exit-codes` for the full table.
 
 The three commands you need
 ---------------------------
