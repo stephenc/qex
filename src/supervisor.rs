@@ -864,13 +864,14 @@ fn apply_politeness(nice: i32, io_class: &str, oom_score_adj: i32) {
     // Linux with the usual `RLIMIT_NICE` of 0: `setpriority(PRIO_PROCESS, 0,
     // -5)` from nice 0 gives EACCES and leaves the process at 0.
     //
-    // The call happens for 0 as well. `--nice 0` says "this job must not give
-    // way", so qex asks for 0 and does not leave the priority that the job
+    // The call happens for 0 as well. `--nice 0` asks that the job does not
+    // give way, so qex asks for 0 and does not leave the priority that the job
     // received from the supervisor. On a machine with no privilege that ASK
-    // frequently gives nothing: a coordinator that a user started under `nice
-    // 5` cannot put its job back at 0, and the job then runs at 5. qex makes
-    // the call so that it obeys the user where the machine permits it, and it
-    // does not promise more.
+    // frequently gives nothing. Measured with a coordinator started under
+    // `nice 5`: `--nice 0` gave a job at nice 5, and `--nice 10` and
+    // `--nice 19` gave 10 and 19. qex makes the call so that it obeys the user
+    // where the machine permits it, and the help text and the documentation say
+    // that qex can only make a job give way MORE than the coordinator does.
     //
     // A number ABOVE the range is worse than a number below it. `setpriority`
     // moves such a number INTO the range and reports success, so it never
