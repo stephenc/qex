@@ -38,11 +38,14 @@
 //!   budget is free, and the next job starts, whatever the hook does.
 //! - The hook has a time limit. qex signals the process group of the hook at
 //!   the limit, and it sends `KILL` a short time after that.
-//! - The hook has a size limit. The time limit is NOT a limit on the output: a
-//!   hook of three seconds that writes with no stop made a file of 3.7GB. qex
-//!   stops a hook that goes above `OUTPUT_LIMIT` while it runs, AND it cuts the
-//!   log after each hook. A hook that wrote 20MB and stopped between two tests
-//!   of the size kept every byte before the second step was there.
+//! - The hook has a size limit, and IT FAILS CLOSED. The hook writes into a
+//!   pipe and never into the file, so qex stops reading at `OUTPUT_LIMIT` and
+//!   shuts the pipe. The disk stops growing AT the cap. An earlier form gave
+//!   the file to the hook and cut it later; that bounded what qex KEPT, and the
+//!   peak on the disk was the speed of the hook multiplied by the interval
+//!   between two tests of the size — measured at 25.3MB for a cap of 1MB, and
+//!   at 334GB for a qex that stopped before it could cut. The casualty of that
+//!   is never the hook: it is every other job on the machine.
 //! - A hook that fails changes no job. The result of the job is the result of
 //!   the job, and a notification that did not arrive does not change it.
 //! - The verdict of qex goes into `hook.log`, which `qex logs --hook` reads. A
@@ -297,7 +300,29 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
         .truncate(true)
         .mode(0o600)
         .open(dir.join(LOG_FILE))?;
-    let err = out.try_clone()?;
+
+    // THE HOOK NEVER RECEIVES THE FILE. It writes into a pipe, and qex copies
+    // from that pipe to the file and STOPS AT THE CAP.
+    //
+    // The earlier form gave the file to the hook and cut it afterwards. The cap
+    // then bounded what qex KEPT and not what reached the disk: a hook writes
+    // for the whole interval between two tests of the size, so the peak was the
+    // speed of the hook multiplied by 20ms. Measured: 25.3MB on the disk for a
+    // cap of 1MB. A qex that stopped before it cut the file left the peak
+    // there for ever, and one such file reached 334GB and filled the machine.
+    //
+    // THE CASUALTY OF THAT IS NEVER THE HOOK. It is every other job on the
+    // machine, and the finished work of other people. A queue exists to make
+    // work survive, so it must not be the thing that fills the disk. Losing the
+    // output of a hook is a small loss, and this code records it. Losing the
+    // file system is not recorded anywhere and destroys what other people
+    // finished.
+    //
+    // With the pipe, qex stops reading at the cap and closes its end. The next
+    // write of the hook meets EPIPE, or SIGPIPE stops the hook. The disk stops
+    // growing AT the cap, and not at the cap multiplied by an interval.
+    let (reader, writer) = pipe()?;
+    let writer_err = writer.try_clone()?;
 
     let mut cmd = std::process::Command::new(&cfg.hooks.on_stop[0]);
     cmd.args(&cfg.hooks.on_stop[1..])
@@ -312,8 +337,8 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
             _ => std::path::PathBuf::from("/"),
         })
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(out))
-        .stderr(std::process::Stdio::from(err));
+        .stdout(std::process::Stdio::from(writer))
+        .stderr(std::process::Stdio::from(writer_err));
 
     // The data of the job goes in the environment, and NEVER in the command
     // line. A job name comes from the user of the queue, and a name such as
@@ -339,6 +364,16 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
     let start = Instant::now();
     let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
+
+    // Close the ends that this process holds. Without this the read below never
+    // meets the end of the data, because this process is still a writer.
+    drop(cmd);
+
+    // Copy in a thread, so the time limit below still operates while the hook
+    // writes.
+    let cut_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cut_seen = cut_flag.clone();
+    let copier = std::thread::spawn(move || capture(reader, out, &cut_seen));
 
     // Wait for the hook. Stop it at the time limit, and stop it also when its
     // output goes above the size limit.
@@ -378,12 +413,15 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
             too_slow = true;
             break;
         }
-        if std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0) > OUTPUT_LIMIT {
+        // The copier holds the cap, and it holds it at the moment of the write
+        // and not one interval later. This test only asks whether it fired, so
+        // that qex ALSO STOPS the hook. Failing closed on the disk is not a
+        // reason to let a broken hook hold a supervisor for its whole time
+        // limit: the pipe is shut, so everything it writes now goes nowhere.
+        if cut_flag.load(std::sync::atomic::Ordering::SeqCst) {
             too_large = true;
             break;
         }
-        // A short interval, because a hook can write a large quantity between
-        // two tests of the size.
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -393,19 +431,17 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
         child.wait().ok();
     }
 
-    // Test the size again, whatever ended the loop.
-    //
-    // The loop tests the size between two sleeps, and it leaves at once when
-    // the hook stops. A hook that wrote 20MB and then stopped inside one
-    // interval thus kept every byte, while the documentation said that the
-    // limit holds. The limit is on the file, and not on the speed of the hook.
-    let cut = cut_log(&log_path);
+    // The copier ends when the hook closes its end of the pipe, which happens
+    // when the hook stops. Take the count that it wrote.
+    let wrote = copier.join().unwrap_or(0);
+    let cut = cut_flag.load(std::sync::atomic::Ordering::SeqCst);
 
-    if too_large {
+    if cut && !too_slow {
         return Ok(format!(
-            "wrote more than {} and qex stopped it. qex cut {}. Write less in the hook.",
+            "wrote more than {}, so qex stopped reading it and closed the pipe.              {} holds the first {}. Write less in the hook.",
             crate::units::format_size(OUTPUT_LIMIT),
-            log_path.display()
+            log_path.display(),
+            crate::units::format_size(wrote)
         ));
     }
 
@@ -417,19 +453,11 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
         );
         if cut {
             text.push_str(&format!(
-                " It also wrote more than {}, so qex cut its log.",
+                " It also wrote more than {}, so qex stopped reading its output.",
                 crate::units::format_size(OUTPUT_LIMIT)
             ));
         }
         return Ok(text);
-    }
-
-    if cut {
-        return Ok(format!(
-            "wrote more than {} before it stopped. qex cut {}. Write less in the hook.",
-            crate::units::format_size(OUTPUT_LIMIT),
-            log_path.display()
-        ));
     }
 
     match exit_of(&mut child) {
@@ -445,18 +473,65 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
     }
 }
 
-/// Cuts the log of the hook to the size limit. Gives `true` if it cut the file.
-fn cut_log(path: &Path) -> bool {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if size <= OUTPUT_LIMIT {
-        return false;
+/// Gives a pipe: the end that qex reads, and the end that the hook writes.
+fn pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as libc::c_int; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
     }
-    // The state directory must not hold gigabytes because one hook wrote with
-    // no stop.
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
-        f.set_len(OUTPUT_LIMIT).ok();
+    unsafe {
+        Ok((
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        ))
     }
-    true
+}
+
+/// Copies the output of the hook to its log, and STOPS AT THE CAP.
+///
+/// This function is the cap. It gives back the number of bytes that it wrote,
+/// and it sets `cut` when the hook offered more than the limit.
+///
+/// IT FAILS CLOSED. At the limit it stops reading and gives back control, which
+/// drops the end of the pipe that qex holds. The hook then meets EPIPE at its
+/// next write, or SIGPIPE stops it. Nothing after this point can make the file
+/// larger, so the disk stops growing at the cap.
+///
+/// The other order — let the hook write and cut the file later — bounds only
+/// what qex KEEPS. It leaves the peak on the disk, and a qex that stops before
+/// it cuts leaves the peak there for ever.
+fn capture(
+    mut reader: std::fs::File,
+    mut out: std::fs::File,
+    cut: &std::sync::atomic::AtomicBool,
+) -> u64 {
+    use std::io::{Read, Write};
+
+    let mut buf = [0u8; 16 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        // Keep the bytes up to the limit, and no more.
+        let room = OUTPUT_LIMIT.saturating_sub(written) as usize;
+        let take = room.min(n);
+        if take > 0 && out.write_all(&buf[..take]).is_err() {
+            break;
+        }
+        written += take as u64;
+        if take < n || written >= OUTPUT_LIMIT {
+            // The hook offered more than the limit. Stop reading, and let the
+            // pipe tell the hook.
+            cut.store(true, std::sync::atomic::Ordering::SeqCst);
+            break;
+        }
+    }
+    written
 }
 
 /// Gives the result of a hook that this code already waited for.
@@ -1006,9 +1081,11 @@ mod tests {
     /// A hook that writes with no stop must not fill the disk.
     ///
     /// The time limit is not a limit on the output: a hook of three seconds
-    /// wrote 3.7GB into the state directory, for one job.
+    /// wrote 3.7GB into the state directory, for one job. The cap now holds at
+    /// the moment of the write, so the disk stops growing AT the cap. Measured
+    /// for the whole file: a peak of 25.3MB before, and 1.0MB after.
     #[test]
-    fn a_hook_that_writes_without_a_stop_is_stopped_and_its_log_is_cut() {
+    fn a_hook_that_writes_without_a_stop_is_stopped_at_the_cap() {
         let dir = temp("flood");
         // A hook that writes far more than the cap and THEN WAITS, instead of
         // one that writes for ever.
@@ -1066,10 +1143,10 @@ mod tests {
         let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap_or_default();
         assert!(
             log.contains("wrote more than"),
-            "the verdict must say that qex cut the file"
+            "the verdict must say that qex stopped reading the hook"
         );
 
-        // The verdict must be a line of its own. qex cuts the file in the
+        // The verdict must be a line of its own. qex stops reading in the
         // middle of a line, so a verdict with no newline before it joins that
         // line, and `qex logs --hook --tail 1` then gives a megabyte.
         let last = log.lines().next_back().unwrap_or("");

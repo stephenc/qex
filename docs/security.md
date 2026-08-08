@@ -73,7 +73,10 @@ value that holds one, so a single NUL in a tag stopped the hook of that job from
 starting at all, and the message named the config file. Job data must never
 decide that a notification does not arrive.
 
-The hook has a time limit and a size limit. Its output goes to `hook.log` in the
+The hook has a time limit and a size limit, and the size limit fails closed: the
+hook writes into a pipe, so qex stops reading at the limit and the disk stops
+growing there. A log that nobody reads must never fill the file system of a
+machine that other people work on. Its output goes to `hook.log` in the
 job directory with mode 0600, and `qex logs <id> --hook` reads that file. A hook
 that fails changes no job.
 
