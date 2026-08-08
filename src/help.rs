@@ -905,9 +905,10 @@ and it does not try again. A message that arrives two times is worse than a
 message that is lost.
 
 A hook that uses more than `[hooks] timeout` receives TERM and then KILL, in a
-process group of its own. qex stops a hook that goes above 1MB of output while
-it runs, and it cuts the log of each hook to that size. That size is fixed, and
-it is NOT `[logs] max_bytes`, which limits the output of a job. A hook that
+process group of its own. The hook writes into a pipe and never into a file, so
+at 1MB of output qex stops reading, shuts the pipe and stops the hook. The disk
+thus stops growing AT 1MB. That size is fixed, and it is NOT `[logs]
+max_bytes`, which limits the output of a job. A hook that
 fails does not change the job, and qex writes nothing in the `error` field of
 the job for it.
 

@@ -1137,11 +1137,20 @@ qex gives these guarantees:
 - **A hook cannot hold the queue.** qex starts it after the final state is on
   the disk, so the job has its result, the budget is free and the next job
   starts before the hook does anything.
-- **A hook has a time limit and a size limit.** A hook that uses more than
-  `[hooks] timeout` receives TERM and then KILL, in a process group of its own.
-  qex stops a hook that goes above 1MB of output while it runs, and it cuts the
-  log of each hook to that size. A hook that writes 20MB and stops at once thus
-  also leaves 1MB.
+- **A hook has a time limit and a size limit, and the size limit FAILS
+  CLOSED.** A hook that uses more than `[hooks] timeout` receives TERM and then
+  KILL, in a process group of its own. The hook writes into a pipe and never
+  into a file, so at 1MB qex stops reading and shuts the pipe: the hook then
+  meets EPIPE, qex stops it, and **the disk stops growing at 1MB**. The earlier
+  form cut the file afterwards, which bounded what qex KEPT and not what
+  reached the disk — a peak of 25.3MB for a cap of 1MB, and no bound at all if
+  qex stopped before it could cut. `qex logs <id> --hook` says when this
+  happened and how much qex kept.
+- **`setpgid` gives the hook a process group of its own.** That is deliberate:
+  it lets qex stop a hook together with the children that it started. It also
+  means a hook OUTLIVES a qex that dies, so the stop above is the only thing
+  that bounds a hook that runs away. The cap holds even then, because the pipe
+  dies with qex and the hook can no longer write anywhere.
 - **A change to `[hooks]` acts on the next job that stops.** qex reads the
   config file at each job, and not one time at the start. A hook that you delete
   runs no more, and a hook that you add runs at once. You do not restart the
