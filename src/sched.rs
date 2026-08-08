@@ -401,6 +401,9 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
 
     if let Ok(dir) = paths::job_dir(&id) {
         job::write_status(&dir, &status).ok();
+        // This code holds the lock of the queue, so the hook runs in a thread
+        // of its own. A hook that hangs must never hold the queue.
+        crate::hook::fire_detached(&dir, &status);
     }
     log(&format!(
         "job {id} did not run, because a job that it needed did not succeed"
@@ -674,6 +677,9 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
                 drop(state);
                 if let Ok(dir) = paths::job_dir(&id) {
                     job::write_status(&dir, &status).ok();
+                    // This job has no supervisor, so the coordinator tells the
+                    // person that it stopped.
+                    crate::hook::fire_detached(&dir, &status);
                 }
             }
             coord.notify();

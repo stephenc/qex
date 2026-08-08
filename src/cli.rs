@@ -374,6 +374,17 @@ pub struct LogsArgs {
     #[arg(long, conflicts_with = "follow")]
     pub json: bool,
 
+    /// Show the output of the stop hook, and the verdict of qex on it.
+    ///
+    /// Use this option when a notification did not arrive. See `[hooks]` in
+    /// `qex help config`.
+    ///
+    /// This file is not a stream of the job, so `--stdout` and `--stderr` have
+    /// no meaning with it. An option that qex ignores in silence gives the
+    /// reader an answer to a question that the reader did not ask.
+    #[arg(long, conflicts_with_all = ["follow", "stdout", "stderr"])]
+    pub hook: bool,
+
     #[command(flatten)]
     pub select: crate::logsel::LogSelect,
 }

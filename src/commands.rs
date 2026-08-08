@@ -946,7 +946,30 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
         return follow(&dir, &args.select);
     }
 
-    let streams = chosen_streams(&args.select);
+    // The log of the stop hook is not a stream of the job, so it comes alone.
+    // A reader who asks why a notification did not arrive must not receive the
+    // output of the job with that answer.
+    let streams = if args.hook {
+        // Say that there is no file. An empty answer would look like a hook
+        // that ran and wrote nothing, and the reader would test the wrong
+        // thing.
+        //
+        // The message goes to stderr, and `--json` continues to the document
+        // below. A reader that asks for JSON must always receive JSON: an empty
+        // answer gives that reader an error from its parser, and not an answer.
+        if !dir.join("hook.log").exists() {
+            eprintln!(
+                "qex: qex ran no stop hook for this job, so there is no log. \
+                 Read `qex config show` to see the hook and the states that it runs on."
+            );
+            if !args.json {
+                return Ok(0);
+            }
+        }
+        vec![("hook", "hook.log")]
+    } else {
+        chosen_streams(&args.select)
+    };
     // The record says what the LIMIT removed. That is not in the file, and no
     // option gives it back, so each path below says it.
     let status = crate::job::read_status(&dir).ok();
@@ -996,8 +1019,16 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
         // The notice goes to stderr, so stdout holds the log lines only.
         // A command such as `qex logs $ID > file` must give a clean file, and a
         // reader that parses the output must not meet a sentence in it.
-        if let Some(notice) = status.as_ref().and_then(|s| dropped_notice(s, name)) {
-            eprintln!("{notice}");
+        //
+        // `logs_dropped` counts the output of the JOB, so it says nothing about
+        // the log of the hook. Without this test, a job whose output did not
+        // close made `qex logs --hook` print "the output of this job did not
+        // close" above the hook log, which sends the reader to the wrong file.
+        // The hook has its own limit, and its own verdict inside `hook.log`.
+        if !args.hook {
+            if let Some(notice) = status.as_ref().and_then(|s| dropped_notice(s, name)) {
+                eprintln!("{notice}");
+            }
         }
         if let Some(notice) = selected.notice() {
             eprintln!("{notice}");

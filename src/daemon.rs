@@ -601,6 +601,9 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                     "job {} was active but its processes are gone; the state is now failed",
                     status.id
                 ));
+                // This coordinator made the job terminal, so this coordinator
+                // tells the person. The supervisor is gone and cannot.
+                crate::hook::fire_detached(&path, &status);
             }
         }
 
@@ -908,6 +911,9 @@ fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
 
             if let Ok(dir) = paths::job_dir(&id) {
                 job::write_status(&dir, &status).ok();
+                // A cancelled job is not in the default filter. A user who asks
+                // for `cancelled` gets it here.
+                crate::hook::fire_detached(&dir, &status);
             }
             coord.notify();
             Response::Ok
