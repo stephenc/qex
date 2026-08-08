@@ -284,6 +284,21 @@ impl Harness {
         std::fs::write(self.root.join("cfg/qex.toml"), config).unwrap();
     }
 
+    /// Names the process that ran the stop hook of this job.
+    ///
+    /// The last word of `hook.ran` is `supervisor` or `coordinator`. Three
+    /// paths reach the hook, and each one alone gives the person exactly one
+    /// message, so a test that counts the messages passes when any one of them
+    /// operates. This helper lets a test say WHICH one must operate.
+    fn hook_origin(&self, id: &str) -> String {
+        let text = std::fs::read_to_string(self.job_dir(id).join("hook.ran"))
+            .unwrap_or_else(|e| panic!("hook.ran is not there for the job {id}: {e}"));
+        text.split_whitespace()
+            .next_back()
+            .unwrap_or_default()
+            .to_string()
+    }
+
     /// Gives the lines that the stop hook of a test wrote.
     fn hook_lines(&self) -> Vec<String> {
         match std::fs::read_to_string(self.root.join("hook.txt")) {
@@ -4833,6 +4848,14 @@ fn a_job_that_stops_runs_the_stop_hook_one_time_with_its_result() {
     // makes this job terminal reads it and does nothing.
     assert!(h.job_dir(&id).join("hook.ran").exists());
 
+    // THE SUPERVISOR notified, and not the coordinator. Both can, and the count
+    // above passes for either, so name the one that must.
+    assert_eq!(
+        h.hook_origin(&id),
+        "supervisor",
+        "the supervisor of a job that ran must be the process that notifies"
+    );
+
     // Give a second process the time to run the hook again. The count must not
     // change.
     std::thread::sleep(Duration::from_secs(2));
@@ -4930,6 +4953,11 @@ fn the_configured_states_select_the_jobs_that_run_the_stop_hook() {
         vec!["skipped test".to_string()],
         "the filter must select the state `skipped` only"
     );
+    assert_eq!(
+        h.hook_origin(&test),
+        "coordinator",
+        "a job that never ran has no supervisor, so the coordinator notifies"
+    );
 }
 
 /// A job whose supervisor stopped must still notify, one time.
@@ -4979,6 +5007,11 @@ fn a_job_whose_supervisor_stopped_still_runs_the_stop_hook_one_time() {
         h.hook_lines(),
         vec!["failed".to_string()],
         "the hook must run one time for a job that lost its supervisor"
+    );
+    assert_eq!(
+        h.hook_origin(&id),
+        "coordinator",
+        "with no supervisor, the coordinator must be the process that notifies"
     );
 
     // The verdict of qex must reach a qex command.
@@ -5060,6 +5093,219 @@ fn a_stop_hook_that_the_user_deletes_does_not_run_again() {
         h.hook_lines(),
         vec!["first".to_string(), "skipped".to_string()],
         "a hook that the user adds must run on the next job that stops"
+    );
+}
+
+/// A job must notify when NO COORDINATOR OPERATES.
+///
+/// # This is the sentence that the design of this feature rests on
+///
+/// `src/supervisor.rs` says: THE SUPERVISOR RUNS THE HOOK, because a
+/// coordinator can stop and start again while a job runs, and a coordinator
+/// that ran the hook would miss the jobs of the period in which it did not
+/// operate. Nothing measured that sentence.
+///
+/// # Why the other tests cannot measure it
+///
+/// Three paths reach the hook of an ordinary job: the supervisor at the end of
+/// its work, the supervisor when the command does not exist, and the
+/// coordinator when it reaps that supervisor. EACH ONE ALONE gives the person
+/// exactly one message. A hand deletion of each of the three, one at a time,
+/// left the whole suite green, because every test asserted the COUNT of the
+/// messages and the count was still one.
+///
+/// This test takes the coordinator away, so one path remains. It also asserts
+/// the word in `hook.ran`, so it fails if the surviving path is the wrong one.
+#[test]
+fn a_job_notifies_from_its_supervisor_when_no_coordinator_operates() {
+    let h = Harness::with_default_config("hooknocoord");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop = [\"sh\", \"-c\", \
+         \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    // The job must still be running when the coordinator goes, so that the
+    // supervisor writes the result and runs the hook with nothing else alive.
+    let id = h.submit(&["submit", "--name", "alone", "--", "sleep", "5"]);
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.state_of(&id) == "running" && h.status_json(&id)["supervisor_pid"].as_i64().is_some()
+    });
+
+    // Take the coordinator away. The supervisor is a session of its own, so it
+    // continues. This test started this coordinator, and the pid comes from
+    // qex itself.
+    let coordinator = h.coordinator_pid();
+    unsafe {
+        libc::kill(coordinator, libc::SIGKILL);
+    }
+
+    // Prove that it is gone BEFORE the job stops. Without this step, a
+    // coordinator that was still alive could notify, and the test would pass
+    // while measuring the path that it means to take away.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while unsafe { libc::kill(coordinator, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator {coordinator} did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // FROM HERE, RUN NO qex COMMAND UNTIL THE HOOK HAS RUN. `qex status` and
+    // `qex list` start a coordinator when none operates, and that new
+    // coordinator would reap the job and could notify. Read the disk instead.
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(60),
+        || !h.hook_lines().is_empty(),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert_eq!(
+        h.hook_lines(),
+        vec!["completed alone".to_string()],
+        "a job must give one message when no coordinator operates"
+    );
+    assert_eq!(
+        h.hook_origin(&id),
+        "supervisor",
+        "with no coordinator, only the supervisor can have notified"
+    );
+}
+
+/// A job whose command does not exist must still notify.
+///
+/// The supervisor never starts a process for such a job, so it reaches the
+/// state `failed` on a path of its own, and it leaves `main` before the end.
+/// A typing fault in a command is one of the most frequent ways for a job to
+/// fail, and it must not be the one failure that gives no message.
+#[test]
+fn a_job_whose_command_does_not_exist_still_runs_the_stop_hook() {
+    let h = Harness::with_default_config("hooknocmd");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop = [\"sh\", \"-c\", \
+         \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let id = h.submit(&["submit", "--name", "typo", "--", "qex-no-such-program"]);
+    h.until("the job failed", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        h.hook_lines(),
+        vec!["failed typo".to_string()],
+        "a job whose command does not exist must give one message"
+    );
+    // The supervisor of this job exists; it never started a process. This is a
+    // path of its own to `failed`, and it leaves `main` before the end.
+    assert_eq!(
+        h.hook_origin(&id),
+        "supervisor",
+        "the supervisor must notify for a command that does not exist"
+    );
+}
+
+/// A cancelled job notifies when, and only when, the config file asks for it.
+///
+/// `cancelled` is not in the default list, because the person who cancelled the
+/// job already knows. A person who WANTS that message adds the name, and the
+/// message must then arrive. Such a job never started, so it has no supervisor
+/// and the COORDINATOR runs its hook.
+#[test]
+fn a_cancelled_job_runs_the_stop_hook_when_the_config_file_asks_for_it() {
+    let h = Harness::with_default_config("hookcancel");
+    let mark = h.root.join("hook.txt");
+    // One core of budget, and one job that takes it. The next job then stays in
+    // the queue, where `qex cancel` can take it out before it ever runs.
+    h.write_config(&format!(
+        "[budget]\ncpu = \"1\"\nmem = \"512MB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop_states = [\"cancelled\"]\n\
+         on_stop = [\"sh\", \"-c\", \
+         \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let occupier = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "128MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.has_started(&occupier)
+    });
+
+    let waiting = h.submit(&[
+        "submit", "--name", "later", "--cpu", "1", "--mem", "128MB", "--", "true",
+    ]);
+    assert_eq!(
+        h.state_of(&waiting),
+        "queued",
+        "the budget of one core must hold this job in the queue"
+    );
+
+    h.qex(&["cancel", &waiting]);
+    h.until("the job is cancelled", Duration::from_secs(30), || {
+        h.state_of(&waiting) == "cancelled"
+    });
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        h.hook_lines(),
+        vec!["cancelled later".to_string()],
+        "a cancelled job must give the message that the config file asks for"
+    );
+    assert_eq!(
+        h.hook_origin(&waiting),
+        "coordinator",
+        "a job that never ran has no supervisor, so the coordinator notifies"
+    );
+
+    // The job that holds the budget stops as `killed`, which this filter does
+    // not select, so the count above stands.
+    h.qex(&["kill", &occupier, "--grace", "1s"]);
+}
+
+/// `qex logs --hook` must SAY that qex ran no hook for this job.
+///
+/// An empty answer looks like a hook that ran and wrote nothing. The reader
+/// then tests the hook itself, and the true cause — that no hook is configured,
+/// or that this state is not in the filter — is somewhere else.
+#[test]
+fn qex_logs_hook_says_when_there_was_no_stop_hook() {
+    let h = Harness::with_default_config("hooknone");
+    let id = h.submit(&["submit", "--", "true"]);
+    h.ok(&["wait", &id]);
+
+    let out = h.qex(&["logs", &id, "--hook"]);
+    assert_eq!(out.status.code(), Some(0), "this is not a fault of the user");
+    let notice = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        notice.contains("ran no stop hook"),
+        "the reader must learn that there was no hook: {notice}"
+    );
+    // The message goes to stderr. `qex logs $ID --hook > file` must give a
+    // file that holds the log and no sentence of qex.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "the standard output must hold the log only"
     );
 }
 
