@@ -845,13 +845,20 @@ mod tests {
         ));
 
         // The directory of the job is there.
+        //
+        // COMPARE THE PATHS THAT THE SYSTEM RESOLVED, and not the text. On
+        // macOS the temporary directory is below `/var`, which is a link to
+        // `/private/var`, so `pwd` in the hook gives `/private/var/...` while
+        // this test holds `/var/...`. The test then failed on macOS only, for a
+        // difference that says nothing about the hook.
         let mut s = status(JobState::Completed);
         s.cwd = dir.display().to_string();
         fire_with(Origin::Supervisor, &cfg, &dir, &s);
+        let got = std::fs::read_to_string(&out).unwrap().trim().to_string();
         assert_eq!(
-            std::fs::read_to_string(&out).unwrap().trim(),
-            dir.display().to_string(),
-            "the hook must start in the directory of the job"
+            std::fs::canonicalize(&got).unwrap(),
+            std::fs::canonicalize(&dir).unwrap(),
+            "the hook must start in the directory of the job (it said {got})"
         );
 
         // The directory of the job is gone. The hook must still run.
