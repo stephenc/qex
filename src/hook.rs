@@ -953,7 +953,10 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap_or_default();
         let (name, tags) = text.split_once('|').unwrap_or(("", ""));
         assert_eq!(name, "a_b_31mc_d", "the name must take its safe form");
-        assert_eq!(tags, "x y", "each control byte of a tag must become a space");
+        assert_eq!(
+            tags, "x y",
+            "each control byte of a tag must become a space"
+        );
         assert!(
             !name.contains('\u{1b}') && !tags.contains('\u{1b}'),
             "no value may carry an escape byte to a screen: {text:?}"
