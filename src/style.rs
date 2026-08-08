@@ -71,7 +71,20 @@ pub fn faint(text: &str) -> String {
 /// work that waits, red for a failure, and a faint colour for a job that
 /// succeeded, because that job needs no attention.
 pub fn state(name: &str, text: &str) -> String {
-    let codes = match name {
+    match state_codes(name) {
+        Some(codes) => wrap(codes, text),
+        None => text.to_string(),
+    }
+}
+
+/// Gives the terminal codes of a job state, or `None` for a name that qex does
+/// not know.
+///
+/// This function is separate from [`state`] so that a test can read the choice.
+/// A test has no terminal, so `state` gives the same plain text for every name
+/// and cannot show which colour a state takes.
+fn state_codes(name: &str) -> Option<&'static str> {
+    Some(match name {
         "running" => GREEN,
         "starting" => GREEN,
         "queued" => YELLOW,
@@ -84,9 +97,8 @@ pub fn state(name: &str, text: &str) -> String {
         "skipped" => BLUE,
         // The same colour as `skipped`: this job also never ran.
         "expired" => BLUE,
-        _ => return text.to_string(),
-    };
-    wrap(codes, text)
+        _ => return None,
+    })
 }
 
 /// Writes a warning.
@@ -111,5 +123,54 @@ mod tests {
     #[test]
     fn an_unknown_state_gives_the_text_back() {
         assert_eq!(state("something-else", "text"), "text");
+        assert_eq!(state_codes("something-else"), None);
+    }
+
+    /// EVERY FINAL STATE MUST HAVE A COLOUR, AND `expired` MUST LOOK LIKE
+    /// `skipped`.
+    ///
+    /// A state with no colour falls to the branch for a name that qex does not
+    /// know, and `qex top` then gives it plain text while every other state has
+    /// a colour. A reader sees that as a fault in the program.
+    ///
+    /// `expired` and `skipped` take the same colour because they say the same
+    /// thing to a reader: this job never ran, and its log file is empty. They
+    /// must not take the colour of `failed`, which says that the work ran and
+    /// gave a bad result.
+    #[test]
+    fn every_state_that_qex_writes_has_a_colour() {
+        for name in [
+            "running",
+            "starting",
+            "queued",
+            "completed",
+            "failed",
+            "oom",
+            "timeout",
+            "killed",
+            "cancelled",
+            "skipped",
+            "expired",
+        ] {
+            assert!(
+                state_codes(name).is_some(),
+                "the state `{name}` has no colour, so `qex top` writes it as plain text"
+            );
+        }
+        assert_eq!(
+            state_codes("expired"),
+            state_codes("skipped"),
+            "a job that expired and a job that was skipped both never ran"
+        );
+        assert_ne!(
+            state_codes("expired"),
+            state_codes("failed"),
+            "a job that expired never ran, and a job that failed did run"
+        );
+        assert_ne!(
+            state_codes("expired"),
+            state_codes("completed"),
+            "a job that expired gave no result"
+        );
     }
 }

@@ -1926,6 +1926,49 @@ fn a_wait_returns_when_the_job_reaches_its_queue_limit() {
     );
 }
 
+/// `qex config show` MUST NAME THE QUEUE LIMIT, AND NAME IT ALWAYS.
+///
+/// This command says what qex uses NOW. A value that it never prints is a value
+/// that a reader cannot confirm, and "no limit" is the answer that most users
+/// get: it says that a job waits for capacity with no end. A user who asks why
+/// a job waited for hours needs to read that line and see that no limit
+/// operates.
+#[test]
+fn the_config_summary_names_the_queue_limit() {
+    // With no value, the line must still appear and must say what happens.
+    let h = Harness::new(
+        "cfgqueuelimit",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let out = h.ok(&["config", "show"]);
+    assert!(
+        out.contains("queue limit:"),
+        "the summary must hold the queue limit line: {out}"
+    );
+    assert!(
+        out.contains("no limit"),
+        "with no value the line must say that a job waits with no end: {out}"
+    );
+
+    // With a value, the line must give it and say what the limit does.
+    let h = Harness::new(
+        "cfgqueuelimit2",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [defaults]\nmax_queue_time = \"30m\"\n",
+    );
+    let out = h.ok(&["config", "show"]);
+    assert!(
+        out.contains("queue limit:") && out.contains("30m"),
+        "the summary must give the value that qex uses: {out}"
+    );
+    assert!(
+        out.contains("expired"),
+        "the line must say what happens to a job that waits longer: {out}"
+    );
+}
+
 /// A WAIT ON A JOB WHOSE DEPENDENCY EXPIRED MUST RETURN AT THE SAME MOMENT.
 ///
 /// This is the configuration that `docs/reference.md` recommends: a limit on

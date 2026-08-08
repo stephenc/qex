@@ -222,9 +222,30 @@ pub fn run(coord: Arc<Coordinator>) {
         // The third case is the one that is easy to lose. An expired job and a
         // skipped job have no supervisor and no request thread to announce
         // them, so a turn that forgets them leaves `qex wait` asleep until the
-        // 30 second fallback in `handle_wait`. Measured before this line
-        // existed: a 3s queue limit gave the record at 3s and `qex wait`
-        // returned at 30.0s.
+        // 30 second fallback in `handle_wait`. Measured with the `finished`
+        // term removed: a 3s queue limit gave `qex wait` at 30.0s, 2 of 2.
+        //
+        // THE TERMS AND THE CONDITION ARE NOT THE SAME KIND OF THING, AND A
+        // READER MUST NOT CONFUSE THEM.
+        //
+        // Each TERM is necessary. Remove `finished > 0` and a waiter on an
+        // expired or skipped job is 30 seconds late, which the end-to-end tests
+        // catch.
+        //
+        // The CONDITION itself is only an economy. A notify that this turn does
+        // not need wakes a parked request thread that finds no change and sleeps
+        // again, so `if true` here is CORRECT and merely wasteful. Measured with
+        // one job running and one waiter parked for 20 seconds: the condition
+        // gave 59 voluntary context switches in the coordinator and `if true`
+        // gave 98, and the processor time of both was below the 10ms that
+        // `/proc` can report. The latency was the same to the millisecond.
+        //
+        // A mutation of this condition that makes it MORE often true therefore
+        // survives every test, and must: no test may fail because qex told the
+        // truth too often. Only a mutation that makes it LESS often true has a
+        // signature. Do not read a surviving mutant here as a hole in the tests,
+        // and do not add a test that counts wakeups to close it: that test would
+        // pin an economy, not a promise, and it would fail on a busy machine.
         match step(&coord) {
             Ok((started, finished)) if started > 0 || finished > 0 || changed => coord.notify(),
             Ok(_) => {}
@@ -616,7 +637,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     // for a pipeline.
     let mut waits_for: std::collections::BTreeMap<uuid::Uuid, Waited> = Default::default();
 
-    // Pass 1: test the dependencies of EVERY job in the queue.
+    // Pass 1: test the dependencies AND THE LOCKS of EVERY job in the queue.
     //
     // This pass is separate from the capacity pass below, and it must stay
     // separate. The capacity pass stops at the first job that must wait, to
@@ -625,8 +646,18 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     // whose dependency already failed would then stay in the queue for ever,
     // and `qex wait` on it would never give an answer.
     //
-    // A dependency decision does not use capacity, so qex can make it for every
-    // job at once.
+    // THE LOCK TEST BELONGS HERE FOR THE SAME REASON. A review measured the
+    // fault: with a job that held the lock, a job of two cores in front of a
+    // budget with one core free, and a victim of one core that asks for the
+    // same lock, the capacity pass stopped at the job in front and never tested
+    // the lock of the victim. The victim then expired with the remedy for
+    // capacity — "give the job a smaller claim" — which gives a lock to nobody.
+    // A busy machine is exactly the machine that this option exists for, so the
+    // fault hit the common case and not a corner.
+    //
+    // Neither decision uses capacity, so qex can make both for every job at
+    // once. `lock_conflict` gives `None` at once for a job with no lock, which
+    // is nearly every job, so this pass stays cheap.
     let mut ready: Vec<uuid::Uuid> = Vec::new();
     for id in state.queue.iter().copied() {
         let Some(job) = state.jobs.get(&id) else {
@@ -637,7 +668,17 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         }
 
         match depends(state, id) {
-            Depends::Ready => ready.push(id),
+            // A lock comes before the capacity. A job that waits for a lock
+            // does not hold capacity, in the same way as a job that waits for a
+            // different job, so it never reaches the list of jobs that can
+            // start.
+            Depends::Ready => match lock_conflict(state, &job.spec) {
+                Some(reason) => {
+                    waits_for.insert(id, Waited::ALock);
+                    reasons.push((id, Some(reason)));
+                }
+                None => ready.push(id),
+            },
             Depends::Waiting(reason) => {
                 waits_for.insert(id, Waited::AJob);
                 reasons.push((id, Some(reason)));
@@ -646,7 +687,8 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         }
     }
 
-    // Pass 2: choose one job from the jobs that have no dependency left.
+    // Pass 2: choose one job from the jobs that have no dependency and no lock
+    // left.
     //
     // The scheduler starts one job for each call, so a lock that this pass gives
     // away cannot be given again: the next call sees the job as active.
@@ -654,15 +696,6 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         let Some(job) = state.jobs.get(&id) else {
             continue;
         };
-
-        // A lock comes before the capacity. A job that waits for a lock does
-        // not hold capacity, in the same way as a job that waits for a
-        // different job, so the loop continues to the next job.
-        if let Some(reason) = lock_conflict(state, &job.spec) {
-            waits_for.insert(id, Waited::ALock);
-            reasons.push((id, Some(reason)));
-            continue;
-        }
 
         match size_check(&cfg, &job.spec) {
             Size::Fits => match admit(&cfg, &job.spec, cpu_used, mem_used) {
@@ -1203,6 +1236,84 @@ mod tests {
         assert!(
             !text.contains("smaller claim"),
             "the machine had three free cores; a smaller claim changes nothing: {text}"
+        );
+    }
+
+    /// A JOB THAT WAITS FOR A LOCK BEHIND A JOB THAT WAITS FOR CAPACITY.
+    ///
+    /// THIS IS THE COMMON CASE, AND IT WAS WRONG. A review measured it end to
+    /// end. `lock_conflict` used to live in the capacity pass, which STOPS at
+    /// the first job that cannot fit, so a job behind that one was never tested
+    /// for a lock. `waits_for` then held no entry for it and the remedy fell
+    /// back to the one for capacity: "give the job a smaller claim", which
+    /// gives a lock to nobody.
+    ///
+    /// A busy machine is the machine that `--max-queue-time` exists for, so the
+    /// fault hit the case that matters and not a corner. The lock test now runs
+    /// in the pass that covers EVERY queued job.
+    #[test]
+    fn a_lock_behind_a_job_that_waits_for_capacity_gets_the_lock_remedy() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+
+        // A job of one core operates and holds the lock. Three cores stay free.
+        let holder = add_job(&mut state, JobState::Running, 1, None, 0);
+        state.jobs.get_mut(&holder).unwrap().spec.locks = vec!["shared".to_string()];
+
+        // A job of four cores is at the front of the queue. Three cores are
+        // free, so it cannot fit, and it holds the capacity for itself.
+        add_job(&mut state, JobState::Queued, 4, None, 0);
+
+        // The victim: one core, the same lock, and past its limit. It sits
+        // BEHIND the job that cannot fit.
+        let victim = add_job(&mut state, JobState::Queued, 1, Some(5), 600);
+        state.jobs.get_mut(&victim).unwrap().spec.locks = vec!["shared".to_string()];
+
+        let choice = choose(&mut state);
+        assert_eq!(choice.start, None, "no job can start");
+        assert_eq!(choice.finished, 1, "the victim must give up");
+
+        let text = state.jobs[&victim].status.error.clone().unwrap();
+        assert!(
+            text.contains("lock"),
+            "the victim waited for a LOCK, and the remedy must say so: {text}"
+        );
+        assert!(
+            !text.contains("smaller claim"),
+            "a smaller claim gives a lock to nobody: {text}"
+        );
+    }
+
+    /// THE REMEDY FOR A DEPENDENCY MUST REACH THE JOB THROUGH `choose`.
+    ///
+    /// `the_remedy_fits_the_reason_for_the_wait` calls `expire` with the cause
+    /// already decided, so it cannot show that `choose` gives the right cause.
+    /// A review deleted the line that records the cause of a dependency wait
+    /// and the whole suite stayed green. This test holds that line.
+    #[test]
+    fn a_job_that_waits_for_a_dependency_gets_the_pipeline_remedy_through_choose() {
+        let mut state = state_with(JobState::Running, None, 0);
+        state.queue.clear();
+        state.jobs.clear();
+
+        // A job that operates, and a queued job that needs it and passed its
+        // limit. The machine has free cores, so capacity is not the cause.
+        let root = add_job(&mut state, JobState::Running, 1, None, 0);
+        let waiter = add_job(&mut state, JobState::Queued, 1, Some(5), 600);
+        state.jobs.get_mut(&waiter).unwrap().spec.needs = vec![root];
+
+        let choice = choose(&mut state);
+        assert_eq!(choice.finished, 1, "the job that waited must give up");
+
+        let text = state.jobs[&waiter].status.error.clone().unwrap();
+        assert!(
+            text.contains("whole pipeline"),
+            "a job that waited for a job that it needs takes the pipeline remedy: {text}"
+        );
+        assert!(
+            !text.contains("smaller claim"),
+            "the machine had free cores; a smaller claim changes nothing: {text}"
         );
     }
 

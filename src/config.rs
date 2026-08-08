@@ -1322,6 +1322,28 @@ mod tests {
         );
     }
 
+    /// A CONFIG FILE WITH A BAD QUEUE LIMIT MUST FAIL AT START.
+    ///
+    /// `validate` reads every field that the parser does not read at once, so
+    /// qex reports a fault one time and not at the moment that it first uses
+    /// the field. Without the call for this field, a coordinator took a file
+    /// with `max_queue_time = "soon"`, started, and gave every job no limit in
+    /// silence — and the user who wrote the line believed that the limit
+    /// operated.
+    #[test]
+    fn validate_refuses_a_queue_limit_that_means_nothing() {
+        let c: Config = toml::from_str("[defaults]\nmax_queue_time = \"soon\"\n").unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("[defaults] max_queue_time"),
+            "the error must name the field: {e}"
+        );
+
+        // A file with a value that qex understands must pass.
+        let ok: Config = toml::from_str("[defaults]\nmax_queue_time = \"30m\"\n").unwrap();
+        ok.validate().unwrap();
+    }
+
     /// A value that means nothing must still give an error that names the
     /// field, and not the type of the value in the program.
     #[test]
