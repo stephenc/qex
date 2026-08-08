@@ -1627,8 +1627,9 @@ mod tests {
         // until qex gained a `[hooks]` section, and the test then failed on a
         // file that parses. Choose a name that this build refuses, and change
         // it again when qex takes that name.
-        let error = toml::from_str::<Config>("[telemetry]\nendpoint = \"https://example.invalid\"\n")
-            .unwrap_err();
+        let error =
+            toml::from_str::<Config>("[telemetry]\nendpoint = \"https://example.invalid\"\n")
+                .unwrap_err();
         let text = config_error(path, error, Detail::Full).to_string();
 
         assert!(
@@ -1699,8 +1700,9 @@ mod tests {
         // until qex gained a `[hooks]` section, and the test then failed on a
         // file that parses. Choose a name that this build refuses, and change
         // it again when qex takes that name.
-        let error = toml::from_str::<Config>("[telemetry]\nendpoint = \"https://example.invalid\"\n")
-            .unwrap_err();
+        let error =
+            toml::from_str::<Config>("[telemetry]\nendpoint = \"https://example.invalid\"\n")
+                .unwrap_err();
         let text = config_error(path, error, Detail::Short).to_string();
 
         assert!(

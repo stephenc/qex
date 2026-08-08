@@ -5295,7 +5295,11 @@ fn qex_logs_hook_says_when_there_was_no_stop_hook() {
     h.ok(&["wait", &id]);
 
     let out = h.qex(&["logs", &id, "--hook"]);
-    assert_eq!(out.status.code(), Some(0), "this is not a fault of the user");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "this is not a fault of the user"
+    );
     let notice = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         notice.contains("ran no stop hook"),
