@@ -600,15 +600,36 @@ mod tests {
         s
     }
 
+    /// A directory for one test, which goes away WHATEVER ENDS THE TEST.
+    ///
+    /// `Drop` removes it, so a test that panics leaves nothing behind. An
+    /// earlier version removed the directory on the last line of each test,
+    /// which is the line that a failed assertion never reaches. A test of the
+    /// SIZE LIMIT that stopped early thus left its log on the disk, and one
+    /// such file reached 334GB and filled the file system of the machine.
+    struct Temp(std::path::PathBuf);
+
+    impl std::ops::Deref for Temp {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
     /// Gives an empty directory for one test.
     ///
     /// The name holds letters, numbers and hyphens only. A test that puts this
     /// path in a shell line with a bracket in it tests the shell and not qex.
-    fn temp(name: &str) -> std::path::PathBuf {
+    fn temp(name: &str) -> Temp {
         let dir = std::env::temp_dir().join(format!("qex-hook-{}-{name}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Temp(dir)
     }
 
     fn cfg_with(hook: &str) -> Config {
@@ -635,7 +656,6 @@ mod tests {
         let text = std::fs::read_to_string(&mark).unwrap();
         assert_eq!(text.lines().count(), 1, "the hook ran more than one time");
         assert!(dir.join(CLAIM_FILE).exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The claim file names the process that ran the hook.
@@ -666,7 +686,6 @@ mod tests {
             // the job directory.
             assert!(text.starts_with("completed "), "got: {text:?}");
             assert!(text.contains(&s.id.to_string()), "got: {text:?}");
-            std::fs::remove_dir_all(&dir).ok();
         }
     }
 
@@ -696,7 +715,6 @@ mod tests {
         // A value that the job has not got is an empty text, and not an absent
         // variable. A shell line then needs no test.
         assert!(text.lines().any(|l| l == "QEX_SIGNAL="), "{text}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A name from a job must be a name, and never a command. The name goes in
@@ -738,7 +756,6 @@ mod tests {
             !got.contains(';') && !got.contains(' ') && !got.contains('/'),
             "the name must carry no shell character and no path: {got}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The files of the hook hold the output of a command that a user wrote, so
@@ -770,7 +787,6 @@ mod tests {
                 "{name} has the mode {mode:o}, and another user can read it"
             );
         }
-        std::fs::remove_dir_all(&dir).ok();
 
         // A hook that DID NOT START. `run` opened no file, so `note` makes
         // `hook.log` itself, and it must give the same mode. This path holds
@@ -784,7 +800,6 @@ mod tests {
             mode, 0o600,
             "the log of a hook that did not start has the mode {mode:o}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The hook gets no standard input.
@@ -825,7 +840,6 @@ mod tests {
         );
         let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
         assert!(log.contains("ran in"), "the hook must succeed: {log}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The hook starts in the directory of the job, and a directory that is
@@ -857,7 +871,7 @@ mod tests {
         let got = std::fs::read_to_string(&out).unwrap().trim().to_string();
         assert_eq!(
             std::fs::canonicalize(&got).unwrap(),
-            std::fs::canonicalize(&dir).unwrap(),
+            std::fs::canonicalize(&*dir).unwrap(),
             "the hook must start in the directory of the job (it said {got})"
         );
 
@@ -871,8 +885,6 @@ mod tests {
             "/",
             "a directory that is gone must not stop the hook"
         );
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&second).ok();
     }
 
     /// A hook that hangs must not hold the caller for ever. The caller runs the
@@ -889,7 +901,6 @@ mod tests {
             took < Duration::from_secs(10),
             "the hook held the caller for {took:?}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A command that does not exist must not stop the caller, and it must not
@@ -902,7 +913,6 @@ mod tests {
         fire_with(Origin::Supervisor, &cfg, &dir, &status);
         // The claim stays: qex tried, and a second try would notify two times.
         assert!(dir.join(CLAIM_FILE).exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The filter decides which jobs give a notification. A queue with many
@@ -926,7 +936,6 @@ mod tests {
 
         fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Failed));
         assert!(mark.exists(), "the filter must permit this state");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A control byte in the data of a job must not stop the notification.
@@ -972,7 +981,6 @@ mod tests {
         // The verdict of qex must not say that the hook did not start.
         let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
         assert!(!log.contains("did not start"), "got: {log}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The verdict of qex must reach a file that a qex command reads.
@@ -993,7 +1001,6 @@ mod tests {
             log.contains("on_stop"),
             "the remedy must name the field: {log}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A hook that writes with no stop must not fill the disk.
@@ -1003,8 +1010,25 @@ mod tests {
     #[test]
     fn a_hook_that_writes_without_a_stop_is_stopped_and_its_log_is_cut() {
         let dir = temp("flood");
-        let cfg =
-            cfg_with("[hooks]\non_stop = [\"yes\", \"aaaaaaaaaaaaaaaa\"]\ntimeout = \"60s\"\n");
+        // A hook that writes far more than the cap and THEN WAITS, instead of
+        // one that writes for ever.
+        //
+        // This test used `yes`, which writes until something stops it. That is
+        // the true shape of the fault, but it makes the test itself dangerous:
+        // qex puts the hook in a process group of its own, so a hook that
+        // outlives the test process keeps its open file and keeps writing. One
+        // such hook reached 334GB and filled the file system of the machine.
+        // The cause was a hand deletion of `stop()`, which took away the one
+        // thing that signals the hook — exactly the state this test exists to
+        // detect, and exactly when the test can least afford to flood a disk.
+        //
+        // 8MB is eight times the cap, which is enough to prove that the cap
+        // holds, and the `sleep` keeps the hook alive so that qex must stop it.
+        // The bytes are now bounded whatever happens to this process.
+        let cfg = cfg_with(
+            "[hooks]\non_stop = [\"sh\", \"-c\", \
+             \"head -c 8000000 /dev/zero; sleep 60\"]\ntimeout = \"60s\"\n",
+        );
         let start = Instant::now();
         fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
 
@@ -1018,7 +1042,6 @@ mod tests {
             size <= OUTPUT_LIMIT + 4096,
             "the log of the hook is {size} bytes and the limit is {OUTPUT_LIMIT}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A hook that writes a large file and then stops at once must also meet
@@ -1055,7 +1078,6 @@ mod tests {
             "the last line is {} bytes",
             last.len()
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A job that still operates must never notify. The state on the disk is
@@ -1070,6 +1092,5 @@ mod tests {
         ));
         fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Running));
         assert!(!mark.exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
