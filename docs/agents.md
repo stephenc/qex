@@ -130,6 +130,11 @@ id.
 Choose a key that names the work **and** the place: `build:$(pwd)`. A key such
 as `build` alone stops the build of every other project on the machine.
 
+**A key names the work. qex does not compare the command.** A second submission
+with the same key gives you the first job, although you wrote a different
+command. Give each different piece of work its own key. The message on stderr
+names the command of the job that you get.
+
 **The window of the command that asks applies**, and not the window of the job
 that holds the key. The window is a question: how old an answer do you accept? A
 command that gives no window thus starts a new job, although a different command

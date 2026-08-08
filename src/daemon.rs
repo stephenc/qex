@@ -881,6 +881,8 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
                          {other}, and that job {doing}.\n\
                          qex gives you the id of that job, so `qex wait` and `qex status` \
                          operate on the work that already exists.\n\
+                         A key names the work, and qex does not compare the command. Run \
+                         `qex status {other}` to see the work that this id names.\n\
                          To run the work a second time, wait for that job to stop, or use a \
                          different key."
                     )),
@@ -1287,6 +1289,53 @@ mod tests {
                 "a job in the state `{job_state}` must free its key inside the window"
             );
         }
+    }
+
+    /// The key goes AT the end of the window, and not one second after it.
+    ///
+    /// This is the edge of the rule, and the only place where a window of this
+    /// shape goes wrong. `<` and `<=` differ for one whole second, and a caller
+    /// that met that second would be given the job of the earlier run.
+    ///
+    /// The test reads the clock twice and repeats if the second changed while
+    /// it worked. The elapsed time is then EXACTLY the window, with no race and
+    /// no wait. An end-to-end test of this edge has to wait for a whole second
+    /// and can be pushed past it by the load of the machine; this one cannot.
+    #[test]
+    fn a_key_goes_at_the_end_of_the_window_and_not_after_it() {
+        const WINDOW: u64 = 600;
+
+        for _ in 0..100 {
+            let now = sys::now_secs();
+            let mut state = empty_state();
+            add(&mut state, "k", JobState::Completed, Some(now - WINDOW));
+            let answer = state.dedupe_holder("k", WINDOW);
+            // Repeat if the clock moved on while the test worked. The elapsed
+            // time was then not the window, and the answer says nothing.
+            if sys::now_secs() != now {
+                continue;
+            }
+            assert_eq!(
+                answer, None,
+                "a job that succeeded exactly one window ago must give the key back"
+            );
+
+            // One second inside the window, the key stays. The two together
+            // pin the comparison from both sides.
+            let mut state = empty_state();
+            let id = add(&mut state, "k", JobState::Completed, Some(now - WINDOW + 1));
+            let answer = state.dedupe_holder("k", WINDOW);
+            if sys::now_secs() != now {
+                continue;
+            }
+            assert_eq!(
+                answer,
+                Some(id),
+                "a job that succeeded inside the window must keep the key"
+            );
+            return;
+        }
+        panic!("the clock moved on every attempt, so the edge was never tested");
     }
 
     /// A submission that holds the key writes its record after it takes the

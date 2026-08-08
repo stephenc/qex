@@ -588,6 +588,188 @@ fn a_job_that_stopped_frees_its_key_and_a_window_keeps_it() {
     h.qex(&["wait", &again]);
 }
 
+/// A job that stopped one moment ago must free its key at once.
+///
+/// `handle_submit` reads the record of each job that operates BEFORE it tests
+/// the key. Without that read, the coordinator answers from a copy in memory
+/// that still says `running`, and it gives the caller the id of a job that has
+/// already stopped, while starting no job.
+///
+/// The test waits on the status file ON THE DISK, and it sends no qex command
+/// while it waits. A qex command would make the coordinator read the records,
+/// which is the very thing under test. The scheduler also reads them every
+/// 500ms, so ONE attempt is not proof: measured over 30 attempts, the fault
+/// appeared 22 times with the line removed and 0 times with it. Ten attempts
+/// that must all start a new job is therefore a reliable test, and it passed
+/// 100 times out of 100 on the code as it stands.
+#[test]
+fn a_key_is_free_the_moment_that_its_job_stops() {
+    let h = Harness::with_default_config("dedupe-refresh");
+
+    for attempt in 0..10 {
+        let key = format!("fresh-{attempt}");
+        let first = h.submit(&["submit", "--dedupe-key", &key, "--", "true"]);
+
+        // Watch the disk. Send no command, or the coordinator reads the
+        // records for that command and the test proves nothing.
+        let file = h
+            .root
+            .join("state/qex/jobs")
+            .join(&first)
+            .join("status.json");
+        let limit = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&file) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if v["state"] == "completed" {
+                        break;
+                    }
+                }
+            }
+            assert!(Instant::now() < limit, "the job never stopped");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let second = h.submit(&["submit", "--dedupe-key", &key, "--", "true"]);
+        assert_ne!(
+            second, first,
+            "attempt {attempt}: the key still held a job that had stopped, so this \
+             submission started no work and gave the id of the finished job"
+        );
+        h.ok(&["wait", &second]);
+    }
+}
+
+/// Deleting the record must free the key. `qex clean` deletes both together.
+///
+/// The reason this test exists: the one line that frees the key lives in
+/// `lifecycle::clean`, and the whole suite passed with that line deleted. The
+/// live fault is worse than a lost key. The key kept naming the deleted job,
+/// so every later submission with that key was answered with an id that
+/// `qex status` then refused with the code 127, and no submission with that
+/// key could ever start work again.
+#[test]
+fn qex_clean_frees_the_key_with_the_record() {
+    let h = Harness::with_default_config("dedupe-clean");
+
+    let first = h.submit(&["submit", "--dedupe-key", "c", "--", "true"]);
+    h.ok(&["wait", &first]);
+    h.ok(&["clean", &first]);
+
+    let second = h.submit(&["submit", "--dedupe-key", "c", "--", "true"]);
+    assert_ne!(
+        second, first,
+        "the key still names the deleted job, so no later submission can start the work"
+    );
+    // The id that a submission gives must answer. This is the fault that the
+    // caller meets: `qex status` refused the id with the code 127, and the
+    // caller could learn nothing about the work that it asked for.
+    let out = h.qex(&["status", &second, "--json"]);
+    assert!(
+        out.status.success(),
+        "`qex status` cannot answer the id that the submission gave: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    h.ok(&["wait", &second]);
+}
+
+/// The same rule for `qex gc`, which deletes a record by age.
+#[test]
+fn qex_gc_frees_the_key_with_the_record() {
+    let h = Harness::with_default_config("dedupe-gc");
+
+    let first = h.submit(&["submit", "--dedupe-key", "g", "--", "true"]);
+    h.ok(&["wait", &first]);
+    h.ok(&["gc", "--older-than", "0s"]);
+
+    let second = h.submit(&["submit", "--dedupe-key", "g", "--", "true"]);
+    assert_ne!(second, first, "gc deleted the record and left the key");
+    h.ok(&["wait", &second]);
+}
+
+/// `qex rerun` must start a job, and the key of the first job must not stop it.
+///
+/// The reason this test exists: the one line that clears the key in `rerun`
+/// was deleted and the whole suite passed. The live fault is a command that
+/// reports work that it did not start — `qex rerun` printed "the job 8902039f
+/// runs again as 8902039f", the same id twice, and nothing ran.
+#[test]
+fn qex_rerun_of_a_keyed_job_starts_a_new_job() {
+    let h = Harness::with_default_config("dedupe-rerun");
+
+    let first = h.submit(&["submit", "--dedupe-key", "rr", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&first)
+    });
+
+    // The first job still operates, so it still holds the key. This is the
+    // case that fails: a rerun that kept the key would be answered with the
+    // id of the job that already operates.
+    let out = h.ok(&["rerun", &first]);
+    let second = out.split_whitespace().last().unwrap().to_string();
+    assert_ne!(
+        second, first,
+        "rerun gave the id of the first job, so it started nothing: {out}"
+    );
+    assert_eq!(h.list_json().len(), 2, "rerun started no second job");
+
+    // The new job must not hold the key either, or the next rerun repeats the
+    // fault.
+    assert!(
+        h.status_json(&second)["dedupe_key"].is_null(),
+        "the job of a rerun must hold no key"
+    );
+
+    h.stop(&first);
+    h.stop(&second);
+}
+
+/// After a restart, the job that has NOT stopped must hold the key.
+///
+/// The reason this test exists: `recover` sorts the holders of a key so that
+/// the best one is written last, and the whole suite passed with that order
+/// reversed. One key with TWO jobs is the only shape that can see it, and the
+/// earlier restart test used one job for each key. With the order reversed, a
+/// record of yesterday took the key from the job that operates now, and the
+/// next submission started a SECOND COPY of a job that was already running.
+#[test]
+fn a_restart_gives_the_key_to_the_job_that_still_operates() {
+    let h = Harness::with_default_config("dedupe-recover-order");
+
+    // A job of yesterday: same key, already stopped.
+    let old = h.submit(&["submit", "--dedupe-key", "two", "--", "true"]);
+    h.ok(&["wait", &old]);
+
+    // The key is free now, so the next submission takes it and keeps running.
+    let live = h.submit(&["submit", "--dedupe-key", "two", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&live)
+    });
+
+    // Two records now name the key, and only one of them may hold it.
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator stops", Duration::from_secs(30), || {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        !alive
+    });
+
+    let again = h.submit(&["submit", "--dedupe-key", "two", "--", "sleep", "30"]);
+    assert_eq!(
+        again, live,
+        "the key went to the job that stopped, so qex started a second copy of the work"
+    );
+    assert_eq!(
+        h.list_json().len(),
+        2,
+        "qex started a third job, so the key did not hold the job that operates"
+    );
+
+    h.stop(&live);
+}
+
 /// The window is the time that the key STAYS. At the end of it, the key goes.
 ///
 /// The test is at the edge of the window, because that is the one place where

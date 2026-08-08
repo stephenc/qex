@@ -85,7 +85,7 @@ BOTH streams. Prefer it: one command gives everything.
 | --- | --- |
 | 0 | The job succeeded. |
 | 1 | The job failed. |
-| 124 | Your wait reached its time limit. **The job continues.** |
+| 124 | Your wait stopped, and **the job continues.** A `qex wait` that reached its time limit, or a `qex run` that a dedupe key gave the job of somebody else. |
 | 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
 | 126 | The job did not run, because a job that it needed failed. |
 | 127 | There is no job with that id. |
@@ -140,8 +140,14 @@ window in each command that shares a key. Add `--json` when your script must
 know if **it** started the work.
 
 `qex run --dedupe-key` waits for the job that the key gives, and Ctrl-C then
-stops your wait only: a different agent can be the owner of that job. Use
-`qex kill <id>` to stop the job itself.
+stops your wait only: a different agent can be the owner of that job. `qex run`
+then gives **124**, which says that your wait stopped and the job continues. Use
+`qex kill <id>` to stop the job itself, or `qex status <id> --wait` to wait
+again.
+
+**A key names the work. qex does not compare the command.** A second submission
+with the same key gives you the first job whatever command you wrote, so give
+each different piece of work its own key.
 
 ## Claims
 

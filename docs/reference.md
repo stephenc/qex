@@ -177,6 +177,13 @@ A key that held a job for ever would give an agent the id of a job of yesterday,
 and that answer would look like a success. A key thus stops a second copy of the
 work, and it does nothing else.
 
+**A key names the work. qex does not compare the command.** A second submission
+with the same key gives you the first job, although you wrote a different
+command. A comparison would make the key mean two things, and it would refuse
+the legitimate case of the same work with one option more. Give each different
+piece of work its own key. The message on stderr names the command of the job
+that you get, so you can see which work the key holds.
+
 `--dedupe-window 1h` extends the rule for a caller that wants a completed result
 to count. A job that did **not** succeed never keeps its key, whatever the
 window is: the remedy for a failure is another run, and a window that blocked it
