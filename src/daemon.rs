@@ -1154,6 +1154,7 @@ mod tests {
             cpu: 1,
             mem: 1 << 20,
             timeout: None,
+            max_queue_time: None,
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,

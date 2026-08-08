@@ -1122,6 +1122,7 @@ mod tests {
             config_seen: 0,
             config_settling: None,
             config_error: None,
+            dedupe: Default::default(),
             stop: false,
         }
     }
