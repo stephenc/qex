@@ -192,6 +192,45 @@ Use an id in a script. Use a name when you type a command yourself.
 A job can name only the jobs that you started before it, so a circle of
 dependencies is not possible.
 
+### The group id is a handle
+
+`qex pipeline` writes a group id to stdout, and that id names **every stage** of
+the pipeline:
+
+```sh
+GROUP=$(qex pipeline ci.toml)
+
+qex wait $GROUP        # wait for every stage
+qex status $GROUP      # the state of every stage
+qex kill $GROUP        # stop every stage
+qex clean $GROUP       # delete every record
+qex list --group $GROUP
+```
+
+`--needs $GROUP` waits for the whole pipeline in the same way.
+
+The name of the pipeline works in the same way as its id, with one limit: a
+pipeline takes its name from its file, so a second run of the same file has the
+same name. qex refuses a name that gives two runs and shows the group id of
+each. Use the group id in a script.
+
+`qex status --json` gives an array for a pipeline, and one object for one job,
+so a script that reads one job does not change. A pipeline of one stage still
+gives an array, because the shape comes from what you named.
+
+`qex logs` reads one job. It refuses a pipeline and names the stages, because
+qex must not choose a stage for you.
+
+`qex kill $GROUP` stops every stage: it signals the stages that operate, and it
+takes the stages that wait out of the queue. A stage that already stopped is not
+a fault. `qex kill $ID` for one job that waits still tells you to use `qex
+cancel`, because you asked about that one job.
+
+A group needs a coordinator. The records on the disk hold the jobs, and they
+hold no group, so `qex wait $GROUP` after the coordinator retires says that
+there is no job with that id. Keep the id of a stage as well when a script must
+work with no coordinator.
+
 ## Job files
 
 ```sh

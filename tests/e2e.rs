@@ -1569,6 +1569,81 @@ fn clean_accepts_a_state_name() {
     assert_eq!(states, vec!["failed"], "qex deleted the wrong jobs");
 }
 
+/// A word that names WORK and a state must give an error, and delete nothing.
+///
+/// `qex clean completed` deletes every job that succeeded, and a job or a
+/// pipeline can carry the name `completed`. qex must not choose one of the two
+/// readings: one reading deletes one record, and the other deletes every record
+/// that the user kept.
+#[test]
+fn clean_refuses_a_word_that_names_work_and_a_state() {
+    let h = Harness::with_default_config("cleanboth");
+
+    // A job that carries the name of a state.
+    let named = h.submit(&["submit", "--name", "completed", "--", "true"]);
+    let other = h.submit(&["submit", "--name", "other", "--", "true"]);
+    h.ok(&["wait", &named, "--timeout", "45s"]);
+    h.ok(&["wait", &other, "--timeout", "45s"]);
+
+    let out = h.qex(&["clean", "completed"]);
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "the word has two readings, so the command must refuse it\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("name of a job") && err.contains("name of a state"),
+        "the message must name both readings: {err}"
+    );
+    assert!(
+        err.contains("--state completed"),
+        "the message must give the way to ask for the state: {err}"
+    );
+
+    // Nothing went. A command that refuses must delete nothing at all.
+    assert_eq!(
+        h.list_json().len(),
+        2,
+        "the refusal must leave every record where it was"
+    );
+
+    // A pipeline that carries the name of a state reads the same way, and it
+    // must read that way ON ITS OWN.
+    //
+    // The job named `completed` goes first. While that job is there the JOB
+    // reading is true, and the pipeline reading is never reached: a test that
+    // keeps the job passes with the pipeline reading deleted, and `qex clean
+    // completed` would then delete every record that succeeded.
+    h.ok(&["clean", &named]);
+    h.ok(&["clean", &other]);
+    assert_eq!(h.list_json().len(), 0, "no job may carry the name now");
+
+    let file = h.root.join("completed.toml");
+    std::fs::write(&file, "[[jobs]]\nname = \"stage\"\ncommand = [\"true\"]\n").unwrap();
+    let group = h.ok(&["pipeline", file.to_str().unwrap()]);
+    h.qex(&["wait", &group, "--timeout", "45s"]);
+    let out = h.qex(&["clean", "completed"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("name of a pipeline"),
+        "the message must name the PIPELINE reading: {err}"
+    );
+    assert_eq!(
+        h.list_json().len(),
+        1,
+        "the refusal must leave the stage of the pipeline: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a pipeline reads the same way"
+    );
+}
+
 /// A job file must accept the dependencies.
 #[test]
 fn a_job_file_accepts_dependencies() {
@@ -2387,6 +2462,645 @@ fn the_id_file_of_a_pipeline_holds_every_stage() {
     assert!(v["group"].as_str().is_some());
     assert!(v["jobs"]["build"].as_str().is_some());
     assert!(v["jobs"]["test"].as_str().is_some());
+}
+
+/// The group id of a pipeline is a handle that every command accepts.
+///
+/// `qex pipeline` writes that id to stdout, so it is the value that a user
+/// keeps. It answered "there is no job with the id ..." in `qex wait`, `qex
+/// status` and `qex kill` with the code 127, and in `qex clean` with the code
+/// one. The code 127 also says that a value names nothing, so a script could
+/// separate neither the two readings nor the two commands, and the documented
+/// way to use a pipeline ended with the user finding the last stage by hand.
+#[test]
+fn the_group_id_of_a_pipeline_is_a_handle() {
+    let h = Harness::with_default_config("grouphandle");
+
+    let pipeline = h.root.join("ci.toml");
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"build\"\ncommand = [\"true\"]\n\n\
+         [[jobs]]\nname = \"test\"\ncommand = [\"true\"]\nneeds = [\"build\"]\n",
+    )
+    .unwrap();
+
+    let group = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+    assert!(group.parse::<uuid::Uuid>().is_ok(), "got: {group}");
+
+    // `qex wait` waits for every stage, and it succeeds because both stages
+    // succeed.
+    let out = h.ok(&["wait", &group, "--timeout", "60s"]);
+    assert!(out.contains("completed"), "got: {out}");
+    assert_eq!(out.lines().count(), 2, "each stage gives one line: {out}");
+
+    // A user who names the pipeline AND one of its stages waits for that stage
+    // ONE time. Each job must appear once, or a reader counts two results for
+    // one job.
+    let build_id = h.status_json("build")["id"].as_str().unwrap().to_string();
+    let out = h.ok(&["wait", &group, &build_id, "--timeout", "60s"]);
+    assert_eq!(
+        out.lines().count(),
+        2,
+        "the pipeline and one of its stages give two jobs, not three: {out}"
+    );
+
+    // `qex status --json` gives an array for a pipeline, and one object for one
+    // job. A script that reads one job must not become a script that reads an
+    // array.
+    let text = h.ok(&["status", &group, "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let stages = v.as_array().expect("a pipeline gives an array");
+    assert_eq!(stages.len(), 2, "got: {text}");
+    // The stages arrive in the order of submission.
+    assert_eq!(stages[0]["name"], "build");
+    assert_eq!(stages[1]["name"], "test");
+
+    // ONE pipeline of several stages is one run, and it gets no warning. The
+    // warning counts RUNS, and not stages, so a pipeline of two stages must
+    // not read as two pipelines.
+    let out = h.qex(&["list", "--group", &group]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("pipelines"),
+        "one run of two stages is one pipeline: {err}"
+    );
+
+    // One stage still gives one object.
+    let one = h.ok(&["status", "build", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&one).unwrap();
+    assert!(v.is_object(), "one job must give one object: {one}");
+
+    // Without `--json`, one empty line separates the stages. A reader of a
+    // pipeline of ten stages needs to see where each record starts.
+    //
+    // Read the output that the command WROTE. `Harness::ok` trims, and a
+    // trimmed answer cannot show a leading empty line, so an assertion on it
+    // would pass whatever the command wrote.
+    let out = h.qex(&["status", &group]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains("\n\nid:"),
+        "an empty line must separate the stages: {text}"
+    );
+    // The separator goes BETWEEN the stages. An empty first line wastes the
+    // first line of the answer, and `qex status $ID` for one job never had one.
+    assert!(
+        text.starts_with("id:"),
+        "the answer must not open with an empty line: {text:?}"
+    );
+
+    // `qex logs` reads one job. It must refuse a pipeline and name the stages,
+    // because qex must not choose a stage for the reader.
+    let out = h.qex(&["logs", &group]);
+    assert_eq!(out.status.code(), Some(127), "a pipeline is not one job");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("takes one job"),
+        "the message must say that this command reads one job: {err}"
+    );
+    assert!(
+        err.contains("build") && err.contains("test"),
+        "the message must name every stage: {err}"
+    );
+
+    // A pipeline of ONE stage is still a pipeline, so `qex logs` refuses it
+    // too. A rule that changed on the day a pipeline has one stage would give
+    // a reader the logs of a stage that the reader did not name.
+    let solo = h.root.join("solo.toml");
+    std::fs::write(
+        &solo,
+        "name = \"solo\"\n\n[[jobs]]\nname = \"only\"\ncommand = [\"true\"]\n",
+    )
+    .unwrap();
+    let one_stage = h.ok(&["pipeline", solo.to_str().unwrap()]);
+    let out = h.qex(&["logs", &one_stage]);
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a pipeline of one stage is still a pipeline: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("takes one job") && err.contains("only"),
+        "the message must name the stage: {err}"
+    );
+
+    // `qex clean` takes the group and deletes every stage.
+    h.ok(&["clean", &group]);
+    let left = h.ok(&["list", "--group", &group]);
+    assert!(left.contains("no jobs"), "got: {left}");
+
+    // `qex status $GROUP --wait` reports the FIRST fault of the pipeline.
+    //
+    // A stage that qex skipped would otherwise hide the stage that failed: the
+    // last stage of a pipeline is nearly always the skipped one, and its code
+    // 126 tells the reader that an earlier job failed without saying that THIS
+    // pipeline holds the failure.
+    let broken = h.root.join("broken.toml");
+    std::fs::write(
+        &broken,
+        "name = \"broken\"\n\n\
+         [[jobs]]\nname = \"bad\"\ncommand = [\"false\"]\n\n\
+         [[jobs]]\nname = \"after\"\ncommand = [\"true\"]\nneeds = [\"bad\"]\n",
+    )
+    .unwrap();
+    let bad_group = h.ok(&["pipeline", broken.to_str().unwrap()]);
+    let out = h.qex(&["status", &bad_group, "--wait", "--timeout", "60s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the code must name the stage that FAILED, and not the stage that qex \
+         skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A value that names nothing still gives the code 127, and the message now
+    // says that a pipeline is also a handle.
+    let out = h.qex(&["status", "no-such-thing"]);
+    assert_eq!(out.status.code(), Some(127));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("pipeline"), "got: {err}");
+}
+
+/// One word must never reach two pipelines.
+///
+/// A pipeline takes its name from its file, so a second run of the same file
+/// carries the same name. `qex kill ci` thus stopped the work of two separate
+/// runs when the user named one. A command that stops or deletes must refuse
+/// the word and name the runs.
+#[test]
+fn a_word_that_names_two_pipelines_is_refused() {
+    let h = Harness::with_default_config("grouptwice");
+
+    let pipeline = h.root.join("twice.toml");
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"one\"\ncommand = [\"sleep\", \"30\"]\n",
+    )
+    .unwrap();
+
+    // Two runs of one file. Both carry the name `twice`.
+    let first = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+    let second = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+    assert_ne!(first, second);
+
+    for command in [
+        vec!["kill", "twice"],
+        vec!["cancel", "twice"],
+        vec!["status", "twice"],
+        vec!["clean", "twice"],
+        vec!["wait", "twice", "--timeout", "5s"],
+    ] {
+        let out = h.qex(&command);
+        assert_eq!(
+            out.status.code(),
+            Some(127),
+            "`qex {}` must refuse the word",
+            command.join(" ")
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("2 pipelines"),
+            "`qex {}` must say how many runs the word names, and it said: {err}",
+            command.join(" ")
+        );
+    }
+
+    // `qex list --group` is where the user looks after that refusal. It reads
+    // and deletes nothing, so it shows every run; but a reader who does not
+    // know that the table holds two runs reads ONE pipeline that ran each
+    // stage two times. It must thus say how many runs the word names, and give
+    // the group id of each.
+    let out = h.qex(&["list", "--group", "twice"]);
+    assert!(out.status.success(), "`qex list --group` must not refuse");
+    let table = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        table.lines().filter(|l| l.contains("one")).count(),
+        2,
+        "the table must hold the stage of both runs: {table}"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("2 pipelines"),
+        "the warning must say how many runs the word names: {err}"
+    );
+    assert!(
+        err.contains(first.as_str()) && err.contains(second.as_str()),
+        "the warning must give the group id of each run: {err}"
+    );
+
+    // `--json` is read by a machine, and that reader needs no sentence: the
+    // `group` field of each job already separates the runs. The warning is for
+    // a person, so it does not go with the JSON.
+    let out = h.qex(&["list", "--group", "twice", "--json"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("2 pipelines"),
+        "the warning is for a person, and `--json` is for a machine: {err}"
+    );
+
+    // One run only gives no warning. A sentence that appears every time is a
+    // sentence that a reader stops reading.
+    let out = h.qex(&["list", "--group", &first]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("pipelines"),
+        "one run must give no warning: {err}"
+    );
+
+    // Both runs must still operate. A refusal that stopped one of them would
+    // be the fault that this test prevents.
+    for group in [&first, &second] {
+        let text = h.ok(&["list", "--group", group, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(jobs.len(), 1, "the run {group} must still hold its stage");
+        assert_ne!(jobs[0]["state"], "killed", "the run {group} must continue");
+    }
+
+    // The group id still names one run, and it stops that run only.
+    //
+    // Wait for the stage to hold a process first. Between "the state is
+    // running" and "the coordinator recorded the pid" a kill answers `the job
+    // starts now. Try the command again.`, which is the same answer that
+    // `qex kill $ID` gives for that moment. This step stops the work of the
+    // test, so it must not race with the start of that work.
+    for group in [&first, &second] {
+        h.until(
+            "the stage of the run holds a process",
+            Duration::from_secs(30),
+            || {
+                let text = h.ok(&["list", "--group", group, "--json"]);
+                let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+                jobs.iter().all(|j| j["pid"].as_u64().is_some())
+            },
+        );
+        h.ok(&["kill", group]);
+    }
+
+    // Each kill reached one run, and the runs stopped separately.
+    for group in [&first, &second] {
+        let text = h.ok(&["list", "--group", group, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        assert_eq!(jobs.len(), 1);
+    }
+}
+
+/// `qex kill $GROUP` must stop a stage that WAITS, and not leave it to start.
+///
+/// The documentation says that the command stops every stage. An early version
+/// reported the refusal for a queued stage as information and gave the code 0,
+/// so a script read that the pipeline stopped, and the queued stage then
+/// started and did its work.
+///
+/// `qex cancel $GROUP` must not do the opposite: a stage that OPERATES cannot
+/// leave the queue, and that refusal keeps its code.
+#[test]
+fn a_kill_of_a_group_stops_a_stage_that_waits_in_the_queue() {
+    // One core, so the second stage cannot start while the first operates.
+    let h = Harness::new(
+        "groupqueued",
+        "[budget]\ncpu = \"1\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let pipeline = h.root.join("both.toml");
+    // Two stages that need nothing. The budget holds one of them.
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"first\"\ncommand = [\"sleep\", \"60\"]\n\n\
+         [[jobs]]\nname = \"second\"\ncommand = [\"sleep\", \"60\"]\n",
+    )
+    .unwrap();
+
+    let group = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+
+    // Wait until one stage operates and one waits.
+    let mut ready = false;
+    for _ in 0..100 {
+        let text = h.ok(&["list", "--group", &group, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        ready = jobs.iter().any(|j| j["state"] == "running")
+            && jobs.iter().any(|j| j["state"] == "queued");
+        if ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "one stage must operate and one must wait");
+
+    // `qex kill $ID` for ONE job that waits keeps its fault and names `qex
+    // cancel`. That user asked about that one job, and the answer is that a
+    // job in the queue has no process to signal. Only a user who named the
+    // whole pipeline asked for the queue to be emptied.
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    let queued = jobs.iter().find(|j| j["state"] == "queued").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = h.qex(&["kill", &queued]);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "`qex kill $ID` for one job that waits must give a fault"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("cancel"),
+        "the fault must name `qex cancel`: {err}"
+    );
+    assert_eq!(
+        h.state_of(&queued),
+        "queued",
+        "that job must stay in the queue"
+    );
+
+    // `qex cancel $GROUP` must NOT report success: the stage that operates
+    // cannot leave the queue.
+    let out = h.qex(&["cancel", &group]);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a stage that operates cannot leave the queue, and the command must say so\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = h.qex(&["kill", &group]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // No stage must operate after this, now or later. A stage that qex left in
+    // the queue would start when the first stage releases the core.
+    for _ in 0..40 {
+        let text = h.ok(&["list", "--group", &group, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        for j in &jobs {
+            assert_ne!(
+                j["state"], "queued",
+                "a stage that waits must leave the queue: {j}"
+            );
+        }
+        if jobs.iter().all(|j| j["state"] != "running") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 2);
+    for j in &jobs {
+        assert!(
+            j["state"] == "killed" || j["state"] == "cancelled",
+            "every stage must stop: {j}"
+        );
+    }
+}
+
+/// `qex kill $GROUP` must succeed when a stage already stopped.
+///
+/// The stages of a pipeline stop in order, so at the moment that a user stops a
+/// pipeline the early stages have usually finished. An early version gave the
+/// code 1 for that ordinary case, and the documentation says that the command
+/// stops every stage.
+#[test]
+fn a_kill_of_a_group_accepts_a_stage_that_already_stopped() {
+    let h = Harness::with_default_config("groupdone");
+
+    let pipeline = h.root.join("mixed.toml");
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"quick\"\ncommand = [\"true\"]\n\n\
+         [[jobs]]\nname = \"slow\"\ncommand = [\"sleep\", \"60\"]\nneeds = [\"quick\"]\n",
+    )
+    .unwrap();
+
+    let group = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+
+    // Wait until the first stage stopped and the second operates.
+    let mut ready = false;
+    for _ in 0..100 {
+        let text = h.ok(&["list", "--group", &group, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        ready = jobs.iter().any(|j| j["state"] == "completed")
+            && jobs.iter().any(|j| j["state"] == "running");
+        if ready {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "one stage must stop and one must operate");
+
+    // The command must succeed. The stage that stopped is information, and the
+    // stage that operates receives the signal.
+    let out = h.qex(&["kill", &group]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a stage that already stopped is not a fault when the user named the whole \
+         pipeline\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // One job that already stopped is still a fault. That user asked about
+    // that job, and the answer is that it stopped.
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    let quick = jobs
+        .iter()
+        .find(|j| j["name"] == "quick")
+        .unwrap()
+        .get("id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = h.qex(&["kill", &quick]);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "one job that already stopped must still give a fault"
+    );
+
+    // `qex cancel $ID` reads the same way. Only a user who named the WHOLE
+    // pipeline said "stop what is left"; this user asked about one job, and a
+    // job that already stopped cannot leave the queue.
+    let out = h.qex(&["cancel", &quick]);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "`qex cancel $ID` for one job that already stopped must give a fault\n\
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `qex kill` takes the group id and stops every stage that operates.
+#[test]
+fn a_kill_of_a_group_reaches_every_stage() {
+    let h = Harness::with_default_config("groupkill");
+
+    let pipeline = h.root.join("slow.toml");
+    // Two stages that need nothing, so both operate together.
+    std::fs::write(
+        &pipeline,
+        "[[jobs]]\nname = \"one\"\ncommand = [\"sleep\", \"60\"]\n\n\
+         [[jobs]]\nname = \"two\"\ncommand = [\"sleep\", \"60\"]\n",
+    )
+    .unwrap();
+
+    let group = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+
+    // Wait until both stages operate.
+    let mut running = 0;
+    for _ in 0..100 {
+        let text = h.ok(&["list", "--group", &group, "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        running = jobs.iter().filter(|j| j["state"] == "running").count();
+        if running == 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(running, 2, "both stages must operate before the kill");
+
+    // The time limit belongs to the COMMAND, and not to each stage. When it
+    // arrives the command stops and says so ONE time. A limit that starts
+    // again for each stage gives a pipeline of ten stages ten times the time
+    // that the user gave, and it repeats the sentence for every stage.
+    let out = h.qex(&["status", &group, "--wait", "--timeout", "1s"]);
+    assert_eq!(out.status.code(), Some(124), "the wait reached its limit");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        err.matches("reached its time limit").count(),
+        1,
+        "the command stops at the first stage that reaches the limit: {err}"
+    );
+
+    h.ok(&["kill", &group]);
+
+    // Both stages must stop. `qex wait` gives a code that is not 0, because a
+    // job that something stopped did not succeed.
+    let out = h.qex(&["wait", &group, "--timeout", "60s"]);
+    assert_ne!(out.status.code(), Some(0));
+
+    let text = h.ok(&["list", "--group", &group, "--json"]);
+    let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(jobs.len(), 2);
+    for j in &jobs {
+        assert_eq!(j["state"], "killed", "got: {j}");
+    }
+}
+
+/// `--needs $GROUP` must wait for the WHOLE pipeline.
+///
+/// The reference and `qex help pipelines` both say so. A job that named a
+/// pipeline could otherwise start while a stage of that pipeline still
+/// operates, and the pipeline would report success although the order was
+/// wrong.
+///
+/// The test for "a run of an earlier day" applies to the pipeline as ONE unit.
+/// The stages of a pipeline stop in order, so a test of each stage would refuse
+/// the ordinary case, in which the early stages have finished and a late stage
+/// still operates.
+#[test]
+fn needs_a_group_waits_for_every_stage() {
+    let h = Harness::with_default_config("needsgroup");
+
+    let pipeline = h.root.join("stages.toml");
+    // `quick` stops at once. `slow` operates for a long time.
+    std::fs::write(
+        &pipeline,
+        "name = \"waves\"\n\n\
+         [[jobs]]\nname = \"quick\"\ncommand = [\"true\"]\n\n\
+         [[jobs]]\nname = \"slow\"\ncommand = [\"sleep\", \"60\"]\nneeds = [\"quick\"]\n",
+    )
+    .unwrap();
+
+    let group = h.ok(&["pipeline", pipeline.to_str().unwrap()]);
+
+    // Wait until `quick` stopped and `slow` operates. This is the ordinary
+    // case: one stage of the pipeline already stopped.
+    h.until(
+        "one stage must stop and one must operate",
+        Duration::from_secs(30),
+        || {
+            let text = h.ok(&["list", "--group", &group, "--json"]);
+            let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+            jobs.iter().any(|j| j["state"] == "completed")
+                && jobs.iter().any(|j| j["state"] == "running")
+        },
+    );
+
+    // The NAME of the pipeline is accepted while one stage still operates.
+    let out = h.qex(&["submit", "--needs", "waves", "--", "true"]);
+    assert!(
+        out.status.success(),
+        "`--needs <pipeline name>` must be accepted while a stage operates: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The group id gives EVERY stage, so the new job waits for the whole
+    // pipeline and not for the stage that already stopped.
+    let last = h.submit(&["submit", "--needs", &group, "--", "true"]);
+    let status = h.status_json(&last);
+    assert_eq!(
+        status["needs"].as_array().map(|n| n.len()),
+        Some(2),
+        "`--needs $GROUP` must name every stage: {status}"
+    );
+    assert_eq!(
+        status["state"].as_str(),
+        Some("queued"),
+        "the job must wait while a stage of the pipeline operates: {status}"
+    );
+
+    // Every stage stops, and the job then leaves the queue.
+    h.ok(&["kill", &group]);
+    h.qex(&["wait", &last, "--timeout", "60s"]);
+    assert_ne!(
+        h.state_of(&last),
+        "queued",
+        "the job must leave the queue when every stage stopped"
+    );
+
+    // A pipeline whose every stage stopped is a run of an earlier day, and the
+    // NAME of it is refused.
+    let out = h.qex(&["submit", "--needs", "waves", "--", "true"]);
+    assert!(
+        !out.status.success(),
+        "a pipeline that stopped must be refused by name"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("every stage already stopped"),
+        "the error must say that the pipeline stopped: {err}"
+    );
+    assert!(
+        err.contains("GROUP=$(qex pipeline"),
+        "the error must give the remedy: {err}"
+    );
+
+    // The group id is still accepted, because an id names one run for ever.
+    let out = h.qex(&["submit", "--needs", &group, "--", "true"]);
+    assert!(
+        out.status.success(),
+        "a group id must be accepted whatever the state of its stages: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `--cwd` gives one directory, and `--under` gives a directory and the
