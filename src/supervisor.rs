@@ -138,6 +138,14 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // job with a correct result and no notification. This call
                 // closes that moment. It costs nothing when the supervisor did
                 // its work: the claim file stops the second run.
+                //
+                // NO TEST HOLDS THIS LINE, and none can. It covers a window of
+                // a few microseconds inside another process, and a test cannot
+                // put a signal there. A hand deletion of it leaves the whole
+                // suite green — measured, after the tests that hold the two
+                // calls in the supervisor were written. Do not read that green
+                // as "this line does nothing": read it as "the fault that this
+                // line stops is one that a test cannot make happen".
                 crate::hook::fire_detached(&dir, &status);
             }
             other => {
@@ -463,7 +471,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 crate::enforce::remove_cgroup(&cgroup);
             }
 
-            crate::hook::fire(&dir, &status);
+            crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
             return Ok(1);
         }
     };
@@ -759,7 +767,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // holds nothing now: `qex wait` gives its answer, the budget is free, and
     // the next job starts. A hook that hangs thus makes this process live
     // longer and does no other damage.
-    crate::hook::fire(&dir, &status);
+    crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
 
     Ok(code.unwrap_or(0))
 }

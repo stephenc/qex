@@ -72,6 +72,42 @@ const GRACE: Duration = Duration::from_secs(2);
 /// A hook that writes a megabyte is not a hook that notifies a person.
 const OUTPUT_LIMIT: u64 = 1 << 20;
 
+/// Which process ran the hook.
+///
+/// THIS EXISTS TO MAKE THE REDUNDANCY TESTABLE, and it is not decoration.
+///
+/// Three paths reach the hook of an ordinary job, and each one alone satisfies
+/// "the person received exactly one message": the supervisor at the end of its
+/// work, the supervisor on the path of a command that does not exist, and the
+/// coordinator when it reaps that supervisor. A test that counts the messages
+/// therefore passes when any ONE of the three operates, so all three can rot
+/// and no test says a word. A hand deletion of each of them, one at a time,
+/// measured that: the whole suite stayed green for each.
+///
+/// The claim file names the process that took the claim. A test can then assert
+/// WHICH path notified, which is the property that the design of this feature
+/// rests on: the SUPERVISOR notifies, so a job still notifies when no
+/// coordinator operates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The supervisor of the job. It exists for each job that ran, and it
+    /// continues when the coordinator stops.
+    Supervisor,
+    /// The coordinator. It notifies for the jobs that have no supervisor —
+    /// `cancelled`, `skipped` — and for a supervisor that left no result.
+    Coordinator,
+}
+
+impl Origin {
+    /// The word that goes in the claim file. A person reads that file too.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Supervisor => "supervisor",
+            Self::Coordinator => "coordinator",
+        }
+    }
+}
+
 /// Runs the stop hook for one job, and gives control back when it stops.
 ///
 /// Call this function only after the terminal state of the job is on the disk.
@@ -86,7 +122,7 @@ const OUTPUT_LIMIT: u64 = 1 << 20;
 /// configuration in this module does not make qex do nothing; it makes qex RUN
 /// A COMMAND THAT THE USER DELETED. The file is small, one job stops one time,
 /// and the read is thus not expensive.
-pub fn fire(dir: &Path, status: &JobStatus) {
+pub fn fire(origin: Origin, dir: &Path, status: &JobStatus) {
     // A job that is not terminal never notifies. Test that first, because it
     // needs no file.
     if !status.state.is_terminal() {
@@ -99,7 +135,7 @@ pub fn fire(dir: &Path, status: &JobStatus) {
     // hide the one line that this reader needs — that no notification came.
     // `supervisor::main` takes the short form for the same reason.
     match Config::load_short() {
-        Ok(cfg) => fire_with(&cfg, dir, status),
+        Ok(cfg) => fire_with(origin, &cfg, dir, status),
         // A configuration that qex cannot read must not run a hook. qex cannot
         // know if the command in memory is still the command in the file.
         Err(e) => log(&format!(
@@ -114,14 +150,14 @@ pub fn fire(dir: &Path, status: &JobStatus) {
 ///
 /// The tests use this form. Each other caller uses [`fire`], which reads the
 /// file, because a configuration in memory can be older than the file.
-fn fire_with(cfg: &Config, dir: &Path, status: &JobStatus) {
+fn fire_with(origin: Origin, cfg: &Config, dir: &Path, status: &JobStatus) {
     if cfg.hooks.on_stop.is_empty() || !status.state.is_terminal() {
         return;
     }
     if !cfg.hooks.runs_on(status.state) {
         return;
     }
-    if !claim(dir, status) {
+    if !claim(origin, dir, status) {
         return;
     }
 
@@ -195,7 +231,7 @@ pub fn fire_detached(dir: &Path, status: &JobStatus) {
     let status = status.clone();
     // The thread reads the config file. The caller frequently holds the lock of
     // the queue, and a read of a file must not happen there.
-    std::thread::spawn(move || fire(&dir, &status));
+    std::thread::spawn(move || fire(Origin::Coordinator, &dir, &status));
 }
 
 /// Takes the right to run the hook of this job. Gives `true` to the winner.
@@ -203,7 +239,7 @@ pub fn fire_detached(dir: &Path, status: &JobStatus) {
 /// `create_new` is the whole mechanism. The operating system gives the file to
 /// one caller, so two processes that stop the same job together cannot both
 /// run the hook.
-fn claim(dir: &Path, status: &JobStatus) -> bool {
+fn claim(origin: Origin, dir: &Path, status: &JobStatus) -> bool {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -214,14 +250,19 @@ fn claim(dir: &Path, status: &JobStatus) -> bool {
         .open(dir.join(CLAIM_FILE))
     {
         Ok(mut f) => {
-            // The contents are for a person who reads the job directory. The
-            // existence of the file is what qex acts on.
+            // The contents are for a person who reads the job directory, and
+            // for a test. The EXISTENCE of the file is what qex acts on; the
+            // last word names the process that took it, so a test can assert
+            // WHICH of the redundant paths notified. See [`Origin`].
+            //
+            //     completed 6f1c8f2e-… 1786171234 supervisor
             writeln!(
                 f,
-                "{} {} {}",
+                "{} {} {} {}",
                 status.state,
                 status.id,
-                crate::sys::now_secs()
+                crate::sys::now_secs(),
+                origin.as_str()
             )
             .ok();
             true
@@ -315,6 +356,20 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
                 unsafe {
                     libc::killpg(pid, libc::SIGKILL);
                 }
+                // TAKE THE DEAD PROCESS OUT OF THE PROCESS TABLE.
+                //
+                // `Child` does not do this when it is dropped, so a return
+                // here left a zombie. On the path of the supervisor that costs
+                // nothing, because the process stops a moment later. On the
+                // path of the COORDINATOR it is a leak: that process operates
+                // for hours, and each such hook leaves one entry for as long as
+                // it operates.
+                //
+                // The `wait` is safe HERE and not in `stop`. There, a second
+                // signal follows, and a `wait` before it would let the machine
+                // give the same number to a different process. Here the signal
+                // is already sent and no other follows.
+                child.wait().ok();
                 return Ok(format!("gave an error at a test of its state: {e}"));
             }
         }
@@ -573,14 +628,46 @@ mod tests {
         let status = status(JobState::Completed);
 
         // Two processes can make one job terminal. Both call this module.
-        fire_with(&cfg, &dir, &status);
-        fire_with(&cfg, &dir, &status);
-        fire_with(&cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
 
         let text = std::fs::read_to_string(&mark).unwrap();
         assert_eq!(text.lines().count(), 1, "the hook ran more than one time");
         assert!(dir.join(CLAIM_FILE).exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The claim file names the process that ran the hook.
+    ///
+    /// Three paths reach the hook, and each one alone gives the person exactly
+    /// one message. A test that counts the messages thus passes when any ONE of
+    /// them operates, and all three can rot in silence — measured, by deleting
+    /// each of them by hand. This word is what lets a test name the path that
+    /// must operate.
+    #[test]
+    fn the_claim_file_names_the_process_that_ran_the_hook() {
+        for (origin, word) in [
+            (Origin::Supervisor, "supervisor"),
+            (Origin::Coordinator, "coordinator"),
+        ] {
+            let dir = temp(word);
+            let cfg = cfg_with("[hooks]\non_stop = [\"true\"]\n");
+            let s = status(JobState::Completed);
+            fire_with(origin, &cfg, &dir, &s);
+
+            let text = std::fs::read_to_string(dir.join(CLAIM_FILE)).unwrap();
+            assert_eq!(
+                text.split_whitespace().next_back(),
+                Some(word),
+                "the claim file must name the process: {text:?}"
+            );
+            // The state and the id stay in front of it, for a person who reads
+            // the job directory.
+            assert!(text.starts_with("completed "), "got: {text:?}");
+            assert!(text.contains(&s.id.to_string()), "got: {text:?}");
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// The hook receives the values that a reader of the notification needs.
@@ -593,7 +680,7 @@ mod tests {
             out.display()
         ));
         let status = status(JobState::Failed);
-        fire_with(&cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
 
         let text = std::fs::read_to_string(&out).unwrap();
         assert!(
@@ -625,7 +712,7 @@ mod tests {
         ));
         let mut status = status(JobState::Completed);
         status.name = format!("x; touch {}", mark.display());
-        fire_with(&cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
 
         assert!(
             !mark.exists(),
@@ -675,7 +762,7 @@ mod tests {
         // A hook that RAN. `run` makes both files.
         let dir = temp("mode");
         let cfg = cfg_with("[hooks]\non_stop = [\"sh\", \"-c\", \"echo a secret\"]\n");
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
         for name in [LOG_FILE, CLAIM_FILE] {
             let mode = mode_of(dir.join(name));
             assert_eq!(
@@ -691,7 +778,7 @@ mod tests {
         // the owner.
         let dir = temp("mode2");
         let cfg = cfg_with("[hooks]\non_stop = [\"qex-no-such-program\"]\n");
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
         let mode = mode_of(dir.join(LOG_FILE));
         assert_eq!(
             mode, 0o600,
@@ -729,7 +816,7 @@ mod tests {
             "[hooks]\non_stop = [\"sh\", \"-c\", \"readlink /proc/self/fd/0 > {}\"]\n",
             out.display()
         ));
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
 
         assert_eq!(
             std::fs::read_to_string(&out).unwrap().trim(),
@@ -760,7 +847,7 @@ mod tests {
         // The directory of the job is there.
         let mut s = status(JobState::Completed);
         s.cwd = dir.display().to_string();
-        fire_with(&cfg, &dir, &s);
+        fire_with(Origin::Supervisor, &cfg, &dir, &s);
         assert_eq!(
             std::fs::read_to_string(&out).unwrap().trim(),
             dir.display().to_string(),
@@ -771,7 +858,7 @@ mod tests {
         let second = temp("cwd2");
         let mut s = status(JobState::Completed);
         s.cwd = second.join("this-directory-is-gone").display().to_string();
-        fire_with(&cfg, &second, &s);
+        fire_with(Origin::Supervisor, &cfg, &second, &s);
         assert_eq!(
             std::fs::read_to_string(&out).unwrap().trim(),
             "/",
@@ -789,7 +876,7 @@ mod tests {
         let dir = temp("hang");
         let cfg = cfg_with("[hooks]\non_stop = [\"sleep\", \"60\"]\ntimeout = \"1s\"\n");
         let start = Instant::now();
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
         let took = start.elapsed();
         assert!(
             took < Duration::from_secs(10),
@@ -805,7 +892,7 @@ mod tests {
         let dir = temp("missing");
         let cfg = cfg_with("[hooks]\non_stop = [\"qex-no-such-program\"]\n");
         let status = status(JobState::Completed);
-        fire_with(&cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
         // The claim stays: qex tried, and a second try would notify two times.
         assert!(dir.join(CLAIM_FILE).exists());
         std::fs::remove_dir_all(&dir).ok();
@@ -823,14 +910,14 @@ mod tests {
             mark.display()
         ));
 
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
         assert!(!mark.exists(), "the filter must stop this state");
         assert!(
             !dir.join(CLAIM_FILE).exists(),
             "a state that the filter stops must not take the claim"
         );
 
-        fire_with(&cfg, &dir, &status(JobState::Failed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Failed));
         assert!(mark.exists(), "the filter must permit this state");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -861,7 +948,7 @@ mod tests {
         let mut status = status(JobState::Completed);
         status.name = "a\0b\u{1b}[31mc\nd".to_string();
         status.tags = vec!["x\0y".to_string()];
-        fire_with(&cfg, &dir, &status);
+        fire_with(Origin::Supervisor, &cfg, &dir, &status);
 
         let text = std::fs::read_to_string(&out).unwrap_or_default();
         let (name, tags) = text.split_once('|').unwrap_or(("", ""));
@@ -887,7 +974,7 @@ mod tests {
     fn the_verdict_of_qex_goes_into_the_log_of_the_hook() {
         let dir = temp("verdict");
         let cfg = cfg_with("[hooks]\non_stop = [\"qex-no-such-program\"]\n");
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
 
         let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
         assert!(log.contains("qex: the stop hook"), "got: {log}");
@@ -909,7 +996,7 @@ mod tests {
         let cfg =
             cfg_with("[hooks]\non_stop = [\"yes\", \"aaaaaaaaaaaaaaaa\"]\ntimeout = \"60s\"\n");
         let start = Instant::now();
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
 
         // The size limit, and not the time limit, stopped this hook.
         assert!(
@@ -936,7 +1023,7 @@ mod tests {
         // This command writes 3MB and stops. It does not hang, so the time
         // limit and the loop have no part in the result.
         let cfg = cfg_with("[hooks]\non_stop = [\"head\", \"-c\", \"3000000\", \"/dev/zero\"]\n");
-        fire_with(&cfg, &dir, &status(JobState::Completed));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
 
         let size = std::fs::metadata(dir.join(LOG_FILE)).unwrap().len();
         assert!(
@@ -971,7 +1058,7 @@ mod tests {
             "[hooks]\non_stop = [\"touch\", \"{}\"]\n",
             mark.display()
         ));
-        fire_with(&cfg, &dir, &status(JobState::Running));
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Running));
         assert!(!mark.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
