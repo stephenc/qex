@@ -11,7 +11,8 @@ description: Every command, option, claim word and configuration field.
 
 ```
 qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--needs ID,ID]
-           [--after ID,ID] [--name NAME] [--job FILE] -- COMMAND...
+           [--after ID,ID] [--name NAME] [--job FILE] [--json]
+           [--dedupe-key KEY] [--dedupe-window TIME] -- COMMAND...
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
@@ -52,6 +53,7 @@ Add `--passthrough` to exit with the exit code of the job.
 | Code | Meaning |
 | ---- | ------- |
 | the exit code of the job | The job ran. `qex run -- sh -c 'exit 7'` gives 7. |
+| 124  | Your wait stopped, and the job continues. See the dedupe key. |
 | 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
 | 127  | There is no job with that id. |
@@ -73,10 +75,14 @@ For each state in which the job gave NO exit code of its own, `qex run` gives
 the same code as `qex wait`. For a job that RAN, `qex run` gives the exit code
 of the job, and `qex wait` gives 0 or 1 unless you add `--passthrough`.
 
-`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
-while the job continued, and `qex run` waits with no limit of its own. A job
-that reaches the time limit of `--timeout` gives 125, because something stopped
-that job.
+`qex run` gives 124 in ONE case: a dedupe key gave it the job of a different
+caller, and a signal then arrived. This command did not start that job, so
+Ctrl-C stops this wait and the job continues. Run `qex status $ID --wait` to
+wait again, or `qex kill $ID` to stop the job.
+
+`qex run` gives 124 for no other reason. It waits with no limit of its own, and
+a job that reaches the time limit of `--timeout` gives 125, because something
+stopped that job.
 
 ## Resource claims
 
@@ -131,6 +137,124 @@ an out-of-memory error.
 Each of these results is data for you. A job that waits for ever gives no data.
 The status field `forced` is `true` for such a job, and `qex submit` writes a
 warning at the time of the submission.
+
+## A submission that a script can repeat
+
+A script that runs a second time must not start a second copy of the work. Give
+the submission a key:
+
+```sh
+ID=$(qex submit --dedupe-key build:$(pwd) -- make)
+```
+
+While a job with that key waits or operates, a second submission with the same
+key **starts no job**. qex writes the id of the first job to stdout and exits
+with the code 0, so `ID=$(qex submit ...)` gives a usable id in both cases and
+the script needs no test.
+
+The reason goes to stderr:
+
+```
+qex: this submission started no job. The dedupe key `build_home_me_p` gives
+the job 7f3c8a12-..., and that job is in the state `running`.
+```
+
+**The coordinator makes the test and the submission one step.** Two agents that
+run the same script in the same moment thus get one job and one id. A test that
+you write yourself (`qex list`, then decide, then submit) has a gap between the
+read and the submission, and both agents start a job in that gap.
+
+### When a key becomes free
+
+| The job with the key | A new submission with that key |
+| -------------------- | ------------------------------ |
+| waits in the queue, or operates | gets that job's id, and starts nothing |
+| stopped, for any reason | starts a new job |
+| succeeded inside the `--dedupe-window` of the **new** submission | gets that job's id, and starts nothing |
+| its record is deleted | starts a new job |
+
+A key that held a job for ever would give an agent the id of a job of yesterday,
+and that answer would look like a success. A key thus stops a second copy of the
+work, and it does nothing else.
+
+**A key names the work. qex does not compare the command.** A second submission
+with the same key gives you the first job, although you wrote a different
+command. A comparison would make the key mean two things, and it would refuse
+the legitimate case of the same work with one option more. Give each different
+piece of work its own key. The message on stderr names the command of the job
+that you get, so you can see which work the key holds.
+
+`--dedupe-window 1h` extends the rule for a caller that wants a completed result
+to count. A job that did **not** succeed never keeps its key, whatever the
+window is: the remedy for a failure is another run, and a window that blocked it
+would make the option dangerous.
+
+**The window of the submission that asks applies, and not the window of the job
+that holds the key.** The window is a question — "how old an answer do I
+accept?" — and it is not a property of the earlier job. A submission that gives
+no window thus starts a new job, although a different submission gave a window a
+moment before:
+
+```sh
+A=$(qex submit --dedupe-key w1 -- true); qex wait $A
+B=$(qex submit --dedupe-key w1 --dedupe-window 1h -- true)   # B is A
+C=$(qex submit --dedupe-key w1 -- true)                      # C is a new job
+```
+
+Each caller thus states its own rule, and the coordinator holds no policy of its
+own. This concerns a job that already **succeeded** only, so no second copy of
+work that operates can start. Give the same window in each command that shares a
+key.
+
+The key is in the record of the job, so `qex status` and `qex list --json` show
+it, and a coordinator that starts again gives each key back to its job.
+
+qex shows the key in the same safe form that it uses for a job name: it keeps
+the letters, the numbers, `-`, `_` and `.`, and it replaces each other character
+with `_`. A key is text that another agent chose, and a key that held an ESC
+byte would move the cursor of the reader. The key that qex holds is the key that
+you gave, so `--dedupe-key` still needs the form that you wrote.
+
+### How a script learns which case it got
+
+```sh
+qex submit --json --dedupe-key build:$(pwd) -- make
+{
+  "id": "7f3c8a12-...",
+  "deduplicated": true
+}
+```
+
+`deduplicated` is `false` when this command started the work. Without `--json`,
+`qex submit` writes the id alone, and the message goes to stderr.
+
+`qex rerun <id>` never keeps the key of the first job. That command exists to
+run the work again.
+
+### `qex run` with a key
+
+`qex run` accepts `--dedupe-key` and waits for the job that the key gives. It
+does not accept `--json`, because its stdout holds the output of the job.
+
+**Ctrl-C stops the job only when this command started the job.** A key can give
+the job of a different caller. `qex run` says so when it attaches, and a signal
+then stops the wait and nothing else:
+
+```
+qex: this command waits for that job. It did not start it, so Ctrl-C stops
+this wait only.
+qex: to stop the job itself, run `qex kill 7f3c8a12-...`.
+```
+
+The exit code of that wait is 124, the code that says "your wait stopped, and
+the job continues". Without this rule, Ctrl-C in one agent would stop a
+four-hour run that a different agent started, and neither agent would know why.
+
+`qex run` that started the job keeps its earlier behaviour: Ctrl-C stops the
+job.
+
+A pipeline stage has no dedupe key. A key on one stage would answer for that
+stage alone, and the stages after it would wait for a job of an earlier run.
 
 ## A pipeline of stages
 
@@ -250,6 +374,16 @@ mem = "8GB"
 [env]
 CUDA_VISIBLE_DEVICES = "0"
 ```
+
+A job file also accepts `dedupe_key` and `dedupe_window`:
+
+```toml
+command = ["uv", "run", "train.py"]
+dedupe_key = "train:experiment-7"
+dedupe_window = "1h"
+```
+
+`--dedupe-key` on the command line replaces the value in the file.
 
 A job file also accepts `needs` and `after`:
 
@@ -583,7 +717,9 @@ Each shell puts the name on the line as ONE word, and a name such as
 
 **qex SHOWS a safe form of each name.** `qex list`, `qex status`, `qex top`, the
 sentence that says why a job waits, the completions, and the JSON of each of
-them hold a name that uses these characters and no other:
+them hold a name that uses these characters and no other. The same rule applies
+to a group name and to a dedupe key, because each of them is text that another
+agent chose:
 
 - the letters `A` to `Z` and `a` to `z`
 - the numbers `0` to `9`

@@ -90,10 +90,65 @@ A monitor script cannot do this. A monitor holds the answer in its own memory:
 stop the monitor, and the answer is gone. Keep the id in a file, and the answer
 waits for you instead.
 
-**Before you start work again in a new session, ask first.** `qex list` shows
-what already operates, and `qex status <id>` gives the result of what stopped.
-A person who stops you pays nothing, and a person who stops you and then gets
-the same build twice pays for it.
+## Give each submission a key, and a second run starts nothing
+
+A person who stops you pays nothing. A person who stops you and then gets the
+same build twice pays for it.
+
+You lose your context, and you run your script again. Without a key, qex starts
+a **second copy** of a four-hour training run beside the first copy. Both copies
+then hold the machine, and both write to the same files.
+
+Give the submission a key:
+
+```sh
+ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+qex wait $ID
+```
+
+The second run of that script gives **the same id** and exits with the code 0.
+Your script does not change, and `ID=$(qex submit ...)` stays correct. qex says
+what happened on stderr:
+
+```
+qex: this submission started no job. The dedupe key `train_home_me_p` gives
+the job 7f3c8a12-..., and that job is in the state `running`.
+```
+
+**Do not read `qex list` and decide for yourself.** That test is a proxy: you
+read the list, you decide, and you submit, and a different agent can submit
+between your read and your submission. The coordinator makes the test and the
+submission **one step**, so two commands in the same moment give one job and one
+id.
+
+| Option | Meaning |
+| ------ | ------- |
+| `--dedupe-key KEY` | Start no second job while a job with this key waits or operates. The key is free when that job stops. |
+| `--dedupe-window 1h` | Keep the key of a job that **succeeded** for this time also. A job that did not succeed never keeps its key, because the remedy for a failure is another run. |
+| `--json` | Write `{"id": "...", "deduplicated": true}` in place of the id alone. Use it when your script must know if **it** started the work. |
+
+Choose a key that names the work **and** the place: `build:$(pwd)`. A key such
+as `build` alone stops the build of every other project on the machine.
+
+**A key names the work. qex does not compare the command.** A second submission
+with the same key gives you the first job, although you wrote a different
+command. Give each different piece of work its own key. The message on stderr
+names the command of the job that you get.
+
+**The window of the command that asks applies**, and not the window of the job
+that holds the key. The window is a question: how old an answer do you accept? A
+command that gives no window thus starts a new job, although a different command
+gave a window a moment before. Give the same window in each command that shares
+a key. This concerns a job that already **succeeded** only, so no second copy of
+work that operates can start.
+
+**`qex run --dedupe-key` waits for the job that the key gives, and Ctrl-C then
+stops your wait only.** A different agent can be the owner of that job. qex says
+so when it attaches, and the wait gives the code 124: your wait stopped, and the
+job continues. Use `qex kill <id>` to stop the job itself.
+
+`qex status <id>` shows the key of a job. You can thus see which key gave you an
+id, and the same command gives the result of a job that stopped.
 
 ## Do not write a monitor script
 
@@ -177,6 +232,7 @@ when the job RAN: `qex run -- sh -c 'exit 7'` gives 7.
 | Code | Meaning |
 | ---- | ------- |
 | the exit code of the job | The job ran. |
+| 124  | Your wait stopped, and the job continues. See the dedupe key. |
 | 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
 | 127  | There is no job with that id. |
@@ -197,9 +253,14 @@ For each state in which the job gave NO exit code of its own, `qex run` gives
 the same code as `qex wait`. For a job that RAN, `qex run` gives the exit code
 of the job, and `qex wait` gives 0 or 1 unless you add `--passthrough`.
 
-`qex run` never gives 124. The code 124 says that YOUR WAIT reached its limit
-while the job continued, and `qex run` waits with no limit of its own. A job
-that reaches the time limit of `--timeout` gives 125.
+`qex run` gives 124 in ONE case: a dedupe key gave it the job of a different
+caller, and a signal then arrived. This command did not start that job, so
+Ctrl-C stops this wait and the job continues. Run `qex status $ID --wait` to
+wait again, or `qex kill $ID` to stop the job.
+
+`qex run` gives 124 for no other reason. It waits with no limit of its own, and
+a job that reaches the time limit of `--timeout` gives 125, because something
+stopped that job.
 
 ## Two fields that need care
 

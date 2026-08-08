@@ -85,7 +85,7 @@ BOTH streams. Prefer it: one command gives everything.
 | --- | --- |
 | 0 | The job succeeded. |
 | 1 | The job failed. |
-| 124 | Your wait reached its time limit. **The job continues.** |
+| 124 | Your wait stopped, and **the job continues.** A `qex wait` that reached its time limit, or a `qex run` that a dedupe key gave the job of somebody else. |
 | 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
 | 126 | The job did not run, because a job that it needed failed. |
 | 127 | There is no job with that id. |
@@ -118,9 +118,36 @@ session stops, but the file goes with the session, and you then hold no handle
 for work that still operates. qex gives a warning when the file goes to such a
 place.
 
-**Before you start work again in a new session, ask first.** `qex list` shows
-what already operates and `qex status <id>` gives the result of what stopped.
-Starting the same build twice is the cost of not asking.
+**Give each submission a key, and a second run of your script starts nothing:**
+
+```sh
+ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+qex wait "$ID"
+```
+
+While a job with that key waits or operates, a second submission with the same
+key starts **no** job: qex writes the id of that job and exits with the code 0.
+Your script does not change, and it cannot start the same four-hour run twice.
+
+Do not read `qex list` and decide for yourself. That test is a proxy, and a
+different agent can submit between your read and your decision. The coordinator
+makes the test and the submission one step.
+
+The key is free when the job stops. Add `--dedupe-window 1h` to keep the key of
+a job that **succeeded** for an hour also; a job that did not succeed never
+keeps its key. The window of the command that asks applies, so give the same
+window in each command that shares a key. Add `--json` when your script must
+know if **it** started the work.
+
+`qex run --dedupe-key` waits for the job that the key gives, and Ctrl-C then
+stops your wait only: a different agent can be the owner of that job. `qex run`
+then gives **124**, which says that your wait stopped and the job continues. Use
+`qex kill <id>` to stop the job itself, or `qex status <id> --wait` to wait
+again.
+
+**A key names the work. qex does not compare the command.** A second submission
+with the same key gives you the first job whatever command you wrote, so give
+each different piece of work its own key.
 
 ## Claims
 

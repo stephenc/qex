@@ -58,6 +58,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         retries: args.retries,
         nice: args.nice,
         no_limit_env_hints: args.no_limit_env_hints,
+        dedupe_key: args.dedupe_key,
+        dedupe_window: args.dedupe_window,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -78,16 +80,36 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
-        Response::Submitted { id, warning } => {
+        Response::Submitted {
+            id,
+            warning,
+            deduplicated,
+        } => {
             // The warning goes to stderr. The id stays alone on stdout, so the
             // command `ID=$(qex submit ...)` continues to operate.
+            //
+            // A submission that a dedupe key answered writes its message here
+            // also. The exit code stays 0 and the id stays alone on stdout,
+            // because a script that captures the id must operate in the same
+            // way in both cases. The difference belongs on the other stream.
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
             if let Some(path) = &args.id_file {
                 write_id_file(path, &format!("{id}\n"))?;
             }
-            println!("{id}");
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": id.to_string(),
+                        // False says: this command started the work.
+                        "deduplicated": deduplicated,
+                    }))?
+                );
+            } else {
+                println!("{id}");
+            }
             Ok(0)
         }
         other => report(other),
@@ -589,6 +611,11 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     }
     if !s.locks.is_empty() {
         println!("locks:     {}", s.locks.join(", "));
+    }
+    // Show the key. A caller that received this id from a second submission can
+    // then see which key gave it, and it does not read the job file again.
+    if let Some(key) = &s.dedupe_key {
+        println!("dedupe:    {key}");
     }
     if !s.needs.is_empty() {
         println!(
@@ -1837,6 +1864,11 @@ fn short_id(id: &uuid::Uuid) -> String {
 fn for_display(mut s: JobStatus) -> JobStatus {
     s.name = safe_name(&s.name);
     s.group_name = s.group_name.as_deref().map(safe_name);
+    // A dedupe key is text that another agent chose, and `qex status` puts it
+    // in front of a reader. It is a LABEL and not a handle: no command finds a
+    // job by its key, so the safe form loses nothing. Without this line, a key
+    // that holds an ESC byte moves the cursor of the reader.
+    s.dedupe_key = s.dedupe_key.as_deref().map(safe_name);
     s
 }
 
@@ -2303,7 +2335,9 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
         match client.call(&Request::Submit {
             spec: Box::new(spec),
         })? {
-            Response::Submitted { id: given, warning } => {
+            Response::Submitted {
+                id: given, warning, ..
+            } => {
                 if let Some(text) = warning {
                     eprintln!("qex: {}: {text}", stage.name);
                 }
@@ -2639,6 +2673,19 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
 
+    // `qex run` gives the output of the job on stdout. A JSON object there
+    // would mix with that output, and neither part could be read.
+    if args.submit.json {
+        bail!(
+            "`qex run` does not accept --json.\n\n\
+             This command writes the output of the job to stdout, so a JSON object there \
+             would mix with that output.\n\n\
+             Use two commands:\n\
+             \x20   ID=$(qex submit --json ... | jq -r .id)\n\
+             \x20   qex wait $ID"
+        );
+    }
+
     let env_capture = if args.submit.no_env_capture {
         Some(EnvCapture::None)
     } else {
@@ -2663,6 +2710,8 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         retries: args.submit.retries,
         nice: args.submit.nice,
         no_limit_env_hints: args.submit.no_limit_env_hints,
+        dedupe_key: args.submit.dedupe_key,
+        dedupe_window: args.submit.dedupe_window,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -2672,14 +2721,18 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     require_capabilities(&mut client, &spec)?;
 
-    let id = match client.call(&Request::Submit {
+    let (id, deduplicated) = match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
-        Response::Submitted { id, warning } => {
+        Response::Submitted {
+            id,
+            warning,
+            deduplicated,
+        } => {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
-            id
+            (id, deduplicated)
         }
         other => return report(other),
     };
@@ -2702,8 +2755,25 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         libc::signal(libc::SIGTERM, handler);
     }
 
+    // Say now what Ctrl-C will do, because a dedupe key changed it.
+    //
+    // This command started no job, so it is not the owner of this job, and a
+    // different agent can be the owner. The user must know that before the
+    // moment of the signal, and not after it.
+    //
+    // This message comes AFTER the handler exists. The message is thus proof
+    // that the rule is active, and a signal that arrives immediately after it
+    // meets the rule and not the default behaviour of the system.
+    if deduplicated {
+        eprintln!(
+            "qex: this command waits for that job. It did not start it, so Ctrl-C stops \
+             this wait only.\n\
+             qex: to stop the job itself, run `qex kill {id}`."
+        );
+    }
+
     let dir = paths::job_dir(&id)?;
-    stream_until_done(&mut client, id, &dir)
+    stream_until_done(&mut client, id, &dir, !deduplicated)
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
@@ -2761,7 +2831,16 @@ fn stop_own_job(client: &mut Client, id: uuid::Uuid) -> bool {
 }
 
 /// Writes the output of a job as it arrives, until the job stops.
-fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path) -> Result<i32> {
+///
+/// `owns_job` says if THIS command started the job. Ctrl-C stops the job only
+/// when that is true. A dedupe key gives the job of a different caller, and a
+/// signal to this command must never stop the work of somebody else.
+fn stream_until_done(
+    client: &mut Client,
+    id: uuid::Uuid,
+    dir: &std::path::Path,
+    owns_job: bool,
+) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let mut handles: Vec<(bool, Option<std::fs::File>)> = vec![(false, None), (true, None)];
@@ -2773,8 +2852,22 @@ fn stream_until_done(client: &mut Client, id: uuid::Uuid, dir: &std::path::Path)
 
     loop {
         if RUN_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
-            eprintln!("\nqex: stopping the job {id}");
             RUN_INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            if !owns_job {
+                // A dedupe key gave this job to this command. A different agent
+                // started the work, and it can be a run of four hours. A signal
+                // to this command stops this wait, and nothing else.
+                eprintln!(
+                    "\nqex: this wait stops. The job {id} continues, because this command \
+                     did not start it.\n\
+                     qex: to stop the job, run `qex kill {id}`. \
+                     To wait again, run `qex status {id} --wait`."
+                );
+                return Ok(EXIT_TIMEOUT);
+            }
+
+            eprintln!("\nqex: stopping the job {id}");
             // Set the flag from the ANSWER, and not from the attempt. A stop
             // that failed leaves the job for a different command to stop, and
             // this command must then not tell the user that it stopped the job.
@@ -2953,12 +3046,21 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     spec.group = None;
     spec.group_name = None;
 
+    // A rerun must not keep the dedupe key of the first job.
+    //
+    // `qex rerun` is the command that says "run this work again". With the key,
+    // qex would give the id of the first job and start nothing, and the command
+    // would do the one thing that it exists to prevent: nothing.
+    spec.dedupe_key = None;
+    spec.dedupe_window = 0;
+
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
         Response::Submitted {
             id: new_id,
             warning,
+            ..
         } => {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
@@ -3397,6 +3499,7 @@ mod tests {
             caused_by: None,
             logs_dropped: None,
             tags: vec![],
+            dedupe_key: None,
         }
     }
 

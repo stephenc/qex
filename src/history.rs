@@ -269,6 +269,8 @@ mod tests {
             needs: vec![],
             after: vec![],
             submitted_at: crate::sys::now_secs(),
+            dedupe_key: None,
+            dedupe_window: 0,
         }
     }
 

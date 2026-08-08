@@ -41,6 +41,18 @@ pub struct State {
     pub jobs: BTreeMap<uuid::Uuid, Job>,
     /// The order of the queue. The scheduler reads this list.
     pub queue: Vec<uuid::Uuid>,
+    /// The job that holds each dedupe key.
+    ///
+    /// The coordinator is the single writer of this map, and it reads the map
+    /// and writes it in ONE lock operation. Two agents that run the same script
+    /// in the same moment thus cannot both find the key free: the first one
+    /// puts its id here before it gives the lock back, and the second one finds
+    /// that id.
+    ///
+    /// A test that read the job list, gave the lock back, and then inserted
+    /// would leave a gap between the two steps. Two submissions in that gap
+    /// would both start a job, which is the fault that the key removes.
+    pub dedupe: BTreeMap<String, uuid::Uuid>,
     /// The time of the last command from a CLI process.
     pub last_contact: Instant,
     /// The time when the queue became empty, for the oversized job rule.
@@ -359,6 +371,41 @@ impl State {
             .fold((0, 0), |(c, m), j| (c + j.status.cpu, m + j.status.mem))
     }
 
+    /// Gives the job that holds this dedupe key now.
+    ///
+    /// `window` comes from the submission that asks, and not from the job that
+    /// holds the key. The caller thus says how old an answer it accepts, and
+    /// the coordinator keeps no policy of its own.
+    ///
+    /// The rules, in order:
+    ///
+    ///   * No entry: the key is free.
+    ///   * An entry with no job record: a submission with this key is in
+    ///     progress in a different thread, and it holds the key. `clean`
+    ///     deletes the entry with the record, so this case cannot mean "the
+    ///     record went away".
+    ///   * A job that has not stopped: it holds the key. This is the case that
+    ///     the option exists for.
+    ///   * A job that SUCCEEDED inside the window: it holds the key.
+    ///   * Every other job: the key is free.
+    pub fn dedupe_holder(&self, key: &str, window: u64) -> Option<uuid::Uuid> {
+        let id = *self.dedupe.get(key)?;
+        let Some(job) = self.jobs.get(&id) else {
+            return Some(id);
+        };
+
+        if !job.status.state.is_terminal() {
+            return Some(id);
+        }
+        if window > 0 && job.status.state == JobState::Completed {
+            let finished = job.status.finished_at.unwrap_or(0);
+            if sys::now_secs().saturating_sub(finished) < window {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub fn count_state(&self, f: impl Fn(JobState) -> bool) -> usize {
         self.jobs.values().filter(|j| f(j.status.state)).count()
     }
@@ -381,6 +428,7 @@ impl Coordinator {
                 cfg,
                 jobs: BTreeMap::new(),
                 queue: Vec::new(),
+                dedupe: BTreeMap::new(),
                 last_contact: Instant::now(),
                 idle_since: Some(Instant::now()),
                 next_sequence: 1,
@@ -633,6 +681,40 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     queued.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
     state.queue = queued.into_iter().map(|(id, _, _)| id).collect();
 
+    // Give each dedupe key back to a job.
+    //
+    // Without this step, a coordinator that starts again frees every key, and
+    // the next submission starts a second copy of work that already operates.
+    // The key comes from `spec.json`, which the CLI wrote at the submission.
+    // (`JobStatus` holds the key also, but that copy is for a reader of
+    // `qex status`.)
+    //
+    // Two jobs can hold one key: the job of yesterday stopped, and the job of
+    // today operates. The job that has not stopped wins, and after that the
+    // latest job wins. A record of an earlier run must never hide a job that
+    // operates now.
+    let mut holders: Vec<(String, uuid::Uuid, bool, u64, u64)> = state
+        .jobs
+        .values()
+        .filter_map(|j| {
+            let key = j.spec.dedupe_key.clone()?;
+            Some((
+                key,
+                j.status.id,
+                j.status.state.is_terminal(),
+                j.status.submitted_at,
+                j.status.sequence,
+            ))
+        })
+        .collect();
+    holders.sort_by(|a, b| {
+        // The best holder comes last, so the insert of it replaces the others.
+        b.2.cmp(&a.2).then(a.3.cmp(&b.3)).then(a.4.cmp(&b.4))
+    });
+    for (key, id, ..) in holders {
+        state.dedupe.insert(key, id);
+    }
+
     if recovered > 0 {
         log(&format!("the coordinator read {recovered} job record(s)"));
     }
@@ -737,14 +819,19 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
 
 fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
     let id = spec.id;
+    let mut status = JobStatus::new(&spec);
 
     // Test each dependency here as well as in the CLI.
     //
     // The coordinator owns the job list, so this is the only test that cannot
     // be wrong. A dependency that names no job would make the queue start a
     // job in the wrong order, and the user would receive no warning.
-    {
-        let state = coord.state.lock().unwrap();
+    //
+    // This one lock operation also holds the dedupe key, the size test and the
+    // reservation of the key. See the comment on `State::dedupe`: the test of
+    // the key and the reservation of the key must not be two steps.
+    let warning = {
+        let mut state = coord.state.lock().unwrap();
         for dep in spec.needs.iter().chain(spec.after.iter()) {
             if !state.jobs.contains_key(dep) {
                 return Response::error(
@@ -764,31 +851,70 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         // A dependency given by name has one more rule, because a name can give
         // a job of an earlier run. The CLI is the only part that sees a name,
         // so that rule is in `resolve_dependencies`.
-    }
-    let dir = match paths::job_dir(&id) {
-        Ok(d) => d,
-        Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),
-    };
 
-    let mut status = JobStatus::new(&spec);
+        // The dedupe key. Test it and reserve it here, with the lock held.
+        if let Some(key) = spec.dedupe_key.clone() {
+            // Read the record of each job that operates first. A job that
+            // stopped one moment ago must free its key now, and not at the next
+            // request.
+            state.refresh_active();
 
-    // Test the size of the job against the budget, and warn now. The agent then
-    // learns immediately. It does not wait for the job to start.
-    let warning = {
-        let state = coord.state.lock().unwrap();
+            if let Some(other) = state.dedupe_holder(&key, spec.dedupe_window) {
+                let doing = match state.jobs.get(&other) {
+                    Some(j) => format!("is in the state `{}`", j.status.state),
+                    // The record is not written yet, so the state is the state
+                    // of every new job.
+                    None => String::from("starts now"),
+                };
+                // Show the SAFE form of the key. The key is text that another
+                // agent chose, and this sentence goes to the log of the
+                // coordinator and to the terminal of the caller. See
+                // `job::safe_name`. The map keeps the key that the user gave.
+                let shown = crate::job::safe_name(&key);
+                log(&format!(
+                    "a submission with the dedupe key `{shown}` gave the job {other}"
+                ));
+                return Response::Submitted {
+                    id: other,
+                    warning: Some(format!(
+                        "this submission started no job. The dedupe key `{shown}` gives the job \
+                         {other}, and that job {doing}.\n\
+                         qex gives you the id of that job, so `qex wait` and `qex status` \
+                         operate on the work that already exists.\n\
+                         A key names the work, and qex does not compare the command. Run \
+                         `qex status {other}` to see the work that this id names.\n\
+                         To run the work a second time, wait for that job to stop, or use a \
+                         different key."
+                    )),
+                    deduplicated: true,
+                };
+            }
+
+            // Hold the key for this job now, before the lock goes. A second
+            // submission with the same key finds this id, whatever moment it
+            // arrives in.
+            state.dedupe.insert(key, id);
+        }
+
+        // Test the size of the job against the budget, and warn now. The agent
+        // then learns immediately. It does not wait for the job to start.
         match crate::sched::size_check(&state.cfg, &spec) {
             crate::sched::Size::Fits => None,
             crate::sched::Size::TooBig(reason) => {
                 use crate::config::OversizedPolicy;
                 match state.cfg.queue.oversized {
                     OversizedPolicy::Reject => {
+                        // qex refuses this job, so it must not hold the key.
+                        // A key that a refused job holds would stop each later
+                        // submission, and no job would ever free it.
+                        release_dedupe(&mut state, id);
                         return Response::error(
                             ErrorKind::WrongState,
                             format!(
                                 "{reason}\nThe config file sets [queue] oversized = \"reject\". \
                                  Decrease the claim, or increase [budget]."
                             ),
-                        )
+                        );
                     }
                     OversizedPolicy::Queue => Some(format!(
                         "{reason}\nThe config file sets [queue] oversized = \"queue\". \
@@ -807,6 +933,14 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         }
     };
 
+    let dir = match paths::job_dir(&id) {
+        Ok(d) => d,
+        Err(e) => {
+            release_dedupe(&mut coord.state.lock().unwrap(), id);
+            return Response::error(ErrorKind::Internal, e.to_string());
+        }
+    };
+
     // Write the record before the answer. If the coordinator stops now, the
     // job is still in the queue after the restart.
     if let Err(e) = (|| -> Result<()> {
@@ -815,6 +949,10 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         job::write_status(&dir, &status)?;
         Ok(())
     })() {
+        // This job does not exist, so it must not hold its key. Without this
+        // step, the key would name a job with no record for ever, and each
+        // later submission with that key would give an id that answers nothing.
+        release_dedupe(&mut coord.state.lock().unwrap(), id);
         return Response::error(
             ErrorKind::Internal,
             format!("qex could not write the job record: {e:#}"),
@@ -859,7 +997,20 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
     crate::history::record_submit_for(&id, &name_for_history, submitted_at);
 
     coord.notify();
-    Response::Submitted { id, warning }
+    Response::Submitted {
+        id,
+        warning,
+        deduplicated: false,
+    }
+}
+
+/// Frees each dedupe key that names this job.
+///
+/// The map holds one id for each key, so this function reads every entry. The
+/// number of keys is the number of jobs, and a submission is not frequent, so
+/// the cost is not important.
+pub fn release_dedupe(state: &mut State, id: uuid::Uuid) {
+    state.dedupe.retain(|_, holder| *holder != id);
 }
 
 fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
@@ -986,4 +1137,229 @@ pub fn log(message: &str) {
     println!("[{}] {message}", sys::now_secs());
     use std::io::Write as _;
     std::io::stdout().flush().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::JobSpec;
+
+    fn spec_with_key(key: &str) -> JobSpec {
+        JobSpec {
+            id: uuid::Uuid::new_v4(),
+            name: "t".into(),
+            cwd: "/".into(),
+            command: vec!["true".into()],
+            env: Default::default(),
+            cpu: 1,
+            mem: 1 << 20,
+            timeout: None,
+            tags: vec![],
+            priority: 0,
+            env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
+            locks: vec![],
+            retries: 0,
+            nice: None,
+            needs: vec![],
+            after: vec![],
+            dedupe_key: Some(key.to_string()),
+            dedupe_window: 0,
+            submitted_at: 0,
+        }
+    }
+
+    fn empty_state() -> State {
+        State {
+            cfg: Config::default(),
+            jobs: BTreeMap::new(),
+            queue: Vec::new(),
+            dedupe: BTreeMap::new(),
+            last_contact: Instant::now(),
+            idle_since: None,
+            next_sequence: 1,
+            started_at: 0,
+            stop: false,
+            config_seen: 0,
+            config_settling: None,
+            config_error: None,
+        }
+    }
+
+    /// Puts one job with a key in the state, and gives its id.
+    fn add(
+        state: &mut State,
+        key: &str,
+        job_state: JobState,
+        finished_at: Option<u64>,
+    ) -> uuid::Uuid {
+        let spec = spec_with_key(key);
+        let id = spec.id;
+        let mut status = JobStatus::new(&spec);
+        status.state = job_state;
+        status.finished_at = finished_at;
+        state.jobs.insert(
+            id,
+            Job {
+                spec,
+                status,
+                supervisor_pid: None,
+            },
+        );
+        state.dedupe.insert(key.to_string(), id);
+        id
+    }
+
+    /// A key holds the job that waits or operates. This is the rule that stops
+    /// a second copy of a four-hour run.
+    #[test]
+    fn a_key_holds_a_job_that_waits_or_operates() {
+        for job_state in [JobState::Queued, JobState::Starting, JobState::Running] {
+            let mut state = empty_state();
+            let id = add(&mut state, "build:/x", job_state, None);
+            assert_eq!(
+                state.dedupe_holder("build:/x", 0),
+                Some(id),
+                "a job in the state `{job_state}` must hold its key"
+            );
+        }
+    }
+
+    /// A key that is free gives nothing. A different key gives nothing also: a
+    /// key must name the work AND the place, and two places must not meet.
+    #[test]
+    fn a_key_with_no_job_is_free() {
+        let mut state = empty_state();
+        add(&mut state, "build:/x", JobState::Running, None);
+        assert_eq!(state.dedupe_holder("build:/y", 0), None);
+        assert_eq!(state.dedupe_holder("", 0), None);
+    }
+
+    /// A job that stopped frees its key.
+    ///
+    /// A key that held a job for ever would give an agent the id of a job of
+    /// yesterday, and that answer would look like a success.
+    #[test]
+    fn a_job_that_stopped_frees_its_key() {
+        for job_state in [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Killed,
+            JobState::Timeout,
+            JobState::Oom,
+            JobState::Cancelled,
+            JobState::Skipped,
+        ] {
+            let mut state = empty_state();
+            add(&mut state, "build:/x", job_state, Some(sys::now_secs()));
+            assert_eq!(
+                state.dedupe_holder("build:/x", 0),
+                None,
+                "a job in the state `{job_state}` must free its key"
+            );
+        }
+    }
+
+    /// The window keeps the key of a job that SUCCEEDED, and of no other job.
+    ///
+    /// A window that held the key of a job that failed would be dangerous: the
+    /// one remedy for a failure is another run, and the option would stop it.
+    #[test]
+    fn the_window_keeps_the_key_of_a_job_that_succeeded_only() {
+        let now = sys::now_secs();
+
+        let mut state = empty_state();
+        let id = add(&mut state, "k", JobState::Completed, Some(now));
+        assert_eq!(state.dedupe_holder("k", 3600), Some(id));
+
+        // A job that succeeded before the window gives the key back.
+        let mut state = empty_state();
+        add(&mut state, "k", JobState::Completed, Some(now - 7200));
+        assert_eq!(state.dedupe_holder("k", 3600), None);
+
+        // A job that failed inside the window gives the key back.
+        for job_state in [JobState::Failed, JobState::Timeout, JobState::Oom] {
+            let mut state = empty_state();
+            add(&mut state, "k", job_state, Some(now));
+            assert_eq!(
+                state.dedupe_holder("k", 3600),
+                None,
+                "a job in the state `{job_state}` must free its key inside the window"
+            );
+        }
+    }
+
+    /// The key goes AT the end of the window, and not one second after it.
+    ///
+    /// This is the edge of the rule, and the only place where a window of this
+    /// shape goes wrong. `<` and `<=` differ for one whole second, and a caller
+    /// that met that second would be given the job of the earlier run.
+    ///
+    /// The test reads the clock twice and repeats if the second changed while
+    /// it worked. The elapsed time is then EXACTLY the window, with no race and
+    /// no wait. An end-to-end test of this edge has to wait for a whole second
+    /// and can be pushed past it by the load of the machine; this one cannot.
+    #[test]
+    fn a_key_goes_at_the_end_of_the_window_and_not_after_it() {
+        const WINDOW: u64 = 600;
+
+        for _ in 0..100 {
+            let now = sys::now_secs();
+            let mut state = empty_state();
+            add(&mut state, "k", JobState::Completed, Some(now - WINDOW));
+            let answer = state.dedupe_holder("k", WINDOW);
+            // Repeat if the clock moved on while the test worked. The elapsed
+            // time was then not the window, and the answer says nothing.
+            if sys::now_secs() != now {
+                continue;
+            }
+            assert_eq!(
+                answer, None,
+                "a job that succeeded exactly one window ago must give the key back"
+            );
+
+            // One second inside the window, the key stays. The two together
+            // pin the comparison from both sides.
+            let mut state = empty_state();
+            let id = add(&mut state, "k", JobState::Completed, Some(now - WINDOW + 1));
+            let answer = state.dedupe_holder("k", WINDOW);
+            if sys::now_secs() != now {
+                continue;
+            }
+            assert_eq!(
+                answer,
+                Some(id),
+                "a job that succeeded inside the window must keep the key"
+            );
+            return;
+        }
+        panic!("the clock moved on every attempt, so the edge was never tested");
+    }
+
+    /// A submission that holds the key writes its record after it takes the
+    /// key. A second submission in that moment must find the key TAKEN.
+    ///
+    /// Without this rule, two submissions in the same moment would both start a
+    /// job, which is the fault that the key removes.
+    #[test]
+    fn a_key_that_a_submission_reserved_is_taken_before_the_record_exists() {
+        let mut state = empty_state();
+        let id = uuid::Uuid::new_v4();
+        state.dedupe.insert("k".into(), id);
+        assert_eq!(state.dedupe_holder("k", 0), Some(id));
+    }
+
+    /// The record and the key go together. A key that named a job with no
+    /// record would give an id that `qex status` cannot answer.
+    #[test]
+    fn the_key_goes_when_the_record_goes() {
+        let mut state = empty_state();
+        let id = add(&mut state, "k", JobState::Completed, Some(sys::now_secs()));
+        state.jobs.remove(&id);
+        release_dedupe(&mut state, id);
+        assert!(state.dedupe.is_empty());
+        assert_eq!(state.dedupe_holder("k", 3600), None);
+    }
 }

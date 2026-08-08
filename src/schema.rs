@@ -95,6 +95,16 @@ pub const JOB: &str = r##"{
       "items": { "type": "string" },
       "description": "The jobs that must stop before this job starts. Their result is not important. Use this field for a cleanup step that must run also when an earlier stage fails.",
       "examples": [["build"]]
+    },
+    "dedupe_key": {
+      "type": "string",
+      "description": "Start no second job when a job with this key already exists. qex gives the id of that job and exits with the code 0. A key holds a job while that job waits or operates, and the key is free when the job stops. Use it in a script that can run a second time.",
+      "examples": ["build:/home/me/project", "train:experiment-7"]
+    },
+    "dedupe_window": {
+      "type": "string",
+      "description": "Keep the key of a job that SUCCEEDED for this time. Use s, m, h or d. The default is \"0\", which frees the key when the job stops. A job that did not succeed never keeps its key. This field needs dedupe_key.",
+      "examples": ["1h", "30m"]
     }
   }
 }
@@ -270,6 +280,10 @@ pub const STATUS: &str = r##"{
         "incomplete": { "type": "boolean", "description": "True when qex could not complete a log file, and could not count what went. A process of the job held the output open after the job stopped. The counts above are then the counts that arrived, and not the full quantity." }
       }
     },
+    "dedupe_key": {
+      "type": ["string", "null"],
+      "description": "The key that made the submission of this job idempotent, if the submission gave one. A second submission with this key gave this id and started no job."
+    },
     "sequence": {
       "type": "integer",
       "description": "The position of the job in the order of submission. Sort by submitted_at and then by this value to see a pipeline in order."
@@ -395,6 +409,8 @@ mod tests {
             "env",
             "needs",
             "after",
+            "dedupe_key",
+            "dedupe_window",
         ] {
             assert!(
                 props.contains_key(field),
@@ -403,7 +419,7 @@ mod tests {
         }
         assert_eq!(
             props.len(),
-            11,
+            13,
             "the schema has a field that the job file does not accept"
         );
     }

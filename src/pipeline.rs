@@ -249,6 +249,17 @@ pub fn stage_spec(
         after: Vec::new(),
         locks: stage.locks.clone(),
         retries: stage.retries,
+        // A stage has no dedupe key, and the `Stage` type holds no such field.
+        //
+        // A key on one stage would answer for that stage alone. The stages
+        // after it would then wait for a job of an EARLIER run, and the
+        // pipeline would mix two runs in one graph. The user asked for one
+        // pipeline, and would receive a shape that no file describes.
+        //
+        // A pipeline needs one key for the whole group, and that is a
+        // different feature. qex does not accept a part of it in silence.
+        dedupe_key: None,
+        dedupe_window: None,
         resources: stage.resources.clone(),
         env: stage.env.clone(),
     };
