@@ -2775,7 +2775,15 @@ fn a_config_fault_in_the_record_of_a_job_stays_short() {
     // NOW the file gets a field that this qex does not know. The coordinator
     // keeps the values that it read when it started, so it still schedules the
     // job; the supervisor of that job is a new process, and it reads this.
-    h.write_config(&format!("{good}\n[hooks]\non_stop = [\"true\"]\n"));
+    //
+    // The section must be one that NO qex knows. This test wrote `[hooks]`
+    // until qex gained a `[hooks]` section, and it then wrote a file that
+    // PARSES: the supervisor met no fault, and the test measured nothing.
+    // Choose a name that this build refuses, and change it again when qex takes
+    // that name.
+    h.write_config(&format!(
+        "{good}\n[telemetry]\nendpoint = \"https://example.invalid\"\n"
+    ));
 
     // Release the budget. The waiting job then starts under the broken file.
     h.qex(&["kill", &occupier, "--grace", "1s"]);

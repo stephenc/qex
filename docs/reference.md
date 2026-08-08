@@ -851,9 +851,9 @@ The job supplies these variables. A variable with no value is empty text.
 | Variable | Value |
 | -------- | ----- |
 | `QEX_JOB_ID` | the job id |
-| `QEX_JOB_NAME` | the job name |
+| `QEX_JOB_NAME` | the job name, in the safe form that `qex list` shows |
 | `QEX_STATE` | the final state |
-| `QEX_EXIT_CODE` | the exit code, if the job stopped without a signal |
+| `QEX_EXIT_CODE` | the exit code of the job, if the job ran to its own end |
 | `QEX_SIGNAL` | the signal number, if a signal stopped the job |
 | `QEX_ELAPSED_SECS` | the seconds that the job ran |
 | `QEX_CWD` | the directory of the job |
@@ -862,8 +862,28 @@ The job supplies these variables. A variable with no value is empty text.
 | `QEX_MAX_RSS` | the maximum memory in bytes |
 | `QEX_TAGS` | the tags, separated by a space |
 
-The values arrive in the environment and never in a command line. A job name
-with a shell character is thus a name, and never a command.
+**The values arrive in the environment and never in a command line.** qex builds
+no text that a shell reads: it starts the program of `on_stop` directly, with the
+arguments that you wrote and no others. A job name such as `x; rm -rf ~` is thus
+a name, and never a command, whatever the hook does with it.
+
+**`QEX_JOB_NAME` is the SAFE name.** It holds the letters, the numbers and
+`-_.` only, which is the one form of a name that qex shows anywhere, and which
+`qex list` and `qex status` already print. A hook exists to put a name in front
+of a person, and a raw name with an ESC byte in it moves the cursor of a
+terminal and writes over the text around it. The safe name goes back into `qex
+status` and `qex logs` as it stands. A hook that needs the name that the
+submitter typed reads `status.json` in `QEX_JOB_DIR`.
+
+`QEX_TAGS` and `QEX_CWD` have no such rule, so qex replaces each control
+character in them with a space. A NUL byte is the reason: the system takes no
+variable that holds one, and the hook of that job would not start at all.
+
+`QEX_EXIT_CODE` is the code of the JOB, and it is the number that `qex run`
+gives for a job that ran to its own end. It is EMPTY for a job that something
+stopped, because such a job produced no code of its own; `QEX_STATE` says what
+happened, with the same word that `qex status` prints. Read `QEX_STATE` first
+and `QEX_EXIT_CODE` after it. See [Exit codes of `qex run`](#exit-codes-of-qex-run).
 
 `on_stop_states` selects the jobs that give a message. The default list holds
 each state of a job that ran. `cancelled` and `skipped` are not in it: you
@@ -891,7 +911,19 @@ qex gives these guarantees:
   config file at each job, and not one time at the start. A hook that you delete
   runs no more, and a hook that you add runs at once. You do not restart the
   coordinator.
-- **A hook that fails does not change the job.**
+- **A hook that fails does not change the job.** The result of a job is the
+  result of the job, and a notification that did not arrive does not change it.
+  qex writes nothing into the `error` field of the job for a hook.
+
+**A hook is not a job, and it receives nothing that belongs to one.** It does
+not take the `[politeness]` values, because those make WORK give way to a
+person and a notification is FOR the person: the hook runs at the priority of
+the qex process that starts it. It does not join the cgroup of the job, so
+`[enforce]` never applies the memory limit of the job to it. It does not receive
+`QEX_CPU`, `GOMAXPROCS` or any other variable of [`[claims]`](#the-claim-reaches-the-job),
+because it makes no claim on the budget. Its output limit is the fixed 1MB
+above, and NOT [`[logs] max_bytes`](#the-limit-on-the-output-of-a-job), which is
+the limit for the output of a job.
 
 The output of the hook goes to `hook.log` in the directory of the job. Read it
 with `qex logs <id> --hook`, which also gives the verdict of qex on the hook: a

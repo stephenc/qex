@@ -789,6 +789,13 @@ pub struct HooksConfig {
     ///
     /// qex signals the process group of the hook at this limit. A hook with no
     /// limit could hold a process of qex for ever.
+    ///
+    /// The quotation marks make no difference here, as in every other field of
+    /// this file that holds a time: `timeout = 30` and `timeout = "30"` and
+    /// `timeout = "30s"` are one value. Without `text_or_number`, `timeout = 30`
+    /// refused the WHOLE FILE with `invalid type: integer, expected a string`,
+    /// while `[queue] settle = 3` beside it was accepted.
+    #[serde(deserialize_with = "text_or_number")]
     pub timeout: String,
 }
 
@@ -1999,6 +2006,35 @@ timeout = "30s"
             c.hook_timeout().unwrap(),
             std::time::Duration::from_secs(30)
         );
+    }
+
+    /// `[hooks] timeout` takes the same forms as every other time in this file.
+    ///
+    /// The rule of the documentation is that the quotation marks make no
+    /// difference. Without `text_or_number`, `timeout = 30` refused the WHOLE
+    /// FILE — every command that reads it — with `invalid type: integer,
+    /// expected a string`, while `[queue] settle = 3` beside it was accepted.
+    #[test]
+    fn the_time_limit_of_a_hook_takes_a_number_and_its_text() {
+        for text in ["30", "\"30\"", "\"30s\""] {
+            let c: Config = toml::from_str(&format!(
+                "[hooks]\non_stop = [\"true\"]\ntimeout = {text}\n"
+            ))
+            .unwrap_or_else(|e| panic!("timeout = {text} must be accepted: {e}"));
+            c.validate().unwrap();
+            assert_eq!(
+                c.hook_timeout().unwrap(),
+                std::time::Duration::from_secs(30),
+                "timeout = {text}"
+            );
+        }
+
+        // A value that names no time must still stop the file, and the message
+        // must name the field that holds it.
+        let c: Config =
+            toml::from_str("[hooks]\non_stop = [\"true\"]\ntimeout = \"soon\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[hooks] timeout"), "got: {err}");
     }
 
     /// The default filter covers the jobs that ran. A pipeline of twenty stages

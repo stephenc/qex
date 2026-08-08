@@ -1019,8 +1019,16 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
         // The notice goes to stderr, so stdout holds the log lines only.
         // A command such as `qex logs $ID > file` must give a clean file, and a
         // reader that parses the output must not meet a sentence in it.
-        if let Some(notice) = status.as_ref().and_then(|s| dropped_notice(s, name)) {
-            eprintln!("{notice}");
+        //
+        // `logs_dropped` counts the output of the JOB, so it says nothing about
+        // the log of the hook. Without this test, a job whose output did not
+        // close made `qex logs --hook` print "the output of this job did not
+        // close" above the hook log, which sends the reader to the wrong file.
+        // The hook has its own limit, and its own verdict inside `hook.log`.
+        if !args.hook {
+            if let Some(notice) = status.as_ref().and_then(|s| dropped_notice(s, name)) {
+                eprintln!("{notice}");
+            }
         }
         if let Some(notice) = selected.notice() {
             eprintln!("{notice}");

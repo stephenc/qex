@@ -93,7 +93,12 @@ pub fn fire(dir: &Path, status: &JobStatus) {
         return;
     }
 
-    match Config::load() {
+    // The SHORT form of a fault in the file. This message goes into a log line
+    // and not in front of a person whose command stopped. `Config::load` gives
+    // some 20 lines of advice about an upgrade of the coordinator, which would
+    // hide the one line that this reader needs — that no notification came.
+    // `supervisor::main` takes the short form for the same reason.
+    match Config::load_short() {
         Ok(cfg) => fire_with(&cfg, dir, status),
         // A configuration that qex cannot read must not run a hook. qex cannot
         // know if the command in memory is still the command in the file.
@@ -144,6 +149,13 @@ fn fire_with(cfg: &Config, dir: &Path, status: &JobStatus) {
 }
 
 /// Adds one line to the log of the hook.
+///
+/// The mode below is belt AND braces, and a deletion of it leaves the test
+/// suite green. [`run`] opens the same file with the same mode before it starts
+/// the hook, so on every path that a test can drive, the file already exists and
+/// `create` does nothing. This call makes the file only when THAT open failed.
+/// The mode stays: the two places that make this file must not disagree, and a
+/// reader who sees one of them must find the same rule in the other.
 fn note(dir: &Path, text: &str) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -440,7 +452,20 @@ fn variables(dir: &Path, status: &JobStatus) -> Vec<(String, String)> {
     let text = |v: Option<i32>| v.map(|n| n.to_string()).unwrap_or_default();
     let mut set = vec![
         ("QEX_JOB_ID".into(), status.id.to_string()),
-        ("QEX_JOB_NAME".into(), status.name.clone()),
+        // THE SAFE NAME, which is the one form of a name that qex shows.
+        //
+        // A hook exists to put a name in front of a person: `notify-send
+        // "$QEX_JOB_NAME"`, a line in a file, a message in a chat. That is the
+        // same act as `qex list`, and it takes the same rule. A name is text
+        // that another agent chose, and a raw name with an ESC byte, written to
+        // a terminal by a hook of two words, moves the cursor and writes over
+        // the text around it.
+        //
+        // The name that arrives here therefore goes back into a qex command as
+        // it stands, because `resolve_id` finds a job by its safe name as well.
+        // A hook that needs the name that the submitter typed reads
+        // `status.json` in `QEX_JOB_DIR`.
+        ("QEX_JOB_NAME".into(), crate::job::safe_name(&status.name)),
         ("QEX_STATE".into(), status.state.to_string()),
         ("QEX_EXIT_CODE".into(), text(status.exit_code)),
         ("QEX_SIGNAL".into(), text(status.signal)),
@@ -467,13 +492,17 @@ fn variables(dir: &Path, status: &JobStatus) -> Vec<(String, String)> {
 ///
 /// A NUL byte in a value stops the start of the hook: the system cannot receive
 /// a variable with a NUL in it, and `spawn` gives "nul byte found in provided
-/// data". A job NAME can hold that byte, because the name comes from the person
-/// or the agent that submitted the job and not from the config file. The
-/// notification of that job was then lost for ever, and the message named the
-/// config file, which was correct.
+/// data". The values that carry that risk come from the person or the agent
+/// that submitted the job, and not from the config file: the TAGS and the
+/// DIRECTORY. The notification of such a job was lost for ever, and the message
+/// named the config file, which was correct and no help at all.
 ///
 /// The other control characters go for the same reason in a smaller degree: a
-/// notification on a screen must not receive an escape sequence from a job name.
+/// notification on a screen must not receive an escape sequence from a tag.
+///
+/// The job NAME does not depend on this function. It goes through
+/// [`crate::job::safe_name`] first, which is stricter, and which is the rule for
+/// every name that qex puts in front of a reader.
 fn printable(value: &str) -> String {
     value
         .chars()
@@ -504,6 +533,7 @@ mod tests {
             group_name: None,
             locks: vec![],
             retries: 0,
+            nice: None,
             needs: vec![],
             after: vec![],
             submitted_at: 0,
@@ -601,8 +631,154 @@ mod tests {
             !mark.exists(),
             "a job name became a command; the name must stay in the environment"
         );
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), status.name);
+        // The SAFE name arrives, which is the name that `qex list` shows. Two
+        // rules hold this test up, and each one alone is sufficient: the value
+        // travels in the environment and never in a command line, and the name
+        // itself holds no shell character when it gets there.
+        //
+        // THE EXPECTATION IS A LITERAL, and it does not call `safe_name`. A
+        // test that builds its expectation with the function that it tests
+        // passes for every result that both sides give, so it would pass with
+        // the RAW name on both sides and measure nothing.
+        let got = std::fs::read_to_string(&out).unwrap();
+        // `; ` is a RUN of two characters that the safe form does not keep, and
+        // a run becomes ONE `_`.
+        assert!(
+            got.starts_with("x_touch_"),
+            "the safe form of the name must arrive: {got}"
+        );
+        assert!(
+            !got.contains(';') && !got.contains(' ') && !got.contains('/'),
+            "the name must carry no shell character and no path: {got}"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The files of the hook hold the output of a command that a user wrote, so
+    /// they take the mode of the other files of a job: the owner, and nobody
+    /// else. `docs/security.md` states 0600 for `hook.log`.
+    ///
+    /// A hook writes a token as easily as a job does. `notify-send "$(cat
+    /// ~/.netrc)"` is one line of a config file, and its output lands here.
+    #[test]
+    fn the_files_of_the_hook_are_readable_by_the_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode_of = |path: std::path::PathBuf| {
+            std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{} is not there: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        // A hook that RAN. `run` makes both files.
+        let dir = temp("mode");
+        let cfg = cfg_with("[hooks]\non_stop = [\"sh\", \"-c\", \"echo a secret\"]\n");
+        fire_with(&cfg, &dir, &status(JobState::Completed));
+        for name in [LOG_FILE, CLAIM_FILE] {
+            let mode = mode_of(dir.join(name));
+            assert_eq!(
+                mode, 0o600,
+                "{name} has the mode {mode:o}, and another user can read it"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A hook that DID NOT START. `run` opened no file, so `note` makes
+        // `hook.log` itself, and it must give the same mode. This path holds
+        // the name of the program that failed, which can name a directory of
+        // the owner.
+        let dir = temp("mode2");
+        let cfg = cfg_with("[hooks]\non_stop = [\"qex-no-such-program\"]\n");
+        fire_with(&cfg, &dir, &status(JobState::Completed));
+        let mode = mode_of(dir.join(LOG_FILE));
+        assert_eq!(
+            mode, 0o600,
+            "the log of a hook that did not start has the mode {mode:o}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The hook gets no standard input.
+    ///
+    /// The hook is a child of the supervisor or of the coordinator, and it
+    /// would take the standard input of that process. A hook that reads its
+    /// input then waits for the whole of its time limit and gives no
+    /// notification, and a hook that a person starts from a terminal takes the
+    /// keys of that person. `qex run` is such a terminal.
+    ///
+    /// THE TEST ASKS THE SYSTEM WHAT THE INPUT IS, and it does not measure the
+    /// time. A test that gave `cat` to the hook and waited passed with no
+    /// `Stdio::null()` at all, because the input of `cargo test` is already
+    /// closed on the machine that runs the suite. It measured the harness.
+    ///
+    /// THIS TEST STILL CANNOT PROVE THE LINE ON EVERY MACHINE. Where the suite
+    /// itself runs with `/dev/null` on its input — measured here — a hook that
+    /// INHERITED that input gives the same answer, so a deletion of
+    /// `Stdio::null()` passes. The test holds the documented property, and the
+    /// property matters most where qex runs from a terminal, which is where no
+    /// automated suite runs. Do not delete the line because this test is green
+    /// without it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_hook_reads_no_standard_input() {
+        let dir = temp("stdin");
+        let out = dir.join("in.txt");
+        let cfg = cfg_with(&format!(
+            "[hooks]\non_stop = [\"sh\", \"-c\", \"readlink /proc/self/fd/0 > {}\"]\n",
+            out.display()
+        ));
+        fire_with(&cfg, &dir, &status(JobState::Completed));
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap().trim(),
+            "/dev/null",
+            "the standard input of the hook must be /dev/null"
+        );
+        let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains("ran in"), "the hook must succeed: {log}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The hook starts in the directory of the job, and a directory that is
+    /// gone does not stop it.
+    ///
+    /// A job can delete its own directory — `rm -rf` in a build tree is
+    /// ordinary work. `spawn` gives an error for a working directory that is
+    /// not there, so the hook of such a job never ran and the message named the
+    /// config file, which was correct and no help at all.
+    #[test]
+    fn the_hook_starts_in_the_directory_of_the_job_or_in_the_root() {
+        let dir = temp("cwd");
+        let out = dir.join("where.txt");
+        let cfg = cfg_with(&format!(
+            "[hooks]\non_stop = [\"sh\", \"-c\", \"pwd > {}\"]\n",
+            out.display()
+        ));
+
+        // The directory of the job is there.
+        let mut s = status(JobState::Completed);
+        s.cwd = dir.display().to_string();
+        fire_with(&cfg, &dir, &s);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap().trim(),
+            dir.display().to_string(),
+            "the hook must start in the directory of the job"
+        );
+
+        // The directory of the job is gone. The hook must still run.
+        let second = temp("cwd2");
+        let mut s = status(JobState::Completed);
+        s.cwd = second.join("this-directory-is-gone").display().to_string();
+        fire_with(&cfg, &second, &s);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap().trim(),
+            "/",
+            "a directory that is gone must not stop the hook"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&second).ok();
     }
 
     /// A hook that hangs must not hold the caller for ever. The caller runs the
@@ -659,21 +835,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A job name that holds a NUL byte must not stop the notification.
+    /// A control byte in the data of a job must not stop the notification.
     ///
-    /// A job file can give the name `a\0b`. qex accepts that name, and
-    /// `Command::env` then refuses the value: `spawn` gives "nul byte found in
-    /// provided data". The hook never started, the claim was already taken, and
-    /// the message of that job was lost for ever — while the log named the
-    /// config file, which was correct. The name comes from the person who
-    /// submitted the job, so job data decided that a notification did not
-    /// arrive.
+    /// A job file can give the name `a\0b` and the tag `x\0y`. qex accepts
+    /// both, and `Command::env` then refuses the value: `spawn` gives "nul byte
+    /// found in provided data". The hook never started, the claim was already
+    /// taken, and the message of that job was lost for ever — while the log
+    /// named the config file, which was correct and no help at all. The data
+    /// comes from the person who submitted the job, so JOB DATA decided that a
+    /// notification did not arrive.
+    ///
+    /// The name and the tags take different roads to the same guarantee. The
+    /// name goes through `safe_name`, which keeps the letters, the numbers and
+    /// `-_.` and nothing else. A tag has no such rule, so `printable` carries
+    /// it, and this test asserts both.
     #[test]
-    fn a_job_name_with_a_control_byte_still_runs_the_hook() {
+    fn a_control_byte_in_the_data_of_a_job_still_runs_the_hook() {
         let dir = temp("nul");
         let out = dir.join("name.txt");
         let cfg = cfg_with(&format!(
-            "[hooks]\non_stop = [\"sh\", \"-c\", \"printf %s \\\"$QEX_JOB_NAME\\\" > {}\"]\n",
+            "[hooks]\non_stop = [\"sh\", \"-c\", \
+             \"printf '%s|%s' \\\"$QEX_JOB_NAME\\\" \\\"$QEX_TAGS\\\" > {}\"]\n",
             out.display()
         ));
         let mut status = status(JobState::Completed);
@@ -682,7 +864,13 @@ mod tests {
         fire_with(&cfg, &dir, &status);
 
         let text = std::fs::read_to_string(&out).unwrap_or_default();
-        assert_eq!(text, "a b [31mc d", "each control byte must become a space");
+        let (name, tags) = text.split_once('|').unwrap_or(("", ""));
+        assert_eq!(name, "a_b_31mc_d", "the name must take its safe form");
+        assert_eq!(tags, "x y", "each control byte of a tag must become a space");
+        assert!(
+            !name.contains('\u{1b}') && !tags.contains('\u{1b}'),
+            "no value may carry an escape byte to a screen: {text:?}"
+        );
 
         // The verdict of qex must not say that the hook did not start.
         let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
