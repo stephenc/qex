@@ -166,6 +166,14 @@ pub struct SubmitArgs {
     #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
+    /// Give up if the job waits this long in the queue. Example: 30m.
+    ///
+    /// The job does not start, and its state becomes `expired`. Use 0 for no
+    /// limit. The time counts from the submission, and `--timeout` limits the
+    /// run of the job instead.
+    #[arg(long, value_name = "TIME")]
+    pub max_queue_time: Option<String>,
+
     /// Wait for these jobs, and stop if one of them does not succeed.
     ///
     /// Give an id or a name. Repeat the option, or separate the values with a

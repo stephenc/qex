@@ -1274,6 +1274,104 @@ fn a_job_that_reaches_its_time_limit_has_the_state_timeout() {
     });
 }
 
+/// A job that never starts must give up and say what it waited for.
+///
+/// Without this rule, an agent that submits a job which the budget can never
+/// admit waits for ever, and it learns nothing. The state `expired` and the
+/// exit code 123 also separate "the job ran too long" from "the job never ran":
+/// the two need different corrections, and an expired job has no output at all.
+#[test]
+fn a_job_that_never_starts_gives_up_and_says_why() {
+    let h = Harness::new(
+        "queuelimit",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    // This claim is larger than the budget, and the config file keeps such a job
+    // in the queue. The job thus can never start, whatever the machine does.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+
+    h.until("the job gives up", Duration::from_secs(45), || {
+        h.state_of(&id) == "expired"
+    });
+
+    let status = h.status_json(&id);
+    assert!(
+        status["started_at"].is_null(),
+        "a job that expired must never have a start time: {status}"
+    );
+    assert!(
+        status["exit_code"].is_null(),
+        "a job that expired has no exit code: {status}"
+    );
+
+    // The text must say what the job waited for and how long it waited. A
+    // reader that gets the state alone cannot correct anything.
+    let error = status["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("did not start"),
+        "the text must say that the job never ran: {error}"
+    );
+    assert!(
+        error.contains("--max-queue-time"),
+        "the text must name the limit: {error}"
+    );
+    assert!(
+        error.contains("budget") || error.contains("cores"),
+        "the text must name the wait: {error}"
+    );
+
+    // `qex wait` must give the code of a job that never started, and not the
+    // code 125 of a job that something stopped.
+    let out = h.qex(&["wait", &id, "--timeout", "30s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(123),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A job that needed this one must NOT be told to read a log file.
+    //
+    // An expired job never started, so it wrote no output. A reader who obeys
+    // that instruction finds an empty file, `qex logs` gives the code 0, and
+    // the reader learns nothing. The same rule already holds for a job that a
+    // user cancelled.
+    let after = h.submit(&["submit", "--needs", &id, "--", "echo", "after"]);
+    h.until(
+        "the job behind it gives up",
+        Duration::from_secs(45),
+        || h.state_of(&after) == "skipped",
+    );
+    let status = h.status_json(&after);
+    let text = format!(
+        "{} {}",
+        status["error"].as_str().unwrap_or(""),
+        status["blocked_reason"].as_str().unwrap_or("")
+    );
+    assert!(
+        text.contains("expired"),
+        "the text must name the state of the job that it needed: {text}"
+    );
+    assert!(
+        !text.contains("qex logs"),
+        "an expired job wrote no log, so the text must not name one: {text}"
+    );
+}
+
 /// qex must record the environment and the directory of the shell that
 /// submitted the job.
 #[test]
@@ -1765,6 +1863,232 @@ fn a_job_that_stops_at_its_time_limit_keeps_its_result() {
             );
         }
         if code == Some(0) {
+            assert_eq!(
+                state, "completed",
+                "a job that stopped with the code 0 must be `completed`: {s}"
+            );
+        }
+    }
+}
+
+/// `qex wait` MUST RETURN WHEN THE JOB GIVES UP, AND NOT 30 SECONDS LATER.
+///
+/// This test starts the wait BEFORE the limit ends. That order is the whole
+/// point: a wait that begins after the job expired returns at once, whatever
+/// the coordinator signalled, so it proves nothing.
+///
+/// The fault that this test holds: the scheduler wrote the state `expired` and
+/// signalled no waiter. Every waiter then slept on the 30 second fallback in
+/// `handle_wait`. The record said 3s and `qex wait` returned at 30.0s, so the
+/// promise "this gives an answer inside 30 minutes" was false by 30 seconds for
+/// every user of the option.
+#[test]
+fn a_wait_returns_when_the_job_reaches_its_queue_limit() {
+    let h = Harness::new(
+        "queuewait",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+
+    // Wait from HERE, while the job is still in the queue.
+    let start = std::time::Instant::now();
+    let out = h.qex(&["wait", &id, "--timeout", "60s"]);
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(123),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The limit is 3s. Ten seconds is far above every measured run and far
+    // below the 30 second fallback, so a failure here names the fault and not
+    // the speed of the machine.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "`qex wait` returned after {elapsed:?}, and the limit is 3s. The \
+         scheduler expired the job and signalled no waiter."
+    );
+}
+
+/// `qex config show` MUST NAME THE QUEUE LIMIT, AND NAME IT ALWAYS.
+///
+/// This command says what qex uses NOW. A value that it never prints is a value
+/// that a reader cannot confirm, and "no limit" is the answer that most users
+/// get: it says that a job waits for capacity with no end. A user who asks why
+/// a job waited for hours needs to read that line and see that no limit
+/// operates.
+#[test]
+fn the_config_summary_names_the_queue_limit() {
+    // With no value, the line must still appear and must say what happens.
+    let h = Harness::new(
+        "cfgqueuelimit",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let out = h.ok(&["config", "show"]);
+    assert!(
+        out.contains("queue limit:"),
+        "the summary must hold the queue limit line: {out}"
+    );
+    assert!(
+        out.contains("no limit"),
+        "with no value the line must say that a job waits with no end: {out}"
+    );
+
+    // With a value, the line must give it and say what the limit does.
+    let h = Harness::new(
+        "cfgqueuelimit2",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [defaults]\nmax_queue_time = \"30m\"\n",
+    );
+    let out = h.ok(&["config", "show"]);
+    assert!(
+        out.contains("queue limit:") && out.contains("30m"),
+        "the summary must give the value that qex uses: {out}"
+    );
+    assert!(
+        out.contains("expired"),
+        "the line must say what happens to a job that waits longer: {out}"
+    );
+}
+
+/// A WAIT ON A JOB WHOSE DEPENDENCY EXPIRED MUST RETURN AT THE SAME MOMENT.
+///
+/// This is the configuration that `docs/reference.md` recommends: a limit on
+/// the first stage, and no limit on the stage that waits for it. Turn N expires
+/// the first job. Turn N+1 sees that the first job stopped without success and
+/// makes the second job `skipped`.
+///
+/// The fault that this test holds: a scheduling pass counted the EXPIRED jobs
+/// only. A skipped job also has no supervisor and no request thread to announce
+/// it, so the pass signalled nobody and every waiter slept on the 30 second
+/// fallback in `handle_wait`. Measured with that count: `qex wait` on the
+/// second job returned at 33.0s, 3 of 3 runs, with a limit of 3s. With the
+/// count it returned at 3.5s.
+///
+/// THE TEST MEASURES THE PROMISE, AND NOT THE RECORD. A test that waits for the
+/// status file to say `skipped` passes while `qex wait` sleeps, because the
+/// file holds the answer that the waiter did not receive.
+#[test]
+fn a_wait_returns_when_the_job_that_it_needs_gives_up_in_the_queue() {
+    let h = Harness::new(
+        "queuedep",
+        "[budget]\ncpu = \"2\"\nmem = \"8GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    // This claim is larger than the budget, and the config file keeps such a
+    // job in the queue, so the first job can never start.
+    let first = h.submit(&[
+        "submit",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+    let second = h.submit(&["submit", "--needs", &first, "--", "echo", "after"]);
+
+    // Wait from HERE, while both jobs are still in the queue.
+    let start = std::time::Instant::now();
+    let out = h.qex(&["wait", &second, "--timeout", "60s"]);
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(126),
+        "a job that did not run because a job that it needs failed gives 126. \
+         stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The limit is 3s. Ten seconds is far above every measured run and far
+    // below the 30 second fallback, so a failure here names the fault and not
+    // the speed of the machine.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "`qex wait` returned after {elapsed:?}, and the limit of the job that \
+         this job needs is 3s. The scheduler skipped this job and signalled no \
+         waiter."
+    );
+}
+
+/// A JOB THAT STARTED MUST NEVER GET THE STATE `expired`.
+///
+/// The scheduler chooses a job, releases the lock, and the start of that job
+/// writes `starting`. A scheduling pass that removed a job in that moment would
+/// write `expired` over a job that ran, and `qex wait` would then report a
+/// failure for a job that succeeded.
+///
+/// These jobs run one at a time on a budget of one core, and their queue limit
+/// is short. Some of them thus reach the start and the limit in the same moment.
+#[test]
+fn a_job_that_started_at_its_queue_limit_keeps_its_result() {
+    let h = Harness::new(
+        "queuerace",
+        "[budget]\ncpu = \"1\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let mut ids = Vec::new();
+    for _ in 0..10 {
+        ids.push(h.submit(&[
+            "submit",
+            "--cpu",
+            "1",
+            "--mem",
+            "64MB",
+            "--max-queue-time",
+            "2s",
+            "--",
+            "sleep",
+            "0.4",
+        ]));
+    }
+
+    for id in &ids {
+        // Not `ok`: a job that reaches its queue limit gives the code 123, and
+        // that is one of the two correct results here.
+        h.qex(&["wait", id, "--timeout", "60s"]);
+        let s = h.status_json(id);
+        let state = s["state"].as_str().unwrap();
+
+        // A record that says `expired` and holds a start time or an exit code is
+        // self contradictory: the job ran, so it did not expire.
+        if state == "expired" {
+            assert!(
+                s["started_at"].is_null(),
+                "a job that started must never be `expired`: {s}"
+            );
+            assert!(
+                s["exit_code"].is_null(),
+                "a job with an exit code must never be `expired`: {s}"
+            );
+        }
+        if s["exit_code"].as_i64() == Some(0) {
             assert_eq!(
                 state, "completed",
                 "a job that stopped with the code 0 must be `completed`: {s}"

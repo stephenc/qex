@@ -187,6 +187,7 @@ pub const ALL: &[&str] = &[
     "history",
     "learn",
     "locks",
+    "max-queue-time",
     "politeness",
     "retries",
 ];
@@ -222,6 +223,12 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
     }
     if spec.retries > 0 {
         out.push("retries");
+    }
+    // A coordinator without this capability keeps the field, gives a job id, and
+    // lets the job wait for ever. That is exactly the fault that the option
+    // removes, so qex must refuse the job.
+    if spec.max_queue_time.is_some() {
+        out.push("max-queue-time");
     }
     if spec.group.is_some() {
         out.push("groups");
@@ -268,6 +275,7 @@ pub fn check(
         .iter()
         .map(|m| match *m {
             "locks" => "--lock",
+            "max-queue-time" => "--max-queue-time",
             "retries" => "--retries",
             "dependencies" => "--needs and --after",
             "groups" => "qex pipeline",
@@ -304,6 +312,7 @@ mod tests {
             cpu: 1,
             mem: 1 << 20,
             timeout: None,
+            max_queue_time: None,
             tags: vec![],
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
@@ -587,6 +596,39 @@ mod tests {
         assert!(check(&new, "0.8.0", 4321, &s).is_ok());
     }
 
+    /// A queue limit must be refused by a coordinator that cannot obey it.
+    ///
+    /// Such a coordinator keeps the field, gives a job id, and lets the job wait
+    /// for ever. The user asked for the opposite of that, and a silent job id
+    /// looks exactly like a job that obeys the limit.
+    #[test]
+    fn a_queue_limit_is_refused_by_a_coordinator_that_cannot_obey_it() {
+        let mut s = spec();
+        s.max_queue_time = Some(1800);
+
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "max-queue-time")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check(&old, "0.7.1", 4321, &s).unwrap_err();
+        assert!(
+            err.contains("--max-queue-time"),
+            "the message must name the option: {err}"
+        );
+        assert!(
+            err.contains("in silence"),
+            "the message must give the danger: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check(&new, "0.8.0", 4321, &s).is_ok());
+    }
+
     #[test]
     fn each_option_that_needs_the_coordinator_is_tested() {
         let mut s = spec();
@@ -600,6 +642,10 @@ mod tests {
         let mut s = spec();
         s.group = Some(uuid::Uuid::new_v4());
         assert_eq!(required_by(&s), vec!["groups"]);
+
+        let mut s = spec();
+        s.max_queue_time = Some(60);
+        assert_eq!(required_by(&s), vec!["max-queue-time"]);
 
         // Two options together give two names in one message.
         let mut s = spec();
