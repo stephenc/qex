@@ -857,9 +857,9 @@ as for a job. To use a shell feature, name the shell:
 The job supplies these variables. A variable with no value is empty text.
 
     QEX_JOB_ID        the job id
-    QEX_JOB_NAME      the job name
+    QEX_JOB_NAME      the job name, in the safe form that `qex list` shows
     QEX_STATE         the final state
-    QEX_EXIT_CODE     the exit code, if the job stopped without a signal
+    QEX_EXIT_CODE     the exit code of the job, if the job ran to its own end
     QEX_SIGNAL        the signal number, if a signal stopped the job
     QEX_ELAPSED_SECS  the seconds that the job ran
     QEX_CWD           the directory of the job
@@ -868,8 +868,22 @@ The job supplies these variables. A variable with no value is empty text.
     QEX_MAX_RSS       the maximum memory in bytes
     QEX_TAGS          the tags, separated by a space
 
-The values arrive in the environment and never in a command line. A job name
-with a shell character is thus a name, and never a command.
+The values arrive in the environment and never in a command line. qex builds no
+text that a shell reads, so a job name such as `x; rm -rf ~` is a name and never
+a command, whatever the hook does with it.
+
+QEX_JOB_NAME is the SAFE name: the letters, the numbers and `-_.` only, which is
+the one form of a name that qex shows anywhere. A hook puts a name in front of a
+person, and a raw name with an ESC byte in it moves the cursor of a terminal and
+writes over the text around it. That name goes back into `qex status` as it
+stands. A hook that needs the name that the submitter typed reads `status.json`
+in QEX_JOB_DIR. QEX_TAGS and QEX_CWD have no such rule, so qex replaces each
+control character in them with a space.
+
+QEX_EXIT_CODE is the code of the JOB. It is empty for a job that something
+stopped, because such a job gave no code of its own. Read QEX_STATE first: it
+holds the same word that `qex status` prints. Run `qex help exit-codes` for the
+codes of the commands.
 
 `on_stop_states` selects the jobs that give a message. The default list holds
 each state of a job that ran. `cancelled` and `skipped` are not in it: you
@@ -892,8 +906,15 @@ message that is lost.
 
 A hook that uses more than `[hooks] timeout` receives TERM and then KILL, in a
 process group of its own. qex stops a hook that goes above 1MB of output while
-it runs, and it cuts the log of each hook to that size. A hook that fails does
-not change the job.
+it runs, and it cuts the log of each hook to that size. That size is fixed, and
+it is NOT `[logs] max_bytes`, which limits the output of a job. A hook that
+fails does not change the job, and qex writes nothing in the `error` field of
+the job for it.
+
+A hook is not a job. It does not take the `[politeness]` values, because those
+make work give way to a person and a notification is FOR the person. It does not
+join the cgroup of the job, so `[enforce]` puts no memory limit on it. It
+receives no variable of `[claims]`, because it makes no claim on the budget.
 
 qex reads the config file at each job that stops. A hook that you delete thus
 runs no more, and a hook that you add runs at once. You do not restart the
