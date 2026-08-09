@@ -32,6 +32,7 @@ pub const TOPICS: &[&str] = &[
     "output",
     "exit-codes",
     "pipeline",
+    "each-line",
 ];
 
 /// Gives the text for one topic.
@@ -48,6 +49,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "output" | "json" => Some(OUTPUT),
         "exit-codes" | "exit" | "exitcodes" => Some(EXIT_CODES),
         "pipeline" | "pipelines" => Some(PIPELINE),
+        "each-line" | "eachline" | "fan-out" | "fanout" => Some(EACH_LINE),
         _ => None,
     }
 }
@@ -625,6 +627,16 @@ For several stages in one file, use a pipeline:
 
 Run `qex help pipeline`. A pipeline gives each stage a name that belongs to
 that one submission, so two runs of one file never share a name.
+
+One command and many inputs
+---------------------------
+
+    GROUP=$(qex submit --each-line inputs.txt -- ./process {})
+    qex list --group $GROUP
+
+One job for each line of the file, and one group id for all of them. `{}` takes
+the text of the line. qex starts no shell, so a line becomes exactly one
+argument and never a command. Run `qex help each-line`.
 
 Tell the people who make qex
 ----------------------------
@@ -1620,6 +1632,190 @@ qex reads the whole file before it submits anything. A circle of jobs, a name
 that no job has, and a job with no command each give an error, and no job
 starts.
 
+For one command and many inputs, use `--each-line`. Run `qex help each-line`.
+
+";
+
+pub const EACH_LINE: &str = "\
+qex fan-out: one job for each line
+==================================
+
+One command, many inputs. `--each-line` reads a file and submits one job for
+each line. Put `{}` in the command, and each job gets the text of one line
+there.
+
+    qex submit --each-line inputs.txt -- ./process {}
+
+The jobs share one group id. The group id goes to stdout, and the name and id of
+each job go to stderr, so this operates:
+
+    GROUP=$(qex submit --each-line inputs.txt -- ./process {})
+    qex list --group $GROUP
+
+Read the lines from another program with the name `-`:
+
+    ls *.parquet | qex submit --each-line - -- ./convert {}
+
+Where `{}` goes
+---------------
+
+`{}` goes in any argument, in the program name, or inside an argument:
+
+    qex submit --each-line urls.txt -- curl -o {}.html https://{}/
+
+Every `{}` takes the line. A command with NO `{}` gives an error, because each
+job would then be the same command and the lines would have no effect.
+
+Write `{{}}` for a literal `{}`. Nothing else in the command changes.
+
+A line is data, and never a command
+-----------------------------------
+
+qex starts no shell. Each line becomes exactly ONE argument, whatever it holds:
+a space, a quotation mark, a semicolon, a dollar sign or a newline. A file of
+names from a directory listing or from a database is therefore safe.
+
+    a b\"; rm -rf ~; echo $HOME
+
+That line gives one argument with those characters in it. No shell reads it.
+
+To use a shell feature, name the shell, and give the line as an argument and
+never inside the text of the script:
+
+    qex submit --each-line names.txt -- bash -c 'echo \"$1\" | tr a-z A-Z' _ {}
+
+A line that starts with a dash
+------------------------------
+
+A line becomes an argument, so a line such as `-v` or `--out=/etc/passwd`
+becomes an OPTION of your program. qex cannot know which arguments your program
+reads as options, so it does not change the line.
+
+Put `--` in the command before `{}`. Almost every program then reads the line as
+data and not as an option:
+
+    qex submit --each-line names.txt -- ./process -- {}
+
+This is the same rule as `xargs`. Use it for input that you did not write
+yourself.
+
+Which lines give a job
+----------------------
+
+    a line                 one job
+    an empty line          no job
+    a line that starts #   no job, it is a comment
+    the space at each end  qex removes it
+    a CRLF ending          the same job as an LF ending
+    no final newline       the last line still gives a job
+
+qex says on stderr how many lines it passed over, so a line that you expected
+never goes away in silence.
+
+A file that is not UTF-8 gives an error with the line number, and qex submits
+nothing. The command of a job is text, so qex cannot run such a line.
+
+All or nothing, and the one case that is not
+-------------------------------------------
+
+qex reads the whole input and tests the command first. Every fault that qex can
+find gives an error and NO job at all.
+
+One case remains: qex submits the jobs one at a time, so a coordinator that
+stops in the middle leaves the earlier jobs in the queue. qex then writes the
+group id and the id of every job that it submitted, and how to stop them. Read
+the group id from that message, because stdout holds the group id of a fan-out
+that succeeded in full.
+
+The limits
+----------
+
+`--each-line` submits 1000 jobs at most. Each job holds a directory, so a file
+with 100000 lines would fill the disk. Raise the limit when you need it:
+
+    qex submit --each-line big.txt --max-jobs 5000 -- ./process {}
+
+qex reads 64 MiB at most, from a file and from a pipe, because it holds the
+whole input in memory. `--max-jobs` does not raise that limit.
+
+The options that a fan-out refuses
+----------------------------------
+
+    --dedupe-key, --dedupe-window   A key holds ONE job. Every job of the
+                                    fan-out would carry the same key, so qex
+                                    would start the first line only.
+    --json                          It writes the id of one job. Use
+                                    `--id-file NAME.json` for the group and
+                                    every job.
+    --job                           The place for the line belongs on the
+                                    command line, where a reader sees it.
+
+`qex run` does not accept `--each-line` at all. It waits for ONE job.
+
+The name of each job
+--------------------
+
+Each job gets a name for `qex list`: the program name, the position in the
+file, and as much of the line as fits.
+
+    process-01-data-a.csv
+    process-02-data-b.csv
+
+Give `--name` to change the first part and the name of the group.
+
+A name holds the letters, the numbers, `.`, `_` and `-` only. A line can hold a
+terminal control sequence, and a name goes to your terminal in `qex list`.
+
+The other options
+-----------------
+
+`--cpu`, `--mem`, `--timeout`, `--max-queue-time`, `--lock`, `--tag`,
+`--priority`, `--env`, `--nice`, `--needs`, `--after` and `--retries` apply to
+every job of the fan-out.
+
+qex calculates the claim one time, from the command of the FIRST line, and
+gives it to every job. The lines of a fan-out are the same kind of work.
+
+`--max-queue-time` is the time that ONE job waits, and not the time of the
+group. The jobs that still wait at the end of that time become `expired`.
+
+N jobs make N of everything
+---------------------------
+
+`qex events` writes at least 3 lines for each job, and the coordinator holds
+the last 512 events only. Start `qex events` BEFORE you submit a large fan-out,
+and filter on `.job.group`. A reader that falls behind receives a `gap` line
+with the number of events that it lost.
+
+`[hooks] on_stop` runs one time for EACH job that stops, and that includes
+`expired` and `skipped`. A fan-out of 1000 lines runs the hook 1000 times. The
+hook environment names the job and not the group, so give the fan-out a `--tag`
+and read `QEX_TAGS`.
+
+A fan-out learns as one task
+----------------------------
+
+qex records what each job used, and gives that measurement to the next job of
+the same command. A fan-out does not fit that rule: `./process a.csv` and
+`./process b.csv` are two commands, and each one runs one time.
+
+qex therefore measures every job of a fan-out against the TEMPLATE
+`./process {}`. One fan-out makes one record, and the second run of the same
+fan-out gets its claim from the first run.
+
+`qex status` says `(from the earlier jobs of this fan-out)` for such a claim.
+
+Use `--lock` when the jobs must not operate together:
+
+    qex submit --each-line inputs.txt --lock db -- ./load {}
+
+Keep the ids in a file
+----------------------
+
+    qex submit --each-line inputs.txt --id-file ids.env -- ./process {}
+    . ids.env                       # gives $group and one name for each job
+
+A name that ends in `.json` gives a JSON object instead, for a parser.
 ";
 
 pub const EXIT_CODES: &str = "\

@@ -13,6 +13,7 @@ description: Every command, option, claim word and configuration field.
 qex submit [--cpu N] [--mem SIZE] [--timeout TIME] [--max-queue-time TIME]
            [--needs ID,ID] [--after ID,ID] [--name NAME] [--job FILE] [--json]
            [--dedupe-key KEY] [--dedupe-window TIME] -- COMMAND...
+qex submit --each-line FILE [--max-jobs N] -- COMMAND... {}
 qex wait   <id>... [--timeout TIME] [--passthrough]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
@@ -558,6 +559,240 @@ no shell, so you need no quotation marks and no escape characters. To use a
 shell feature, name the shell: `["bash", "-lc", "a | b > c.txt"]`.
 
 A field name with a spelling error gives an error. qex does not ignore it.
+
+## One job for each line of a file
+
+`--each-line` reads a file and submits one job for each line. Put `{}` in the
+command. Each job gets the text of one line in the place of `{}`.
+
+```sh
+GROUP=$(qex submit --each-line inputs.txt -- ./process {})
+qex list --group $GROUP
+```
+
+The jobs share one group id. The group id goes to stdout, and the name and the
+id of each job go to stderr, so `GROUP=$(qex submit --each-line ...)` operates
+in the same way as `qex pipeline`.
+
+The name `-` reads the lines from standard input:
+
+```sh
+ls *.parquet | qex submit --each-line - -- ./convert {}
+```
+
+### A line is data, and never a command
+
+qex starts no shell. Each line becomes exactly **one** argument, whatever it
+holds: a space, a quotation mark, a semicolon, a dollar sign or a newline. A
+file of names that came from a directory listing, a database or another program
+is therefore safe.
+
+```
+a b"; rm -rf ~; echo $HOME
+```
+
+That line gives one argument with those characters in it. Nothing reads them.
+
+To use a shell feature, name the shell, and give the line as an argument. Do
+not put `{}` inside the text of the script:
+
+```sh
+qex submit --each-line names.txt -- bash -c 'echo "$1" | tr a-z A-Z' _ {}
+```
+
+### A line that starts with a dash
+
+A line becomes an argument, so a line such as `-v` or `--out=/etc/passwd`
+becomes an **option** of your program. qex cannot know which arguments your
+program reads as options, so it does not change the line.
+
+Put `--` in the command before `{}`. Almost every program then reads the line
+as data and not as an option:
+
+```sh
+qex submit --each-line names.txt -- ./process -- {}
+```
+
+This is the same rule as `xargs`. Use it for input that you did not write
+yourself.
+
+### Where `{}` goes
+
+`{}` goes in any argument, in the program name, or inside an argument:
+
+```sh
+qex submit --each-line urls.txt -- curl -o {}.html https://{}/
+```
+
+Every `{}` takes the line. A command with **no** `{}` gives an error and
+submits nothing, because each job would then be the same command and the lines
+would have no effect. Write `{{}}` for a literal `{}`. Nothing else in the
+command changes.
+
+### Which lines give a job
+
+| The line | The result |
+| -------- | ---------- |
+| ordinary text | one job |
+| an empty line | no job |
+| a line that starts with `#` | no job, it is a comment |
+| space at the start or the end | qex removes it |
+| a CRLF ending | the same job as an LF ending |
+| no final newline | the last line still gives a job |
+
+qex writes to stderr how many lines it passed over. A line that you expected to
+run never goes away in silence.
+
+A file that is not UTF-8 gives an error with the line number, and qex submits
+nothing. The command of a job is text, so qex cannot run such a line.
+
+### All or nothing, and the one case that is not
+
+qex tests the command, reads the whole input and makes every job specification
+before it submits the first job. **Every fault that qex can find gives an error
+and no job at all**, in the same way as `qex pipeline`: a command with no `{}`,
+a file that qex cannot read, a file that is not UTF-8, an input with no line, a
+count above the limit, and an option that a fan-out refuses.
+
+One case remains. qex submits the jobs one at a time, so a coordinator that
+stops in the middle of a fan-out leaves the earlier jobs in the queue. qex then
+writes **the group id and the id of every job that it submitted**, and it says
+how to see them and how to stop them:
+
+```
+qex: qex lost the coordinator at the job `process-07-g.csv`. 6 jobs of this
+     fan-out are in the queue.
+qex: the group of those jobs is 4f2c.... They are:
+...
+qex: Run `qex list --group 4f2c...` to see them, and `qex cancel <id>` or
+     `qex kill <id>` to stop them.
+```
+
+The exit code is not 0 in that case. Read the group id from the message, and
+not from stdout: stdout holds the group id of a fan-out that succeeded in full.
+
+### The limits
+
+`--each-line` submits **1000 jobs** at most. Each job holds a directory in the
+state of qex, so a file with 100000 lines would fill the disk. The limit asks
+no question, because an agent cannot answer one. Raise it when you need to:
+
+```sh
+qex submit --each-line big.txt --max-jobs 5000 -- ./process {}
+```
+
+A fan-out submits the jobs **one at a time**, so the command takes time in
+proportion to the number of lines: 300 jobs took 4.9 s on this machine, and it
+wrote 301 lines to stderr. A `--max-jobs 100000` fan-out therefore holds your
+terminal for about half an hour. Submit a large fan-out in the background, or
+divide it.
+
+qex also reads **64 MiB** at most, from a file and from a pipe. qex holds the
+whole input in memory, because it makes every job before it submits the first
+one, so an input larger than this gives an error and no job. `--max-jobs` does
+not raise this limit: qex must read the bytes before it can count the lines.
+
+A directory in the place of the input file gives the message of a file that qex
+cannot read, and no job.
+
+### The options that a fan-out refuses
+
+| The option | Why |
+| ---------- | --- |
+| `--dedupe-key`, `--dedupe-window` | A key holds ONE job. Every job of the fan-out would carry the same key, so qex would start the first line and give you the id of that job for every other line. Put the key on a job that starts the fan-out. |
+| `--json` | That option writes the id of one job. A fan-out makes a group and one job for each line. Use `--id-file NAME.json`, which holds both. |
+| `--job` | The place for the line belongs on the command line, where the reader sees it. |
+| `--each-line` on `qex run` | `qex run` waits for one job and gives the output and the exit code of that job. |
+
+### The name of each job
+
+Each job gets a name for `qex list`: the program name, the position in the
+file, and as much of the line as fits.
+
+```
+process-01-data-a.csv
+process-02-data-b.csv
+```
+
+The position comes before the line and it has the same width for every job, so
+the names sort in the order of the file and two long lines never give one name.
+Give `--name` to change the first part and the name of the group. Without
+`--name`, the name of the group is the name of the input file with no
+extension, so two fan-outs of `inputs.txt` in two directories share one group
+NAME. Their group **ids** stay different, so use the id in a script.
+
+A name holds the letters, the numbers, `.`, `_` and `-` only. A line can hold a
+terminal control sequence, and a name goes to your terminal in `qex list`.
+
+### The other options
+
+`--cpu`, `--mem`, `--timeout`, `--max-queue-time`, `--lock`, `--tag`,
+`--priority`, `--env`, `--nice`, `--needs`, `--after` and `--retries` apply to
+every job of the fan-out.
+
+`--max-queue-time` is the time that **one job** waits, and not the time of the
+group. A fan-out of 1000 jobs behind a small budget therefore runs the jobs
+that it can, and the jobs that still wait at the end of that time become
+`expired`. Read the group with `qex list --group $GROUP` to see which lines
+ran.
+
+qex calculates the claim one time, from the command of the **first** line, and
+gives it to every job. The lines of a fan-out are the same kind of work, so one
+claim is correct for them.
+
+### A fan-out learns as one task
+
+qex records what each job used, and gives that measurement to the next job of
+the same command. A fan-out does not fit that rule: `./process a.csv` and
+`./process b.csv` are two commands, and each one runs one time.
+
+qex therefore measures every job of a fan-out against the **template**
+`./process {}`. One fan-out makes one record, and the second run of the same
+fan-out gets its claim from the first run. Without this rule a fan-out of 1000
+lines would add 1000 records that no later job can use.
+
+The record keeps the largest measurement, so the claim goes to the size of the
+largest line. `qex status` says `(from the earlier jobs of this fan-out)` for
+such a claim, and not `(from the earlier jobs of this command)`: the command of
+one line can have no measurement at all.
+
+`--id-file` writes the group id and the id of each job. A name that ends in
+`.json` gives a JSON object.
+
+### A fan-out of N jobs makes N of everything
+
+A fan-out is N ordinary jobs, so every rule of a job applies N times. Two of
+those are loud:
+
+* **The event stream.** `qex events` writes one line for each change of a
+  record, so a fan-out of N jobs writes **at least 3N lines** (`queued`,
+  `running`, and the state that stops the job). Each `job` event carries the
+  whole record, so filter on `.job.group`:
+
+  ```sh
+  qex events | jq --arg g "$GROUP" 'select(.event=="job" and .job.group==$g)'
+  ```
+
+  The coordinator holds the last 512 events only. A fan-out of more than about
+  170 jobs therefore makes more events than that ring holds, so **start `qex
+  events` before you submit the fan-out**. A reader that starts after it, or
+  that falls behind, receives a `gap` line with the number of events that it
+  lost. qex never hides that loss.
+* **The stop hook.** `[hooks] on_stop` runs one time for **each** job that
+  reaches a state that stops it, and that includes `expired` and `skipped`. A
+  fan-out of 1000 lines therefore runs the hook 1000 times, and a hook that
+  sends a message sends 1000 messages. The hook environment names the job and
+  not the group, so give the fan-out a tag and read `QEX_TAGS`:
+
+  ```sh
+  qex submit --each-line inputs.txt --tag nightly -- ./process {}
+  ```
+
+  A hook that must report the fan-out one time only belongs on one job that
+  waits for the group, and not on every job of it.
+
+`qex run` does not accept `--each-line`. It waits for one job and gives the
+output and the exit code of that job.
 
 ## The environment and the directory
 
@@ -1294,6 +1529,7 @@ Each topic below is also in the binary, so an agent needs no network:
 qex help agents      the one page for an agent
 qex help job-file    the fields of a job file
 qex help resources   claims, the budget and the several-user accounting
+qex help each-line   one job for each line of a file
 qex help states      each job state and what causes it
 qex help events      the event stream, its numbers and its gaps
 qex help exit-codes  the exit code of each command

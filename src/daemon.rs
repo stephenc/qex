@@ -1227,6 +1227,7 @@ mod tests {
             after: vec![],
             dedupe_key: Some(key.to_string()),
             dedupe_window: 0,
+            learn_key: None,
             submitted_at: 0,
         }
     }

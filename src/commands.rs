@@ -7,7 +7,7 @@ use crate::job::{safe_name, JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
 use crate::spec::{JobSpec, SubmitOptions};
-use crate::units::{format_duration, format_size, parse_duration};
+use crate::units::{count_of, format_duration, format_size, parse_duration};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,10 @@ pub const EXIT_NO_SUCH_JOB: i32 = 127;
 const AUTO_CLEAN_AGE: u64 = 3600;
 
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
+    if args.each_line.is_some() {
+        return submit_each_line(args);
+    }
+
     let cfg = Config::load()?;
     cfg.validate()?;
 
@@ -68,6 +72,8 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         no_limit_env_hints: args.no_limit_env_hints,
         dedupe_key: args.dedupe_key,
         dedupe_window: args.dedupe_window,
+        // An ordinary job measures against its own command.
+        learn_key: None,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -122,6 +128,308 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         }
         other => report(other),
     }
+}
+
+/// Submits one job for each line of a file, and gives the jobs one group id.
+///
+/// # Why qex reads the whole input before it submits anything
+///
+/// `qex pipeline` does the same, and for the same reason. A fan-out that stops
+/// in the middle leaves a part of the work in the queue and a part of the work
+/// with no job. The user then holds a group that is not the file, and the only
+/// correction is to find and cancel each job by hand. qex therefore reads the
+/// input, tests the command, tests the count and makes every specification
+/// first.
+///
+/// A fault can still arrive after the first submission. The coordinator can
+/// refuse a job, and the connection to the coordinator can stop. A fan-out
+/// holds up to 1000 jobs, so that window is much wider than the window of a
+/// pipeline. EVERY message for such a fault names the group and the command
+/// that finds the jobs: a user who never learns the group id cannot reach the
+/// jobs that qex already made.
+///
+/// # Why one claim covers every job
+///
+/// qex resolves the claim one time, from the command of the FIRST line, and
+/// gives it to every job. The lines of a fan-out are the same kind of work, so
+/// one claim is correct for them. A claim for each line separately would come
+/// from a different measurement for each line, and the order of the queue would
+/// then change with the history and not with the file.
+///
+/// The measurements come from the TEMPLATE, and not from the command of the
+/// line. `JobSpec::learn_key` holds the reason. The claim of the first line is
+/// thus the claim of the whole fan-out of the last run.
+///
+/// `qex status` says `fan-out` for such a claim, and not `learned`. The word
+/// `learned` means "from the earlier jobs of this command", and the command of
+/// one line can have no measurement at all.
+fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
+    let cfg = Config::load()?;
+    cfg.validate()?;
+
+    let path = args
+        .each_line
+        .clone()
+        .expect("the caller tested this option");
+
+    // A key holds ONE job. Every job of a fan-out would carry the same key, so
+    // the coordinator would answer the second line and every line after it with
+    // the id of the first job, and start nothing. A fan-out of 1000 lines would
+    // then give 1 job and no error at all, which is the quiet wrong answer that
+    // this project exists to prevent.
+    if args.dedupe_key.is_some() || args.dedupe_window.is_some() {
+        bail!(
+            "`qex submit --each-line` does not accept `--dedupe-key` or `--dedupe-window`.\n\n\
+             A key holds one job. Every job of a fan-out would carry the same key, so qex \
+             would start the first line only and give you the id of that job for every \
+             other line.\n\n\
+             To run a fan-out one time only, put the key on a job that guards it:\n\n\
+             \x20   qex submit --dedupe-key nightly -- ./fan-out.sh"
+        );
+    }
+
+    // `qex submit` writes one id to stdout, and `--json` writes that id as an
+    // object. A fan-out writes a group id and N job ids, which is a different
+    // shape, and `--id-file NAME.json` already gives it.
+    if args.json {
+        bail!(
+            "`qex submit --each-line` does not accept `--json`.\n\n\
+             That option writes the id of ONE job, and a fan-out makes a group and one job \
+             for each line.\n\n\
+             Use an id file with the name `.json`. It holds the group and every job:\n\n\
+             \x20   qex submit --each-line inputs.txt --id-file jobs.json -- ./process {{}}"
+        );
+    }
+
+    // Test the command before qex reads the file. A command with no `{}` is a
+    // fault of the command line, and the user must see that fault first.
+    let template = args.command.clone();
+    crate::fanout::check_command(&template)?;
+
+    let input = crate::fanout::read(&path)?;
+    let max = args.max_jobs.unwrap_or(crate::fanout::DEFAULT_MAX_JOBS);
+    crate::fanout::check_count(input.lines.len(), max)?;
+    let count = input.lines.len();
+
+    // Say what qex passed over. A line that a user expected to run, and that
+    // qex passed over in silence, is a quiet wrong answer.
+    if input.skipped() > 0 {
+        let mut passed: Vec<String> = Vec::new();
+        if input.blank > 0 {
+            passed.push(count_of(input.blank, "empty line"));
+        }
+        if input.comments > 0 {
+            passed.push(count_of(input.comments, "comment line"));
+        }
+        eprintln!(
+            "qex: this input gives {}. qex passed over {}.",
+            count_of(count, "job"),
+            passed.join(" and ")
+        );
+    }
+
+    let env_capture = if args.no_env_capture {
+        Some(EnvCapture::None)
+    } else {
+        args.env_capture
+    };
+
+    let opts = SubmitOptions {
+        name: args.name.clone(),
+        cwd: args.cwd,
+        cpu: args.cpu,
+        mem: args.mem,
+        timeout: args.timeout,
+        // Every job of the fan-out gets the same limit. The limit is on the
+        // time that ONE job waits, and not on the time of the group, so a
+        // fan-out of 1000 jobs behind a small budget expires the jobs that
+        // still wait at the end of it.
+        max_queue_time: args.max_queue_time,
+        tags: args.tags,
+        priority: args.priority,
+        env: args.env,
+        env_capture,
+        // The command of the first line. It gives the directory, the
+        // environment and the name of the program, and the claim comes from the
+        // template below.
+        command: crate::fanout::substitute(&template, &input.lines[0]),
+        job_file: None,
+        needs: args.needs,
+        after: args.after,
+        locks: args.locks,
+        retries: args.retries,
+        nice: args.nice,
+        no_limit_env_hints: args.no_limit_env_hints,
+        // A fan-out refuses these options above, so no job of it holds a key.
+        dedupe_key: None,
+        dedupe_window: None,
+        // Every job of this fan-out measures against the template, so the whole
+        // fan-out makes one record and the next run reads it.
+        learn_key: Some(template.clone()),
+    };
+
+    let (first, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
+
+    let group = uuid::Uuid::new_v4();
+    let group_name = args.name.clone().unwrap_or_else(|| {
+        if path == std::path::Path::new("-") {
+            "stdin".to_string()
+        } else {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("each-line")
+                .to_string()
+        }
+    });
+    // `first.name` is the `--name` value, or the program name of the command.
+    let base = first.name.clone();
+
+    let mut client = Client::connect()?;
+    warn_if_version_differs(&mut client);
+
+    // Every job of the fan-out waits for the same jobs, so qex changes each
+    // name into an id one time.
+    let needs = resolve_dependencies(&mut client, &deps.needs, "--needs")?;
+    let after = resolve_dependencies(&mut client, &deps.after, "--after")?;
+
+    let mut specs: Vec<JobSpec> = Vec::with_capacity(count);
+    for (position, line) in input.lines.iter().enumerate() {
+        let mut spec = first.clone();
+        spec.id = uuid::Uuid::new_v4();
+        spec.command = crate::fanout::substitute(&template, line);
+        spec.name = crate::fanout::job_name(&base, position + 1, count, line);
+        spec.needs = needs.clone();
+        spec.after = after.clone();
+        spec.group = Some(group);
+        spec.group_name = Some(group_name.clone());
+        specs.push(spec);
+    }
+
+    // Test the coordinator one time, before the first job.
+    require_capabilities(&mut client, &specs[0])?;
+
+    let mut submitted: Vec<(String, uuid::Uuid)> = Vec::with_capacity(count);
+    // Every job of the fan-out has the same claim, so the coordinator gives the
+    // same warning for each one. A fan-out of 1000 jobs would write that
+    // warning 1000 times and hide every other line. Say it one time, and count
+    // the rest.
+    //
+    // The comparison uses the FIRST line of the warning. The other lines hold
+    // the id of the job, which is different for each job and is not the reason
+    // for the warning.
+    let mut warned: Option<String> = None;
+    let mut warned_again = 0usize;
+    for spec in specs {
+        let name = spec.name.clone();
+        // Take the answer in two steps. A transport fault gives an `Err` here,
+        // and the `?` of the first form would carry that fault out of this
+        // function with the group id still in this frame only. The jobs that
+        // qex already submitted are on the disk, and a user who never saw the
+        // group id has no way to reach them.
+        let answer = match client.call(&Request::Submit {
+            spec: Box::new(spec),
+        }) {
+            Ok(answer) => answer,
+            Err(e) => {
+                partial_fan_out(
+                    &format!("qex lost the coordinator at the job `{name}`"),
+                    group,
+                    &submitted,
+                );
+                return Err(e);
+            }
+        };
+
+        match answer {
+            // `deduplicated` is always false here. A fan-out refuses
+            // `--dedupe-key`, so no job of it holds a key and the coordinator
+            // has nothing to match a new job against.
+            Response::Submitted {
+                id,
+                warning,
+                deduplicated: _,
+            } => {
+                if let Some(text) = warning {
+                    let head = text.lines().next().unwrap_or_default().to_string();
+                    if warned.as_deref() == Some(head.as_str()) {
+                        warned_again += 1;
+                    } else {
+                        eprintln!("qex: {name}: {text}");
+                        warned = Some(head);
+                    }
+                }
+                submitted.push((name, id));
+            }
+            other => {
+                partial_fan_out(
+                    &format!("the coordinator refused the job `{name}`"),
+                    group,
+                    &submitted,
+                );
+                return report(other);
+            }
+        }
+    }
+
+    if warned_again > 0 {
+        eprintln!(
+            "qex: the same warning applies to {} of this fan-out. \
+             Run `qex list --group {group}` to see them all.",
+            count_of(warned_again, "more job")
+        );
+    }
+
+    if let Some(path) = &args.id_file {
+        let text = pipeline_id_file(path, group, &group_name, &submitted)?;
+        write_id_file(path, &text)?;
+    }
+
+    // The detail goes to stderr and the group id goes to stdout alone, so
+    // `GROUP=$(qex submit --each-line ...)` operates.
+    // The SAFE forms: these lines go to a terminal. `job_name` already cleans
+    // the name of a job, and the group name comes from `--name` or from the
+    // path of the input file, which a user can write with any byte at all.
+    // See `job::safe_name`. The id file above keeps the name as it is, because
+    // a machine reads that name as a KEY.
+    for (name, id) in &submitted {
+        eprintln!("{}: {id}", crate::job::safe_name(name));
+    }
+    eprintln!(
+        "qex: {} in the group `{}`",
+        count_of(count, "job"),
+        crate::job::safe_name(&group_name)
+    );
+    println!("{group}");
+    Ok(0)
+}
+
+/// Reports a fan-out that stopped in the middle.
+///
+/// This function exists because of the ONE thing that a user must not lose: the
+/// group id. The jobs that qex already submitted are on the disk and they
+/// operate, and the group id is the only short handle to all of them. A message
+/// that gives the fault and no group id leaves the user with jobs that they
+/// cannot find.
+///
+/// The ids come as well. `qex list --group` needs a coordinator, and this
+/// function frequently reports that qex just lost the coordinator.
+fn partial_fan_out(what: &str, group: uuid::Uuid, submitted: &[(String, uuid::Uuid)]) {
+    eprintln!(
+        "qex: {what}. {} of this fan-out {} in the queue.",
+        count_of(submitted.len(), "job"),
+        if submitted.len() == 1 { "is" } else { "are" }
+    );
+    if submitted.is_empty() {
+        return;
+    }
+    eprintln!("qex: the group of those jobs is {group}. They are:");
+    for (name, id) in submitted {
+        eprintln!("{}: {id}", crate::job::safe_name(name));
+    }
+    eprintln!(
+        "qex: Run `qex list --group {group}` to see them, and `qex cancel <id>` or \
+         `qex kill <id>` to stop them."
+    );
 }
 
 pub fn list(args: cli::ListArgs) -> Result<i32> {
@@ -533,6 +841,10 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
             // Say where the claim came from. A reader then knows that qex
             // calculated it from the earlier jobs, and that no agent chose it.
             "learned" => "  (from the earlier jobs of this command)",
+            // A job of a fan-out learns against its template, so its claim can
+            // come from a different line of an earlier run. Do not say `this
+            // command`: the command of this job can have no measurement at all.
+            "fan-out" => "  (from the earlier jobs of this fan-out)",
             "default" => "  (the default; give --cpu and --mem to change it)",
             _ => "",
         }
@@ -3013,6 +3325,19 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for
 /// work that must live longer than the command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
+    // `qex run` takes the options of `qex submit`, and `--each-line` is the one
+    // option that it cannot obey: `qex run` waits for ONE job and gives the
+    // output and the exit code of that job. To accept the option here and use
+    // one line only would give the user a result that is not the file.
+    if args.submit.each_line.is_some() {
+        bail!(
+            "`qex run` does not accept `--each-line`, because it waits for one job and \
+             gives the output and the exit code of that job.\n\n\
+             Use `qex submit --each-line`, then wait for the group:\n\
+             \x20   GROUP=$(qex submit --each-line inputs.txt -- ./process {{}})"
+        );
+    }
+
     let cfg = Config::load()?;
     cfg.validate()?;
 
@@ -3056,6 +3381,8 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         no_limit_env_hints: args.submit.no_limit_env_hints,
         dedupe_key: args.submit.dedupe_key,
         dedupe_window: args.submit.dedupe_window,
+        // An ordinary job measures against its own command.
+        learn_key: None,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
