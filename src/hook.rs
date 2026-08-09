@@ -628,31 +628,9 @@ fn variables(dir: &Path, status: &JobStatus) -> Vec<(String, String)> {
         ("QEX_TAGS".into(), status.tags.join(" ")),
     ];
     for (_, value) in set.iter_mut() {
-        *value = printable(value);
+        *value = crate::job::printable(value);
     }
     set
-}
-
-/// Replaces each control character with a space.
-///
-/// A NUL byte in a value stops the start of the hook: the system cannot receive
-/// a variable with a NUL in it, and `spawn` gives "nul byte found in provided
-/// data". The values that carry that risk come from the person or the agent
-/// that submitted the job, and not from the config file: the TAGS and the
-/// DIRECTORY. The notification of such a job was lost for ever, and the message
-/// named the config file, which was correct and no help at all.
-///
-/// The other control characters go for the same reason in a smaller degree: a
-/// notification on a screen must not receive an escape sequence from a tag.
-///
-/// The job NAME does not depend on this function. It goes through
-/// [`crate::job::safe_name`] first, which is stricter, and which is the rule for
-/// every name that qex puts in front of a reader.
-fn printable(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 #[cfg(test)]

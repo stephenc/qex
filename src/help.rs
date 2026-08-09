@@ -1275,7 +1275,7 @@ The default is `start`.
 
 KEEP TWO VALUES: the `stream_id` of the first line, and the largest `seq` that
 you read. Give both to `--since` when your program starts again, as
-`<stream_id>:<seq>`. You then lose nothing, and you read nothing a second time.
+`<stream_id>:<seq>`. You then lose nothing while the same coordinator operates.
 
 THE NUMBERS BELONG TO ONE COORDINATOR. The coordinator stops when no job
 operates, and the next command starts a new one. That coordinator starts its
@@ -1285,6 +1285,13 @@ number 348 thus names a DIFFERENT event there.
 With the stream name, qex compares the two and gives you a `gap` line that says
 that the coordinator changed, then continues with the events that the new
 coordinator holds. Its job records are the same records.
+
+A NEW COORDINATOR THUS GIVES YOU SOME LINES A SECOND TIME. It makes one event
+for each record that it reads, so a job that stopped while you were away arrives
+again as `completed`, with a new number. This is the ordinary case: the
+coordinator retires when no job operates, which is when your program is away.
+ACT ON `id` AND `state`, AND NOT ON THE ARRIVAL OF A LINE. Keep the states that
+you acted on, by job id, and do the work of a line one time.
 
 WITH A NUMBER ALONE, qex cannot make that comparison, and you can lose events
 with no message. Give the name. `qex events` writes a warning when you give a

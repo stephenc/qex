@@ -1920,6 +1920,20 @@ fn for_display(mut s: JobStatus) -> JobStatus {
     // job by its key, so the safe form loses nothing. Without this line, a key
     // that holds an ESC byte moves the cursor of the reader.
     s.dedupe_key = s.dedupe_key.as_deref().map(safe_name);
+    // The two SENTENCES take the rule for a sentence, and not `safe_name`.
+    //
+    // qex wrote these two, but it wrote them AROUND text that the caller chose.
+    // `blocked_reason` names the lock that a job waits for, and a lock name is a
+    // word from the command line; `error` on an expired job folds the last
+    // `blocked_reason` into itself, so that word reaches the reader again on a
+    // terminal line. Measured with a lock named `lk<ESC>[2Jbad`: the ESC byte
+    // reached the terminal through both fields.
+    //
+    // `safe_name` would destroy a sentence — it keeps the letters, the numbers
+    // and `-_.` only. `job::printable` takes the bytes that move a cursor and
+    // nothing else.
+    s.blocked_reason = s.blocked_reason.as_deref().map(crate::job::printable);
+    s.error = s.error.as_deref().map(crate::job::printable);
     s
 }
 

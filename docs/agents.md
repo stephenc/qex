@@ -61,12 +61,20 @@ that you read. Give both to `--since` when your program starts again:
 qex events --json --since "$STREAM_ID:348"
 ```
 
-You then lose nothing and you read nothing twice. The numbers belong to one
-coordinator: the coordinator stops when no job operates, and the next one starts
-its numbers at 1 again, so your number 348 names a different event there. With
-the name, qex compares the two and gives you a `gap` line that says the
+You then lose nothing while the same coordinator operates. The numbers belong to
+one coordinator: the coordinator stops when no job operates, and the next one
+starts its numbers at 1 again, so your number 348 names a different event there.
+With the name, qex compares the two and gives you a `gap` line that says the
 coordinator changed. **With a number alone it cannot**, and you can lose events
 with no message.
+
+**A new coordinator gives you some lines a second time, so act on `id` and
+`state` and not on the arrival of a line.** After the `gap` line above, the new
+coordinator makes one event for each record that it reads, so a job that
+finished while you were away arrives again as `completed` with a new number.
+This is the ordinary case and not a fault: the coordinator retires when no job
+operates, which is exactly when your program is away. Keep the states that you
+acted on, by job id, and do the work of a line one time.
 
 Each `job` line carries the whole record, the same as `qex status --json`, so
 you need no second command to learn the exit code, the measured use or the

@@ -432,38 +432,40 @@ mod tests {
         }
     }
 
-    /// The status schema must list each state. A missing state gives an agent
-    /// an incorrect list.
+    /// The two schemas must list EVERY state that qex has, and no other.
+    ///
+    /// A missing state gives an agent an incorrect list, and a reader that
+    /// validates the stream refuses a line that is correct. The event schema had
+    /// lost `expired` in that way.
+    ///
+    /// The list comes from `JobState::ALL`, and not from a list written here. A
+    /// list written here would pass while a state that qex added reached
+    /// NEITHER schema — which is the whole fault, one step further back.
     #[test]
-    fn the_status_schema_lists_every_state() {
+    fn each_schema_lists_every_state_that_qex_has() {
         use crate::job::JobState;
-        let parsed: serde_json::Value = serde_json::from_str(STATUS).unwrap();
-        let listed = parsed["properties"]["state"]["enum"]
-            .as_array()
-            .expect("the state property has no enum");
+        let want: Vec<&str> = JobState::ALL.iter().map(|s| s.as_str()).collect();
 
-        for state in [
-            JobState::Queued,
-            JobState::Starting,
-            JobState::Running,
-            JobState::Completed,
-            JobState::Failed,
-            JobState::Killed,
-            JobState::Timeout,
-            JobState::Expired,
-            JobState::Oom,
-            JobState::Cancelled,
-        ] {
-            assert!(
-                listed.iter().any(|v| v == state.as_str()),
-                "the schema does not list the state `{state}`"
+        for (name, text) in [("status", STATUS), ("event", EVENT)] {
+            let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+            let listed: Vec<&str> = parsed["properties"]["state"]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("the `{name}` schema has no enum of states"))
+                .iter()
+                .map(|v| v.as_str().expect("a state must be a string"))
+                .collect();
+            for state in &want {
+                assert!(
+                    listed.contains(state),
+                    "the `{name}` schema does not list the state `{state}`"
+                );
+            }
+            assert_eq!(
+                listed.len(),
+                want.len(),
+                "the `{name}` schema lists a state that qex does not have: {listed:?}"
             );
         }
-        assert_eq!(
-            listed.len(),
-            11,
-            "the schema lists a state that qex does not use"
-        );
     }
 
     /// The job schema must list each field of the job file. A missing field
@@ -512,24 +514,6 @@ mod tests {
                 "the schema does not name the line `{name}`"
             );
         }
-    }
-
-    /// The event schema and the status schema must list THE SAME states.
-    ///
-    /// A `job` line carries the same state as `status.json`, so two lists that
-    /// disagree make a reader that validates the stream refuse a line that is
-    /// correct. The event schema lost `expired` in exactly this way: `expired`
-    /// arrived while the stream was in a branch of its own, and the branch
-    /// carried the list that it copied. This test compares the two lists, so a
-    /// state that qex adds next must reach both.
-    #[test]
-    fn the_event_schema_lists_the_same_states_as_the_status_schema() {
-        let event: serde_json::Value = serde_json::from_str(EVENT).unwrap();
-        let status: serde_json::Value = serde_json::from_str(STATUS).unwrap();
-        assert_eq!(
-            event["properties"]["state"]["enum"], status["properties"]["state"]["enum"],
-            "the two schemas must list the same states"
-        );
     }
 
     /// The example in the job schema must parse as a job file.

@@ -174,6 +174,10 @@ The numbers belong to one coordinator, and the next coordinator starts them at 1
 again. With the name, qex sees that and gives you a `gap` line; **with a number
 alone it cannot**, and you can lose events with no message.
 
+A new coordinator reads the records again, so after that `gap` line it gives you
+some lines a second time — a job that stopped while you were away arrives again
+as `completed`. **Act on `id` and `state`, and not on the arrival of a line.**
+
 The coordinator keeps the last 512 events and never waits for a reader. If you
 fall behind you receive a `gap` line that counts what you lost; qex never hides
 a gap. The stream reports what the coordinator saw: a job shorter than half a

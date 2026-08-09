@@ -8101,6 +8101,167 @@ fn the_stream_shows_the_safe_name() {
     }
 }
 
+/// The stream must show no control byte in the SENTENCES either.
+///
+/// A sentence that qex writes is not safe because qex wrote it. It carries
+/// values that the caller chose: `blocked_reason` names the LOCK that a job
+/// waits for, and a lock name is a word from the command line. `expire` then
+/// folds that reason into `error`, so the same word reaches the reader a second
+/// time on a TERMINAL line — and a terminal line is the one that an agent acts
+/// on.
+///
+/// `safe_name` is the wrong rule for a sentence; it would destroy the prose.
+/// `job::printable` takes the bytes that move a cursor and nothing else.
+#[test]
+fn the_stream_shows_no_control_byte_in_a_sentence() {
+    let h = Harness::new(
+        "eventsreason",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let plain = events_reader(&h, &["--timeout", "20s"]);
+    let json = events_reader(&h, &["--json", "--timeout", "20s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The lock name holds an ESC byte, and it reaches `blocked_reason` of the
+    // job that waits, and then `error` of that job when it gives up waiting.
+    let lock = "lk\u{1b}[2Jbad";
+    let holder = h.submit(&[
+        "submit", "--name", "holder", "--lock", lock, "--", "sleep", "10",
+    ]);
+    // The holder must HOLD the lock before the waiter arrives. A waiter that
+    // arrives first waits for capacity, and the sentence then names no lock.
+    h.until("the holder runs", Duration::from_secs(30), || {
+        h.state_of(&holder) == "running"
+    });
+    let waiter = h.submit(&[
+        "submit",
+        "--name",
+        "waiter",
+        "--lock",
+        lock,
+        "--max-queue-time",
+        "3s",
+        "--",
+        "true",
+    ]);
+    h.qex(&["wait", &waiter, "--timeout", "40s"]);
+    h.qex(&["kill", &holder]);
+
+    let text = plain.wait_with_output().expect("the reader did not stop");
+    for stream in [&text.stdout, &text.stderr] {
+        assert!(
+            !stream.windows(5).any(|w| w == b"lk\x1b[2"),
+            "`qex events` wrote the ESC byte of a lock name"
+        );
+    }
+
+    // The JSON form takes the same rule, so a reader of the stream and a reader
+    // of `qex status --json` never see two forms of one sentence.
+    let lines = events_lines(json);
+    let mine: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["event"] == "job" && l["id"] == waiter.as_str())
+        .collect();
+    assert!(!mine.is_empty(), "the stream gave no event for the job");
+    let mut saw_the_lock = false;
+    for line in mine {
+        for field in ["blocked_reason", "error"] {
+            if let Some(sentence) = line["job"][field].as_str() {
+                if sentence.contains("lk") {
+                    saw_the_lock = true;
+                }
+                assert!(
+                    !sentence.chars().any(|c| c.is_control()),
+                    "the field `{field}` holds a control byte: {sentence:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        saw_the_lock,
+        "the test proved nothing: no sentence carried the lock name"
+    );
+}
+
+/// `--since now` must give the NEW events only.
+///
+/// The coordinator holds the last 512 events. A reader that asks for the live
+/// stream and receives that history acts a second time on every result that it
+/// handled already — the harm that the numbers exist to stop. Without this
+/// test, `Cursor::Now` can start at the oldest event that the coordinator holds
+/// and the whole suite stays green.
+#[test]
+fn a_live_reader_receives_the_new_events_only() {
+    let h = Harness::with_default_config("eventsnow");
+
+    // This job stops BEFORE the reader connects, so its events are history.
+    let old = h.submit(&["submit", "--name", "before", "--", "true"]);
+    h.ok(&["wait", &old]);
+
+    let reader = events_reader(&h, &["--json", "--since", "now", "--timeout", "12s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let new = h.submit(&["submit", "--name", "after", "--", "true"]);
+    h.ok(&["wait", &new]);
+
+    let lines = events_lines(reader);
+    assert!(
+        lines.iter().any(|l| l["id"] == new.as_str()),
+        "the live stream gave no event for the job that started after it"
+    );
+    assert!(
+        !lines.iter().any(|l| l["id"] == old.as_str()),
+        "`--since now` gave the events of a job that stopped before the reader \
+         connected: {lines:?}"
+    );
+}
+
+/// `--count N` must stop the reader after N events.
+///
+/// A script that wants one result writes `--count 1` and expects the command to
+/// give control back. A reader that counts a line that is not an event, or that
+/// counts none, either stops early with nothing or never stops at all.
+#[test]
+fn the_reader_stops_after_the_number_of_events_that_it_asked_for() {
+    let h = Harness::with_default_config("eventscount");
+    let reader = events_reader(&h, &["--json", "--count", "2", "--timeout", "20s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let id = h.submit(&["submit", "--name", "counted", "--", "true"]);
+    h.ok(&["wait", &id]);
+
+    let out = reader.wait_with_output().expect("the reader did not stop");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a reader that read its count stops with 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // The `stream` line is not an event, so it does not count. Two events and
+    // the header make three lines.
+    let counted = lines
+        .iter()
+        .filter(|l| l["event"] == "job" || l["event"] == "gap")
+        .count();
+    assert_eq!(
+        counted, 2,
+        "the reader must stop after two events, and it wrote: {text}"
+    );
+    assert_eq!(
+        lines[0]["event"], "stream",
+        "the header must not count as an event: {text}"
+    );
+}
+
 /// The stream must give an event for EVERY terminal state, and not for the
 /// happy path alone.
 ///
