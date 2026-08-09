@@ -85,13 +85,16 @@ BOTH streams. Prefer it: one command gives everything.
 | --- | --- |
 | 0 | The job succeeded. |
 | 1 | The job failed. |
+| 123 | The job never started. It reached its `--max-queue-time`. |
 | 124 | Your wait stopped, and **the job continues.** A `qex wait` that reached its time limit, or a `qex run` that a dedupe key gave the job of somebody else. |
 | 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
 | 126 | The job did not run, because a job that it needed failed. |
 | 127 | There is no job with that id. |
 
 `qex run` gives the exit code of the job when the job RAN, and for every other
-state it gives the same code as the table above. **125 from `qex run` does not
+state it gives the same code as the table above. It never gives 124: that code
+says that YOUR WAIT stopped while the job continued, and `qex run` sets no limit
+on its own wait. **125 from `qex run` does not
 say that your work failed.** A job of `qex run` is a job like any other, so
 another agent on this machine can run `qex kill` or `qex cancel` on it. Read the
 line on stderr before you start the work again.
@@ -201,6 +204,10 @@ Every command that reads data accepts `--json`.
 
 - **`qex wait --timeout` limits YOUR WAIT and not the job.** Code 124 means the
   job continues. Use `--timeout` on `qex submit` to limit the job itself.
+- **A job waits until the machine has capacity.** Add `--max-queue-time 30m` to
+  `qex submit` when you must have an answer inside a time. The job then does not
+  start after that wait: its state becomes `expired` and `qex wait` gives 123.
+  Nothing ran, so there is no output to read.
 - **`pid` is null once a job stops.** The machine gives that number to another
   process. `last_pid` is history for a reader; never signal it. Use
   `qex kill <id>`, which is correct at every moment.

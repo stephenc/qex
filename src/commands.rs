@@ -11,6 +11,13 @@ use crate::units::{format_duration, format_size, parse_duration};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
+/// The exit code of `qex wait` when the job never started.
+///
+/// The job waited more time than its `--max-queue-time` value. This code is not
+/// 125: a job that ran too long wrote output and used the machine, and this job
+/// did neither. A script must be able to separate "the work is too slow" from
+/// "the machine had no capacity", because the two need different corrections.
+pub const EXIT_EXPIRED: i32 = 123;
 /// The exit code of `qex wait` when the wait reached its time limit.
 /// The command `timeout` uses the same code.
 pub const EXIT_TIMEOUT: i32 = 124;
@@ -46,6 +53,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         cpu: args.cpu,
         mem: args.mem,
         timeout: args.timeout,
+        max_queue_time: args.max_queue_time,
         tags: args.tags,
         priority: args.priority,
         env: args.env,
@@ -1781,6 +1789,9 @@ fn exit_code_for(status: &JobStatus, mode: ExitMode) -> i32 {
         if status.state == JobState::Skipped {
             return EXIT_SKIPPED;
         }
+        if status.state == JobState::Expired {
+            return EXIT_EXPIRED;
+        }
         return status.exit_code.unwrap_or(match status.state {
             JobState::Completed => 0,
             _ => 1,
@@ -1795,6 +1806,9 @@ fn exit_code_for(status: &JobStatus, mode: ExitMode) -> i32 {
         // start. The code is the same for `qex run` and for `qex wait`,
         // because one state gives one answer.
         JobState::Killed | JobState::Timeout | JobState::Oom | JobState::Cancelled => EXIT_KILLED,
+        // A job that never started has its own code. A script can then separate
+        // "my job ran too long" from "my job never got the machine".
+        JobState::Expired => EXIT_EXPIRED,
         // A job that did not run has its own code. A script can then separate
         // "my job failed" from "a job before mine failed", and it does not read
         // the JSON output.
@@ -1814,6 +1828,12 @@ fn describe_result(s: &JobStatus) -> String {
         },
         JobState::Killed => "a command stopped the job".to_string(),
         JobState::Timeout => "the job reached its time limit".to_string(),
+        // Give the queue reason here. The reader learns what the job waited for
+        // with no other command, and there is no log file to read.
+        JobState::Expired => s
+            .error
+            .clone()
+            .unwrap_or_else(|| "the job waited more time than its queue limit".to_string()),
         JobState::Oom => {
             format!(
                 "the machine ran out of memory. The job claimed {} and used {}.",
@@ -2698,6 +2718,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         cpu: args.submit.cpu,
         mem: args.submit.mem,
         timeout: args.submit.timeout,
+        max_queue_time: args.submit.max_queue_time,
         tags: args.submit.tags,
         priority: args.submit.priority,
         env: args.submit.env,
@@ -3861,6 +3882,25 @@ mod tests {
             exit_code_for(&status_with(JobState::Oom, None), ExitMode::State),
             EXIT_KILLED
         );
+        // A job that never started has its own code. It must not be 125: a job
+        // with the code 125 ran and wrote output, and this job did neither.
+        //
+        // Pin the LITERAL, and not the constant alone. The documents, the skill
+        // file and every script of a user name the number 123, so a change to
+        // the constant is a change to a published interface. A test that reads
+        // the constant on both sides agrees with itself and with nothing else.
+        assert_eq!(EXIT_EXPIRED, 123);
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Expired, None), ExitMode::State),
+            123
+        );
+        // `--passthrough` gives the code of the state here as well. A job that
+        // never started has no exit code of its own, so the alternative is 1,
+        // and 1 says that the work ran and failed.
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Expired, None), ExitMode::Passthrough),
+            123
+        );
     }
 
     /// The option `--passthrough` gives the exit code of the job.
@@ -3948,6 +3988,7 @@ mod tests {
             JobState::Timeout,
             JobState::Oom,
             JobState::Skipped,
+            JobState::Expired,
         ] {
             let s = status_with(state, None);
             assert_eq!(
@@ -3980,6 +4021,18 @@ mod tests {
         // The text must give the claim and the true use. An agent then corrects
         // its claim from this line.
         assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
+
+        // A job that never started has no log file, so this line is the only
+        // text that the reader gets. It must carry the queue reason.
+        let mut s = status_with(JobState::Expired, None);
+        s.error = Some("the job did not start. It waited 5s in the queue".into());
+        assert_eq!(
+            describe_result(&s),
+            "the job did not start. It waited 5s in the queue"
+        );
+        // A record with no text must still say what happened.
+        let s = status_with(JobState::Expired, None);
+        assert!(!describe_result(&s).is_empty());
     }
 
     #[test]

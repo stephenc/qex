@@ -668,6 +668,22 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
             None => "no timeout".to_string(),
         }
     );
+    // Show the queue limit on its own line, and always.
+    //
+    // This command says what qex uses NOW, so a value that it never prints is a
+    // value that a reader cannot confirm. "no limit" is the answer that most
+    // users get, and it is the answer that they need: it says that a job waits
+    // for capacity with no end.
+    println!(
+        "queue limit:  {}",
+        match cfg.default_max_queue_time()? {
+            Some(d) => format!(
+                "{}; a job that waits longer becomes `expired`",
+                units::format_duration(d)
+            ),
+            None => "no limit; a job waits for capacity with no end".to_string(),
+        }
+    );
     println!(
         "keep free:    {} of memory",
         units::format_size(cfg.reserve_mem()?)

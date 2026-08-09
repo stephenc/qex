@@ -216,6 +216,7 @@ These are the codes of `qex wait` and of `qex status --wait`.
 | ---- | ------- |
 | 0    | The job succeeded. |
 | 1    | The job failed. |
+| 123  | The job never started. It reached its `--max-queue-time`. |
 | 124  | Your wait reached its time limit. The job continues. |
 | 125  | Something stopped the job: kill, cancel, timeout or out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |
@@ -223,6 +224,10 @@ These are the codes of `qex wait` and of `qex status --wait`.
 
 The code 124 has the same meaning as the code of the `timeout` command. A
 timeout on `qex wait` stops your wait only. It does not stop the job.
+
+The code 123 says that the job never got the machine, so it wrote no output. Add
+`--max-queue-time 30m` to `qex submit` to get that answer in place of a wait with
+no end.
 
 ### The exit codes of `qex run`
 
@@ -232,6 +237,7 @@ when the job RAN: `qex run -- sh -c 'exit 7'` gives 7.
 | Code | Meaning |
 | ---- | ------- |
 | the exit code of the job | The job ran. |
+| 123  | The job never started. It reached its `--max-queue-time`. |
 | 124  | Your wait stopped, and the job continues. See the dedupe key. |
 | 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
 | 126  | The job did not run, because a job that it needed failed. |

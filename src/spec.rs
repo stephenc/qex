@@ -29,6 +29,12 @@ pub struct JobFile {
     /// no quotation marks and no word division are necessary.
     pub command: Vec<String>,
     pub timeout: Option<String>,
+    /// The time that this job may wait in the queue before it starts.
+    ///
+    /// `timeout` limits the time that the job RUNS. This field limits the time
+    /// that the job WAITS. A job that reaches this limit does not start, and its
+    /// state becomes `expired`.
+    pub max_queue_time: Option<String>,
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env_capture: Option<EnvCapture>,
@@ -142,6 +148,7 @@ pub struct SubmitOptions {
     pub cpu: Option<crate::claim::Claim>,
     pub mem: Option<crate::claim::Claim>,
     pub timeout: Option<String>,
+    pub max_queue_time: Option<String>,
     pub tags: Vec<String>,
     pub priority: Option<i32>,
     pub env: Vec<(String, String)>,
@@ -188,6 +195,13 @@ pub struct JobSpec {
     pub mem: u64,
     /// The time limit in seconds. The value `None` means that there is no limit.
     pub timeout: Option<u64>,
+    /// The queue limit in seconds. `None` means that the job waits with no end.
+    ///
+    /// qex counts this time from `submitted_at`, and not from the last
+    /// scheduling pass. A coordinator that starts again thus continues the same
+    /// count, and a restart does not give the job a new full wait.
+    #[serde(default)]
+    pub max_queue_time: Option<u64>,
     pub tags: Vec<String>,
     pub priority: i32,
     /// The environment mode that qex used for this job.
@@ -494,6 +508,16 @@ impl JobSpec {
             None => cfg.default_timeout()?,
         };
 
+        let max_queue_time = match opts
+            .max_queue_time
+            .as_ref()
+            .or(file.max_queue_time.as_ref())
+        {
+            Some(s) => crate::units::parse_duration(s)
+                .map_err(|e| anyhow::anyhow!("--max-queue-time: {e}"))?,
+            None => cfg.default_max_queue_time()?,
+        };
+
         let name = opts
             .name
             .clone()
@@ -596,6 +620,7 @@ impl JobSpec {
                 cpu,
                 mem,
                 timeout: timeout.map(|d| d.as_secs()),
+                max_queue_time: max_queue_time.map(|d| d.as_secs()),
                 tags,
                 priority: opts.priority.or(file.priority).unwrap_or(0),
                 env_capture: capture,
@@ -1404,6 +1429,59 @@ mod tests {
             spec.timeout, None,
             "a job must have no time limit by default"
         );
+    }
+
+    /// The queue limit must come from each of the three sources, in the same
+    /// order as every other value. A job file that qex ignored would let a job
+    /// wait with no end, which is the fault that the option removes.
+    #[test]
+    fn the_queue_limit_comes_from_the_config_the_file_or_the_command_line() {
+        let _guard = env_lock();
+        let mut cfg: Config = toml::from_str("[defaults]\nmax_queue_time = \"20m\"\n").unwrap();
+        cfg.learn.enabled = false;
+
+        // The config file gives the value.
+        let spec = JobSpec::resolve(&opts(&["true"]), &cfg).unwrap();
+        assert_eq!(spec.max_queue_time, Some(1200));
+
+        // The job file replaces the config file.
+        let dir = tmpdir("queuelimit");
+        let p = job_file(
+            &dir,
+            "j.toml",
+            "command = [\"true\"]\nmax_queue_time = \"5m\"\n",
+        );
+        let mut o = SubmitOptions {
+            job_file: Some(p),
+            ..Default::default()
+        };
+        assert_eq!(
+            JobSpec::resolve(&o, &cfg).unwrap().max_queue_time,
+            Some(300)
+        );
+
+        // The command line replaces the job file.
+        o.max_queue_time = Some("90s".into());
+        assert_eq!(JobSpec::resolve(&o, &cfg).unwrap().max_queue_time, Some(90));
+
+        // The value `0` removes the limit that the config file gives.
+        o.max_queue_time = Some("0".into());
+        assert_eq!(
+            JobSpec::resolve(&o, &cfg).unwrap().max_queue_time,
+            None,
+            "`--max-queue-time 0` must remove the limit"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A job with no option must wait with no end. A built-in limit would
+    /// discard the work of a user who did not ask for the rule.
+    #[test]
+    fn a_job_has_no_queue_limit_by_default() {
+        let _guard = env_lock();
+        let spec = JobSpec::resolve(&opts(&["true"]), &cfg_without_learning()).unwrap();
+        assert_eq!(spec.max_queue_time, None);
     }
 
     #[test]

@@ -384,6 +384,10 @@ fn note_for(job: &JobStatus) -> String {
         JobState::Timeout => "reached its time limit".to_string(),
         JobState::Killed => "stopped by a command".to_string(),
         JobState::Cancelled => "left the queue".to_string(),
+        JobState::Expired => "it never started; it waited too long".to_string(),
+        // Every state that a job STOPS in must give a note. A reader of `qex
+        // top` sees the state and the note together, and a note that is empty
+        // makes the reader open a second command to learn the cause.
         _ => String::new(),
     }
 }
@@ -456,6 +460,29 @@ mod tests {
         assert!(page.contains("2/12 cores"), "the budget is missing: {page}");
         assert!(page.contains("example"), "the job name is missing");
         assert!(page.contains("4GB"), "the memory claim is missing");
+    }
+
+    /// EVERY STATE THAT A JOB STOPS IN MUST GIVE A NOTE.
+    ///
+    /// A reader of `qex top` sees the state and the note together. A note that
+    /// is empty makes that reader open a second command to learn the cause,
+    /// and `expired` is the state with the least in the record: no exit code,
+    /// no output and no log file.
+    #[test]
+    fn each_final_state_gives_a_note() {
+        for state in [
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Killed,
+            JobState::Timeout,
+            JobState::Expired,
+            JobState::Oom,
+            JobState::Cancelled,
+            JobState::Skipped,
+        ] {
+            let note = note_for(&job(state, 1, 1 << 30));
+            assert!(!note.is_empty(), "the state {state} gives no note");
+        }
     }
 
     /// The first refresh cannot give a CPU value, because there is no earlier

@@ -45,6 +45,11 @@ pub const JOB: &str = r##"{
       "description": "The time limit. Use s, m, h or d. Use \"0\" for no limit. The default is no limit.",
       "examples": ["30s", "5m", "4h", "0"]
     },
+    "max_queue_time": {
+      "type": "string",
+      "description": "The time that the job may wait in the queue before it starts. Use s, m, h or d. Use \"0\" for no limit. The default is no limit. A job that reaches this limit does not start, and its state becomes expired. `timeout` limits the run of the job; this field limits the wait.",
+      "examples": ["30m", "2h", "0"]
+    },
     "tags": {
       "type": "array",
       "items": { "type": "string" },
@@ -157,6 +162,7 @@ pub const PIPELINE: &str = r##"{
           },
           "cwd": { "type": "string", "description": "The directory for this stage." },
           "timeout": { "type": "string", "description": "The time limit. Use s, m, h or d." },
+          "max_queue_time": { "type": "string", "description": "The time that this stage may wait in the queue before it starts. Use s, m, h or d. The wait for an earlier stage counts, so give a value that covers the whole pipeline." },
           "tags": { "type": "array", "items": { "type": "string" } },
           "priority": { "type": "integer" },
           "env_capture": {
@@ -205,8 +211,8 @@ pub const STATUS: &str = r##"{
     "cwd": { "type": "string", "description": "The directory of the job." },
     "state": {
       "type": "string",
-      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled", "skipped"],
-      "description": "The job state. The states queued, starting and running are not final. Each other state is final. The state skipped means that a job which this job needed did not succeed, so this job did not run."
+      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "expired", "oom", "cancelled", "skipped"],
+      "description": "The job state. The states queued, starting and running are not final. Each other state is final. The state skipped means that a job which this job needed did not succeed, so this job did not run. The state expired means that the job waited more time than its max_queue_time value, so it never started and it has no output."
     },
     "pid": {
       "type": ["integer", "null"],
@@ -317,6 +323,7 @@ mod tests {
             "after",
             "cwd",
             "timeout",
+            "max_queue_time",
             "tags",
             "priority",
             "env_capture",
@@ -330,7 +337,7 @@ mod tests {
         }
         assert_eq!(
             props.len(),
-            11,
+            12,
             "the schema has a field that a stage does not accept"
         );
     }
@@ -376,6 +383,7 @@ mod tests {
             JobState::Failed,
             JobState::Killed,
             JobState::Timeout,
+            JobState::Expired,
             JobState::Oom,
             JobState::Cancelled,
         ] {
@@ -386,7 +394,7 @@ mod tests {
         }
         assert_eq!(
             listed.len(),
-            10,
+            11,
             "the schema lists a state that qex does not use"
         );
     }
@@ -402,6 +410,7 @@ mod tests {
             "name",
             "cwd",
             "timeout",
+            "max_queue_time",
             "tags",
             "priority",
             "env_capture",
@@ -419,7 +428,7 @@ mod tests {
         }
         assert_eq!(
             props.len(),
-            13,
+            14,
             "the schema has a field that the job file does not accept"
         );
     }
