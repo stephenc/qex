@@ -344,7 +344,7 @@ pub const EVENT: &str = r##"{
     "name": { "type": "string", "description": "On a `job` line: the name of the job." },
     "state": {
       "type": "string",
-      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "oom", "cancelled", "skipped"],
+      "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "expired", "oom", "cancelled", "skipped"],
       "description": "On a `job` line: the state of the job now. Run `qex help states` for each state. The stream gives one line for each state THAT THE COORDINATOR SAW: it reads the record of a job twice each second, so a job that is shorter than that period goes from `starting` to `completed` with no `running` line. The field `previous` then says `starting`, so the sequence that you read is the true sequence."
     },
     "previous": {
@@ -512,6 +512,24 @@ mod tests {
                 "the schema does not name the line `{name}`"
             );
         }
+    }
+
+    /// The event schema and the status schema must list THE SAME states.
+    ///
+    /// A `job` line carries the same state as `status.json`, so two lists that
+    /// disagree make a reader that validates the stream refuse a line that is
+    /// correct. The event schema lost `expired` in exactly this way: `expired`
+    /// arrived while the stream was in a branch of its own, and the branch
+    /// carried the list that it copied. This test compares the two lists, so a
+    /// state that qex adds next must reach both.
+    #[test]
+    fn the_event_schema_lists_the_same_states_as_the_status_schema() {
+        let event: serde_json::Value = serde_json::from_str(EVENT).unwrap();
+        let status: serde_json::Value = serde_json::from_str(STATUS).unwrap();
+        assert_eq!(
+            event["properties"]["state"]["enum"], status["properties"]["state"]["enum"],
+            "the two schemas must list the same states"
+        );
     }
 
     /// The example in the job schema must parse as a job file.
