@@ -780,6 +780,12 @@ impl Default for LearnConfig {
 pub struct HooksConfig {
     /// The program and its arguments. An empty list gives no hook.
     ///
+    /// NAME AN ABSOLUTE PATH. The hook starts in the DIRECTORY OF THE JOB, and
+    /// the person who submitted the job chose that directory. A relative name
+    /// such as `["./notify"]` therefore selects a program that the submitter
+    /// can put there. Job data cannot become a command line, but a relative
+    /// name lets it select WHICH program runs.
+    ///
     /// This is not a shell command line. qex starts no shell for a job, and it
     /// starts no shell here. To use a shell feature, name the shell:
     /// `["bash", "-lc", "notify-send \"qex: $QEX_JOB_NAME\""]`. The values of
@@ -811,7 +817,7 @@ impl Default for HooksConfig {
     fn default() -> Self {
         Self {
             on_stop: Vec::new(),
-            on_stop_states: ["completed", "failed", "killed", "timeout", "oom"]
+            on_stop_states: ["completed", "failed", "killed", "timeout", "expired", "oom"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -1317,7 +1323,7 @@ impl Config {
             let state = name.parse::<crate::job::JobState>().map_err(|_| {
                 anyhow::anyhow!(
                     "config [hooks] on_stop_states holds `{name}`, which is not a job state. \
-                     Use the final states: completed, failed, killed, timeout, oom, \
+                     Use the final states: completed, failed, killed, timeout, expired, oom, \
                      cancelled, skipped."
                 )
             })?;
@@ -1325,7 +1331,7 @@ impl Config {
                 anyhow::bail!(
                     "config [hooks] on_stop_states names the state `{state}`. A job does not \
                      stop in that state, so the hook would never run. Use the final states: \
-                     completed, failed, killed, timeout, oom, cancelled, skipped."
+                     completed, failed, killed, timeout, expired, oom, cancelled, skipped."
                 );
             }
         }

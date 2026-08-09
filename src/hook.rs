@@ -71,7 +71,16 @@ const GRACE: Duration = Duration::from_secs(2);
 ///
 /// The time limit is not a limit on the output. A hook of three seconds that
 /// writes with no stop made a file of 3.7GB in the state directory, for one
-/// job. qex stops a hook that goes above this size, and it cuts the file to it.
+/// job. qex NEVER CUTS THE FILE: the hook writes into a pipe, and qex stops
+/// reading at this size and shuts the pipe, so the file never grows past it.
+/// An earlier form of this code did cut the file afterwards, which bounded what
+/// qex kept and not what reached the disk.
+///
+/// THIS BOUNDS THE STANDARD OUTPUT AND THE STANDARD ERROR OF THE HOOK, AND
+/// NOTHING ELSE. A hook that opens a file of its own and writes to it is a
+/// program that the user chose to run, and qex limits what it writes there as
+/// little as it limits what a job writes.
+///
 /// A hook that writes a megabyte is not a hook that notifies a person.
 const OUTPUT_LIMIT: u64 = 1 << 20;
 
@@ -222,9 +231,14 @@ fn note(dir: &Path, text: &str) {
 /// THE TIME LIMIT STOPS WITH THE COORDINATOR. This thread applies the limit,
 /// and a thread dies with its process. A coordinator that stops while the hook
 /// operates thus leaves the hook to the init process with no limit, and a hook
-/// that hangs then stays on the machine. The coordinator uses this form for the
-/// jobs that have no supervisor only: `cancelled`, `skipped`, and a job whose
-/// supervisor left no result. The supervisor path keeps its limit at all times,
+/// that hangs then stays on the machine.
+///
+/// The coordinator uses this form for the jobs that have no supervisor —
+/// `cancelled`, `skipped`, `expired`, and a job whose supervisor left no result
+/// — AND ALSO ON THE ORDINARY PATH, in `supervisor::reap`, where it closes the
+/// moment between the terminal record and the hook. On that ordinary path the
+/// claim file means that the supervisor has almost always run the hook already,
+/// so this call does nothing. The supervisor path keeps its limit at all times,
 /// because the supervisor waits for the hook itself.
 pub fn fire_detached(dir: &Path, status: &JobStatus) {
     if !status.state.is_terminal() {
@@ -438,7 +452,8 @@ fn run(cfg: &Config, dir: &Path, status: &JobStatus, limit: Duration) -> std::io
 
     if cut && !too_slow {
         return Ok(format!(
-            "wrote more than {}, so qex stopped reading it and closed the pipe.              {} holds the first {}. Write less in the hook.",
+            "wrote more than {}, so qex stopped reading it and closed the pipe. \
+             {} holds the first {}. Write less in the hook.",
             crate::units::format_size(OUTPUT_LIMIT),
             log_path.display(),
             crate::units::format_size(wrote)
@@ -664,6 +679,9 @@ mod tests {
             locks: vec![],
             retries: 0,
             nice: None,
+            max_queue_time: None,
+            dedupe_key: None,
+            dedupe_window: 0,
             needs: vec![],
             after: vec![],
             submitted_at: 0,
@@ -960,6 +978,38 @@ mod tests {
             "/",
             "a directory that is gone must not stop the hook"
         );
+    }
+
+    /// A hook that IGNORES `TERM` must still stop.
+    ///
+    /// `stop` sends `TERM`, waits the grace time, and then sends `KILL`. Only
+    /// the `KILL` holds this test up: a hook that traps `TERM` and continues
+    /// takes no notice of the first signal, and without the second one the
+    /// `child.wait()` inside `stop` never gives back control. The supervisor of
+    /// that job would then stay for ever.
+    ///
+    /// A hand deletion of the `KILL` left the whole suite green before this
+    /// test, because every other hook here stops when it is asked politely.
+    #[test]
+    fn a_hook_that_ignores_the_first_signal_still_stops() {
+        let dir = temp("stubborn");
+        // `trap '' TERM` makes the shell ignore TERM. It cannot ignore KILL.
+        let cfg = cfg_with(
+            "[hooks]\non_stop = [\"sh\", \"-c\", \"trap '' TERM; sleep 60\"]\n\
+             timeout = \"1s\"\n",
+        );
+        let start = Instant::now();
+        fire_with(Origin::Supervisor, &cfg, &dir, &status(JobState::Completed));
+        let took = start.elapsed();
+
+        // The time limit is 1s and the grace time is 2s, so the KILL lands at
+        // about 3s. A hook that only TERM could stop would hold this for 60s.
+        assert!(
+            took < Duration::from_secs(20),
+            "a hook that ignores TERM held the caller for {took:?}; only KILL ends it"
+        );
+        let log = std::fs::read_to_string(dir.join(LOG_FILE)).unwrap();
+        assert!(log.contains("time limit"), "got: {log}");
     }
 
     /// A hook that hangs must not hold the caller for ever. The caller runs the

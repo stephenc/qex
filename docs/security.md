@@ -56,6 +56,16 @@ qex therefore gives the values of the job to the hook IN THE ENVIRONMENT, and it
 builds no command line from them. A job with the name `; rm -rf ~` reaches the
 hook as a variable, and never as a command.
 
+**Name an absolute path in `on_stop`.** The hook starts in the DIRECTORY OF THE
+JOB, and the submitter of the job chose that directory. With
+`on_stop = ["./notify"]`, a `./notify` that the submitter put there is the
+program that runs. Job data cannot become a command line, as above — but a
+relative name lets job data select WHICH program runs.
+
+The size limit bounds the standard output and the standard error of the hook,
+and nothing else. A hook that opens a file of its own and writes to it is a
+program that you chose to run.
+
 qex starts no shell for the hook, in the same way as for a job. A shell that you
 name in `on_stop` reads the variables, and the quotation is then yours to write.
 

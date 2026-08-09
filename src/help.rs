@@ -817,7 +817,7 @@ that qex uses now.
 
     [hooks]
     on_stop = []          # the command that qex runs when a job stops
-    on_stop_states = [\"completed\", \"failed\", \"killed\", \"timeout\", \"oom\"]
+    on_stop_states = [\"completed\", \"failed\", \"killed\", \"timeout\", \"expired\", \"oom\"]
     timeout = \"30s\"       # the time limit for that command
 
 Quotation marks around a number
@@ -847,6 +847,10 @@ the job of four hours stopped.
 The hook is in the config file only. A job file has no hook field. The hook
 belongs to the machine and to the person at it, and not to the work: the same
 pipeline runs on a laptop with a screen and on a build machine with none.
+
+Name an ABSOLUTE path. The hook starts in the directory of the job, and the
+person who submitted the job chose that directory, so `[\"./notify\"]` selects a
+program that the submitter can put there.
 
 The value is a program and its arguments. qex starts no shell, in the same way
 as for a job. To use a shell feature, name the shell:
@@ -886,7 +890,8 @@ holds the same word that `qex status` prints. Run `qex help exit-codes` for the
 codes of the commands.
 
 `on_stop_states` selects the jobs that give a message. The default list holds
-each state of a job that ran. `cancelled` and `skipped` are not in it: you
+each state of a job that ran, and `expired`: a job that gave up waiting never
+ran, so nothing else says so. `cancelled` and `skipped` are not in it: you
 cancelled the job yourself, and one failure in a pipeline of twenty stages
 would give twenty messages. Add those names to get them. For a message on a
 failure only:
@@ -906,8 +911,9 @@ message that is lost.
 
 A hook that uses more than `[hooks] timeout` receives TERM and then KILL, in a
 process group of its own. The hook writes into a pipe and never into a file, so
-at 1MB of output qex stops reading, shuts the pipe and stops the hook. The disk
-thus stops growing AT 1MB. That size is fixed, and it is NOT `[logs]
+at 1MB of output qex stops reading, shuts the pipe and stops the hook. The two
+streams of the hook thus stop growing AT 1MB. This bounds those streams only: a
+hook that opens a file of its own is a program that you chose to run. That size is fixed, and it is NOT `[logs]
 max_bytes`, which limits the output of a job. A hook that
 fails does not change the job, and qex writes nothing in the `error` field of
 the job for it.

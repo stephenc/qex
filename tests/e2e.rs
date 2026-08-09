@@ -5177,6 +5177,70 @@ fn a_job_notifies_from_its_supervisor_when_no_coordinator_operates() {
     );
 }
 
+/// A job that gives up waiting must notify.
+///
+/// #14 added the state `expired` after this feature was written, and
+/// `sched::expire` wrote the terminal record and ran no hook. A job that gave
+/// up waiting is the case that a person MOST wants to hear about: nothing ran,
+/// so no output, no exit code and no other message says so. Such a job never
+/// had a supervisor, so the COORDINATOR must notify.
+#[test]
+fn a_job_that_gives_up_waiting_runs_the_stop_hook() {
+    let h = Harness::new(
+        "hookexpire",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n\
+         [hooks]\non_stop = [\"sh\", \"-c\", \
+         \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    // A claim larger than the budget, which this config keeps in the queue. The
+    // job thus can never start, whatever the machine does.
+    let id = h.submit(&[
+        "submit",
+        "--name",
+        "waiter",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+
+    h.until("the job gives up", Duration::from_secs(45), || {
+        h.state_of(&id) == "expired"
+    });
+    h.until(
+        "the stop hook wrote its line",
+        Duration::from_secs(30),
+        || !h.hook_lines().is_empty(),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert_eq!(
+        h.hook_lines(),
+        vec!["expired waiter".to_string()],
+        "a job that gave up waiting must give one message"
+    );
+    assert_eq!(
+        h.hook_origin(&id),
+        "coordinator",
+        "such a job never had a supervisor, so the coordinator notifies"
+    );
+}
+
 /// A job whose command does not exist must still notify.
 ///
 /// The supervisor never starts a process for such a job, so it reaches the

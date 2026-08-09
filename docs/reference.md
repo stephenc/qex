@@ -1066,7 +1066,7 @@ that a long job stopped.
 ```toml
 [hooks]
 on_stop = ["notify-send", "a qex job stopped"]
-on_stop_states = ["completed", "failed", "killed", "timeout", "oom"]
+on_stop_states = ["completed", "failed", "killed", "timeout", "expired", "oom"]
 timeout = "30s"
 ```
 
@@ -1097,6 +1097,12 @@ The job supplies these variables. A variable with no value is empty text.
 | `QEX_MAX_RSS` | the maximum memory in bytes |
 | `QEX_TAGS` | the tags, separated by a space |
 
+**Name an absolute path in `on_stop`.** The hook starts in the DIRECTORY OF THE
+JOB, and the person who submitted the job chose that directory. A relative name
+such as `["./notify"]` therefore selects a program that the submitter can put
+there. Job data cannot become a command line, but a relative name lets it select
+WHICH program runs.
+
 **The values arrive in the environment and never in a command line.** qex builds
 no text that a shell reads: it starts the program of `on_stop` directly, with the
 arguments that you wrote and no others. A job name such as `x; rm -rf ~` is thus
@@ -1121,9 +1127,11 @@ happened, with the same word that `qex status` prints. Read `QEX_STATE` first
 and `QEX_EXIT_CODE` after it. See [Exit codes of `qex run`](#exit-codes-of-qex-run).
 
 `on_stop_states` selects the jobs that give a message. The default list holds
-each state of a job that ran. `cancelled` and `skipped` are not in it: you
-cancelled the job yourself, and one failure in a pipeline of twenty stages would
-give twenty messages. Add those names to get them.
+each state of a job that ran, and `expired` — a job that gave up waiting is the
+case that a person most wants to hear about, because nothing ran and nothing
+else says so. `cancelled` and `skipped` are not in it: you cancelled the job
+yourself, and one failure in a pipeline of twenty stages would give twenty
+messages. Add those names to get them.
 
 qex gives these guarantees:
 
@@ -1141,7 +1149,10 @@ qex gives these guarantees:
   CLOSED.** A hook that uses more than `[hooks] timeout` receives TERM and then
   KILL, in a process group of its own. The hook writes into a pipe and never
   into a file, so at 1MB qex stops reading and shuts the pipe: the hook then
-  meets EPIPE, qex stops it, and **the disk stops growing at 1MB**. The earlier
+  meets EPIPE, qex stops it, and **the standard output and the standard error
+  of the hook stop growing at 1MB**. This bounds those two streams and nothing
+  else: a hook that opens a file of its own and writes to it is a program that
+  you chose to run, and qex limits it as little as it limits a job. The earlier
   form cut the file afterwards, which bounded what qex KEPT and not what
   reached the disk — a peak of 25.3MB for a cap of 1MB, and no bound at all if
   qex stopped before it could cut. `qex logs <id> --hook` says when this

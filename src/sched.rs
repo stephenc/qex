@@ -555,6 +555,11 @@ fn expire(
 
     if let Ok(dir) = paths::job_dir(&id) {
         job::write_status(&dir, &status).ok();
+        // A job that gave up waiting is the case that a person MOST wants to
+        // hear about: nothing ran, and nothing else will say so. This job never
+        // had a supervisor, so the coordinator runs the hook, in a thread of
+        // its own because this code holds the lock of the queue.
+        crate::hook::fire_detached(&dir, &status);
     }
     log(&format!(
         "job {id} did not start; it waited {waited}s and its queue limit is {limit}s"
