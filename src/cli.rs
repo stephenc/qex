@@ -268,6 +268,7 @@ pub struct SubmitArgs {
     /// `ID=$(qex submit ...)` stays correct.
     #[arg(long)]
     pub json: bool,
+
     /// Submit one job for each line of this file. Use `-` for standard input.
     ///
     /// Put `{}` in the command. Each job gets the text of one line in the place

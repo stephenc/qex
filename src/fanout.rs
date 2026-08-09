@@ -93,36 +93,80 @@ pub fn parse(text: &str) -> Input {
     input
 }
 
+/// The largest input that `--each-line` reads.
+///
+/// qex holds the whole input in memory, because it must count the lines and
+/// make every job specification before it submits the first job. With no limit,
+/// `qex submit --each-line /var/log/huge.log` or a pipe that never ends takes
+/// the memory of the machine, and the fault arrives as an out-of-memory kill
+/// with no message that a reader can act on.
+///
+/// 64 MiB holds about one million lines of a path. The limit is on the BYTES
+/// and not on the lines, because qex must read the bytes before it can count
+/// the lines. `--max-jobs` is the limit on the jobs, and it applies after this
+/// one.
+pub const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Reads the input file, or standard input for the name `-`.
 ///
 /// `qex submit` reads nothing from standard input for any other purpose, so the
 /// name `-` is free and it has its usual meaning.
+///
+/// The read stops at `MAX_INPUT_BYTES`, on a file and on a pipe.
 pub fn read(path: &Path) -> Result<Input> {
-    let bytes = if path == Path::new("-") {
-        use std::io::Read;
-        let mut buffer = Vec::new();
-        std::io::stdin().read_to_end(&mut buffer).map_err(|e| {
-            anyhow::anyhow!(
-                "qex cannot read the lines from standard input: {e}\n\n\
+    use std::io::Read;
+    // Read one byte more than the limit. A read that gives exactly the limit
+    // can be a file of that size or a file that is larger, and those two need
+    // different answers.
+    let mut buffer = Vec::new();
+    if path == Path::new("-") {
+        std::io::stdin()
+            .take(MAX_INPUT_BYTES + 1)
+            .read_to_end(&mut buffer)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "qex cannot read the lines from standard input: {e}\n\n\
                  `--each-line -` needs those lines, and one line makes one job, so qex \
                  submits nothing.\n\n\
                  Send the lines through a pipe, or give the path of a file:\n\
                  \x20   ls *.csv | qex submit --each-line - -- ./process {PLACEHOLDER}"
-            )
-        })?;
-        buffer
+                )
+            })?;
     } else {
-        std::fs::read(path).map_err(|e| {
-            anyhow::anyhow!(
-                "qex cannot read the input file {}: {e}\n\n\
-                 `--each-line` needs that file, and one line makes one job, so qex \
-                 submits nothing.\n\n\
-                 Give the path of a file that exists, or use `-` to read the lines from \
-                 another program.",
-                path.display()
-            )
-        })?
-    };
+        // `File::open` succeeds on a directory, and the read below then gives
+        // `Is a directory`. The message says the same thing in both cases: qex
+        // cannot read this input, so it submits nothing.
+        std::fs::File::open(path)
+            .and_then(|f| f.take(MAX_INPUT_BYTES + 1).read_to_end(&mut buffer))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "qex cannot read the input file {}: {e}\n\n\
+                     `--each-line` needs that file, and one line makes one job, so qex \
+                     submits nothing.\n\n\
+                     Give the path of a file that exists, or use `-` to read the lines from \
+                     another program.",
+                    path.display()
+                )
+            })?;
+    }
+
+    if buffer.len() as u64 > MAX_INPUT_BYTES {
+        let name = if path == Path::new("-") {
+            "the input from standard input".to_string()
+        } else {
+            format!("the input file {}", path.display())
+        };
+        bail!(
+            "{name} is larger than {} MiB, and qex submits no job at all.\n\n\
+             qex holds the whole input in memory, because it makes every job before it \
+             submits the first one. An input of this size is almost always the wrong \
+             file.\n\n\
+             Give a file that holds one line for each job, or divide the work into \
+             several fan-outs.",
+            MAX_INPUT_BYTES / (1024 * 1024)
+        );
+    }
+    let bytes = buffer;
 
     // The text must be UTF-8, and qex refuses the whole file when it is not.
     //
@@ -493,6 +537,47 @@ mod tests {
         let name = job_name("p", 3, 10, "!!! ???");
         assert_eq!(name, "p-03");
         assert!(name.parse::<uuid::Uuid>().is_err());
+    }
+
+    /// An input that is larger than the limit gives an error, and no job.
+    ///
+    /// Without the limit, qex reads the whole file into memory before it counts
+    /// the lines, so a very large file takes the memory of the machine and the
+    /// fault arrives as an out-of-memory kill with no message.
+    #[test]
+    fn an_input_above_the_size_limit_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "qex-fanout-{}-{}",
+            std::process::id(),
+            MAX_INPUT_BYTES
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.txt");
+
+        // One byte MORE than the limit.
+        let line = b"aaaaaaaaaaaaaaaa\n";
+        let mut text = Vec::with_capacity(MAX_INPUT_BYTES as usize + 1);
+        while (text.len() as u64) < MAX_INPUT_BYTES + 1 {
+            text.extend_from_slice(line);
+        }
+        std::fs::write(&path, &text).unwrap();
+        let err = read(&path).unwrap_err().to_string();
+        // Clean up before the assertions, so a failure leaves no large file.
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.contains("larger than 64 MiB"), "got: {err}");
+        assert!(err.contains("no job at all"), "got: {err}");
+    }
+
+    /// A directory in the place of the input file must give the message of a
+    /// file that qex cannot read, and no job.
+    #[test]
+    fn a_directory_in_the_place_of_the_input_is_refused() {
+        let dir = std::env::temp_dir().join(format!("qex-fanout-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = read(&dir).unwrap_err().to_string();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(err.contains("cannot read the input file"), "got: {err}");
+        assert!(err.contains("submits nothing"), "got: {err}");
     }
 
     /// A job name must not have the form of a job id, and the position keeps

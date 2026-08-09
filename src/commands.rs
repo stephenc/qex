@@ -377,12 +377,18 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
 
     // The detail goes to stderr and the group id goes to stdout alone, so
     // `GROUP=$(qex submit --each-line ...)` operates.
+    // The SAFE forms: these lines go to a terminal. `job_name` already cleans
+    // the name of a job, and the group name comes from `--name` or from the
+    // path of the input file, which a user can write with any byte at all.
+    // See `job::safe_name`. The id file above keeps the name as it is, because
+    // a machine reads that name as a KEY.
     for (name, id) in &submitted {
-        eprintln!("{name}: {id}");
+        eprintln!("{}: {id}", crate::job::safe_name(name));
     }
     eprintln!(
-        "qex: {} in the group `{group_name}`",
-        count_of(count, "job")
+        "qex: {} in the group `{}`",
+        count_of(count, "job"),
+        crate::job::safe_name(&group_name)
     );
     println!("{group}");
     Ok(0)
@@ -409,7 +415,7 @@ fn partial_fan_out(what: &str, group: uuid::Uuid, submitted: &[(String, uuid::Uu
     }
     eprintln!("qex: the group of those jobs is {group}. They are:");
     for (name, id) in submitted {
-        eprintln!("{name}: {id}");
+        eprintln!("{}: {id}", crate::job::safe_name(name));
     }
     eprintln!(
         "qex: Run `qex list --group {group}` to see them, and `qex cancel <id>` or \

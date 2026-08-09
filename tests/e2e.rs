@@ -5443,6 +5443,29 @@ fn each_line_gives_one_job_for_each_line_in_one_group() {
     assert_eq!(jobs.len(), 3, "three lines must give three jobs: {text}");
     assert_eq!(h.list_json().len(), 3, "no other job may exist");
 
+    // The group takes its NAME as well as its id, which is the rule that a
+    // group id follows everywhere in qex. The name of this group comes from
+    // the file, so it is `inputs`. Without `spec.group_name`, the id half
+    // still operates and this half gives nothing.
+    for job in &jobs {
+        assert_eq!(
+            job["group_name"].as_str(),
+            Some("inputs"),
+            "each job must carry the name of its group: {job}"
+        );
+    }
+    let text = h.ok(&["list", "--group", "inputs", "--json"]);
+    let by_name: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        by_name.len(),
+        3,
+        "`qex list --group inputs` must give the 3 jobs: {text}"
+    );
+    // The start of the id names the group as well.
+    let text = h.ok(&["list", "--group", &group[..8], "--json"]);
+    let by_prefix: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+    assert_eq!(by_prefix.len(), 3, "the start of the group id must name it");
+
     // Each job must have received its own line, and no other line.
     let mut seen: Vec<String> = Vec::new();
     for job in &jobs {
@@ -5770,6 +5793,228 @@ fn each_line_reads_the_lines_from_standard_input() {
     let text = h.ok(&["list", "--group", &group, "--json"]);
     let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
     assert_eq!(jobs.len(), 2);
+}
+
+/// Every option of the submission must reach EVERY job of the fan-out.
+///
+/// The documentation promises this, and each value takes a different path to
+/// the job. `--needs` is the dangerous one: qex changes the names into ids one
+/// time, and then copies them into each job. A fan-out that lost that copy
+/// would start immediately, in front of the build that it needs, and it would
+/// give no error at all.
+///
+/// `learn_key` is the other one. It is not an option; it holds the TEMPLATE, so
+/// the whole fan-out makes one measurement record. A fan-out that lost it makes
+/// one record for every line, and no later job can read any of them.
+///
+/// Measured by hand-deletion: with `spec.needs`/`spec.after`, `learn_key`,
+/// `nice`, `no_limit_env_hints` or `max_queue_time` removed from
+/// `submit_each_line`, the whole suite stayed green before this test existed.
+#[test]
+fn every_option_of_a_fan_out_reaches_every_job() {
+    let h = Harness::with_default_config("eachline-options");
+
+    // A job that the fan-out must wait for. It never runs, so the fan-out
+    // stays in the queue and the test reads the records with no race.
+    let gate = h.submit(&["submit", "--name", "gate", "--", "sleep", "300"]);
+
+    let input = h.root.join("inputs.txt");
+    std::fs::write(&input, "alpha\nbeta\n").unwrap();
+
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--needs",
+        "gate",
+        "--max-queue-time",
+        "20m",
+        "--nice",
+        "7",
+        // Both halves of the claim, because qex writes the claim into the
+        // environment of the job only when the USER chose both. Without them,
+        // the test of `--no-limit-env-hints` below proves nothing.
+        "--cpu",
+        "1",
+        "--mem",
+        "256MB",
+        "--no-limit-env-hints",
+        "--tag",
+        "batch",
+        "--",
+        "echo",
+        "{}",
+    ]);
+    assert!(
+        out.status.success(),
+        "the fan-out must operate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let jobs: Vec<serde_json::Value> = h
+        .list_json()
+        .into_iter()
+        .filter(|j| j["group"].as_str() == Some(group.as_str()))
+        .collect();
+    // ANTI-VACUITY: the loop below proves nothing when the group holds no job.
+    assert_eq!(jobs.len(), 2, "the group must hold the 2 jobs of the file");
+
+    let template = vec!["echo".to_string(), "{}".to_string()];
+    for job in &jobs {
+        let id = job["id"].as_str().unwrap();
+        let text = std::fs::read_to_string(h.job_dir(id).join("spec.json")).unwrap();
+        let spec: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let needs: Vec<String> = spec["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            needs,
+            vec![gate.clone()],
+            "the job {id} must wait for the gate"
+        );
+        assert_eq!(spec["max_queue_time"], serde_json::json!(1200), "job {id}");
+        assert_eq!(spec["nice"], serde_json::json!(7), "job {id}");
+        assert_eq!(
+            spec["tags"],
+            serde_json::json!(["batch"]),
+            "the tag must reach the job {id}"
+        );
+        // The template, and NOT the command of the line. This is what makes
+        // the whole fan-out give one measurement record.
+        assert_eq!(
+            spec["learn_key"],
+            serde_json::json!(template),
+            "the job {id} must measure against the template"
+        );
+        assert_ne!(
+            spec["learn_key"], spec["command"],
+            "the command of the line must not become the key of the record"
+        );
+        // `--no-limit-env-hints` says: do not write the claim into the
+        // environment of the job.
+        let env = spec["env"].as_object().unwrap();
+        assert!(
+            !env.contains_key("QEX_CPU") && !env.contains_key("QEX_MEM"),
+            "`--no-limit-env-hints` must reach the job {id}: {env:?}"
+        );
+    }
+
+    // ANTI-VACUITY for `--no-limit-env-hints`. The same fan-out WITHOUT that
+    // option must write the claim, and the test above then measures the
+    // option and not the absence of the claim.
+    let out = h.qex(&[
+        "submit",
+        "--each-line",
+        input.to_str().unwrap(),
+        "--needs",
+        "gate",
+        "--cpu",
+        "1",
+        "--mem",
+        "256MB",
+        "--",
+        "echo",
+        "{}",
+    ]);
+    assert!(out.status.success());
+    let other = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let with_hints: Vec<serde_json::Value> = h
+        .list_json()
+        .into_iter()
+        .filter(|j| j["group"].as_str() == Some(other.as_str()))
+        .collect();
+    assert_eq!(with_hints.len(), 2);
+    for job in &with_hints {
+        let id = job["id"].as_str().unwrap();
+        let text = std::fs::read_to_string(h.job_dir(id).join("spec.json")).unwrap();
+        let spec: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            spec["env"]["QEX_CPU"],
+            serde_json::json!("1"),
+            "with no `--no-limit-env-hints`, the job {id} must hear its claim"
+        );
+    }
+
+    // The two jobs must still hold their OWN line.
+    let mut commands: Vec<String> = jobs
+        .iter()
+        .map(|j| {
+            let id = j["id"].as_str().unwrap();
+            let text = std::fs::read_to_string(h.job_dir(id).join("spec.json")).unwrap();
+            let spec: serde_json::Value = serde_json::from_str(&text).unwrap();
+            spec["command"][1].as_str().unwrap().to_string()
+        })
+        .collect();
+    commands.sort();
+    assert_eq!(commands, vec!["alpha".to_string(), "beta".to_string()]);
+
+    h.qex(&["kill", &gate]);
+}
+
+/// A fan-out must refuse the options that hold a meaning for ONE job only.
+///
+/// `--dedupe-key` is the dangerous one. A key holds one job, so every job of
+/// the fan-out would carry the same key: the coordinator would start the first
+/// line, answer every other line with the id of that job, and give exit code 0.
+/// A fan-out of 100 lines would then give 1 job and NO error at all.
+#[test]
+fn a_fan_out_refuses_the_options_that_hold_a_meaning_for_one_job() {
+    let h = Harness::with_default_config("eachline-refuse");
+
+    let input = h.root.join("inputs.txt");
+    std::fs::write(&input, "alpha\nbeta\ngamma\n").unwrap();
+    let path = input.to_str().unwrap().to_string();
+
+    for (option, value, must_say) in [
+        ("--dedupe-key", Some("nightly"), "A key holds one job"),
+        ("--dedupe-window", Some("1h"), "A key holds one job"),
+        ("--json", None, "--id-file"),
+    ] {
+        let mut args: Vec<&str> = vec!["submit", "--each-line", &path];
+        args.push(option);
+        if let Some(v) = value {
+            args.push(v);
+        }
+        args.extend_from_slice(&["--", "echo", "{}"]);
+        let out = h.qex(&args);
+
+        assert!(
+            !out.status.success(),
+            "`{option}` must not submit a fan-out"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains(option),
+            "the error must name the option `{option}`: {err}"
+        );
+        assert!(
+            err.contains(must_say),
+            "the error must say why, and what to do: {err}"
+        );
+        // ANTI-VACUITY: the refusal must come BEFORE the coordinator, so no
+        // job of the fan-out reaches the queue. A message with jobs behind it
+        // is the fault that this test looks for.
+        assert!(
+            h.list_json().is_empty(),
+            "`{option}` refused the fan-out and still left a job in the queue"
+        );
+    }
+
+    // ANTI-VACUITY: the same command with no refused option MUST submit. A
+    // typing error in `--each-line` or in the input file would make every
+    // assertion above pass for the wrong reason.
+    let out = h.qex(&["submit", "--each-line", &path, "--", "echo", "{}"]);
+    assert!(
+        out.status.success(),
+        "the fan-out without those options must operate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.list_json().len(), 3, "3 lines must give 3 jobs");
 }
 
 /// The limit must stop a fan-out that would fill the state directory, and the
