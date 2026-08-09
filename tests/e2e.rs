@@ -1658,7 +1658,7 @@ fn the_first_screen_points_to_the_topic_for_agents() {
 #[test]
 fn the_schemas_are_valid_json() {
     let h = Harness::with_default_config("schema");
-    for name in ["job", "status"] {
+    for name in ["job", "status", "pipeline", "event"] {
         let text = h.ok(&["schema", name]);
         serde_json::from_str::<serde_json::Value>(&text)
             .unwrap_or_else(|e| panic!("the schema `{name}` is not valid JSON: {e}"));
@@ -7949,5 +7949,741 @@ fn the_config_file_controls_the_claim_in_the_environment() {
     assert!(
         err.contains("`java`") && err.contains("`make`"),
         "the message must give the remedy: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The event stream
+// ---------------------------------------------------------------------------
+
+/// Starts `qex events` in this harness, with the given extra arguments.
+///
+/// EVERY reader in a test has a time limit. A test that reads a stream with no
+/// limit hangs for ever when the stream gives nothing, and a test that hangs is
+/// worse than a test that fails: it says nothing and it holds the machine.
+fn events_reader(h: &Harness, args: &[&str]) -> std::process::Child {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+    cmd.arg("events")
+        .args(args)
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd.spawn().expect("qex events did not start")
+}
+
+/// Reads the lines of a reader that stopped, as JSON.
+fn events_lines(child: std::process::Child) -> Vec<serde_json::Value> {
+    let out = child.wait_with_output().expect("the reader did not stop");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .map(|line| {
+            serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("the stream must give one JSON object for each line: {e}\nline: {line}")
+            })
+        })
+        .collect()
+}
+
+/// The stream must report each change of state, in order, while the job runs.
+///
+/// This test prevents the fault that the command exists to remove: an agent
+/// that drives many jobs asks about each job in a loop. Without the stream, it
+/// learns of a result late and it writes a monitor with a timer.
+///
+/// The reader starts BEFORE the job, so this test also proves that the stream
+/// is live and is not a report of the records at the end.
+#[test]
+fn the_event_stream_reports_each_change_of_state_in_order() {
+    let h = Harness::with_default_config("events");
+    // The reader stops by itself. See `events_reader`.
+    let reader = events_reader(&h, &["--json", "--timeout", "12s"]);
+
+    // Give the reader time to attach. A job that starts first still appears,
+    // because the stream begins with the events that the coordinator holds.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let id = h.submit(&["submit", "--name", "streamed", "--", "sh", "-c", "sleep 2"]);
+    h.ok(&["wait", &id]);
+
+    let lines = events_lines(reader);
+    assert!(!lines.is_empty(), "the stream gave no line");
+    assert_eq!(
+        lines[0]["event"], "stream",
+        "the first line must name the coordinator: {:?}",
+        lines[0]
+    );
+
+    let mine: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["event"] == "job" && l["id"] == id.as_str() && l["change"] == "state")
+        .collect();
+    let states: Vec<&str> = mine.iter().map(|l| l["state"].as_str().unwrap()).collect();
+    assert_eq!(
+        states,
+        vec!["queued", "starting", "running", "completed"],
+        "the stream must give each change of state in order: {states:?}"
+    );
+
+    // The numbers must increase, because an agent keeps the last number and
+    // continues from it.
+    let seqs: Vec<u64> = mine.iter().map(|l| l["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[1] > w[0]),
+        "the numbers must increase: {seqs:?}"
+    );
+
+    // Each line carries the whole record, so a reader needs no second command.
+    let last = mine.last().unwrap();
+    assert_eq!(last["previous"], "running");
+    assert_eq!(last["job"]["exit_code"], 0);
+    assert_eq!(last["job"]["name"], "streamed");
+}
+
+/// The stream must show the SAFE name, in both of its forms.
+///
+/// A job name is text that another agent chose. `qex events` with no `--json`
+/// writes that name to a terminal, so an ESC byte in a name moves the cursor
+/// and writes over the lines around it. `qex list` and `qex status` close this
+/// already; a stream that does not close it is a hole of the same shape in a
+/// command that a person leaves open for hours.
+///
+/// The JSON form takes the same name. `serde_json` escapes a control byte, so
+/// the JSON is safe to PARSE either way; the rule here is that one line of the
+/// stream and one line of `qex status --json` must never give two names for
+/// one job.
+#[test]
+fn the_stream_shows_the_safe_name() {
+    let h = Harness::with_default_config("eventsname");
+    let reader = events_reader(&h, &["--json", "--timeout", "20s"]);
+    let plain = events_reader(&h, &["--timeout", "20s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let esc = "esc\u{1b}[2Jbad";
+    let id = h.submit(&["submit", &format!("--name={esc}"), "--", "true"]);
+    h.ok(&["wait", &id]);
+
+    // The text form goes to a terminal, so test the BYTES.
+    let text = plain.wait_with_output().expect("the reader did not stop");
+    for stream in [&text.stdout, &text.stderr] {
+        assert!(
+            !stream.windows(6).any(|w| w == b"esc\x1b[2"),
+            "`qex events` wrote the ESC byte of a job name"
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("esc_2Jbad"),
+        "`qex events` must show the safe name: {}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
+    // The JSON form must hold the same name as `qex status --json`.
+    let shown = h.status_json(&id)["name"].as_str().unwrap().to_string();
+    let lines = events_lines(reader);
+    let mine: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["event"] == "job" && l["id"] == id.as_str())
+        .collect();
+    assert!(!mine.is_empty(), "the stream gave no event for the job");
+    for line in mine {
+        assert_eq!(
+            line["name"].as_str(),
+            Some(shown.as_str()),
+            "the stream and `qex status --json` must give one name: {line}"
+        );
+        assert_eq!(
+            line["job"]["name"].as_str(),
+            Some(shown.as_str()),
+            "the record in the stream must hold the safe name: {line}"
+        );
+    }
+}
+
+/// The stream must show no control byte in the SENTENCES either.
+///
+/// A sentence that qex writes is not safe because qex wrote it. It carries
+/// values that the caller chose: `blocked_reason` names the LOCK that a job
+/// waits for, and a lock name is a word from the command line. `expire` then
+/// folds that reason into `error`, so the same word reaches the reader a second
+/// time on a TERMINAL line — and a terminal line is the one that an agent acts
+/// on.
+///
+/// `safe_name` is the wrong rule for a sentence; it would destroy the prose.
+/// `job::printable` takes the bytes that move a cursor and nothing else.
+#[test]
+fn the_stream_shows_no_control_byte_in_a_sentence() {
+    let h = Harness::new(
+        "eventsreason",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let plain = events_reader(&h, &["--timeout", "20s"]);
+    let json = events_reader(&h, &["--json", "--timeout", "20s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The lock name holds an ESC byte, and it reaches `blocked_reason` of the
+    // job that waits, and then `error` of that job when it gives up waiting.
+    let lock = "lk\u{1b}[2Jbad";
+    let holder = h.submit(&[
+        "submit", "--name", "holder", "--lock", lock, "--", "sleep", "10",
+    ]);
+    // The holder must HOLD the lock before the waiter arrives. A waiter that
+    // arrives first waits for capacity, and the sentence then names no lock.
+    h.until("the holder runs", Duration::from_secs(30), || {
+        h.state_of(&holder) == "running"
+    });
+    let waiter = h.submit(&[
+        "submit",
+        "--name",
+        "waiter",
+        "--lock",
+        lock,
+        "--max-queue-time",
+        "3s",
+        "--",
+        "true",
+    ]);
+    h.qex(&["wait", &waiter, "--timeout", "40s"]);
+    h.qex(&["kill", &holder]);
+
+    let text = plain.wait_with_output().expect("the reader did not stop");
+    for stream in [&text.stdout, &text.stderr] {
+        assert!(
+            !stream.windows(5).any(|w| w == b"lk\x1b[2"),
+            "`qex events` wrote the ESC byte of a lock name"
+        );
+    }
+
+    // The JSON form takes the same rule, so a reader of the stream and a reader
+    // of `qex status --json` never see two forms of one sentence.
+    let lines = events_lines(json);
+    let mine: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|l| l["event"] == "job" && l["id"] == waiter.as_str())
+        .collect();
+    assert!(!mine.is_empty(), "the stream gave no event for the job");
+    let mut saw_the_lock = false;
+    for line in mine {
+        for field in ["blocked_reason", "error"] {
+            if let Some(sentence) = line["job"][field].as_str() {
+                if sentence.contains("lk") {
+                    saw_the_lock = true;
+                }
+                assert!(
+                    !sentence.chars().any(|c| c.is_control()),
+                    "the field `{field}` holds a control byte: {sentence:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        saw_the_lock,
+        "the test proved nothing: no sentence carried the lock name"
+    );
+}
+
+/// `--since now` must give the NEW events only.
+///
+/// The coordinator holds the last 512 events. A reader that asks for the live
+/// stream and receives that history acts a second time on every result that it
+/// handled already — the harm that the numbers exist to stop. Without this
+/// test, `Cursor::Now` can start at the oldest event that the coordinator holds
+/// and the whole suite stays green.
+#[test]
+fn a_live_reader_receives_the_new_events_only() {
+    let h = Harness::with_default_config("eventsnow");
+
+    // This job stops BEFORE the reader connects, so its events are history.
+    let old = h.submit(&["submit", "--name", "before", "--", "true"]);
+    h.ok(&["wait", &old]);
+
+    let reader = events_reader(&h, &["--json", "--since", "now", "--timeout", "12s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let new = h.submit(&["submit", "--name", "after", "--", "true"]);
+    h.ok(&["wait", &new]);
+
+    let lines = events_lines(reader);
+    assert!(
+        lines.iter().any(|l| l["id"] == new.as_str()),
+        "the live stream gave no event for the job that started after it"
+    );
+    assert!(
+        !lines.iter().any(|l| l["id"] == old.as_str()),
+        "`--since now` gave the events of a job that stopped before the reader \
+         connected: {lines:?}"
+    );
+}
+
+/// `--count N` must stop the reader after N events.
+///
+/// A script that wants one result writes `--count 1` and expects the command to
+/// give control back. A reader that counts a line that is not an event, or that
+/// counts none, either stops early with nothing or never stops at all.
+#[test]
+fn the_reader_stops_after_the_number_of_events_that_it_asked_for() {
+    let h = Harness::with_default_config("eventscount");
+    let reader = events_reader(&h, &["--json", "--count", "2", "--timeout", "20s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let id = h.submit(&["submit", "--name", "counted", "--", "true"]);
+    h.ok(&["wait", &id]);
+
+    let out = reader.wait_with_output().expect("the reader did not stop");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a reader that read its count stops with 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    // The `stream` line is not an event, so it does not count. Two events and
+    // the header make three lines.
+    let counted = lines
+        .iter()
+        .filter(|l| l["event"] == "job" || l["event"] == "gap")
+        .count();
+    assert_eq!(
+        counted, 2,
+        "the reader must stop after two events, and it wrote: {text}"
+    );
+    assert_eq!(
+        lines[0]["event"], "stream",
+        "the header must not count as an event: {text}"
+    );
+}
+
+/// The stream must give an event for EVERY terminal state, and not for the
+/// happy path alone.
+///
+/// This is the fault that a stream must never have. `expired` and `skipped` are
+/// the two terminal states that NO SUPERVISOR reports: the scheduler writes
+/// them on its own, and nothing else says that they happened. A stream that
+/// carries `completed` and `failed` and drops these two leaves an agent waiting
+/// for ever for a job that already gave up, and a silent stream is worse than
+/// no stream. The same fault was in the stop hooks: `expire` told nobody.
+///
+/// The first job claims more than the budget and the config file keeps such a
+/// job in the queue, so it can never start and it reaches its queue limit. The
+/// second job needs the first, so it is skipped.
+#[test]
+fn the_stream_reports_the_terminal_states_that_no_supervisor_reports() {
+    let h = Harness::new(
+        "eventsterm",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"queue\"\n",
+    );
+
+    // The reader stops by itself. See `events_reader`.
+    let reader = events_reader(&h, &["--json", "--timeout", "25s"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let first = h.submit(&[
+        "submit",
+        "--cpu",
+        "64",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "echo",
+        "never",
+    ]);
+    let second = h.submit(&["submit", "--needs", &first, "--", "echo", "after"]);
+
+    // Both jobs stop without running. Wait for the second, which stops last.
+    h.qex(&["wait", &second, "--timeout", "60s"]);
+
+    let lines = events_lines(reader);
+    let state_of = |id: &str| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|l| l["event"] == "job" && l["id"] == id && l["change"] == "state")
+            .map(|l| l["state"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let one = state_of(&first);
+    assert!(
+        one.contains(&"expired".to_string()),
+        "the stream must report the job that gave up waiting: {one:?}"
+    );
+    let two = state_of(&second);
+    assert!(
+        two.contains(&"skipped".to_string()),
+        "the stream must report the job that did not run: {two:?}"
+    );
+
+    // The line carries the whole record, so the reader learns WHY without a
+    // second command. A terminal event with no cause makes an agent ask again,
+    // which is the loop that this command removes.
+    let expired = lines
+        .iter()
+        .find(|l| l["event"] == "job" && l["id"] == first.as_str() && l["state"] == "expired")
+        .unwrap();
+    assert!(
+        expired["job"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("--max-queue-time"),
+        "the record must name the limit: {expired}"
+    );
+    assert!(
+        !expired["job"]["finished_at"].is_null(),
+        "a terminal record must hold the time when the job stopped: {expired}"
+    );
+}
+
+/// A reader that starts again must continue with no loss and no repetition.
+///
+/// An agent stops and starts. Without the numbers, it must read the stream from
+/// the start and act on each event a second time, or start at "now" and lose
+/// the results that arrived while it was away.
+#[test]
+fn a_reader_continues_from_the_number_that_it_read() {
+    let h = Harness::with_default_config("eventssince");
+    let id = h.submit(&["submit", "--name", "again", "--", "true"]);
+    h.ok(&["wait", &id]);
+
+    let all = events_lines(events_reader(
+        &h,
+        &["--json", "--since", "start", "--timeout", "3s"],
+    ));
+    let jobs: Vec<&serde_json::Value> = all.iter().filter(|l| l["event"] == "job").collect();
+    assert!(jobs.len() >= 2, "the stream must hold the events: {all:?}");
+
+    // The reader keeps the name of the stream with the number. The name is what
+    // lets the coordinator see that it is not the coordinator that gave that
+    // number.
+    let stream_id = all[0]["stream_id"].as_str().unwrap().to_string();
+    let first = jobs[0]["seq"].as_u64().unwrap();
+    let after = events_lines(events_reader(
+        &h,
+        &[
+            "--json",
+            "--since",
+            &format!("{stream_id}:{first}"),
+            "--timeout",
+            "3s",
+        ],
+    ));
+    let got: Vec<u64> = after
+        .iter()
+        .filter(|l| l["event"] == "job")
+        .map(|l| l["seq"].as_u64().unwrap())
+        .collect();
+    let expected: Vec<u64> = jobs
+        .iter()
+        .map(|l| l["seq"].as_u64().unwrap())
+        .filter(|s| *s > first)
+        .collect();
+    assert_eq!(got, expected, "the reader must continue after its number");
+    assert!(
+        !got.contains(&first),
+        "the reader must not read one event a second time"
+    );
+}
+
+/// The stream must SAY when it dropped events.
+///
+/// The coordinator keeps the last events only, and it never waits for a reader.
+/// A reader that arrives late thus loses events. A gap in silence is worse than
+/// a gap that is reported: an agent that loses the line "the job failed" and
+/// hears nothing waits for a result that will never arrive.
+#[test]
+fn the_stream_counts_the_events_that_it_dropped() {
+    let h = Harness::with_default_config("eventsgap");
+
+    // Make the ring small. With the usual size this test needs more than five
+    // hundred events, and a test that takes minutes is a test that nobody runs.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+    cmd.args(["submit", "--name", "gap0", "--", "true"])
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .env("QEX_EVENTS_RETAINED", "3");
+    let out = cmd.output().expect("qex did not start");
+    assert!(out.status.success(), "the first submission failed");
+    let first = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    h.ok(&["wait", &first]);
+
+    // Each job gives three or four events, so these jobs pass the ring.
+    for i in 1..4 {
+        let id = h.submit(&["submit", "--name", &format!("gap{i}"), "--", "true"]);
+        h.ok(&["wait", &id]);
+    }
+
+    let lines = events_lines(events_reader(
+        &h,
+        &["--json", "--since", "start", "--timeout", "3s"],
+    ));
+    let gap = lines
+        .iter()
+        .find(|l| l["event"] == "gap")
+        .unwrap_or_else(|| panic!("the stream must report the gap: {lines:?}"));
+    assert!(
+        gap["missed"].as_u64().unwrap() > 0,
+        "the gap must count the events that went away: {gap:?}"
+    );
+
+    // The stream must continue after the gap, and not stop.
+    assert!(
+        lines.iter().any(|l| l["event"] == "job"),
+        "the stream must continue after a gap: {lines:?}"
+    );
+}
+
+/// A reader must not hold the coordinator open, and it must hear the stop.
+///
+/// A stream that keeps a coordinator alive for ever is a leak. A stream that
+/// dies in silence under its reader is a fault, because the reader cannot tell
+/// an orderly stop from a broken socket.
+#[test]
+fn the_coordinator_retires_under_a_reader_and_says_goodbye() {
+    let h = Harness::new(
+        "eventsbye",
+        "[peers]\nenabled = false\n[system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    // The reader is the FIRST command, so the coordinator that it starts holds
+    // this short idle time.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+    cmd.args(["events", "--json", "--timeout", "60s"])
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "3")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let reader = cmd.spawn().expect("qex events did not start");
+
+    let out = reader.wait_with_output().expect("the reader did not stop");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "an orderly stop is not a failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap_or("")).unwrap();
+    assert_eq!(
+        last["event"], "bye",
+        "the coordinator must say why the stream ends: {text}"
+    );
+    assert!(
+        last["reason"].as_str().unwrap().contains("no job operates"),
+        "the goodbye must give the reason: {last:?}"
+    );
+}
+
+/// A coordinator that cannot obey `qex events` must REFUSE it.
+///
+/// This is the capability rule of qex, in the one place where a silent refusal
+/// is worst. An earlier coordinator gave no line and no error, and the reader
+/// then cannot tell "no job changed" from "this coordinator has no stream". It
+/// waits for ever, which is the fault that qex exists to remove.
+///
+/// The test uses a coordinator of its own that answers like an earlier version.
+/// It never starts a qex coordinator, so it never kills a process.
+#[test]
+fn a_coordinator_that_has_no_event_stream_refuses_the_command() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let root = std::env::temp_dir().join(format!("qxold{}", std::process::id()));
+    let run = root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::create_dir_all(root.join("cfg")).unwrap();
+    let socket = run.join("s");
+
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        // Answer one CLI process, then stop.
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().unwrap();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            // An earlier version knows `info` and `capabilities`, and it does
+            // not know `events`.
+            let answer = if line.contains("\"info\"") {
+                serde_json::json!({
+                    "result": "info", "pid": 4321, "version": "0.7.1",
+                    "started_at": 0, "program_replaced": false,
+                    "jobs_running": 0, "jobs_queued": 0,
+                    "cpu_budget": 1, "mem_budget": 1, "cpu_claimed": 0, "mem_claimed": 0,
+                })
+            } else if line.contains("\"capabilities\"") {
+                serde_json::json!({ "result": "capabilities", "names": ["locks", "retries"] })
+            } else {
+                serde_json::json!({
+                    "result": "error", "kind": "internal",
+                    "message": "qex could not read this request",
+                })
+            };
+            writeln!(writer, "{answer}").ok();
+            writer.flush().ok();
+        }
+    });
+
+    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
+        .args(["events", "--json", "--timeout", "10s"])
+        .env("XDG_CONFIG_HOME", root.join("cfg"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .output()
+        .expect("qex did not start");
+
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    drop(server);
+    std::fs::remove_dir_all(&root).ok();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the command must fail. stdout: {stdout} stderr: {err}"
+    );
+    assert!(
+        err.contains("cannot obey `qex events`"),
+        "the message must say what happened: {err}"
+    );
+    assert!(
+        err.contains("kill 4321"),
+        "the message must give the remedy: {err}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "a refused command must give no stream: {stdout}"
+    );
+}
+
+/// A number from a coordinator that stopped must give a gap, and never a
+/// silent continuation.
+///
+/// The numbers start at 1 in each coordinator, and a new coordinator makes one
+/// event for each record that it reads. The number 2 of the earlier stream thus
+/// names a DIFFERENT event in the new stream. Without the name of the stream,
+/// the coordinator continues from that number, and the reader loses the events
+/// before it with no message — which is the class of fault that qex exists to
+/// remove.
+#[test]
+fn a_number_from_a_coordinator_that_stopped_gives_a_gap() {
+    let h = Harness::with_default_config("eventsrestart");
+    for i in 0..3 {
+        let id = h.submit(&["submit", "--name", &format!("old{i}"), "--", "true"]);
+        h.ok(&["wait", &id]);
+    }
+
+    let before = events_lines(events_reader(
+        &h,
+        &["--json", "--since", "now", "--timeout", "2s"],
+    ));
+    let old_stream = before[0]["stream_id"].as_str().unwrap().to_string();
+
+    // Stop the coordinator of THIS test. The next command starts a new one,
+    // which reads the same records and makes its own numbers.
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator goes away", Duration::from_secs(20), || {
+        (unsafe { libc::kill(pid, 0) }) != 0
+    });
+
+    let lines = events_lines(events_reader(
+        &h,
+        &[
+            "--json",
+            "--since",
+            &format!("{old_stream}:2"),
+            "--timeout",
+            "3s",
+        ],
+    ));
+
+    assert_ne!(
+        lines[0]["stream_id"].as_str().unwrap(),
+        old_stream,
+        "the new coordinator must have a stream of its own"
+    );
+    let gap = lines
+        .iter()
+        .find(|l| l["event"] == "gap")
+        .unwrap_or_else(|| {
+            panic!("a number from a stream that stopped must give a gap: {lines:?}")
+        });
+    assert!(
+        gap["missed"].is_null(),
+        "qex cannot count across two streams, and it must not invent a number: {gap:?}"
+    );
+    assert!(
+        gap["reason"].as_str().unwrap().contains(&old_stream),
+        "the reason must name the stream that gave the number: {gap:?}"
+    );
+
+    // The stream must continue with everything that the new coordinator holds,
+    // and not from the number of the stream that stopped.
+    let seqs: Vec<u64> = lines
+        .iter()
+        .filter(|l| l["event"] == "job")
+        .map(|l| l["seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        seqs.first(),
+        Some(&1),
+        "the stream must continue from the first event that the new coordinator holds: {seqs:?}"
+    );
+}
+
+/// A reader that goes away must not leave a thread and two file handles behind.
+///
+/// A bounded read is the shape that `--since`, `--count` and `--timeout` exist
+/// for: an agent reads for a few seconds, does its work, and comes back. On a
+/// quiet queue there is nothing to write to such a reader, so a write cannot
+/// find that it went away. Without a test of the connection itself, each of
+/// those readers held a thread and two handles for the hour of the idle time,
+/// and at the limit of the handles the coordinator accepts no connection.
+///
+/// This test reads `/proc`, so it runs on Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reader_that_goes_away_leaves_no_thread_behind() {
+    let h = Harness::with_default_config("eventsfds");
+    let pid = h.coordinator_pid();
+    let count = |what: &str| {
+        std::fs::read_dir(format!("/proc/{pid}/{what}"))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+
+    let threads = count("task");
+    let handles = count("fd");
+    assert!(threads > 0, "this test needs /proc");
+
+    // Each reader stops by itself. See `events_reader`.
+    for _ in 0..8 {
+        let reader = events_reader(&h, &["--json", "--since", "now", "--timeout", "1s"]);
+        reader.wait_with_output().expect("the reader did not stop");
+    }
+
+    // The coordinator finds a reader that went away at its next test of the
+    // connection, so give it a moment.
+    h.until(
+        "the coordinator releases the threads of the readers that stopped",
+        Duration::from_secs(20),
+        || count("task") <= threads + 1 && count("fd") <= handles + 2,
     );
 }

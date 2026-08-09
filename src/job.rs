@@ -74,6 +74,28 @@ impl JobState {
             Self::Skipped => "skipped",
         }
     }
+
+    /// EVERY state, in the order that a job meets them.
+    ///
+    /// A schema, a help topic and a completion each need the whole list, and a
+    /// list that each of them keeps by hand goes out of date one at a time. The
+    /// event schema lost `expired` in exactly that way, and a reader that
+    /// validates the stream would have refused a line that was correct.
+    ///
+    /// `place_in_all` below makes this list impossible to leave behind.
+    pub const ALL: &'static [JobState] = &[
+        Self::Queued,
+        Self::Starting,
+        Self::Running,
+        Self::Completed,
+        Self::Failed,
+        Self::Killed,
+        Self::Timeout,
+        Self::Expired,
+        Self::Oom,
+        Self::Cancelled,
+        Self::Skipped,
+    ];
 }
 
 impl std::fmt::Display for JobState {
@@ -97,15 +119,21 @@ impl std::str::FromStr for JobState {
             "oom" => Ok(Self::Oom),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             "skipped" => Ok(Self::Skipped),
-            // `skipped` AND `expired` belong in this list. A reader who took
-            // the list as complete, and then wrote one of them, met "unknown
-            // job state" for a state that qex uses and shows. A rebase dropped
-            // `skipped` here in silence, because the two changes wrote the same
-            // line; the list and the arms above it must always agree.
+            // THE LIST BELOW COMES FROM `ALL`, AND NOBODY WRITES IT BY HAND.
+            //
+            // It was written by hand, and a rebase dropped `skipped` from it in
+            // silence, because two changes wrote the same line. A reader who
+            // took the list as complete, and then wrote `skipped`, met "unknown
+            // job state" for a state that qex uses and shows. `ALL` cannot go
+            // out of date: `place_in_all` stops the build when somebody adds a
+            // variant without giving it a place.
             other => Err(format!(
-                "unknown job state `{other}`. Use one of these states: queued, starting, \
-                 running, completed, failed, killed, timeout, expired, oom, cancelled, \
-                 skipped"
+                "unknown job state `{other}`. Use one of these states: {}",
+                Self::ALL
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }
@@ -183,6 +211,37 @@ pub fn safe_name(name: &str) -> String {
     // cuts on a character boundary.
     out.truncate(128);
     out
+}
+
+/// Replaces each control character with a space.
+///
+/// THIS IS THE RULE FOR A SENTENCE, AND `safe_name` IS THE RULE FOR A NAME.
+/// A name is a handle: a reader pastes it back into a command, so `safe_name`
+/// keeps the letters, the numbers and `-_.` and nothing else. A sentence is
+/// prose that qex wrote, and it holds spaces, back quotes and punctuation that
+/// a reader needs. `safe_name` on a sentence would destroy it, so a sentence
+/// takes this rule instead: it loses the bytes that move a cursor, and nothing
+/// else.
+///
+/// # Where a sentence gets text that a user chose
+///
+/// A sentence that qex writes is not safe because qex wrote it. It carries
+/// values that came from the submission:
+///
+///   * `blocked_reason` names the LOCK that a job waits for, and a lock name is
+///     a word that the caller chose. Measured with a lock named
+///     `lk<ESC>[2Jbad`: `qex events` and `qex status` each wrote that ESC byte
+///     to the terminal, and the byte cleared the screen.
+///   * `error` on an expired job folds the last `blocked_reason` into itself, so
+///     the same word reaches the reader a second time on a TERMINAL line.
+///
+/// A NUL byte also stops the start of a stop hook, because the system cannot
+/// take an environment variable that holds one.
+pub fn printable(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// What qex removed from the output files of a job.
@@ -563,6 +622,54 @@ pub fn write_spec(dir: &Path, spec: &JobSpec) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the place of one state in [`JobState::ALL`].
+    ///
+    /// Gives the place of one state in [`JobState::ALL`].
+    ///
+    /// THIS FUNCTION EXISTS TO STOP THE BUILD. The match is exhaustive, so a
+    /// new variant of `JobState` fails to compile here until somebody gives it
+    /// a place, and the test below then fails until `ALL` holds it at that
+    /// place. A list that a person keeps by hand goes out of date; a list that
+    /// the compiler keeps cannot.
+    ///
+    /// It lives in the tests, and not beside `ALL`, because the program itself
+    /// has no use for it: a build of the program alone would then carry a
+    /// function that nothing calls. The tests build on every change and in CI,
+    /// so the guard holds.
+    const fn place_in_all(state: JobState) -> usize {
+        match state {
+            JobState::Queued => 0,
+            JobState::Starting => 1,
+            JobState::Running => 2,
+            JobState::Completed => 3,
+            JobState::Failed => 4,
+            JobState::Killed => 5,
+            JobState::Timeout => 6,
+            JobState::Expired => 7,
+            JobState::Oom => 8,
+            JobState::Cancelled => 9,
+            JobState::Skipped => 10,
+        }
+    }
+
+    /// `ALL` and `place_in_all` must agree at the end of the list. This line
+    /// fails when the program is COMPILED, and not when a test runs.
+    const _: () = assert!(place_in_all(JobState::Skipped) + 1 == JobState::ALL.len());
+
+    /// `JobState::ALL` must name every state, each one time, in its place.
+    ///
+    /// Read `place_in_all` for the reason that this cannot go out of date.
+    #[test]
+    fn the_list_of_every_state_is_complete() {
+        for (i, state) in JobState::ALL.iter().enumerate() {
+            assert_eq!(
+                place_in_all(*state),
+                i,
+                "the state `{state}` is not in its place in ALL"
+            );
+        }
+    }
 
     #[test]
     fn terminal_states_are_classified_correctly() {

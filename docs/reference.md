@@ -20,9 +20,10 @@ qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
 qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
+qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
 qex config show             the values that qex uses now
-qex schema job|status       the JSON Schema of each format
+qex schema job|status|pipeline|event    the JSON Schema of each format
 qex completions <shell>     the completions for bash, zsh or fish
 qex help <topic>
 ```
@@ -141,6 +142,104 @@ you. Write `[defaults] max_queue_time` to get the rule for every job.
 A job takes this value at its SUBMISSION. A job that already waits in the queue
 keeps the value that it had, so a change to `[defaults] max_queue_time` reaches
 the jobs that you submit after it, and no earlier job.
+## The event stream
+
+```sh
+qex events --json
+```
+
+One JSON object on one line for each change of state, at the moment of the
+change. Read this stream in place of a loop that asks about each job. An agent
+that drives twenty jobs reads one stream, and it learns of each result when the
+result happens.
+
+```json
+{"event":"job","seq":12,"time":1770000000,"id":"a1b2...","name":"build",
+ "state":"failed","previous":"running","change":"state","job":{ ... }}
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `event` | `stream`, `job`, `gap` or `bye`. Ignore a value that you do not know. |
+| `seq` | The number of this event. Keep the largest number that you read, with the `stream_id` of the first line. |
+| `state`, `previous` | The state now, and the state before. `previous` is `null` for the first line of a job, which says that qex accepted it. |
+| `change` | `state`, or `reason` for a job that stays in the queue and whose reason to wait changed. |
+| `job` | The whole record, the same as `qex status --json`. |
+
+`qex schema event` gives the full schema.
+
+The field `job` holds everything, so a reader needs no second command to learn
+the exit code, the measured use or the cause of a failure.
+
+The stream reports what the coordinator **saw**. The supervisor of a job writes
+the record, and the coordinator reads it twice each second, so a job that is
+shorter than that period gives `starting` and then `completed` with no `running`
+line. `previous` gives the true sequence, and qex writes no line for a state that
+it did not see.
+
+### Read the stream again after a stop
+
+```sh
+qex events --json --since "$STREAM_ID:348"   # the events after the number 348
+qex events --json --since start              # everything that it holds
+qex events --json --since now                # the new events only
+```
+
+The default is `start`. A program that keeps two values — the `stream_id` of the
+first line and the largest `seq` — and gives both to `--since` loses nothing when
+it stops and starts again. **This is the reason for the numbers**: a stream that
+begins at "now" makes a reader that restarts lose the results that arrived while
+it was away.
+
+**The numbers belong to one stream.** The coordinator stops when no job operates,
+and the next command starts a new one. That coordinator starts its numbers at 1
+again, and it makes one event for each record that it reads, so the number 348
+names a different event there.
+
+With the stream name, qex compares the two, gives a `gap` line that says the
+coordinator changed, and continues with the events that the new coordinator
+holds. Its job records are the same records.
+
+With a **number alone**, qex cannot make that comparison: it sees a number that
+this stream also issued, and it continues from there. You then lose events with
+no message. Give the name. `qex events` writes a warning when you give a number
+with no name.
+
+### A reader that is slow
+
+The coordinator keeps the last 512 events. **It never waits for a reader**, and
+its memory does not grow for one. A reader that falls behind receives a `gap`
+line that COUNTS the events that it lost:
+
+```json
+{"event":"gap","time":1770000000,"missed":37,"next_seq":420,"reason":"..."}
+```
+
+qex reports a gap and never hides one. A reader that loses the line `failed` and
+hears nothing waits for a result that will never arrive.
+
+`missed` is `null` when qex cannot count the events, which happens when the
+number comes from a different stream: the two streams have no common measure, so
+a number there would say something that qex cannot support. `reason` says what
+happened.
+
+### The end of the stream
+
+A reader does **not** hold the coordinator open: a stream that keeps a
+coordinator alive for ever is a leak. The coordinator stops when no job operates
+and no command arrives for the idle time, and it writes a `bye` line first. The
+command then exits with the code 0.
+
+A stream that ends with **no** `bye` line means that something stopped the
+coordinator. `qex events` writes a message to stderr and exits with the code 1.
+The records of the jobs are on the disk and they are correct.
+
+### An earlier coordinator
+
+A coordinator that operates can be older than your command. Such a coordinator
+does not know this request, so `qex events` refuses to run, names the
+coordinator and gives the command that stops it. It never gives an empty stream,
+because an empty stream and a stream with no events look the same.
 
 ## Resource claims
 
@@ -1196,8 +1295,10 @@ qex help agents      the one page for an agent
 qex help job-file    the fields of a job file
 qex help resources   claims, the budget and the several-user accounting
 qex help states      each job state and what causes it
+qex help events      the event stream, its numbers and its gaps
 qex help exit-codes  the exit code of each command
 qex help config      each configuration field
 qex schema job       the JSON Schema of a job file
 qex schema status    the JSON Schema of status.json
+qex schema event     the JSON Schema of one line of `qex events`
 ```

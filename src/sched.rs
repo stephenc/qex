@@ -214,7 +214,15 @@ pub fn run(coord: Arc<Coordinator>) {
 
         // Read the status file of each job that operates. The supervisors write
         // those files, so this is how the coordinator learns that a job started.
-        let changed = coord.state.lock().unwrap().refresh_active();
+        let changed = {
+            let mut state = coord.state.lock().unwrap();
+            let changed = state.refresh_active();
+            // The supervisors write the records, so this read is how the
+            // coordinator learns that a job started or stopped. Report each of
+            // those changes to the readers of the event stream.
+            state.publish_changes();
+            changed
+        };
 
         // Signal the waiters when a job started, when a supervisor wrote a new
         // status, AND when this turn moved a job to a final state on its own.
@@ -251,6 +259,10 @@ pub fn run(coord: Arc<Coordinator>) {
             Ok(_) => {}
             Err(e) => log(&format!("the scheduler failed: {e:#}")),
         }
+
+        // The step above can start a job, skip a job, or change the reason that
+        // a job waits. Report those changes as well.
+        coord.state.lock().unwrap().publish_changes();
 
         // Publish the claims of this coordinator, so the coordinators of the
         // other users see them.
@@ -446,6 +458,7 @@ fn skip(state: &mut crate::daemon::State, id: uuid::Uuid, reason: String, root: 
         // of its own. A hook that hangs must never hold the queue.
         crate::hook::fire_detached(&dir, &status);
     }
+    state.publish_changes();
     log(&format!(
         "job {id} did not run, because a job that it needed did not succeed"
     ));
@@ -809,6 +822,14 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         finished += 1;
     }
 
+    // Report every change that this pass made: the skipped jobs, the expired
+    // jobs, and the reason of a job that waits. A job that waits keeps the
+    // state `queued`, so the reason is its only change, and a reader that sees
+    // `queued` and no reason cannot learn what the job waits for. This call is
+    // AFTER the two loops above, so the terminal states `skipped` and
+    // `expired` each give a line as well.
+    state.publish_changes();
+
     Choice {
         start: chosen,
         finished,
@@ -857,6 +878,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         // The SAFE name: this value goes into the log of the coordinator.
         let name = crate::job::safe_name(&job.spec.name);
         state.queue.retain(|q| *q != id);
+        state.publish_changes();
         (forced, name, status)
     };
 
@@ -872,6 +894,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             job.status.finished_at = Some(sys::now_secs());
             job.status.error = Some(format!("qex could not write the job record: {e:#}"));
         }
+        state.publish_changes();
         drop(state);
         coord.notify();
         log(&format!("job {id} could not start: {e:#}"));
@@ -934,6 +957,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
                 job.status.finished_at = Some(sys::now_secs());
                 job.status.error = Some(format!("qex could not start the job: {e:#}"));
                 let status = job.status.clone();
+                state.publish_changes();
                 drop(state);
                 if let Ok(dir) = paths::job_dir(&id) {
                     job::write_status(&dir, &status).ok();
@@ -1134,6 +1158,7 @@ mod tests {
             config_settling: None,
             config_error: None,
             dedupe: Default::default(),
+            events: crate::events::EventLog::new(),
             stop: false,
         }
     }

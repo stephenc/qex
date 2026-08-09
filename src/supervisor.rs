@@ -197,6 +197,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 crate::hook::fire_detached(&dir, &status);
             }
         }
+        state.publish_changes();
     }
     drop(state);
 

@@ -152,6 +152,38 @@ again.
 with the same key gives you the first job whatever command you wrote, so give
 each different piece of work its own key.
 
+## Many jobs at one time
+
+Do not ask about each job in a loop. Read one stream:
+
+```sh
+qex events --json      # one JSON object on one line for each change of state
+```
+
+Each `job` line holds the whole record, the same as `qex status --json`, so you
+need no second command for the exit code or the cause of a failure.
+
+Keep **two** values: the `stream_id` of the first line and the largest `seq` you
+read. Give both when you start again:
+
+```sh
+qex events --json --since "$STREAM_ID:348"
+```
+
+The numbers belong to one coordinator, and the next coordinator starts them at 1
+again. With the name, qex sees that and gives you a `gap` line; **with a number
+alone it cannot**, and you can lose events with no message.
+
+A new coordinator reads the records again, so after that `gap` line it gives you
+some lines a second time — a job that stopped while you were away arrives again
+as `completed`. **Act on `id` and `state`, and not on the arrival of a line.**
+
+The coordinator keeps the last 512 events and never waits for a reader. If you
+fall behind you receive a `gap` line that counts what you lost; qex never hides
+a gap. The stream reports what the coordinator saw: a job shorter than half a
+second can go from `starting` to `completed` with no `running` line, and
+`previous` gives the true sequence. Run `qex help events` for the detail.
+
 ## Claims
 
 Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate together,
@@ -192,6 +224,7 @@ qex list                     what operates, what waits, and WHY it waits
 qex list --cwd .             the jobs of this directory
 qex kill <id>                stop a job that operates, and each of its children
 qex cancel <id>              take a job out of the queue
+qex events --json            one line for each change of state, as it happens
 qex top                      watch the queue; press q to leave
 qex watchers                 find the polling loops that already wait on this machine
 qex clean --auto             delete the records that stopped more than an hour ago

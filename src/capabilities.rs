@@ -183,6 +183,7 @@ pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Floor {
 pub const ALL: &[&str] = &[
     "dedupe",
     "dependencies",
+    "events",
     "groups",
     "history",
     "learn",
@@ -295,6 +296,34 @@ pub fn check(
          \x20   kill {coordinator_pid}\n\n\
          The jobs that operate now continue; a new coordinator reads the same records.",
         options.join(" and ")
+    ))
+}
+
+/// Tests one COMMAND against a coordinator.
+///
+/// `check` covers a job that carries an option. This function covers a command
+/// that needs a request name, such as `qex events`. The two faults are the same
+/// fault: a coordinator that cannot obey must refuse, and it must never leave
+/// the user with a command that gives nothing and says nothing.
+pub fn check_command(
+    have: &[String],
+    coordinator_version: &str,
+    coordinator_pid: i32,
+    capability: &str,
+    command: &str,
+) -> Result<(), String> {
+    if have.iter().any(|h| h == capability) {
+        return Ok(());
+    }
+    Err(format!(
+        "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and it \
+         cannot obey `{command}`.\n\n\
+         qex refuses this command. That coordinator does not know this request, so the \
+         command would give you nothing and no reason.\n\n\
+         The coordinator stops when no job operates, and the next command then starts one \
+         that can obey. To change it now:\n\
+         \x20   kill {coordinator_pid}\n\n\
+         The jobs that operate now continue; a new coordinator reads the same records."
     ))
 }
 
@@ -627,6 +656,41 @@ mod tests {
 
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
         assert!(check(&new, "0.8.0", 4321, &s).is_ok());
+    }
+
+    /// A command that needs a request name must be refused by a coordinator
+    /// that does not know that name.
+    ///
+    /// `qex events` against such a coordinator gave no line and no error. The
+    /// reader then cannot tell "no job changed" from "this coordinator has no
+    /// stream", and it waits for ever. That is the fault that qex exists to
+    /// remove, in qex itself.
+    #[test]
+    fn a_command_is_refused_by_a_coordinator_that_does_not_know_it() {
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "events")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check_command(&old, "0.7.1", 4321, "events", "qex events").unwrap_err();
+        assert!(
+            err.contains("qex events"),
+            "the message must name the command: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check_command(&new, "0.8.0", 4321, "events", "qex events").is_ok());
+    }
+
+    /// This build must say that it has the event stream. Without the name in
+    /// this list, every new CLI refuses every new coordinator.
+    #[test]
+    fn this_build_says_that_it_has_the_event_stream() {
+        assert!(ALL.contains(&"events"));
     }
 
     #[test]

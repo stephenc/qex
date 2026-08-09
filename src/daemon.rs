@@ -79,6 +79,11 @@ pub struct State {
     /// read must not become the DEFAULT values in silence: that would turn a
     /// budget of 2 cores into a budget of 12 with no word to anybody.
     pub config_error: Option<String>,
+    /// The events that the coordinator holds for the readers of the stream.
+    ///
+    /// The log is behind the same lock as the jobs. The stream and `qex list`
+    /// thus read one map, and the two can never disagree.
+    pub events: crate::events::EventLog,
     pub stop: bool,
 }
 
@@ -440,6 +445,7 @@ impl Coordinator {
                 config_seen: config_fingerprint(&crate::config::read_config_file()),
                 config_settling: None,
                 config_error: None,
+                events: crate::events::EventLog::new(),
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -558,6 +564,21 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Delete the socket file FIRST, and then do the other work of the stop.
+    //
+    // This process no longer accepts a connection. While the file stays, a new
+    // command connects to it, sends a request, and receives nothing: the
+    // command then reports a coordinator with no version and no pid. Without
+    // the file, that command starts a coordinator, which is correct.
+    std::fs::remove_file(&socket_path).ok();
+
+    // Let each reader of the event stream receive the goodbye.
+    //
+    // Without this wait, the process ends while the `bye` line is still in a
+    // buffer. Each reader then meets a socket that closed, and it cannot tell
+    // an orderly stop from a failure of the machine.
+    crate::events::wait_for_readers(&coord, Duration::from_secs(1));
+
     // Delete the record of this coordinator. Without this step, its claims stop
     // the jobs of a different user until the record becomes stale.
     {
@@ -565,7 +586,6 @@ pub fn run() -> Result<()> {
         crate::peers::withdraw(&cfg);
     }
 
-    std::fs::remove_file(&socket_path).ok();
     log("the coordinator stopped");
     Ok(())
 }
@@ -717,6 +737,10 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     for (key, id, ..) in holders {
         state.dedupe.insert(key, id);
     }
+    // Give the stream the state of each job that this coordinator read. A
+    // reader that connects to a new coordinator thus learns what it holds, and
+    // it does not wait for a change that already happened.
+    state.publish_changes();
 
     if recovered > 0 {
         log(&format!("the coordinator read {recovered} job record(s)"));
@@ -737,7 +761,20 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
 
         coord.state.lock().unwrap().last_contact = Instant::now();
 
-        let response = match serde_json::from_str::<Request>(&line) {
+        let parsed = serde_json::from_str::<Request>(&line);
+
+        // The event stream gives many answers to one request, so it takes this
+        // connection for the rest of its life. Every other request gives one
+        // answer, and the loop continues.
+        //
+        // A reader that goes away gives a write error here. That is normal, and
+        // it must not appear in the log of the coordinator as a failure.
+        if let Ok(Request::Events { since }) = parsed {
+            crate::events::stream(&coord, &mut writer, since).ok();
+            break;
+        }
+
+        let response = match parsed {
             Ok(request) => handle(&coord, request),
             Err(e) => Response::error(
                 ErrorKind::Internal,
@@ -770,6 +807,10 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
         Request::List => {
             let mut state = coord.state.lock().unwrap();
             state.refresh_active();
+            // Report each change that this read found. A change that a command
+            // sees and the stream does not is a change that an agent that reads
+            // the stream never learns.
+            state.publish_changes();
             Response::Jobs {
                 jobs: state.jobs.values().map(|j| j.status.clone()).collect(),
             }
@@ -777,6 +818,7 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
         Request::Status { id } => {
             let mut state = coord.state.lock().unwrap();
             state.refresh_active();
+            state.publish_changes();
             match state.jobs.get(&id) {
                 Some(j) => Response::Status {
                     status: Box::new(j.status.clone()),
@@ -784,6 +826,14 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
                 None => no_such_job(id),
             }
         }
+        // `serve` takes the connection for the stream before it calls this
+        // function, so this arm never runs. It exists because a request that
+        // has no answer must never leave a reader with an open socket and
+        // nothing on it.
+        Request::Events { .. } => Response::error(
+            ErrorKind::Internal,
+            "qex could not open the event stream on this connection. Run `qex events` again.",
+        ),
         Request::Wait { id } => handle_wait(coord, id),
         Request::Cancel { id } => handle_cancel(coord, id),
         Request::Kill {
@@ -993,6 +1043,8 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
             })
             .unwrap_or(state.queue.len());
         state.queue.insert(pos, id);
+        // The admission of a job is the first event of that job.
+        state.publish_changes();
     }
 
     // Keep a short record of this job, so a reader can tell "the record was
@@ -1058,6 +1110,7 @@ fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
             job.status.blocked_reason = None;
             let status = job.status.clone();
             state.queue.retain(|q| *q != id);
+            state.publish_changes();
             drop(state);
 
             if let Ok(dir) = paths::job_dir(&id) {
@@ -1192,6 +1245,7 @@ mod tests {
             config_seen: 0,
             config_settling: None,
             config_error: None,
+            events: crate::events::EventLog::new(),
         }
     }
 
