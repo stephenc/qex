@@ -865,12 +865,37 @@ a new file and starts the queue again.
 The pause covers YOUR queue only. It does not pause another user of the
 machine. `qex info` says so.
 
+What a pause does NOT do
+------------------------
+
+A pause does not expire a job. `--max-queue-time` measures the time that a job
+waits for the QUEUE, and a person who holds the machine is not the queue. The
+clock of that limit stops at the pause and runs again at the resume, so a pause
+of 30 minutes does not kill every job with a smaller limit. `qex status` gives
+that time in `queue_pause_secs`.
+
+A pause of a LOCK does not stop that clock. A job that waits for a lock already
+expires in the same way, whatever holds it.
+
+A pause refuses no command. `qex submit` gives you a job id and the exit code 0,
+and the job waits with the pause as its reason.
+
+Who may end it
+--------------
+
+Anybody who can reach this queue. A pause is not a lock on the queue: the queue
+belongs to one user of the machine, and everybody who reaches it already shares
+every job in it. Each line below names the pid that asked for the pause, so you
+can find the owner before you start the queue again.
+
 Where to read it
 ----------------
 
-    qex pause                    what is paused, and for how long
+    qex pause                    what is paused, for how long, and who asked
     qex info                     the same line, with the budget and the load
     qex top                      the same line, on the page
+    qex list                     the same line, before the jobs
+    qex wait <id>                the same line, before the wait begins
     qex status <id>              the reason that one job waits
 ";
 
