@@ -1003,6 +1003,21 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         }
     };
 
+    // Say the pause BEFORE the wait begins.
+    //
+    // Issue #28: `qex wait` gives no word where `qex run` explains itself. A
+    // pause makes that silence unbounded — a wait with no `--timeout`, behind a
+    // pause with no end, never returns and never says why. One line on stderr
+    // is the whole remedy, and stdout keeps the result alone.
+    //
+    // `--json` keeps its silence, in the same way as the answers below: a
+    // reader that asked for JSON reads the exit code.
+    if !args.json {
+        if let Ok(mut client) = Client::connect() {
+            warn_if_paused(&mut client);
+        }
+    }
+
     // With `--any`, give control back when the FIRST job stops. An agent that
     // started several jobs can then read a result as soon as it arrives, in
     // place of the order of submission.
@@ -2239,6 +2254,13 @@ fn for_display(mut s: JobStatus) -> JobStatus {
     // job by its key, so the safe form loses nothing. Without this line, a key
     // that holds an ESC byte moves the cursor of the reader.
     s.dedupe_key = s.dedupe_key.as_deref().map(safe_name);
+    // A lock name is a word from the command line, and `qex status` prints the
+    // list of locks on its own line. `qex pause lock <name>` puts that same
+    // word in front of a person as well. Measured with a lock named
+    // `esc<ESC>[2Jlock`: `qex status` wrote the ESC byte to the terminal. A
+    // lock name is a NAME, so it takes `safe_name`, in the same way as the
+    // name of the job.
+    s.locks = s.locks.iter().map(|l| safe_name(l)).collect();
     // The two SENTENCES take the rule for a sentence, and not `safe_name`.
     //
     // qex wrote these two, but it wrote them AROUND text that the caller chose.
@@ -3157,18 +3179,23 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
                 return print_pause_state(queue.as_ref(), &locks, true);
             }
 
+            // A lock name is text that the person typed, and these lines go
+            // to a terminal. Show the safe form of the name. See
+            // `job::safe_name`.
+            let shown = crate::job::safe_name(&name);
             match locks.iter().find(|l| l.name == name) {
                 Some(lock) => match &lock.held_by {
                     Some(job) => println!(
-                        "the job {job} holds the lock `{name}` now. qex gives it to you when that \
-                         job stops, and no other job takes it. Use `qex list` to watch that job."
+                        "the job {job} holds the lock `{shown}` now. qex gives it to you when \
+                         that job stops, and no other job takes it. Use `qex list` to watch \
+                         that job."
                     ),
                     None => println!(
-                        "the lock `{name}` is yours. Every job that needs it waits until you run \
-                         `qex resume lock {name}`."
+                        "the lock `{shown}` is yours. Every job that needs it waits until you \
+                         run `qex resume lock {shown}`."
                     ),
                 },
-                None => println!("the lock `{name}` is yours"),
+                None => println!("the lock `{shown}` is yours"),
             }
             Ok(0)
         }
@@ -3190,9 +3217,10 @@ pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
     };
     let words = match &target {
         PauseTarget::Queue => "the queue operates again".to_string(),
-        PauseTarget::Lock { name } => {
-            format!("the lock `{name}` is free. The next job that needs it takes it.")
-        }
+        PauseTarget::Lock { name } => format!(
+            "the lock `{}` is free. The next job that needs it takes it.",
+            crate::job::safe_name(name)
+        ),
     };
 
     let mut client = Client::connect()?;

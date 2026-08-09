@@ -9923,3 +9923,301 @@ fn a_second_pause_keeps_the_end_of_the_first() {
 
     h.ok(&["resume"]);
 }
+
+/// A pause must NOT expire a job that carries `--max-queue-time`.
+///
+/// # The fault that this test prevents
+///
+/// `--max-queue-time` and the pause are two features that landed apart, and
+/// their meeting is the sharp edge of both. A person pauses the queue to take
+/// the machine for half an hour. Every job with a smaller limit then reaches
+/// that limit while NOBODY can start it: qex writes `expired`, it fires the
+/// stop hook of each one, and the person — who is away, which is the whole
+/// point of a pause — comes back to an empty queue and a set of dead records.
+///
+/// A pause protects the machine. It must not delete the queue. The clock of the
+/// limit therefore stops while the queue is paused, and it runs again at the
+/// resume.
+#[test]
+fn a_pause_does_not_expire_a_job_that_has_a_queue_limit() {
+    let h = Harness::with_default_config("pauseexpire");
+
+    h.ok(&["pause", "queue"]);
+
+    // A limit of 3 seconds, and a pause much longer than that.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "true",
+    ]);
+
+    // Measure over a period. The scheduler tests the queue every 500ms, so a
+    // job that expires does so inside this window.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let state = h.state_of(&id);
+        assert_eq!(
+            state, "queued",
+            "a paused queue must not expire a job; the job became `{state}`"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // The record must say that the pause gave the time back. Without this the
+    // test above would also pass on a build that merely DELAYED the expiry to
+    // the resume, which kills the same job one moment later.
+    let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
+    assert_eq!(
+        credited, 0,
+        "the credit belongs to the END of the pause, not to each second of it"
+    );
+
+    h.ok(&["resume", "queue"]);
+
+    let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
+    assert!(
+        credited >= 5,
+        "the resume must give the paused time back; got {credited} seconds"
+    );
+
+    // The job runs. It never expired.
+    h.until(
+        "the job runs after the resume",
+        Duration::from_secs(45),
+        || h.state_of(&id) == "completed",
+    );
+    assert_eq!(
+        h.state_of(&id),
+        "completed",
+        "the job must run, and not expire"
+    );
+}
+
+/// The limit must still expire a job after the pause ends.
+///
+/// # The fault that this test prevents
+///
+/// The rule above stops the clock of `--max-queue-time` while the queue is
+/// paused. A build that stopped that clock and never started it again would
+/// turn one pause into a queue with no limits at all, and `--max-queue-time`
+/// would give an id and wait for ever — which is the fault that
+/// `--max-queue-time` exists to remove.
+#[test]
+fn the_limit_still_expires_a_job_after_the_pause_ends() {
+    let h = Harness::with_default_config("pauseexpire2");
+
+    // Block the job with a DEPENDENCY, and not with the capacity of the
+    // machine. A test that holds every core gives a different answer on a
+    // machine that is busy.
+    let holder = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    h.ok(&["pause", "queue"]);
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--needs",
+        &holder,
+        "--max-queue-time",
+        "4s",
+        "--",
+        "true",
+    ]);
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        h.state_of(&id),
+        "queued",
+        "the pause must hold the clock of the limit"
+    );
+
+    h.ok(&["resume", "queue"]);
+
+    // The clock runs again from the resume. The job still waits for a job that
+    // does not stop, so it reaches its limit and gives up.
+    h.until("the job reaches its limit", Duration::from_secs(45), || {
+        h.state_of(&id) == "expired"
+    });
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+}
+
+/// `qex wait` must say that the queue is paused.
+///
+/// # The fault that this test prevents
+///
+/// Issue #28: `qex wait` gives no word where `qex run` explains itself. A pause
+/// makes that silence unbounded. An agent that runs `qex wait <id>` with no
+/// `--timeout`, behind a pause with no end, waits for ever and reads nothing —
+/// no line, no reason, no remedy. The wait must name the pause and the command
+/// that ends it.
+#[test]
+fn a_wait_behind_a_pause_says_the_pause() {
+    let h = Harness::with_default_config("pausewait");
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    let out = h.qex(&["wait", &id, "--timeout", "3s"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        err.contains("THE QUEUE IS PAUSED"),
+        "the wait must say that the queue is paused: {err}"
+    );
+    assert!(
+        err.contains("recording a demo"),
+        "the wait must give the reason of the pause: {err}"
+    );
+    assert!(
+        err.contains("qex resume queue"),
+        "the wait must give the command that ends the pause: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the wait still reaches its own limit and gives 124"
+    );
+
+    // The result of a wait stays alone on stdout. An agent reads that stream.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !stdout.contains("PAUSED"),
+        "the pause belongs on stderr: {stdout}"
+    );
+
+    h.ok(&["resume"]);
+}
+
+/// A pause reason and a lock name are user text. No control byte of either may
+/// reach a terminal.
+///
+/// # The fault that this test prevents
+///
+/// `--reason` is a SENTENCE that `qex info`, `qex top`, `qex list` and `qex
+/// pause` each print, and a lock name is a NAME that goes into the
+/// `blocked_reason` of every job that waits for it. An ESC byte in either one
+/// clears the screen of the next reader or moves the cursor over the lines
+/// above, and the reader then trusts a display that the text wrote.
+#[test]
+fn a_pause_shows_no_control_byte_of_a_reason_or_a_lock_name() {
+    let h = Harness::with_default_config("pausebytes");
+
+    h.ok(&["pause", "queue", "--reason", "esc\x1b[2Jbad"]);
+    h.ok(&["pause", "lock", "esc\x1b[2Jlock"]);
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--lock",
+        "esc\x1b[2Jlock",
+        "--",
+        "true",
+    ]);
+    h.until(
+        "the job takes the reason of the pause",
+        Duration::from_secs(45),
+        || !h.status_json(&id)["blocked_reason"].is_null(),
+    );
+
+    for args in [
+        vec!["pause"],
+        vec!["info"],
+        vec!["list"],
+        vec!["status", id.as_str()],
+    ] {
+        let out = h.qex(&args);
+        let mut stream = out.stdout.clone();
+        stream.extend_from_slice(&out.stderr);
+        assert!(
+            !stream.windows(4).any(|w| w == b"\x1b[2J"),
+            "`qex {}` wrote the ESC byte of a pause",
+            args.join(" ")
+        );
+    }
+
+    // The sentences must still NAME the reason and the lock, in their safe
+    // form. A test that only looks for the absence of a byte passes when the
+    // text is gone.
+    let shown = h.ok(&["pause"]);
+    assert!(
+        shown.contains("esc [2Jbad"),
+        "`qex pause` must keep the reason, without the control byte: {shown}"
+    );
+    assert!(
+        shown.contains("esc_2Jlock"),
+        "`qex pause` must keep the lock name, in its safe form: {shown}"
+    );
+
+    h.ok(&["resume", "lock", "esc\x1b[2Jlock"]);
+    h.ok(&["resume"]);
+}
+
+/// An oversized job in a paused queue must say the PAUSE, and not the budget.
+///
+/// # The fault that this test prevents
+///
+/// A job that is larger than the budget carries its own reason, and the pause
+/// carries another. A record that kept the budget reason sends the reader to
+/// change the budget, and no budget starts a job while the queue is paused. The
+/// reader then makes a change that cannot help, and reads the same line again.
+///
+/// The pause REPLACES the capacity reason; it never stands beside one.
+#[test]
+fn an_oversized_job_in_a_paused_queue_says_the_pause() {
+    let h = Harness::new(
+        "pauseoversized",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"run-when-idle\"\nsettle = \"1s\"\n",
+    );
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    // Larger than the budget, so the submission also has the oversized reason.
+    let id = h.submit(&["submit", "--cpu", "4", "--mem", "128MB", "--", "true"]);
+
+    let reason = h.status_json(&id)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("the queue is paused"),
+        "the record must give the pause as the reason: {reason}"
+    );
+    assert!(
+        !reason.contains("the budget is"),
+        "the record must not send the reader to the budget: {reason}"
+    );
+
+    // The warning of the submission still gives BOTH, because the person who
+    // typed the command must learn about the claim as well.
+    let out = h.qex(&["submit", "--cpu", "4", "--mem", "128MB", "--", "true"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("the queue is paused"),
+        "the submission must name the pause: {err}"
+    );
+    assert!(
+        err.contains("the budget is"),
+        "the submission must still name the claim: {err}"
+    );
+
+    h.ok(&["resume"]);
+}

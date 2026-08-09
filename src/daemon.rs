@@ -684,7 +684,10 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         None => {}
     }
     for name in state.paused.locks.keys() {
-        log(&format!("a person holds the lock `{name}`"));
+        log(&format!(
+            "a person holds the lock `{}`",
+            crate::job::safe_name(name)
+        ));
     }
 
     for entry in entries.flatten() {
@@ -958,7 +961,10 @@ fn handle_pause(
         }
         PauseTarget::Lock { name } => {
             let record = keep_the_end(state.paused.locks.remove(&name), by_pid, reason, until);
-            log(&format!("a person asked for the lock `{name}`"));
+            log(&format!(
+                "a person asked for the lock `{}`",
+                crate::job::safe_name(&name)
+            ));
             state.paused.locks.insert(name, record);
         }
     }
@@ -1012,28 +1018,19 @@ fn handle_resume(coord: &Arc<Coordinator>, target: crate::proto::PauseTarget) ->
     let mut state = coord.state.lock().unwrap();
     match target {
         PauseTarget::Queue => {
-            // The clock of `--max-queue-time` did not run while the queue was
-            // paused. Give that time back BEFORE the scheduler can look at a
-            // limit again. See `pause::credit_paused_wait`.
+            // A `--for` that reaches its time and this command are the same
+            // event. `pause::end_queue_pause` is the one place that says what
+            // that event does. See it for both of the things that it does.
             if let Some(record) = state.paused.queue.take() {
-                crate::pause::credit_paused_wait(
-                    &mut state,
-                    record.paused_at,
-                    crate::sys::now_secs(),
-                );
+                crate::pause::end_queue_pause(&mut state, &record, crate::sys::now_secs());
             }
-            // Start the settle timer again.
-            //
-            // `idle_since` says how long no job has operated. A paused queue is
-            // idle by construction, so at the resume that timer is already
-            // satisfied and the FIRST job to start would be an oversized job,
-            // alone, in front of everything that waited. The person who resumes
-            // the queue asked for the queue, and not for that.
-            state.idle_since = Some(Instant::now());
             log("a person started the queue again");
         }
         PauseTarget::Lock { name } => {
-            log(&format!("a person gave the lock `{name}` back"));
+            log(&format!(
+                "a person gave the lock `{}` back",
+                crate::job::safe_name(&name)
+            ));
             state.paused.locks.remove(&name);
         }
     }
@@ -1202,9 +1199,6 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         if !lines.is_empty() {
             pause_warning = Some(lines.join("\n"));
         }
-        if let Some(reason) = &pause_reason {
-            status.blocked_reason = Some(reason.clone());
-        }
 
         // Test the size of the job against the budget, and warn now. The agent
         // then learns immediately. It does not wait for the job to start.
@@ -1243,17 +1237,27 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
         }
     };
 
-    // The pause replaces the capacity reason; it never stands beside one.
+    // The pause REPLACES the capacity reason in the record; it never stands
+    // beside one.
     //
-    // A paused job that also said "waits for memory" would send the reader to
-    // look at the memory, which is not why the job waits.
+    // A record that said "waits for memory" would send the reader to change the
+    // budget, and no budget starts a job while the queue is paused. This is one
+    // assignment, and it is AFTER the size test above: the oversized branch of
+    // that test writes its own reason, and the order of the two decides which
+    // reason the reader gets.
+    //
+    // `sched::choose` writes the same reason on its next pass, so this line
+    // covers the window before that pass — the record is correct from the first
+    // byte that qex writes for this job, and not 500ms later.
+    if let Some(reason) = &pause_reason {
+        status.blocked_reason = Some(reason.clone());
+    }
+
+    // The WARNING gives both. The person who typed the command must learn about
+    // the claim as well, because that claim is a fault of the command and the
+    // pause is not.
     let warning = match (pause_warning, warning) {
-        (Some(pause), Some(size)) => {
-            if let Some(reason) = &pause_reason {
-                status.blocked_reason = Some(reason.clone());
-            }
-            Some(format!("{pause}\n{size}"))
-        }
+        (Some(pause), Some(size)) => Some(format!("{pause}\n{size}")),
         (Some(pause), None) => Some(pause),
         (None, size) => size,
     };

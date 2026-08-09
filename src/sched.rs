@@ -336,24 +336,18 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<(usize, usize)> {
             // pause, so a pause can never end in the record and continue in the
             // decision.
             let now = sys::now_secs();
-            let queue_paused_at = state.paused.queue.as_ref().map(|r| r.paused_at);
+            let queue_pause = state.paused.queue.clone();
             if state.paused.expire(now) {
-                // A pause of the QUEUE that reached its `--for` gives the time
-                // back, in the same way as `qex resume queue`. This call is
-                // before `choose`, so no job can expire on time that the pause
-                // took. See `pause::credit_paused_wait`.
-                if let Some(paused_at) = queue_paused_at {
+                // A pause of the QUEUE that reached its `--for` ends in exactly
+                // the same way as `qex resume queue`. This call is before
+                // `choose`, so no job can expire on time that the pause took.
+                if let Some(record) = queue_pause {
                     if state.paused.queue.is_none() {
-                        crate::pause::credit_paused_wait(&mut state, paused_at, now);
+                        crate::pause::end_queue_pause(&mut state, &record, now);
+                        log("a pause reached its end; qex starts the queue again");
                     }
                 }
                 state.save_pause();
-                // Start the settle timer again, for the same reason as
-                // `qex resume`: a paused queue is idle by construction, and
-                // without this the first job to start would be an oversized
-                // one, alone, in front of everything that waited.
-                state.idle_since = Some(Instant::now());
-                log("a pause reached its end; qex starts the queue again");
             }
 
             let active = state.count_state(|s| s.is_active());
@@ -1311,6 +1305,67 @@ mod tests {
         assert_eq!(
             state.jobs[&running].status.queue_pause_secs, 0,
             "a job that operates does not wait in the queue"
+        );
+    }
+
+    /// The end of a pause of the queue must start the settle timer again.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// `idle_since` says how long no job has operated. A paused queue is idle
+    /// by construction, so at the end of the pause that timer is ALREADY
+    /// satisfied, and the first job that qex starts would be an OVERSIZED job,
+    /// alone, in front of everything that waited for hours. The deletion of
+    /// this one line left the whole suite green before this test existed.
+    #[test]
+    fn the_end_of_a_pause_starts_the_settle_timer_again() {
+        let now = sys::now_secs();
+        let mut state = state_with(JobState::Queued, Some(60), 100);
+        let record = crate::pause::PauseRecord::new(1, None, None);
+
+        // A queue that has been idle since long ago. That is the state at the
+        // end of a pause, and it is the state that must not survive.
+        state.idle_since = Some(Instant::now() - Duration::from_secs(3600));
+        crate::pause::end_queue_pause(&mut state, &record, now);
+
+        let waited = state.idle_since.expect("the timer must exist").elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "the end of a pause must start the settle timer again; it says {waited:?}"
+        );
+    }
+
+    /// A pause that reaches its `--for` must give the time back, in the same
+    /// way as `qex resume queue`.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// The two ends of a pause were two blocks of code, and the deletion of the
+    /// credit in the `--for` block left the suite green: a pause of 30 minutes
+    /// that ended BY ITSELF still killed every job with a smaller limit, and
+    /// only a pause that a person ended was safe. `pause::end_queue_pause` is
+    /// now the one place, and this test holds both paths to it.
+    #[test]
+    fn a_pause_that_reaches_its_time_gives_the_time_back_too() {
+        let now = sys::now_secs();
+        let mut state = state_with(JobState::Queued, Some(60), 100);
+        let id = state.queue[0];
+
+        // A pause that began 30 seconds ago and ends now.
+        let mut record = crate::pause::PauseRecord::new(1, None, Some(now));
+        record.paused_at = now.saturating_sub(30);
+        state.paused.queue = Some(record.clone());
+
+        assert!(
+            state.paused.expire(now),
+            "a pause with a time in the past must end"
+        );
+        assert!(state.paused.queue.is_none());
+        crate::pause::end_queue_pause(&mut state, &record, now);
+
+        assert_eq!(
+            state.jobs[&id].status.queue_pause_secs, 30,
+            "a pause that ended by itself must give its time back"
         );
     }
 

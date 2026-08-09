@@ -162,6 +162,32 @@ impl Paused {
     }
 }
 
+/// Ends a pause of the QUEUE, whatever ended it.
+///
+/// `qex resume queue` and a `--for` that reached its time are the same event,
+/// and both must do the same two things. They were two blocks of code, and two
+/// blocks drift: the deletion of either one left the whole test suite green.
+/// This function is the one place, so a later change cannot correct one path
+/// and forget the other.
+///
+/// The caller has ALREADY removed the record from `state.paused`, and it gives
+/// the record here. `now` is the moment when the pause ended.
+///
+/// The two things:
+///
+///   1. Give back the time that the pause took from `--max-queue-time`. See
+///      `credit_paused_wait`.
+///   2. Start the settle timer again. `idle_since` says how long no job has
+///      operated, and a paused queue is idle by construction, so at the end of
+///      the pause that timer is already satisfied. Without this the FIRST job
+///      to start would be an OVERSIZED job, alone, in front of everything that
+///      waited. The person who ends a pause asked for the queue, and not for
+///      that.
+pub fn end_queue_pause(state: &mut crate::daemon::State, record: &PauseRecord, now: u64) {
+    credit_paused_wait(state, record.paused_at, now);
+    state.idle_since = Some(std::time::Instant::now());
+}
+
 /// Adds the length of a pause of the QUEUE to each job that waited through it.
 ///
 /// # The fault that this function prevents
@@ -219,6 +245,30 @@ pub fn path() -> Result<std::path::PathBuf> {
     Ok(paths::runtime_dir()?.join("paused.json"))
 }
 
+/// Gives the form of a `--reason` that a terminal may print.
+///
+/// The reason is text that a person or an agent typed, and every function below
+/// puts it in a SENTENCE that `qex info`, `qex top`, `qex list` and the log of
+/// the coordinator write to a terminal. A reason that held an ESC byte would
+/// thus clear the screen of the next reader, or move the cursor over the lines
+/// above. `job::printable` is the rule for a sentence: it changes a control
+/// byte into a space and it keeps every other character.
+///
+/// The record on the disk keeps the text that the person gave. This function is
+/// for the reader, in the same way as `job::safe_name` is for a job name.
+fn shown_reason(reason: &str) -> String {
+    crate::job::printable(reason)
+}
+
+/// Gives the form of a lock name that a terminal may print.
+///
+/// A lock name is a NAME, and not a sentence, so it takes `job::safe_name`.
+/// `qex pause lock` accepts any text, and the name goes into `blocked_reason`,
+/// which every job of the queue carries and every reader prints.
+fn shown_lock(name: &str) -> String {
+    crate::job::safe_name(name)
+}
+
 /// Gives the reason that a job in the queue waits, while the queue is paused.
 ///
 /// # Why this text holds no elapsed time
@@ -237,16 +287,21 @@ pub fn queue_reason(record: &PauseRecord) -> String {
             "the queue is paused, so qex starts no job. qex could not read its pause record, and \
              a record that qex cannot read can hold a pause, so qex holds the queue. The fault: \
              {}. Correct that file, or run `qex resume queue` to write a new one.",
-            record.reason.as_deref().unwrap_or("unknown")
+            record
+                .reason
+                .as_deref()
+                .map(shown_reason)
+                .unwrap_or_else(|| "unknown".into())
         );
     }
 
     let mut text = String::from("the queue is paused, so qex starts no job.");
     if let Some(reason) = &record.reason {
-        text.push_str(&format!(" Reason: {reason}."));
+        text.push_str(&format!(" Reason: {}.", shown_reason(reason)));
     }
     text.push_str(&format!(
-        " A person or an agent paused it at {}. Run `qex resume queue` to start the queue again.",
+        " The process {} paused it at {}. Run `qex resume queue` to start the queue again.",
+        record.by_pid,
         crate::sys::clock_text(record.paused_at)
     ));
     text
@@ -254,7 +309,10 @@ pub fn queue_reason(record: &PauseRecord) -> String {
 
 /// Gives the reason that a job waits for a lock that a person holds.
 pub fn lock_reason(name: &str) -> String {
-    format!("waits for the lock `{name}`, which a person holds")
+    format!(
+        "waits for the lock `{}`, which a person holds",
+        shown_lock(name)
+    )
 }
 
 /// Gives one line that says how long the queue has been paused.
@@ -266,16 +324,26 @@ pub fn queue_line(record: &PauseRecord, now: u64) -> String {
         return format!(
             "PAUSED BY A FAULT: qex could not read its pause record, so it holds the queue · {} · \
              correct that file, or run `qex resume queue` to write a new one",
-            record.reason.as_deref().unwrap_or("unknown")
+            record
+                .reason
+                .as_deref()
+                .map(shown_reason)
+                .unwrap_or_else(|| "unknown".into())
         );
     }
 
+    // Name WHO asked. A second person who finds a paused queue must be able to
+    // tell an agent that paused it from a colleague who paused it, before that
+    // person types `qex resume queue` over the work of somebody else. The pid
+    // is the only "who" that qex holds, and a pid that no longer exists is
+    // itself an answer: the command that paused the queue has gone away.
     let mut text = format!(
-        "paused since {} ({})",
+        "paused since {} ({}) by pid {}",
         crate::sys::clock_text(record.paused_at),
         crate::units::format_duration(std::time::Duration::from_secs(
             now.saturating_sub(record.paused_at)
-        ))
+        )),
+        record.by_pid
     );
     match record.until {
         Some(end) => text.push_str(&format!(
@@ -288,7 +356,7 @@ pub fn queue_line(record: &PauseRecord, now: u64) -> String {
         None => text.push_str(" · NO END: it continues until `qex resume queue`"),
     }
     if let Some(reason) = &record.reason {
-        text.push_str(&format!(" · reason: {reason}"));
+        text.push_str(&format!(" · reason: {}", shown_reason(reason)));
     }
     text
 }
@@ -296,11 +364,13 @@ pub fn queue_line(record: &PauseRecord, now: u64) -> String {
 /// Gives one line for a lock that a person holds.
 pub fn lock_line(name: &str, record: &PauseRecord, held_by: Option<&str>, now: u64) -> String {
     let mut text = format!(
-        "lock `{name}`: paused since {} ({})",
+        "lock `{}`: paused since {} ({}) by pid {}",
+        shown_lock(name),
         crate::sys::clock_text(record.paused_at),
         crate::units::format_duration(std::time::Duration::from_secs(
             now.saturating_sub(record.paused_at)
-        ))
+        )),
+        record.by_pid
     );
     match held_by {
         Some(job) => text.push_str(&format!(
@@ -309,7 +379,7 @@ pub fn lock_line(name: &str, record: &PauseRecord, held_by: Option<&str>, now: u
         None => text.push_str(" · it is yours now"),
     }
     if let Some(reason) = &record.reason {
-        text.push_str(&format!(" · reason: {reason}"));
+        text.push_str(&format!(" · reason: {}", shown_reason(reason)));
     }
     text
 }
@@ -399,6 +469,43 @@ mod tests {
         let line = queue_line(&record(), 1_360);
         assert!(line.contains("NO END"), "got: {line}");
         assert!(line.contains("6m"), "the line must give the length: {line}");
+    }
+
+    /// Every place that reports a pause must name WHO asked for it.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// A queue is shared. The second person finds a queue that starts nothing,
+    /// and the only safe next step is to find the person or the agent that
+    /// paused it — a colleague on a call needs the machine, and an agent that
+    /// paused itself does not. A line that gave no owner leaves one choice:
+    /// type `qex resume queue` over the work of somebody else, and learn
+    /// nothing either way.
+    ///
+    /// The pid is the only "who" that qex holds, and it is in the record for
+    /// this purpose. It was in the record and in no output.
+    #[test]
+    fn every_report_of_a_pause_names_who_asked_for_it() {
+        let r = record();
+        assert_eq!(r.by_pid, 42, "the helper must give a pid to look for");
+
+        let line = queue_line(&r, 1_360);
+        assert!(
+            line.contains("pid 42"),
+            "the queue line must say who: {line}"
+        );
+
+        let reason = queue_reason(&r);
+        assert!(
+            reason.contains("42"),
+            "the reason of each queued job must say who: {reason}"
+        );
+
+        let lock = lock_line("gpu0", &r, None, 1_360);
+        assert!(
+            lock.contains("pid 42"),
+            "the lock line must say who: {lock}"
+        );
     }
 
     /// A file that qex cannot read must PAUSE the queue, and say why.

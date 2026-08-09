@@ -459,8 +459,38 @@ a new file.
 A second `qex pause queue` keeps the end and the reason of the first one. To
 replace an end, run `qex resume queue` first.
 
-`qex pause` with no word says what is paused now. `qex info`, `qex top` and
-`qex list` say it too, and a pause with no end is reported loudly each time.
+`qex pause` with no word says what is paused now. `qex info`, `qex top`,
+`qex list` and `qex wait` say it too, and a pause with no end is reported loudly
+each time. Each line names the pid that asked for the pause: a queue is shared,
+and the second person must be able to find the owner before that person types
+`qex resume queue` over the work of somebody else.
+
+Any command on this queue can end any pause on it. A pause is not a lock on the
+queue, and qex refuses nobody: the queue belongs to one user of the machine, and
+the people and the agents that reach it already share every job in it.
+
+**A pause does not expire a job.** `--max-queue-time` measures the time that a
+job waits for the QUEUE. A person who pauses the queue is not the queue, so the
+clock of that limit stops at the pause and runs again at the resume. Without
+this rule a pause of 30 minutes killed every job with a smaller limit, fired the
+stop hook of each one, and gave the person an empty queue on the return — from a
+command that exists to protect the machine. `qex status` gives the time in
+`queue_pause_secs`. A pause of a LOCK does not stop that clock: a lock is one
+name, the person holds it in place of a job, and a job that waits for a lock
+already expires in the same way.
+
+`qex submit` into a paused queue still gives a job id and the exit code 0. The
+job waits, and the reason of the job says the pause. No command is refused
+because the queue is paused. A command IS refused when the coordinator is too
+old to pause at all, and it then gives the code 1 with the pid to kill.
+
+`qex submit --each-line` into a paused queue says the pause one time, and not
+one time for each job.
+
+A pause of the queue changes the reason of every job that waits, so a reader of
+`qex events` sees one `job` line with `change: "reason"` for each of those jobs,
+and the same at the resume. The pause itself is not a job, so it has no event of
+its own; a reader that must know the pause reads `qex pause --json`.
 
 ## A pipeline of stages
 
