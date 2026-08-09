@@ -129,7 +129,24 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
 
         match job::read_status(&dir) {
             Ok(status) if status.state.is_terminal() => {
-                job.status = status;
+                job.status = status.clone();
+
+                // Run the hook here as well.
+                //
+                // The supervisor writes the terminal record and then runs the
+                // hook. A signal in the moment between those two steps leaves a
+                // job with a correct result and no notification. This call
+                // closes that moment. It costs nothing when the supervisor did
+                // its work: the claim file stops the second run.
+                //
+                // NO TEST HOLDS THIS LINE, and none can. It covers a window of
+                // a few microseconds inside another process, and a test cannot
+                // put a signal there. A hand deletion of it leaves the whole
+                // suite green — measured, after the tests that hold the two
+                // calls in the supervisor were written. Do not read that green
+                // as "this line does nothing": read it as "the fault that this
+                // line stops is one that a test cannot make happen".
+                crate::hook::fire_detached(&dir, &status);
             }
             other => {
                 // The supervisor stopped before it wrote a result. Something
@@ -173,6 +190,11 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 let status = job.status.clone();
                 job::write_status(&dir, &status).ok();
                 log(&format!("the supervisor of the job {id} left no result"));
+
+                // The supervisor of this job stopped before it could run the
+                // hook, so the coordinator runs it. The claim file stops a
+                // second run if the supervisor already started one.
+                crate::hook::fire_detached(&dir, &status);
             }
         }
     }
@@ -437,6 +459,19 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             status.error = Some(message);
             status.blocked_reason = None;
             job::write_status(&dir, &status)?;
+
+            // Leave the cgroup of the job before the hook runs.
+            //
+            // This process put itself in that cgroup for the job, and the job
+            // never started. The hook is not the job, so it must not receive
+            // the memory limit of the job. Without this step, a hook in a
+            // `hard` mode cgroup meets a limit that belongs to other work.
+            if let Some(cgroup) = crate::enforce::job_cgroup_path(&dir) {
+                crate::enforce::leave_cgroup(&cgroup);
+                crate::enforce::remove_cgroup(&cgroup);
+            }
+
+            crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
             return Ok(1);
         }
     };
@@ -718,6 +753,21 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // Keep the measurement, so the next job of this command gets an accurate
     // claim with no effort from the agent.
     crate::usage::record(&spec, &status);
+
+    // Tell the person that the job stopped.
+    //
+    // THE SUPERVISOR RUNS THE HOOK, and it runs it here, at the end.
+    //
+    // The supervisor is the process that knows the result first, and it exists
+    // for each job that ran. The coordinator can stop and start again while a
+    // job runs, so a coordinator that ran the hook would miss the jobs of the
+    // period in which it did not operate.
+    //
+    // The record on the disk already says that the job stopped, so this process
+    // holds nothing now: `qex wait` gives its answer, the budget is free, and
+    // the next job starts. A hook that hangs thus makes this process live
+    // longer and does no other damage.
+    crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
 
     Ok(code.unwrap_or(0))
 }
