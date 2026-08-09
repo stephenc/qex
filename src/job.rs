@@ -98,39 +98,6 @@ impl JobState {
     ];
 }
 
-/// Gives the place of one state in [`JobState::ALL`].
-///
-/// THIS FUNCTION EXISTS TO STOP THE BUILD. The match is exhaustive, so a new
-/// variant of `JobState` fails to compile here until somebody gives it a place,
-/// and the test `the_list_of_every_state_is_complete` then fails until `ALL`
-/// holds it at that place. A list that a person keeps by hand cannot go out of
-/// date when the compiler keeps it.
-const fn place_in_all(state: JobState) -> usize {
-    match state {
-        JobState::Queued => 0,
-        JobState::Starting => 1,
-        JobState::Running => 2,
-        JobState::Completed => 3,
-        JobState::Failed => 4,
-        JobState::Killed => 5,
-        JobState::Timeout => 6,
-        JobState::Expired => 7,
-        JobState::Oom => 8,
-        JobState::Cancelled => 9,
-        JobState::Skipped => 10,
-    }
-}
-
-/// Proves, WHEN THE PROGRAM IS BUILT, that `ALL` and `place_in_all` agree at
-/// the end of the list.
-///
-/// A new variant of `JobState` stops the build in `place_in_all`. Whoever adds
-/// it there must give it a number, and a number that is not the next one makes
-/// this line fail. The test `the_list_of_every_state_is_complete` covers each
-/// place between; this line covers the length, and it does it in every build
-/// and not in a test build alone.
-const _: () = assert!(place_in_all(JobState::Skipped) + 1 == JobState::ALL.len());
-
 impl std::fmt::Display for JobState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -152,15 +119,21 @@ impl std::str::FromStr for JobState {
             "oom" => Ok(Self::Oom),
             "cancelled" | "canceled" => Ok(Self::Cancelled),
             "skipped" => Ok(Self::Skipped),
-            // `skipped` AND `expired` belong in this list. A reader who took
-            // the list as complete, and then wrote one of them, met "unknown
-            // job state" for a state that qex uses and shows. A rebase dropped
-            // `skipped` here in silence, because the two changes wrote the same
-            // line; the list and the arms above it must always agree.
+            // THE LIST BELOW COMES FROM `ALL`, AND NOBODY WRITES IT BY HAND.
+            //
+            // It was written by hand, and a rebase dropped `skipped` from it in
+            // silence, because two changes wrote the same line. A reader who
+            // took the list as complete, and then wrote `skipped`, met "unknown
+            // job state" for a state that qex uses and shows. `ALL` cannot go
+            // out of date: `place_in_all` stops the build when somebody adds a
+            // variant without giving it a place.
             other => Err(format!(
-                "unknown job state `{other}`. Use one of these states: queued, starting, \
-                 running, completed, failed, killed, timeout, expired, oom, cancelled, \
-                 skipped"
+                "unknown job state `{other}`. Use one of these states: {}",
+                Self::ALL
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )),
         }
     }
@@ -649,6 +622,40 @@ pub fn write_spec(dir: &Path, spec: &JobSpec) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Gives the place of one state in [`JobState::ALL`].
+    ///
+    /// Gives the place of one state in [`JobState::ALL`].
+    ///
+    /// THIS FUNCTION EXISTS TO STOP THE BUILD. The match is exhaustive, so a
+    /// new variant of `JobState` fails to compile here until somebody gives it
+    /// a place, and the test below then fails until `ALL` holds it at that
+    /// place. A list that a person keeps by hand goes out of date; a list that
+    /// the compiler keeps cannot.
+    ///
+    /// It lives in the tests, and not beside `ALL`, because the program itself
+    /// has no use for it: a build of the program alone would then carry a
+    /// function that nothing calls. The tests build on every change and in CI,
+    /// so the guard holds.
+    const fn place_in_all(state: JobState) -> usize {
+        match state {
+            JobState::Queued => 0,
+            JobState::Starting => 1,
+            JobState::Running => 2,
+            JobState::Completed => 3,
+            JobState::Failed => 4,
+            JobState::Killed => 5,
+            JobState::Timeout => 6,
+            JobState::Expired => 7,
+            JobState::Oom => 8,
+            JobState::Cancelled => 9,
+            JobState::Skipped => 10,
+        }
+    }
+
+    /// `ALL` and `place_in_all` must agree at the end of the list. This line
+    /// fails when the program is COMPILED, and not when a test runs.
+    const _: () = assert!(place_in_all(JobState::Skipped) + 1 == JobState::ALL.len());
 
     /// `JobState::ALL` must name every state, each one time, in its place.
     ///
