@@ -5821,6 +5821,9 @@ fn every_option_of_a_fan_out_reaches_every_job() {
     let input = h.root.join("inputs.txt");
     std::fs::write(&input, "alpha\nbeta\n").unwrap();
 
+    let work = h.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
     let out = h.qex(&[
         "submit",
         "--each-line",
@@ -5831,6 +5834,18 @@ fn every_option_of_a_fan_out_reaches_every_job() {
         "20m",
         "--nice",
         "7",
+        "--cwd",
+        work.to_str().unwrap(),
+        "--timeout",
+        "99s",
+        "--priority",
+        "5",
+        "--env",
+        "FOO=bar",
+        "--lock",
+        "db",
+        "--retries",
+        "2",
         // Both halves of the claim, because qex writes the claim into the
         // environment of the job only when the USER chose both. Without them,
         // the test of `--no-limit-env-hints` below proves nothing.
@@ -5884,6 +5899,20 @@ fn every_option_of_a_fan_out_reaches_every_job() {
             serde_json::json!(["batch"]),
             "the tag must reach the job {id}"
         );
+        // Measured by hand-deletion: each of the six below could go away from
+        // `submit_each_line` with the whole suite green. A fan-out then ran in
+        // the wrong directory, with no time limit, at priority 0, with no
+        // variable of the user, with no lock and with no retry.
+        assert_eq!(
+            spec["cwd"].as_str(),
+            work.canonicalize().unwrap().to_str(),
+            "the job {id} must run in the directory that the user gave"
+        );
+        assert_eq!(spec["timeout"], serde_json::json!(99), "job {id}");
+        assert_eq!(spec["priority"], serde_json::json!(5), "job {id}");
+        assert_eq!(spec["env"]["FOO"], serde_json::json!("bar"), "job {id}");
+        assert_eq!(spec["locks"], serde_json::json!(["db"]), "job {id}");
+        assert_eq!(spec["retries"], serde_json::json!(2), "job {id}");
         // The template, and NOT the command of the line. This is what makes
         // the whole fan-out give one measurement record.
         assert_eq!(
@@ -5995,6 +6024,14 @@ fn a_fan_out_refuses_the_options_that_hold_a_meaning_for_one_job() {
         assert!(
             err.contains(must_say),
             "the error must say why, and what to do: {err}"
+        );
+        // The message must WRAP. A single-line literal with the indentation of
+        // the source baked into it gives a run of 13 spaces where each line
+        // break belongs, and `contains` does not see that at all. A message
+        // indents an example by 4, so 6 separates the two.
+        assert!(
+            !err.contains("      "),
+            "the message holds the indentation of the source in place of a              line break: {err:?}"
         );
         // ANTI-VACUITY: the refusal must come BEFORE the coordinator, so no
         // job of the fan-out reaches the queue. A message with jobs behind it

@@ -681,6 +681,12 @@ no question, because an agent cannot answer one. Raise it when you need to:
 qex submit --each-line big.txt --max-jobs 5000 -- ./process {}
 ```
 
+A fan-out submits the jobs **one at a time**, so the command takes time in
+proportion to the number of lines: 300 jobs took 4.9 s on this machine, and it
+wrote 301 lines to stderr. A `--max-jobs 100000` fan-out therefore holds your
+terminal for about half an hour. Submit a large fan-out in the background, or
+divide it.
+
 qex also reads **64 MiB** at most, from a file and from a pipe. qex holds the
 whole input in memory, because it makes every job before it submits the first
 one, so an input larger than this gives an error and no job. `--max-jobs` does
@@ -710,7 +716,10 @@ process-02-data-b.csv
 
 The position comes before the line and it has the same width for every job, so
 the names sort in the order of the file and two long lines never give one name.
-Give `--name` to change the first part and the name of the group.
+Give `--name` to change the first part and the name of the group. Without
+`--name`, the name of the group is the name of the input file with no
+extension, so two fan-outs of `inputs.txt` in two directories share one group
+NAME. Their group **ids** stay different, so use the id in a script.
 
 A name holds the letters, the numbers, `.`, `_` and `-` only. A line can hold a
 terminal control sequence, and a name goes to your terminal in `qex list`.

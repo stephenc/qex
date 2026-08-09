@@ -179,7 +179,12 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
     // this project exists to prevent.
     if args.dedupe_key.is_some() || args.dedupe_window.is_some() {
         bail!(
-            "`qex submit --each-line` does not accept `--dedupe-key` or `--dedupe-window`.\n\n             A key holds one job. Every job of a fan-out would carry the same key, so qex              would start the first line only and give you the id of that job for every              other line.\n\n             To run a fan-out one time only, put the key on a job that guards it:\n\n             \x20   qex submit --dedupe-key nightly -- ./fan-out.sh"
+            "`qex submit --each-line` does not accept `--dedupe-key` or `--dedupe-window`.\n\n\
+             A key holds one job. Every job of a fan-out would carry the same key, so qex \
+             would start the first line only and give you the id of that job for every \
+             other line.\n\n\
+             To run a fan-out one time only, put the key on a job that guards it:\n\n\
+             \x20   qex submit --dedupe-key nightly -- ./fan-out.sh"
         );
     }
 
@@ -188,7 +193,11 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
     // shape, and `--id-file NAME.json` already gives it.
     if args.json {
         bail!(
-            "`qex submit --each-line` does not accept `--json`.\n\n             That option writes the id of ONE job, and a fan-out makes a group and one job              for each line.\n\n             Use an id file with the name `.json`. It holds the group and every job:\n\n             \x20   qex submit --each-line inputs.txt --id-file jobs.json -- ./process {{}}"
+            "`qex submit --each-line` does not accept `--json`.\n\n\
+             That option writes the id of ONE job, and a fan-out makes a group and one job \
+             for each line.\n\n\
+             Use an id file with the name `.json`. It holds the group and every job:\n\n\
+             \x20   qex submit --each-line inputs.txt --id-file jobs.json -- ./process {{}}"
         );
     }
 
