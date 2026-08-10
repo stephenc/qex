@@ -1,5 +1,11 @@
 # qex — Queued EXecutor
 
+[![CI on main](https://img.shields.io/github/actions/workflow/status/stephenc/qex/ci.yml?branch=main&label=CI)](https://github.com/stephenc/qex/actions/workflows/ci.yml?query=branch%3Amain)
+[![Latest release](https://img.shields.io/github/v/release/stephenc/qex?label=release)](https://github.com/stephenc/qex/releases/latest)
+[![Version on crates.io](https://img.shields.io/crates/v/qex)](https://crates.io/crates/qex)
+[![Earliest Rust that qex needs](https://img.shields.io/crates/msrv/qex)](https://crates.io/crates/qex)
+[![Licence: Apache 2.0](https://img.shields.io/crates/l/qex)](LICENSE)
+
 qex is a job queue for long tasks on one machine. It controls the number of
 cores and the quantity of memory that the jobs use together.
 
