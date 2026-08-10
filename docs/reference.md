@@ -625,7 +625,7 @@ qex version --check --json   # the same answer for a program
 | --- | --- |
 | Exit code 0 | The answer arrived, whatever it says. A newer release is information, not a fault. |
 | Exit code 1 | qex could not ask. The message says why, and nothing changed. |
-| `--json` | The answer of `qex version`, with an `update` object added: `newest`, `newer`, `development`, `source`, `error`. |
+| `--json` | The answer of `qex version`, with an `update` object added: `version`, `newest`, `newer`, `development`, `source`, `error`. |
 
 **The coordinator asks, and your command never does.** A check must not delay a
 command and must not fail one, so the network stays out of the path of a
@@ -651,9 +651,11 @@ timeout = "5s"
 file, no message, for ever. `qex version --check` still asks, because a person
 asked it to.
 
-qex runs `curl`, and then `wget`. An HTTP client inside qex would bring a TLS
-stack to a tool with nine dependencies, and both programs are on Linux and
-macOS already; a machine with neither gets a message that says so. `url` takes
+qex runs `curl`, and `wget` where the machine has no curl. An HTTP client
+inside qex would bring a TLS stack to a tool with nine dependencies, and both
+programs are on Linux and macOS already; a machine with neither gets a message
+that says so. A curl that exists and fails is the answer: qex does not ask the
+same service again with the other program. `url` takes
 a mirror, and every answer names the service that gave it.
 
 **A development build is neither new nor old.** A build from a working copy

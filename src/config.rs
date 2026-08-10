@@ -1448,8 +1448,17 @@ impl Config {
                 )
             })?;
         }
-        crate::units::parse_duration(self.update.timeout.trim())
-            .map_err(|e| anyhow::anyhow!("config [update] timeout: {e}"))?;
+        match crate::units::parse_duration(self.update.timeout.trim()) {
+            // `0` means "no limit" for a job, and a check with no limit is a
+            // command that waits for ever. It takes a number here.
+            Ok(None) => anyhow::bail!(
+                "config [update] timeout must be a time above zero, such as `5s`. A check \
+                 with no limit waits for ever. Use `[update] check = \"never\"` to stop the \
+                 check itself."
+            ),
+            Ok(Some(_)) => {}
+            Err(e) => anyhow::bail!("config [update] timeout: {e}"),
+        }
         let url = self.update.url.trim();
         if !url.is_empty() && !crate::update::is_an_address(url) {
             anyhow::bail!(

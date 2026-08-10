@@ -4,22 +4,31 @@
 //!
 //! THE COORDINATOR ASKS. THE CLI READS A FILE.
 //!
-//! A check must never delay a command and must never fail one. The one way to
-//! keep both rules absolutely is to take the network out of the path of a
-//! command: the coordinator already lives across commands, so it asks on its
-//! own time, in its own thread, and a `qex submit` waits for the queue and for
-//! nothing else. One call also serves every agent on the machine, which is the
-//! property that this queue exists for.
+//! A command must never wait for a web service, and must never fail because of
+//! one. The way to keep both rules absolutely is to take the network out of
+//! the path of a command: the coordinator already lives across commands, so it
+//! asks on its own time, in its own thread, and a `qex submit` waits for the
+//! queue and for nothing else. One call also serves every agent on the
+//! machine, which is the property that this queue exists for.
+//!
+//! A command reads one small file, and it waits for the lock of that file for
+//! two seconds at the most, one time for each release. It never waits for the
+//! network, and it never fails for this: a lock that it cannot take leaves the
+//! line for the next command.
 //!
 //! `qex version --check` is the one exception. A person asked for an answer
 //! now, so that command asks now.
 //!
 //! # How qex asks
 //!
-//! It runs `curl`, and then `wget`. qex holds nine dependencies and an HTTP
-//! client would bring a TLS stack; both of these programs are on Linux and on
-//! macOS already. A machine with neither gets the message that says so, and
-//! nothing else changes.
+//! It runs `curl`, and `wget` where the machine has no curl. qex holds nine
+//! dependencies and an HTTP client would bring a TLS stack; both of these
+//! programs are on Linux and on macOS already. A machine with neither gets the
+//! message that says so, and nothing else changes.
+//!
+//! A curl that EXISTS AND FAILS is the answer. qex does not ask again with
+//! wget: the second question costs the reader a second wait, and it asks the
+//! same service the same thing.
 //!
 //! # What qex never does
 //!
@@ -139,8 +148,9 @@ fn with_the_record_in(dir: &std::path::Path, change: impl FnOnce(&mut Record)) -
         }
         let e = std::io::Error::last_os_error();
         // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal
-        // arrives, and qex catches SIGINT and SIGTERM in every command that
-        // waits, so this is an ordinary event and not a fault.
+        // arrives — a stop hook that ends gives SIGCHLD, and a command that
+        // waits for a job catches SIGINT and SIGTERM — so this is an ordinary
+        // event and not a fault.
         let busy = e.kind() == std::io::ErrorKind::WouldBlock;
         if (busy || e.kind() == std::io::ErrorKind::Interrupted)
             && std::time::Instant::now() < give_up
@@ -194,6 +204,8 @@ pub fn ask(cfg: &Config) -> Result<Answer> {
              that asks."
         );
     }
+    // `Config::validate` refuses a limit of zero, so this default covers a
+    // caller that did not validate and never a file that a person wrote.
     let limit = parse_duration(&cfg.update.timeout)
         .map_err(|e| anyhow::anyhow!("[update] timeout: {e}"))?
         .unwrap_or(Duration::from_secs(5));
@@ -213,6 +225,11 @@ pub fn ask(cfg: &Config) -> Result<Answer> {
 /// with no limit reached 8.3GB of memory in 5 seconds against a service that
 /// floods, IN THE PROCESS WHOSE PURPOSE IS TO STOP AN OUT-OF-MEMORY KILL.
 const MOST_BYTES: usize = 256 * 1024;
+
+/// The most that qex keeps of what a program says about a fault.
+///
+/// It keeps the END of that text, because the reason comes last.
+const MOST_WORDS: usize = 2 * 1024;
 
 /// The schemes that `[update] url` may hold.
 ///
@@ -253,8 +270,9 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
             vec![
                 "-fsSL".into(),
                 "--max-time".into(),
-                // Round UP, and never to zero. A limit of 500ms would give
-                // curl `--max-time 0`, which means NO limit.
+                // Round UP, and never to zero. A limit below one second would
+                // give curl `--max-time 0`, which means NO limit. The limit of
+                // qex stays exact; this one is the coarse backstop.
                 limit.as_secs_f64().ceil().max(1.0).to_string(),
                 "--max-filesize".into(),
                 MOST_BYTES.to_string(),
@@ -289,15 +307,28 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        // GIVE THE PROGRAM ITS OWN GROUP, so that a stop reaches every
-        // process of it. qex does the same for a job, and for the same
-        // reason: a program that starts another program leaves that other one
-        // behind when a signal names one process. Measured with a shell that
-        // starts `sleep`: four processes stayed with pid 1 as their parent.
+        // GIVE THE PROGRAM ITS OWN GROUP, so that a stop reaches every process
+        // of it. qex does the same for a job, and for the same reason: a
+        // program that starts another program leaves that other one behind
+        // when a signal names one process. Measured with a shell that starts
+        // `sleep`: four processes stayed with pid 1 as their parent.
+        //
+        // A GROUP OF ITS OWN ALSO TAKES IT OUT OF THE GROUP OF QEX, so a
+        // Ctrl-C at a terminal no longer reaches it, and a coordinator that
+        // stops leaves it with pid 1 as its parent. On Linux the kernel closes
+        // that hole: PR_SET_PDEATHSIG asks for a signal when the thread that
+        // started this program ends. A program with no time limit of its own —
+        // the `wget` of busybox takes none that it can obey — would otherwise
+        // run for ever after qex is gone.
+        //
+        // macOS has no equivalent, so there the bound holds while qex lives.
+        // `curl` carries `--max-time` in either case.
         unsafe {
             use std::os::unix::process::CommandExt;
             command.pre_exec(|| {
                 libc::setpgid(0, 0);
+                #[cfg(target_os = "linux")]
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
                 Ok(())
             });
         }
@@ -326,10 +357,35 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
         let mut said = child.stderr.take();
         let (sender, complaints) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut text = Vec::new();
+            // KEEP THE END, AND NEVER STOP READING.
+            //
+            // The reason that a program gives comes LAST: `curl` writes its
+            // progress and then the fault. A reader that keeps the first 8KB
+            // gives back 8KB of noise with the answer cut off it.
+            //
+            // A reader that STOPS at 8KB is worse still. The program then
+            // writes into a pipe that nobody reads, takes a SIGPIPE, and dies
+            // of that in place of its own fault: an exit code of 7 became -1,
+            // and the message that named the cause never arrived.
+            let mut tail: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
             if let Some(handle) = said.as_mut() {
-                handle.take(8 * 1024).read_to_end(&mut text).ok();
+                // READ TO THE END, and keep the tail only. A reader that
+                // stops early leaves the program writing into a pipe that
+                // nobody empties, and the last line — the one that names the
+                // fault — never arrives. The end always comes: the program
+                // closes this stream when it stops, and qex stops it.
+                let mut buffer = [0u8; 4096];
+                while let Ok(n) = handle.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    tail.extend(&buffer[..n]);
+                    while tail.len() > MOST_WORDS {
+                        tail.pop_front();
+                    }
+                }
             }
+            let text: Vec<u8> = tail.into_iter().collect();
             sender
                 .send(String::from_utf8_lossy(&text).trim().to_string())
                 .ok();
@@ -468,9 +524,14 @@ enum Stop {
 
 /// Stops a program and every process that it started.
 ///
-/// The program is the leader of its own group, so one signal to the group
-/// reaches the program and its children. A signal to the program alone leaves
-/// a child of it with pid 1 as its parent, and that child runs for ever.
+/// qex asked for the program to lead a group of its own, so one signal to that
+/// group reaches the program and every process that it started.
+///
+/// The call that makes the group can fail, and this code cannot see that: it
+/// happens in the program between the fork and the exec. The signal to the
+/// group then reaches nothing, so the caller sends one to the PROGRAM as well.
+/// A child of a program that never made its group is the one case that stays,
+/// and it is the case that this function cannot reach.
 fn stop_the_group(child: &std::process::Child) {
     let pid = child.id() as i32;
     if pid > 1 {
@@ -482,9 +543,14 @@ fn stop_the_group(child: &std::process::Child) {
 
 /// Waits for a program to stop, and gives up after a short time.
 ///
-/// A program that took a signal ends at once. One that ignores a signal must
-/// not hold this command: qex gives it a second signal and stops waiting, so
-/// the caller always returns.
+/// A program that took a signal ends at once. One that ignores a signal takes
+/// the signal that no program can ignore.
+///
+/// The wait after THAT signal has no limit, and it cannot have one: a process
+/// that the system holds in a read of a file system that stopped answering is
+/// not reaped by any signal, and a caller that gave up would leave a zombie
+/// and a handle with no owner. That case needs the file system, and no limit
+/// here reaches it.
 fn wait_briefly(
     child: &mut std::process::Child,
     limit: Duration,
@@ -722,6 +788,16 @@ impl Report {
                  Take it from https://github.com/stephenc/qex/releases/latest , or run \
                  `cargo install qex`.\n\
                  qex installs nothing by itself."
+            );
+        }
+        // qex ORDERS RELEASES BY THEIR NUMBERS. A service that answers with
+        // something else — a name, a tag with letters, bytes that are not text
+        // — gives a version that has no place in that order, and qex must not
+        // call this build the newest on the strength of it.
+        if numbers_of(&newest).is_none() {
+            return format!(
+                "The service named `{newest}`, from {source}. That is not a release number of \
+                 the form X.Y.Z, so qex cannot say whether it is newer than this build."
             );
         }
         format!("This is the newest release. The newest is {newest}, from {source}.")
@@ -995,6 +1071,53 @@ mod tests {
         cfg.update.url = "-K/tmp/curlrc".into();
         let e = format!("{:#}", ask(&cfg).expect_err("qex must refuse this"));
         assert!(e.contains("must start with"), "got: {e}");
+    }
+
+    /// A service that never answers stops at the limit of the reader.
+    ///
+    /// THIS TEST IS THE WHOLE OF THE TIME LIMIT. A deadline that qex tested
+    /// before a BLOCKING read gave no limit at all, and every test passed: a
+    /// deadline made 1000 times longer still passed all of them. The test uses
+    /// a FIFO, which nothing writes, so the real `curl` waits for ever — and
+    /// `--max-time` of curl does NOT cover a read of `file://`, so the limit
+    /// under test here is the limit of qex and no other.
+    #[test]
+    fn a_service_that_never_answers_stops_at_the_limit() {
+        let dir = a_directory("slow");
+        let pipe = dir.join("pipe");
+        let name = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            // A file system with no FIFO gives no verdict.
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+
+        let mut cfg = Config::default();
+        cfg.update.url = format!("file://{}", pipe.display());
+        cfg.update.timeout = "2s".into();
+
+        // Ask on a thread, so that a limit which does NOT hold makes this test
+        // fail at a moment of its own choosing. A test that waits for `ask`
+        // itself hangs for as long as the fault lasts, and a hang says less
+        // than a failure.
+        let (sender, answer) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(ask(&cfg).map(|a| a.newest)).ok();
+        });
+
+        let answer = answer
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the limit of 2 seconds did not hold");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let e = format!(
+            "{:#}",
+            answer.expect_err("a service that never answers is a fault")
+        );
+        assert!(
+            e.contains("did not answer"),
+            "the message must name the limit: {e}"
+        );
     }
 
     /// A service that floods must not fill the memory of the coordinator.
