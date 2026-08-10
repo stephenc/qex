@@ -620,7 +620,7 @@ impl State {
 /// stops.
 #[cfg(unix)]
 fn update_watch(coord: Arc<Coordinator>) {
-    // The FIRST look comes soon, and the ones after it are far apart.
+    // The FIRST look comes soon, and the ones after it follow the interval.
     //
     // The first look of a fresh install asks nothing: it writes the time, and
     // that time starts the interval. A long wait here would start the interval
@@ -629,7 +629,6 @@ fn update_watch(coord: Arc<Coordinator>) {
     let mut step = Duration::from_secs(2);
     loop {
         std::thread::sleep(step);
-        step = Duration::from_secs(60);
         // TAKE THE CONFIGURATION, AND GIVE THE LOCK BACK BEFORE THE ASK.
         // `ask` talks to a web service, and no thread may hold the state of
         // the queue while it waits for one.
@@ -644,6 +643,20 @@ fn update_watch(coord: Arc<Coordinator>) {
             state.cfg.clone()
         };
         crate::update::check_if_due(&cfg);
+
+        // THE STEP FOLLOWS THE INTERVAL. A user who asks for `10s` gets a look
+        // every 10 seconds, and the default of `7d` costs one look each
+        // minute: the limit above holds the cost of the default, and the limit
+        // below holds the cost of a very small interval.
+        //
+        // The step comes from the configuration at EVERY turn, so a change to
+        // the file reaches this thread in the same way as it reaches the rest
+        // of the coordinator.
+        step = crate::update::interval(&cfg)
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_secs(60))
+            .clamp(Duration::from_secs(1), Duration::from_secs(60));
     }
 }
 

@@ -32,6 +32,7 @@ use crate::paths;
 use crate::units::parse_duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 /// The word that turns the check off completely.
@@ -84,6 +85,43 @@ fn write_record(record: &Record) -> Result<()> {
     paths::ensure_dir(&paths::state_dir()?, 0o700)?;
     let bytes = serde_json::to_vec_pretty(record)?;
     crate::job::write_atomic(&path, &bytes, 0o600)
+}
+
+/// Reads the record, changes it, and writes it, with nobody else in between.
+///
+/// TWO WRITERS SHARE THIS FILE. The coordinator writes what a service said,
+/// and a command writes the version that it named to a reader. Each one holds
+/// the WHOLE record, so a write of one can undo a write of the other: a
+/// command that says "0.24.0 exists" while the coordinator waits for the
+/// network would lose that word when the coordinator writes, and a reader
+/// would then meet the same line again.
+///
+/// A lock file makes the three steps one operation. The kernel gives the lock
+/// back when a process stops, so a process that dies here leaves nothing
+/// locked.
+fn with_the_record(change: impl FnOnce(&mut Record)) -> Result<Record> {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = paths::state_dir()?;
+    paths::ensure_dir(&dir, 0o700)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(dir.join("update.lock"))?;
+    let held = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0;
+
+    let mut record = read_record();
+    change(&mut record);
+    let answer = write_record(&record);
+
+    if held {
+        unsafe {
+            libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+    answer.map(|_| record)
 }
 
 /// Gives the time between two checks, and `None` for `never`.
@@ -230,7 +268,7 @@ pub fn check_if_due(cfg: &Config) {
     let Ok(Some(gap)) = interval(cfg) else {
         return;
     };
-    let mut record = read_record();
+    let record = read_record();
     let now = crate::sys::now_secs();
 
     // THE FIRST RUN DOES NOT ASK.
@@ -240,8 +278,7 @@ pub fn check_if_due(cfg: &Config) {
     // are up to date". qex therefore writes the time and stays quiet, and it
     // opens no connection at all until the first interval passes.
     if record.last_checked == 0 {
-        record.last_checked = now;
-        write_record(&record).ok();
+        with_the_record(|r| r.last_checked = now).ok();
         return;
     }
 
@@ -249,20 +286,26 @@ pub fn check_if_due(cfg: &Config) {
         return;
     }
 
-    record.last_checked = now;
-    match ask(cfg) {
-        Ok(answer) => {
-            record.newest = Some(answer.newest);
-            record.source = Some(answer.source);
-            record.error = None;
-        }
-        Err(e) => {
+    // ASK WITH NO LOCK. The service can take seconds, or never answer, and a
+    // command that reads this file must not wait for it.
+    let answer = ask(cfg);
+
+    // Change THIS coordinator's fields, and leave the field that a command
+    // owns. See `with_the_record`.
+    with_the_record(|r| {
+        r.last_checked = now;
+        match &answer {
+            Ok(answer) => {
+                r.newest = Some(answer.newest.clone());
+                r.source = Some(answer.source.clone());
+                r.error = None;
+            }
             // Keep the newest version that qex knows. A service that did not
             // answer today does not remove what it said last week.
-            record.error = Some(format!("{e:#}"));
+            Err(e) => r.error = Some(format!("{e:#}")),
         }
-    }
-    write_record(&record).ok();
+    })
+    .ok();
 }
 
 /// Gives the line that a command writes, and `None` when there is nothing new.
@@ -271,12 +314,28 @@ pub fn check_if_due(cfg: &Config) {
 /// it cannot wait for a service and cannot fail because of one.
 pub fn note_for_a_command(cfg: &Config) -> Option<String> {
     interval(cfg).ok().flatten()?;
-    let mut record = read_record();
-    let line = note(crate::version::VERSION, &record)?;
-    // Keep the version that qex named, so the next command says nothing.
-    record.told.clone_from(&record.newest);
-    write_record(&record).ok();
-    Some(line)
+    // DECIDE WITH NO LOCK AND NO WRITE FIRST.
+    //
+    // This runs at the end of EVERY command, and nearly every time it has
+    // nothing to say. A lock and a write on that path would cost each command
+    // a file operation, and it would make the file exist before the
+    // coordinator ever asked anything.
+    note(crate::version::VERSION, &read_record())?;
+
+    // There is a line to give. Decide again on the record as it stands INSIDE
+    // the lock, and claim the version in the same operation: the coordinator
+    // writes this file as well, and a decision from before its write would
+    // give the same line two times.
+    let mut line = None;
+    with_the_record(|r| {
+        line = note(crate::version::VERSION, r);
+        if line.is_some() {
+            // Keep the version that qex named, so the next command is quiet.
+            r.told.clone_from(&r.newest);
+        }
+    })
+    .ok()?;
+    line
 }
 
 /// The decision behind `note_for_a_command`, with no file and no clock.

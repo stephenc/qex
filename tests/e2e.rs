@@ -209,9 +209,12 @@ impl Harness {
         self.until("the job starts", Duration::from_secs(45), || {
             self.has_started(id)
         });
-        if self.state_of(id) == "running" {
-            self.ok(&["kill", id, "--grace", "1s"]);
-        }
+        // Do not require the kill to succeed. A job can stop by ITSELF between
+        // the test above and this command, and the coordinator then refuses
+        // the kill with "the job has no process". That is a race in the test
+        // and never a fault of the code under test: the purpose here is to
+        // leave no process behind.
+        self.qex(&["kill", id, "--grace", "1s"]);
     }
 
     /// Gives the process id of the coordinator.
@@ -10844,7 +10847,9 @@ fn a_retry_does_not_take_a_lock_that_a_person_holds() {
         count(&log) > after_the_pause
     });
 
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    // The attempt runs `sleep 2; exit 1`, so it can stop by itself before this
+    // command reaches it. `stop` allows that; `ok` would call it a failure.
+    h.stop(&id);
 }
 
 /// A pause record that qex cannot read must HOLD the queue, and say why.
