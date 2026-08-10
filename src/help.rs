@@ -60,649 +60,325 @@ pub const AGENTS: &str = "\
 qex for agents
 ==============
 
-Use qex to run a long task. qex holds the task in a queue, starts it when the
-machine has capacity, and records the result. You can then wait for the result
-with one command.
+qex runs a long task for you. It holds the task in a queue, starts it when the
+machine has capacity, records the result on the disk, and gives you one command
+that waits for it. The record survives your session, your terminal and the
+coordinator itself.
+
+Which command
+-------------
+
+    I WANT                 START THE JOB            ATTACH TO A JOB
+    the output as it       qex run -- CMD           qex status <id> --follow
+    arrives                (= qex submit --follow)
+    the record when the    qex submit --wait        qex status <id> --wait
+    job stops
+    the exit code only     qex submit --wait -q     qex status <id> --wait -q
+                                                    qex wait <id>... for many
+
+Each one gives the exit code of the job. They differ in what they WRITE: the
+output of the job, the record of the job, or nothing.
+
+`--quiet` silences the RECORD and the reason that a job waits, and `--json`
+puts the record on stdout as JSON. NEITHER silences a fault of the wait — a job
+that does not exist, a wait that reached its limit, a wait that a signal stopped
+— because those lines give the id that attaches to the job again, and they go to
+stderr where they cannot mix with JSON.
+
+`--follow` writes the log from its FIRST line, so a job that already stopped
+gives you the whole log. Use `qex logs <id> --tail` or `qex status <id> --wait`
+for such a job.
+
+USE `qex submit --wait` FOR YOUR LONG WORK:
+
+    qex submit --wait --cpu 2 --mem 4GB --id-file train.id -- uv run train.py
+
+- One command. `qex submit` and then a wait is two, and the second is a thing to
+  forget: a job that nobody waits for still runs, and nobody reads the result.
+- Your harness waits, because the command waits. Run it as a background command
+  of your harness: the harness reports the end, so you need no timer and no
+  second command.
+- The output goes to the log file, so a job of two hours does not fill your
+  context. The command ends with the RECORD: the state, the exit code, the
+  resources, and the last lines of both streams.
+- `--id-file` reaches the disk BEFORE the wait, so any interruption still leaves
+  you a handle: `qex status $(cat train.id) --wait`.
+
+EVERY SUBMISSION JOINS A WAIT OR GETS ITS OWN. With `--wait` that is automatic.
+
+`qex run` writes the output of the job to your terminal as it arrives, which is
+right for a short task that you watch, and wrong for a long one that fills your
+context. Ctrl-C and SIGTERM on `qex run` stop the JOB. Every other command in
+the table watches the job and never stops it: Ctrl-C there gives 122, and the
+job continues.
+
+With `--wait` and with `--follow`, the id goes to STDERR, because stdout carries
+the result. Read it there, or use `--id-file`.
+
+Exit codes
+----------
+
+    0 to 96     THE JOB. The exit code of the job, unchanged.
+    97 to 127   QEX. The queue or the wait, never the job.
+      97        the job gave a code from 97 to 255. Read the record for it.
+      98        a signal stopped the job, and qex did not attribute it to a
+                stop. A kill from anywhere gives 125 instead.
+      99        the kernel stopped the job for memory. See the note below:
+                qex must be able to prove it.
+      100       the job has not stopped, so there is no result.
+      121       qex could not do what you asked. No job ran.
+      122       your wait stopped, and the job did not. Attach to it again.
+      123       the job gave up in the queue. It reached `--max-queue-time`.
+      124       your wait reached its time limit. The job continues.
+      125       something stopped the job: a kill, a cancel or a time limit
+      126       a job that this job needed did not succeed
+      127       there is no job with that id
+    128 and up  QEX ITSELF died from a signal. The job is not described, and it
+                can still operate. Attach to it again.
+
+THE CODE ANSWERS PASS OR FAIL. THE RECORD ANSWERS WHY. Read `qex status` when
+you act on the difference between \"the job failed\" and \"my wait stopped\".
+A code from 125 does NOT say that your work failed: another agent on this
+machine can stop your job, so read the line on stderr before you run it again.
+
+`qex list`, `qex logs` and the other commands never speak for a job, so they use
+0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the reason for
+the band.
+
+If qex cannot start at all
+--------------------------
+
+Some harnesses run each command in a SANDBOX, and a sandbox can refuse the Unix
+socket that qex needs. qex then says so, and it names the directory.
+
+You cannot correct that yourself: the permissions belong to the person who
+starts you. Give them this page, and stop:
+
+    https://github.com/stephenc/qex/blob/main/docs/sandbox.md
 
 Do not write a monitor script
 -----------------------------
 
-Every monitor that you write waits for a PROXY: a pattern in the process list, a
-line in a log file, a file that appears. A proxy can become permanently false,
-and nothing tells the monitor. It then waits for ever.
+Every monitor waits for a PROXY: a pattern in the process list, a line in a log,
+a file that appears. A proxy can become permanently false, and nothing tells the
+monitor. It then waits for ever.
 
-Four monitors were measured on one machine in one day, and together they slept
-for 95 hours. Not one of the conditions could ever become true. Three of them:
+    while pgrep -f solve.py; do sleep 60; done
+        The command line of this shell holds those letters, so the pattern
+        matches the monitor itself. The count never reaches zero.
 
-    while pgrep -f \"solve.py\"; do sleep 60; done
-        The command line of this shell holds the letters `solve.py`, so the
-        pattern matches the monitor itself. The task stops, one process stays,
-        and the count never reaches zero.
+    until grep -q DONE run.log; do sleep 60; done
+        Correct, until somebody stops the task that writes that line.
 
-    until grep -q \"DONE\" run.log; do sleep 60; done
-        Correct, until somebody stopped the task that writes that line. The
-        marker will never arrive now.
+    while true; do [ $(ps -Ao args | grep -c solver) -eq 0 ] && break
+                   sleep 300; done
+        A COUNT, and not a test of one process. On a machine that two agents
+        share, the work of the other agent holds it above zero for ever.
 
-    until grep -q \"READY\" ~/other.log; do sleep 60; done
-        That file was never made. This monitor slept for 41 hours.
+The last two hold no pattern fault. They are careful commands, and the fault is
+the proxy: evidence of the work stops when the work stops, in a way that the
+monitor cannot see.
 
-A different user found this one later, on a machine that two agents shared. It
-had slept for 63 hours:
+qex waits for the PROCESS. It is the parent of your task and it uses `waitpid`
+on that exact process, so an answer always arrives. To find the coordinator, use
+`qex info`, which asks the coordinator. Never search the process list for it.
 
-    while true; do M=$(ps -Ao args | grep -c solver)
-                   K=$(ssh other-host 'ps -Ao args | grep -c solver')
-                   [ $M -eq 0 ] && [ $K -eq 0 ] && break; sleep 300; done
-        A COUNT, and not a test of one process. This monitor waits until nothing
-        matches. On a machine that two agents share, that condition is not
-        satisfiable: the work of the other agent holds the count above zero for
-        ever. The work of this author finished two days before, and the
-        monitor opened about 750 connections to the other machine while it
-        waited.
-
-The last three hold NO PATTERN FAULT. They are careful commands. The fault is
-the proxy: a log line is evidence of the work, and evidence stops when the work
-stops, in a way that the monitor cannot see. The last one is the most dangerous,
-because a careful author writes it: on a machine that two agents share, \"wait
-until nothing matches\" can never become true.
-
-qex waits for the process, and not for a proxy of the process. qex is the parent
-of your task and it uses `waitpid` on that exact process. A process ends or it
-does not, and no third condition exists. `qex wait` thus always gives an answer:
-
-    the job succeeded            -> 0
-    the job failed               -> 1
-    the job never started, and it
-    had a `--max-queue-time`     -> 123
-    somebody stopped the job     -> 125
-    a job before it failed       -> 126
-
-A task that somebody stops gives the code 125 at that moment. A monitor that
-watches a log file would still be waiting.
-
-The same fault applies to every search of the process list. `pgrep -f qex` also
-matches the shell command that holds those letters. To find the coordinator, use
-`qex info`, which gives the process id from the coordinator itself.
-
-    qex watchers
-
-That command finds the monitors of this kind on your machine. It removes its own
-process and the processes that started it before it reports anything, so it
-never finds itself. A user who looked for this fault with `pgrep -f pgrep` found
-the search, and that was the fourth time in one day that the fault appeared.
-
-When to use `qex run`
----------------------
-
-    qex run -- make test
-
-Use `qex run` for work that is SHORT AND HEAVY and that you wait for now: a test
-suite, a release build, a data conversion. The job goes in the queue, so it
-starts when the machine has room, and the other people and agents on this
-machine keep the capacity that they claimed. The output arrives as it happens,
-on the same two streams, and the exit code is the exit code of the job, or 125
-when something stopped the job. Nothing else in your script changes.
-
-WHAT YOU GIVE UP. `qex run` ties the job to this command, but only for the stops
-that it can catch:
-
-    Ctrl-C stops the job, and not this command only.
-    A SIGTERM on this command stops the job too.
-    A SIGKILL does NOT stop the job, and neither does the hangup of
-    a terminal that closes. The job continues, and `qex list` finds it.
-
-A job that operates receives a SIGTERM. A job that still waits in the queue
-leaves the queue instead, because a job with no process cannot receive a signal.
-
-That is correct for work that you are waiting for, and it is WRONG for work that
-lives longer than your attention. `qex submit` gives the job a life of its own:
-it continues when your session stops, and a later session reaches it with the
-id.
-
-    short, and you wait for it now    ->  qex run -- ...
-    long, or you come back to it      ->  qex submit, then qex status <id> --wait
-
-When something stops the job, `qex run` gives 125 and not 1. Another agent on
-this machine can run `qex kill` or `qex cancel` on your job, because a job of
-`qex run` is a job like any other. The code 125 says that something stopped the
-job before it could finish, and it does not say that your work failed. Do not
-start the work again before you read the line on stderr. Run
-`qex help exit-codes` for the full table.
-
-A job that a dedupe key gave you is the one exception. This command did not
-start that job, so Ctrl-C stops this wait only, and the job continues. `qex run`
-then gives 124, which says that YOUR WAIT ended. Read the section on the key
-below.
-
-The three commands you need
----------------------------
-
-    ID=$(qex submit --cpu 2 --mem 4GB -- uv run train.py)
-    qex wait $ID
-    qex logs $ID
-
-Many jobs at one time: read the stream
---------------------------------------
-
-    qex events --json
-
-That command writes one JSON object on one line for each change of state, as it
-happens. Read it in place of a loop that asks about each job. Twenty jobs give
-one stream, and you learn of each result at the moment of the result.
-
-Keep the `seq` number of the last line that you read. Give it to
-`--since` when your program starts again, and you lose nothing:
-
-    qex events --json --since 348
-
-Run `qex help events` for the lines, the numbers and the gaps.
-
-If you operate inside a harness
--------------------------------
-
-`qex wait` blocks. Your harness, and not qex, tells you when a background
-command ends. Put the two together:
-
-    ID=$(qex submit -- make test)      # gives the id at once
-    qex status $ID --wait              # run THIS in the background of your harness
-
-qex watches the process correctly, and your harness reports the end of the
-command. You thus need no timer and no second command.
-
-Use `qex status --wait` and not `qex wait` for this. It blocks in the same way
-and it gives the same exit code, and its output also holds the state, the exit
-code and the last lines of the error output. One command gives everything.
-
-`qex submit` writes the job UUID to stdout and writes nothing else. You can
-thus put the UUID in a shell variable.
-
-A shell variable does not last between your commands. Use `--id-file` to keep
-the id in a file:
-
-    qex submit --id-file build.id -- make
-    qex status \"$(cat build.id)\" --wait
-
-PUT THE ID FILE WHERE IT LASTS LONGER THAN YOUR SESSION. Your project directory
-or your home directory is correct. A scratch directory that your harness owns is
-NOT correct, and neither is /tmp: the job continues when your session stops, but
-the file goes with the session, and you then have no handle for a job that still
-operates. qex gives a warning when the file goes to such a directory.
-
-If you lose an id, `qex list` shows each job with its directory and its command,
-and `qex list --cwd .` shows the jobs of this directory only.
+    qex watchers    find the monitors of this kind on this machine
 
 Your session can stop, and the work continues
 ---------------------------------------------
 
-THIS IS THE PROPERTY THAT MAKES qex SAFE FOR AN AGENT THAT A PERSON CAN STOP.
+The job is not a child of your shell and not a child of you. Somebody stops your
+agent, your terminal closes, or qex replaces the coordinator: the job continues
+and it still writes its result. Your wait is the only thing that stops, and you
+attach again with the id.
 
-The job is not a child of your shell, and it is not a child of your agent. qex
-starts a supervisor in its own session, and the supervisor starts the job. Three
-things follow, and all three matter:
+    qex submit --wait --id-file build.id -- make   # a person stops you here
+    qex status \"$(cat build.id)\" --wait            # a later session, and the
+                                                   # result is there
 
-    Somebody stops your agent           the job continues.
-    Your terminal closes                the job continues.
-    The coordinator stops or is replaced the job continues, and it still writes
-                                        its result.
+PUT THE ID FILE WHERE IT LASTS LONGER THAN YOUR SESSION: your project directory
+or your home directory. NOT a scratch directory of your harness, and not /tmp.
+qex gives a warning when the file goes to such a place. If you lose an id,
+`qex list --cwd .` gives the jobs of this directory.
 
-Each line is true for a job of `qex run` as well, with one exception: Ctrl-C or
-a SIGTERM on the waiting `qex run` stops the job. See WHAT YOU GIVE UP above.
+Many jobs at one time
+---------------------
 
-Nothing is lost, because the record of the job is on the disk and not in the
-memory of a process. Your wait is the only thing that stops.
+Give each job its own `qex submit --wait`. Each notification from your harness
+then names its own job, and no job waits with nobody to read it.
 
-You can therefore attach the wait again, in a later session, in a new shell,
-from a different agent, at any time:
+To read many results in one place, read the stream:
 
-    qex status $ID --wait
+    qex events --json      # one JSON object for each change of state
 
-The id is the handle. That command gives the same answer whether the job
-operates now, stopped one second ago, or stopped last night. A job that stopped
-while nobody watched loses nothing at all.
+Keep the `stream_id` of the first line and the largest `seq` that you read, and
+give both to `--since` when you start again. Run `qex help events`.
 
-This is what a monitor script cannot do. A monitor holds the answer in its own
-memory: stop the monitor, and the answer is gone. Keep the id in a file with
-`--id-file`, and the answer waits for you instead.
-
-    qex submit --id-file build.id -- make    # session 1
-    # the person stops the agent here. `make` continues.
-    qex status \"$(cat build.id)\" --wait      # session 2, and the result is there
-
-A person can thus stop you at any moment with no cost.
-
-Give each submission a key, and a second run starts nothing
------------------------------------------------------------
-
-YOU LOSE YOUR CONTEXT AND YOU RUN YOUR SCRIPT AGAIN. Without a key, qex starts a
-SECOND copy of a four-hour training run beside the first copy. Both copies then
-hold the machine, and both write to the same files.
-
-Give the submission a key. The second run of the same script starts nothing:
-
-    ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
-    qex wait $ID
-
-The second run gives THE SAME id and exits with the code 0, so your script does
-not change and `ID=$(qex submit ...)` stays correct. qex writes the reason to
-stderr:
-
-    qex: this submission started no job. The dedupe key `train_home_me_p`
-    gives the job 7f3c8a12-..., and that job is in the state `running`.
-
-DO NOT READ `qex list` AND DECIDE FOR YOURSELF. That test is a PROXY: you read
-the list, you decide, and you submit, and a different agent can submit between
-your read and your submission. The coordinator makes the test and the submission
-ONE step. Two commands in the same moment thus give one job and one id.
-
-    --dedupe-key KEY     start no second job while a job with this key waits or
-                         operates. The key is free when that job stops.
-
-    --dedupe-window 1h   keep the key of a job that SUCCEEDED for this time
-                         also. A job that did not succeed never keeps its key,
-                         because the remedy for a failure is another run.
-
-    --json               write {\"id\": \"...\", \"deduplicated\": true} in place of
-                         the id alone. Use it when your script must know if IT
-                         started the work.
-
-Choose a key that names the work AND the place: `build:$(pwd)`. A key such as
-`build` alone stops the build of every other project on the machine.
-
-THE WINDOW OF THE COMMAND THAT ASKS APPLIES, and not the window of the job that
-holds the key. The window is a question: how old an answer do you accept? A
-command that gives no window thus starts a new job, although a different command
-gave a window a moment before. Give the same window in each command that shares
-a key. This concerns a job that already SUCCEEDED only, so no second copy of
-work that operates can start.
-
-`qex run --dedupe-key` waits for the job that the key gives. CTRL-C THEN STOPS
-YOUR WAIT ONLY, because a different agent can be the owner of that job. qex says
-so when it attaches, and the wait gives the code 124: your wait stopped, and the
-job continues. Use `qex kill <id>` to stop the job itself.
-
-`qex status <id>` shows the key of a job. You can thus see which key gave you an
-id, and `qex status <id>` gives the result of a job that stopped.
-
-One command gives the result and the cause
-------------------------------------------
-
-`qex status` of a job that did not succeed also writes the last lines of its
-standard error. You thus need no second command for the usual question.
-
-    qex status $ID                  the state, the exit code and the last lines
-                                    of BOTH streams
-    qex status $ID --wait           the same, but wait for the job first
-    qex status $ID --tail 50        more lines
-    qex status $ID --stderr         one stream only
-    qex status $ID --grep ERROR     the lines that match
-    qex status $ID --no-logs        the state only
-
-qex gives both streams, because a program frequently writes its result to the
-standard output and its failure summary to the standard error. The error alone
-reads as a complete failure.
-
-`qex wait` stops until the job stops. Its exit code tells you the result:
-
-    0    the job succeeded
-    1    the job failed
-    123  the job never started; it reached its `--max-queue-time`
-    124  your wait timed out; the job still operates
-    125  something stopped the job
-    126  the job did not run, because a job that it needed failed
-    127  there is no job with that id
-
-Add `--timeout` to limit your wait. Example: `qex wait $ID --timeout 30m`.
-A timeout stops your wait only. It does not stop the job.
-
-Give up on a job that never starts
-----------------------------------
-
-A job waits until the machine has capacity for it. On a busy machine that wait
-can be long, and a job with a claim that no budget can meet waits with no end.
-
-    ID=$(qex submit --max-queue-time 30m -- make test)
-    qex wait $ID                 # this gives an answer inside 30 minutes
-
-The job does not start after that time. Its state becomes `expired`, `qex wait`
-gives the code 123, and `qex status` says what the job waited for. Nothing ran,
-so there is no output to read.
-
-The clock starts at the submission. A coordinator that stops and starts again
-continues the same count, so a restart does not give the job a new full wait.
-
-qex counts the wait in whole seconds. A job can thus give up as much as one
-second BEFORE its limit, and the time in the record is that count of seconds.
-Give a limit of a minute or more, where one second changes nothing.
-
-The wait for a job in `--needs` counts also. Give a value that covers the whole
-pipeline, or give no value on a stage that waits for an earlier stage.
-
-There is no value for this option by default, and there is none in the config
-file until you write one. A job that qex discards is work that a person wanted,
-so qex never chooses that for you.
-
-A job takes this value at its SUBMISSION. A job that already waits in the queue
-keeps the value that it had, so a change to `[defaults] max_queue_time` reaches
-the jobs that you submit after it, and no earlier job.
-
-What qex captures
------------------
-
-`qex submit` copies your environment and your current directory. Your job thus
-operates in the same way as a command that you type now. Use `--env K=V` to add
-or replace one variable. Use `--env-capture minimal` if your shell holds
-secrets.
+`qex wait A B C` waits for all of them and gives one line for each.
+`qex wait --next A B C` gives control back when the NEXT job stops — ONE TIME.
+The jobs that did not stop then have no watcher, so wait again for them. qex
+names them when it returns.
 
 Resource claims
 ---------------
 
-Give `--cpu` and `--mem`. qex uses these claims to decide how many jobs operate
-together. Claims stop two agents from starting too much work at the same time.
-
-If you do not know the size of the task, use a word in place of a number:
-
-    qex submit --cpu guess --mem guess -- ./unknown-task
+Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate
+together, and that is what stops two agents from filling the machine.
 
     half, guess   one half of the budget. Two such jobs operate together.
     full, max     the full budget. The job operates alone.
 
-Use `guess` to start an unknown task safely. The words also operate in a job
-file:
+DO NOT RUN A SMALL TEST JOB TO MEASURE A TASK. It costs time and it measures
+different work. Give `guess` and start the REAL task:
 
-    [resources]
-    cpu = \"guess\"
-    mem = \"half\"
-
-Do not measure a task before you run it
----------------------------------------
-
-Do not run a small test job to find the size of a task. That method costs you
-time and gives a poor measurement, because a small job does different work.
-
-Give `--cpu guess --mem guess` and start the REAL task. That run gives you a
-true measurement, and it does the work at the same time.
-
-qex then uses that measurement for you. The next job of the same command gets a
-claim from the earlier runs, so you give no claim at all:
-
-    qex submit --cpu guess --mem guess -- ./task    # run 1
-    qex submit -- ./task                            # run 2: the claim is ready
-
-`qex status` says where a claim came from.
-
-Read the numbers yourself when you want an exact claim:
-
-    qex status $ID --json      # the usage field gives max_rss and cpu_secs
-
-The first run with `guess` is thus not wasted effort: it produces both the
-result and the measurement that makes every later run cheap. What is wasted is
-a separate test job that produces no result.
-
-If your claim is larger than the full budget, qex starts the job alone when no
-other job operates. The job can then swap or stop with an out-of-memory error.
-The status field `forced` is `true` for such a job. That result is data: your
-claim or the machine is too small.
-
-qex learns the size of a task
------------------------------
+    qex submit --wait --cpu guess --mem guess -- ./task   # run 1
+    qex submit --wait -- ./task                           # run 2: the claim is
+                                                          # ready
 
 qex records what each job really used, and it uses those numbers as the claim
-for the next job of the same command. You thus give no claim at all after the
-first run:
+for the next job of the same command. It keeps the LARGEST measurement and adds
+a margin. A job that the kernel stopped for memory gives a lower bound, so the
+next claim is above it, and a smaller run later does not remove that lesson.
+`qex status` says where a claim came from, and `qex status --json` gives
+`max_rss` and `cpu_secs`.
 
-    qex submit -- cargo test        # run 1: the default claim
-    qex submit -- cargo test        # run 2: the claim comes from run 1
+A claim that is larger than the whole budget still runs: qex starts the job
+alone when nothing else operates, and the field `forced` is true. The job can
+then swap or stop for memory, and that result is data.
 
-`qex status` says where a claim came from. The record is for the command, and
-not for the name, because `cargo build` and `cargo test` need different sizes.
+Give each submission a key
+--------------------------
 
-qex uses the LARGEST measurement that it holds, and it adds a margin. A claim
-that is too small stops the job, and a claim that is a little too large costs
-some capacity only.
+You lose your context and you run your script again. Without a key, qex starts a
+SECOND copy of a four-hour run beside the first, and both write the same files.
 
-qex records a job that completed, and a job that the kernel stopped for memory.
-The two give different evidence, and qex keeps them apart:
+    qex submit --wait --dedupe-key train:$(pwd) -- uv run train.py
 
-  - a job that COMPLETED gives the memory that the job needs;
-  - a job that the KERNEL STOPPED AT ITS OWN LIMIT gives a lower bound. The true
-    need is above that value, so the next claim is above it as well. A smaller
-    run that succeeds later does not remove that lesson. qex records this
-    measurement when it applied the limit itself; see `qex help config`.
+While a job with that key waits or operates, a second submission starts nothing:
+qex gives the id of that job and exits with the code 0, so your script does not
+change. DO NOT READ `qex list` AND DECIDE FOR YOURSELF: that test is a proxy,
+and another agent can submit between your read and your submission. The
+coordinator makes the test and the submission one step.
 
-qex records nothing else. A job that you stopped, or that reached its time
-limit, shows the memory that it reached and not the memory that it needs.
+Choose a key that names the work AND the place: `build:$(pwd)`. A key names the
+work, and qex does not compare the command, so give each different piece of work
+its own key. The key is free when the job stops; `--dedupe-window 1h` keeps the
+key of a job that SUCCEEDED for an hour also. A wait that a key gave you is a
+wait for the job of another agent, so Ctrl-C stops your wait only and gives 122.
 
-In short: give `guess`, start the task, and read the result. Add an exact claim
-later, and only if you repeat the task. After the first run of a command, qex
-gives the claim for you.
+A stage for each step
+---------------------
 
-A pipeline of stages
---------------------
-
-Do not put the stages of a pipeline in one script. If stage 3 of that script
-fails, you get one exit code and one log file with the output of every stage
-mixed together, and you must find the cause.
-
-Give each stage its own job, and name the jobs that must succeed first:
+Do not put the steps in one script. One exit code and one mixed log leave you to
+find the cause. Give each step its own job:
 
     BUILD=$(qex submit --name build -- make)
-    TEST=$(qex submit --name test  --needs $BUILD -- make test)
-    SHIP=$(qex submit --name ship  --needs $TEST  -- ./deploy.sh)
-    qex wait $SHIP
-
-Keep the id of each stage and give the id to the next stage. An id names one
-job for ever, so the script stays correct when you run it again.
-
-Each stage has its own log file, its own exit code and its own claim. If `build`
-fails, `test` and `ship` do not start. Their state becomes `skipped`, and their
-record names the job that failed:
-
-    qex list
-    ID        STATE     NAME   ...  NOTE
-    a1b2c3d4  failed    build  ...  the job stopped with the exit code 2
-    b2c3d4e5  skipped   test   ...  the job a1b2c3d4 (build) is failed, ...
-    c3d4e5f6  skipped   ship   ...  the job a1b2c3d4 (build) is failed, ...
-
-There is one failure only, and it is the cause. Run `qex logs a1b2c3d4` to read
-the output of that stage, and no other output.
-
-Each skipped job names the first job that failed, and not the job before it. A
-read of the last stage thus gives you the cause immediately.
+    TEST=$(qex submit --name test --needs $BUILD -- make test)
+    qex status $TEST --wait
 
     --needs <id>,<id>   wait for these jobs, and stop if one does not succeed
     --after <id>,<id>   wait for these jobs, whatever their result
 
-Use `--after` to control the order only. A cleanup job that must run after a
-build, and must run also when the build fails, uses `--after`.
+A stage that does not start becomes `skipped`, and its record names the FIRST
+job that failed, so you read the cause and not the chain. `qex wait` gives 126
+for a skipped job and the code of the job for a job that failed, so your script
+separates its own failure from an earlier one.
 
-`qex wait` gives the code 126 for a skipped job, and the code 1 for a job that
-failed. Your script can thus separate a failure of your stage from a failure of
-an earlier stage.
+An ID must exist, and that is the only rule, so a script can submit its last
+stage while an earlier stage already failed. A NAME must give a job that waits
+or operates, because a name can give the job of yesterday. Use an id in a
+script, and a name when you type a command yourself. `qex pipeline ci.toml`
+gives the stages of one file their own names; run `qex help pipeline`.
 
-A job can name the jobs that you started before it. A job cannot name a job that
-does not exist, so a circle of dependencies is not possible.
+A job that never starts
+-----------------------
 
-An id and a name have different rules
--------------------------------------
+A job waits until the machine has capacity, and a claim that no budget can meet
+waits with no end.
 
-An ID must exist. That is the only rule. qex accepts an id whatever the state
-of that job, so a script can submit its last stage even when the first stage
-already failed. The last stage then becomes `skipped` with the correct cause.
+    qex submit --wait --max-queue-time 30m -- make test
 
-A NAME must give a job that is in the queue or operates. A name can give a job
-of an earlier run: you write `--needs test`, you forgot to start a new test job,
-and the name gives the test job of yesterday. That job already succeeded, so
-your stage would start immediately and wait for nothing. qex refuses a name in
-that case and tells you what happened.
+The job does not start after that time. Its state becomes `expired`, the code is
+123, and `qex status` says what the job waited for. Nothing ran, so there is no
+output. The clock starts at the submission and a restart of the coordinator
+continues it. There is no limit by default: work that a person wanted is work
+that qex does not discard for you.
 
-Use an id in a script. Use a name when you type a command yourself.
+Other options
+-------------
 
-Other useful options
---------------------
-
-    --retries 3        run the job again when it fails, up to 3 times.
-                       The job keeps one id and one record, and the log holds
-                       every attempt. Use it for a fault outside the task,
-                       such as a network that is not ready.
-
-                       You do not need this option for a job that the kernel
-                       stops for memory. qex raises the claim and starts such
-                       a job again by itself, and that correction does not use
-                       this count. See `qex help config`.
-
-    --nice N           how much the job gives way to the work of a person.
-                       -20 to 19, and a larger number gives way. The default
-                       comes from `[politeness] nice`, and it is 10. Use
-                       `--nice 0` to ask that this job does not give way.
-                       qex can only make a job give way MORE than the
-                       coordinator does: a coordinator that a user started
-                       under `nice 5` keeps its jobs at 5 or above, because
-                       a lower number needs privilege.
-
-    --lock NAME        two jobs with one lock name never operate together.
-                       Use it for work that shares something that a claim
-                       cannot express: a build directory, a port, a database.
-                       `qex run --lock target -- cargo test` stops two builds
-                       from destroying each other in one directory.
-
-    --dedupe-key KEY   start no second job while a job with this key waits or
-                       operates. qex gives the id of that job and exits with
-                       the code 0. Use it in a script that can run a second
-                       time: `--dedupe-key build:$(pwd)`.
-    --gpu N            claim N devices from the pool `gpu`. qex says WHICH
+    --name NAME        a name for `qex list`, and a handle in place of the id
+    --timeout 4h       stop the JOB after this time. `--wait-timeout` stops
+                       your wait instead, and the job continues.
+    --retries 3        run the job again when it fails. One id, one record,
+                       every attempt in the log. You do not need this for a
+                       kill for memory: qex raises the claim by itself.
+    --lock NAME        two jobs with one lock name never operate together. Use
+                       it for a build directory, a port or a database.
+    --nice N           -20 to 19. A larger number gives way to a person. The
+                       default is 10.
+    --gpu N            claim N devices from the pool `gpu`. qex says which
                        index the job gets and writes CUDA_VISIBLE_DEVICES.
-    --vram SIZE        claim SIZE on EACH GPU that this job gets. qex does
-                       NOT add the memory of the devices together.
+    --vram SIZE        claim SIZE on EACH GPU. qex does NOT add the memory of
+                       the devices together.
     --claim NAME=N     claim N units of the pool NAME. `--lock NAME` is the
-                       same as `--claim NAME=1`.
-
-                       Run `qex help resources` for the pools.
-
-    --id-file FILE     write the job id to a file as well as to stdout.
-
-    qex wait A B --any   give control back when the FIRST job stops.
-    qex rerun <id>       submit the same job again, with a new id.
-
-If the coordinator is older than your command
----------------------------------------------
-
-A coordinator operates for hours, and a new build can replace the qex program.
-The coordinator then holds earlier code.
-
-qex asks the coordinator what it can do, and it REFUSES a job that the
-coordinator cannot obey:
-
-    qex: the coordinator (pid 3507877) is version 0.3.0, and it cannot
-    obey --lock.
-
-    qex refuses this job. The coordinator would ignore that option in
-    silence, give you a job id, and run the job without the rule that you
-    asked for.
-
-A refusal is safer than a job that starts. A job specification travels as JSON,
-and a field that the coordinator does not know is ignored with no message. A
-lock that nothing applies looks exactly like a lock that operates, until two
-jobs destroy each other.
-
-The coordinator stops when no job operates, and the next command starts one that
-can obey. `kill <pid>` changes it at once; the jobs that operate continue,
-because a new coordinator reads the same records.
-
-`qex version` gives what your command can do and what the coordinator can do.
+                       same as `--claim NAME=1`. Run `qex help resources`.
+    --env K=V          add or replace one variable. qex copies your environment
+                       and your directory, so use `--env-capture minimal` when
+                       your shell holds secrets.
+    --job FILE         read the job from a TOML, YAML or JSON file. Run
+                       `qex help job-file`.
+    --each-line FILE   one job for each line, and one group id. `{}` takes the
+                       line, and qex starts no shell, so a line is one argument
+                       and never a command. Run `qex help each-line`.
 
 Other commands
 --------------
 
-    qex list --json            all the jobs and their states
+    qex list --json            all the jobs, their states and why they wait
     qex status <id> --json     one job in detail, with the last error lines
-    qex logs <id> --follow     the output while the job operates
+    qex logs <id> --grep ERR   the lines that you want from a large log
     qex kill <id>              stop a job that operates
     qex cancel <id>            remove a job from the queue
+    qex rerun <id>             submit the same job again, with a new id
     qex clean --state done     delete the records of the jobs that stopped
     qex info                   the coordinator and the free capacity
+    qex pause / qex resume     stop the queue, or give it back
 
-Every command that reads data accepts `--json`. Use `qex schema status`,
-`qex schema job` and `qex schema pipeline` to get the JSON Schema of each
-format.
+Every command that reads data accepts `--json`, and each command accepts the
+first characters of an id or the name of a job. `qex schema status|job|pipeline`
+gives the JSON Schema of each format.
 
-Short forms of a job id
------------------------
+If the coordinator is older than your command
+---------------------------------------------
 
-Each command accepts the first characters of an id, and it also accepts the
-name of a job:
-
-    qex submit --name build -- make
-    qex status build
-
-Give a name with `--name` when you start a job. You can then use that name in
-place of the id, and you do not keep the UUID.
-
-A name that gives more than one job gives an error with the list of the jobs.
-
-Start with a job file for a complex task
-----------------------------------------
-
-    qex submit --job train.toml
-
-Run `qex help job-file` for the fields.
-
-For several stages in one file, use a pipeline:
-
-    qex pipeline ci.toml
-
-Run `qex help pipeline`. A pipeline gives each stage a name that belongs to
-that one submission, so two runs of one file never share a name.
-
-One command and many inputs
----------------------------
-
-    GROUP=$(qex submit --each-line inputs.txt -- ./process {})
-    qex list --group $GROUP
-
-One job for each line of the file, and one group id for all of them. `{}` takes
-the text of the line. qex starts no shell, so a line becomes exactly one
-argument and never a command. Run `qex help each-line`.
+A new build can replace the qex program while a coordinator operates. qex asks
+the coordinator what it can do and REFUSES a job that it cannot obey, because a
+field that the coordinator does not know is ignored in silence: a lock that
+nothing applies looks exactly like a lock that operates. The coordinator stops
+when no job operates, and the next command starts one that can obey. The jobs
+continue, because a new coordinator reads the same records. `qex version` gives
+what each side can do.
 
 Tell the people who make qex
 ----------------------------
 
-qex exists because somebody measured their own monitor scripts and gave the
-numbers. Each of the parts above came from a report of that kind.
+Each part of this page came from a report of a fault or a measurement.
 
-    Something helped you:
-        https://github.com/stephenc/qex/issues/1
-        Leave a comment. Give the number if you have one: the hours, the jobs,
-        the size of the machine. Say which model you are and which harness runs
-        you, because the faults are not the same in each harness.
-
-    A recipe that is not in the documentation:
-        https://github.com/stephenc/qex/issues/2
-        qex has no timer, because cron and `qex submit --lock` do it better.
-        That recipe is there, with the guard that stops the queue from growing.
-
-    Something did NOT work, or a word sent you the wrong way:
-        LOOK FOR IT FIRST, AND ADD TO WHAT IS THERE.
-            gh issue list --repo stephenc/qex --state all --search \"your words\"
-        A second report of one fault says that the fault is common, and that is
-        useful. A second ISSUE for one fault divides the answer between two
-        pages, and the person who corrects it must read both and close one.
-        Add your machine, your model and your harness to the issue that exists:
+    Something helped you        https://github.com/stephenc/qex/issues/1
+    A recipe worth sharing      https://github.com/stephenc/qex/issues/2
+    Something did NOT work, including a word that sent you the wrong way:
+        LOOK FIRST, AND ADD TO WHAT IS THERE.
+            gh issue list --repo stephenc/qex --state all --search \"words\"
             gh issue comment <number> --repo stephenc/qex
-        Open a new one only when nothing matches:
-            https://github.com/stephenc/qex/issues/new/choose
+        Open a new issue only when nothing matches. A SMALL FAULT IS WORTH AN
+        ISSUE: an option that you looked for and did not find, a message that
+        sent you the wrong way, an exit code that surprised you.
 
-        A SMALL FAULT IS WORTH AN ISSUE. An option that you looked for and did
-        not find, a message that made you look in the wrong place, an exit code
-        that surprised you: those reports are the ones that make a tool good.
-
-    Give four things, and no more: the command in full, what qex wrote in full
-    (use --json), what you expected, and the output of `qex version`.
-
-DO NOT PUT THE OUTPUT OF `--show-env` IN A PUBLIC PAGE, and do not put anything
-that a token can hide in. `qex submit` copies the environment of your shell, so
-that output is a secret. This is the same rule as `qex help output`.
-
-If you cannot reach GitHub, give the words to the person that you work with and
-let them decide.
+Give four things: the command in full, what qex wrote in full (use `--json`),
+what you expected, and the output of `qex version`. DO NOT PUT THE OUTPUT OF
+`--show-env` IN A PUBLIC PAGE: it holds the environment of your shell.
 ";
 
 pub const JOB_FILE: &str = "\
@@ -2216,79 +1892,117 @@ pub const EXIT_CODES: &str = "\
 qex exit codes
 ==============
 
-`qex wait`
-----------
+One table. Every command that gives you the result of a job obeys it.
 
-    0    the job succeeded (exit code 0)
-    1    the job failed (a different exit code, or a signal)
-    123  the job never started. It waited more time than its
-         `--max-queue-time` value, and its state is `expired`.
-    124  your wait timed out. The job still operates.
-    125  something stopped the job: kill, cancel, timeout or out-of-memory
-    126  the job did not run, because a job that it needed did not succeed
-    127  there is no job with that id
+    0 to 96     THE JOB. qex gives the exit code of the job, unchanged.
+    97 to 127   QEX. The code describes the queue or the wait, never the job.
+      97        the job gave a code from 97 to 255. Read the record for it.
+      98        a signal stopped the job, and qex did not attribute it to a
+                stop. A kill from anywhere gives 125 instead.
+      99        the kernel stopped the job for memory. See the note below:
+                qex must be able to prove it.
+      100       the job has not stopped, so there is no result.
+      121       qex could not do what you asked. No job ran.
+      122       your wait stopped, and the job did not. Attach to it again.
+      123       the job gave up in the queue. It reached `--max-queue-time`.
+      124       your wait reached its time limit. The job continues.
+      125       something stopped the job: a kill, a cancel or a time limit
+      126       the job did not run, because a job that it needed did not succeed
+      127       there is no job with that id
+    128 and up  QEX ITSELF died from a signal. The job is not described. It can
+                still operate, so attach to it again.
 
-The code 124 has the same meaning as the code of the `timeout` command.
+The code 98 says that a signal stopped the job and that qex did not attribute
+that signal to a stop. A kill, a cancel and a time limit give 125, and an
+EXTERNAL `kill -9` gives 125 as well: qex cannot know who sent it. The record
+holds the number of the signal in both cases, so nothing is lost.
 
-The code 123 is not 125. A job with the code 125 ran and wrote output. A job with
-the code 123 never got the machine, so it has no output. Read the `error` field
-of `qex status` for the wait that stopped it.
+The code 99 needs proof that memory stopped the job. qex has that proof when
+`[enforce] mode` applies a limit, and when the kernel names the job that it
+stopped. WITH NO ENFORCEMENT A CLAIM IS A PROMISE AND NOT A LIMIT: a job that
+claims 64MB and uses 1.6GB is not stopped at all, and it never gives 99.
 
-A timeout on `qex wait` stops your wait only. It does not stop the job. Use
-`qex kill` to stop the job.
+THE CODE ANSWERS `PASS OR FAIL`. THE RECORD ANSWERS `WHY`. An agent that acts
+on the difference between \"the job failed\" and \"my wait stopped\" reads
+`qex status`. An agent that needs pass or fail reads the code.
 
-To get the exit code of the job itself, add `--passthrough`:
+Every command that gives you the result of a job obeys it: `qex run`,
+`qex submit --wait`, `qex submit --follow`, `qex wait`, `qex status --wait`,
+`qex status --follow` and `qex status --quiet`.
 
-    qex wait $ID --passthrough
+Every other command gives 0 for success, 1 for a failure, 2 for a command line
+that qex cannot read, and 127 for a job that does not exist. `qex list` never
+speaks for a job, so those codes are not ambiguous there.
 
-`qex wait` then exits with the exit code of the job. Use this option to send the
-result of the job to a script.
+Why a band, and why a sentinel
+------------------------------
 
-`qex run`
----------
+A job can exit with any code from 0 to 255. Every code that qex gives itself is
+thus a code that a job can give as well, and no single free number escapes that.
 
-    the exit code of the job    the job ran (0, 7, 1, whatever it gave)
-    123  the job never started; it reached its `--max-queue-time`
-    124  your wait stopped, and the job continues. See the dedupe key below.
-    125  something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory
-    126  the job did not run, because a job that it needed did not succeed
-    127  there is no job with that id
+The sentinel escapes it. A job that exits 124 of its own accord gives you 97,
+and `qex status` holds the 124. A wait that reached its time limit gives you
+124. Each code thus has one meaning.
 
-`qex run` writes the output of the job, so it gives the exit code of the job
-when the job RAN. `qex run -- sh -c 'exit 7'` gives 7.
+The cost is small and it is real: a job that exits between 97 and 255 loses its
+exact code AT THE SHELL, and keeps it in the record. A wrapper that reads `$?`
+alone thus sees 97 for each of those jobs, and it reads `qex status --json` to
+get the number. Programs that exit in that range are rare, and most of them
+speak the same convention as qex: 126 for a program that cannot be executed,
+127 for a program that does not exist.
 
-A job of `qex run` is a job like any other, so `qex kill` and `qex cancel` from
-a DIFFERENT command can stop it. That job gave no exit code of its own, and
-`qex run` then gives 125 and not 1. The two are thus separate: 125 says that
-something stopped your work before it could finish. `qex run` also writes a line
-to stderr that names the cause, and that line says when this command did not
-stop the job.
+The band starts at 97, and the job keeps 0 to 96. It starts there because the
+codes above it hold the two conventions that a shell already uses, 126 and 127,
+with room for the codes of qex between them.
 
-The code 1 has two causes. Your work ran and it gave the exit code 1, or qex
-could not finish its own work: the coordinator stopped while `qex run` waited,
-for example. qex writes the second cause on stderr, and the job can then still
-operate.
+Why 128 and above is qex, and not the job
+-----------------------------------------
 
-For each state in which the job gave NO exit code of its own, `qex run` gives
-the same code as `qex wait`. Two commands must not answer one question two ways.
-For a job that RAN, `qex run` gives the exit code of the job, and `qex wait`
-gives 0 or 1 unless you add `--passthrough`.
+A program that a signal stops conventionally gives `128 + N`, so an
+out-of-memory kill gives 137. That form cannot serve here:
 
-`qex run` gives 124 in ONE case: a dedupe key gave it the job of a different
-caller, and a signal then arrived. This command did not start that job, so
-Ctrl-C stops this wait and the job continues. The code 124 says the same thing
-there as on `qex wait`: YOUR WAIT ended, and the work did not. Run
-`qex status $ID --wait` to wait again, or `qex kill $ID` to stop the job.
+    qex wait <id>
+    ^C
+    echo $?      <- 130 from the shell, and THE JOB IS STILL RUNNING
 
-`qex run` gives 124 for no other reason. It waits with no limit of its own, and
-a job that reaches the time limit of `--timeout` gives 125, because something
-stopped that job.
+A dead process writes no exit code. `128 + N` from a qex command can thus only
+mean that the qex command itself died, and the job is then not described at all.
+qex gives 98 for a job that a signal stopped, and the record names the signal.
+A kill, a cancel or a time limit gives 125 in place of 98, and a kill for memory
+gives 99: qex knows the cause of those, and each of them takes a different
+correction from the reader.
 
-Other commands
---------------
+qex catches Ctrl-C and SIGTERM during a wait, so the usual case gives 122 with a
+sentence, and not 130 in silence. A SECOND Ctrl-C stops the command immediately,
+in the usual way. A SIGKILL cannot be caught, so a wait that the out-of-memory
+killer takes still gives 137 — which, by this table, says exactly what happened:
+your command died, and your job did not.
 
-    0    the command succeeded
-    1    the command failed
-    2    the command line is not correct
-    127  there is no job with that id
+`qex run` and `qex submit --wait`
+---------------------------------
+
+Both give the exit code of the job when the job RAN. `qex run -- sh -c 'exit 7'`
+gives 7.
+
+`qex run` writes the output of the job to your terminal. `qex submit --wait`
+writes it to the log file, so the context of an agent stays small; read the part
+that you want with `qex logs --grep`.
+
+A job of either command is a job like any other, so `qex kill` and `qex cancel`
+from a DIFFERENT command can stop it. That job gave no exit code of its own, and
+the command then gives 125 and not 1: 125 says that something stopped your work
+before it could finish. Both commands also write a line to stderr that names the
+cause, and that line says when this command did not stop the job.
+
+A dedupe key can give `qex run` the job of a different caller. A signal then
+stops your wait and not the job, and the code is 122.
+
+`qex wait --next`
+----------------
+
+`--next` gives control back ONE time. The jobs that did not stop then have no
+watcher, so wait again for them. qex names them on STDERR when it returns, in a
+line that a person reads. That line is not a data format: your program gave
+those ids, so it holds them already, and `--json` writes the record of the job
+that stopped on stdout.
 ";

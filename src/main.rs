@@ -132,15 +132,110 @@ fn main() {
             // Write the cause of each error. An agent then sees the full
             // sequence and does not need to run the command a second time.
             eprintln!("qex: {e:#}");
-            1
+            // A command that gives the code of a JOB must not report a fault of
+            // its own with a code from the job band. The code 1 is the most
+            // common code of a program that failed, so a `qex run` that could
+            // not start looked exactly like a job that failed. Every other
+            // command keeps the code 1, which is conventional and unambiguous:
+            // `qex list` never claims to speak for a job.
+            if speaks_for_a_job(&subcommand_word()) {
+                commands::EXIT_QEX_FAILED
+            } else {
+                1
+            }
         }
     };
     std::process::exit(code);
 }
 
+/// True for a command that gives the exit code of a JOB.
+///
+/// These commands, and only these, keep the rule of the band: a code below 97
+/// comes from the job. A fault of qex itself in one of them thus takes a code
+/// from the band, and a fault in every other command keeps the code 1 and the
+/// usage code 2 of the convention.
+#[cfg(unix)]
+fn speaks_for_a_job(name: &str) -> bool {
+    // A word that qex does not know takes the band as well. `qex staus $ID
+    // --wait` is a command that an agent writes, and the code 2 there says
+    // "the job exited 2" when no job ran. The words of 121 — qex could not do
+    // what you asked, no job ran — describe a name that qex cannot read
+    // exactly.
+    //
+    // An EMPTY word says that the command line held no subcommand at all, such
+    // as `qex --bogus`. That is a fault of the command line and not of a job,
+    // so it keeps the conventional code 2.
+    !name.is_empty() && !SPEAKS_FOR_ITSELF.contains(&name)
+}
+
+/// The commands that never give the exit code of a job.
+///
+/// `qex list` and the others answer about qex, so a usage error there is the
+/// conventional 2 and nothing can read it as the code of a job.
+#[cfg(unix)]
+const SPEAKS_FOR_ITSELF: &[&str] = &[
+    "list",
+    "logs",
+    "events",
+    "kill",
+    "cancel",
+    "rerun",
+    "clean",
+    "gc",
+    "du",
+    "info",
+    "pause",
+    "resume",
+    "config",
+    "schema",
+    "help",
+    "version",
+    "watchers",
+    "completions",
+    "top",
+    "pipeline",
+    "daemon",
+    "supervise",
+    "__complete",
+];
+
+/// Gives the first word of the command line that is not an option.
+///
+/// clap gives no subcommand when it cannot READ the command line, and the exit
+/// code for that fault must still obey the rule of the band. The word is thus
+/// taken from the arguments themselves.
+#[cfg(unix)]
+fn subcommand_word() -> String {
+    std::env::args()
+        .skip(1)
+        .find(|a| !a.starts_with('-'))
+        .unwrap_or_default()
+}
+
 #[cfg(unix)]
 fn run() -> Result<i32> {
-    let cli = Cli::parse();
+    // Read the command line here, and do not let clap end the process.
+    //
+    // clap exits with the code 2 for a command line that it cannot read. In a
+    // command that gives the exit code of a job, 2 says "the job exited 2", and
+    // no job ran. A wrong option is the fault that an agent meets FIRST, so
+    // that reading is both plausible and wrong.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // clap chooses the stream: the help text and the version go to
+            // stdout, and an error goes to stderr.
+            e.print().ok();
+            if !e.use_stderr() {
+                return Ok(0);
+            }
+            return Ok(if speaks_for_a_job(&subcommand_word()) {
+                commands::EXIT_QEX_FAILED
+            } else {
+                EXIT_USAGE
+            });
+        }
+    };
 
     let Some(command) = cli.command else {
         // `qex` without a command writes the help text. This is not an error.

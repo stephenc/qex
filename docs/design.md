@@ -3,7 +3,7 @@ title: How qex operates
 description: The coordinator, the supervisor, the files on the disk, and the limits.
 ---
 
-*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md)*
+*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md) · [Sandbox](sandbox.md)*
 
 # Design
 

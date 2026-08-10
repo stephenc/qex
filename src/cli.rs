@@ -295,6 +295,39 @@ pub struct SubmitArgs {
     #[arg(long, value_name = "FILE")]
     pub id_file: Option<PathBuf>,
 
+    /// Wait here until the job stops, and give the exit code of the job.
+    ///
+    /// Use this option in place of `qex submit` and then `qex wait`. One
+    /// command cannot be forgotten, and the harness of an agent waits for it.
+    /// The output of the job goes to the log file, so read it with `qex logs`
+    /// and take the part that you want.
+    ///
+    /// The id goes to STDERR before the wait begins, because stdout carries the
+    /// record of the job. Use `--id-file` as well, and
+    /// `qex status $(cat FILE) --wait` attaches to the job again.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Wait here, and write the output of the job as it arrives.
+    ///
+    /// `qex run` is the short form of this option, and the two behave in the
+    /// same way. Ctrl-C stops the job.
+    #[arg(long, conflicts_with = "wait")]
+    pub follow: bool,
+
+    /// Write no record when the job stops. Give the exit code of the job.
+    ///
+    /// Use it with `--wait`. qex still reports a FAULT of the wait, and those
+    /// lines give the id that attaches to the job again.
+    #[arg(long, short)]
+    pub quiet: bool,
+
+    /// Stop the wait of --wait after this time. The job continues. Example: 30m.
+    ///
+    /// This option limits YOUR WAIT. `--timeout` limits the JOB.
+    #[arg(long, value_name = "TIME", requires = "wait")]
+    pub wait_timeout: Option<String>,
+
     /// Write the id and the result of the dedupe test as JSON.
     ///
     /// Use this option when your script must know if IT started the work.
@@ -327,10 +360,6 @@ pub struct SubmitArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub submit: SubmitArgs,
-
-    /// Write the id of the job to stderr before the output of the job.
-    #[arg(long)]
-    pub show_id: bool,
 }
 
 #[derive(Debug, Args)]
@@ -406,15 +435,36 @@ pub struct StatusArgs {
     #[arg(long)]
     pub no_logs: bool,
 
-    /// Wait until the job stops, then show the status.
+    /// Wait until the job stops, then show the record.
     ///
-    /// The exit code is the code of `qex wait`. This option gives the result
-    /// and the cause of a failure with one command.
-    #[arg(long)]
+    /// This option gives the result and the cause of a failure with one
+    /// command. The exit code is the code of the job.
+    #[arg(long, conflicts_with = "follow")]
     pub wait: bool,
 
+    /// Wait until the job stops, and write the output of the job as it arrives.
+    ///
+    /// This is the way back to a job of `qex run`, from any session. qex adds
+    /// no text of its own to stdout: the output of the job is the output of
+    /// this command, and the exit code is the code of the job.
+    #[arg(long)]
+    pub follow: bool,
+
+    /// Write no record. Give the exit code of the job.
+    ///
+    /// Use this option in a script that tests the result. With --wait, this
+    /// command blocks first.
+    ///
+    /// qex still reports a FAULT of the wait: a job that does not exist, a wait
+    /// that reached its limit, and a wait that a signal stopped. Those lines
+    /// give the id that attaches to the job again.
+    #[arg(long, short, conflicts_with_all = ["follow", "json"])]
+    pub quiet: bool,
+
     /// Stop the wait after this time. The job continues. Example: 30m.
-    #[arg(long, value_name = "TIME", requires = "wait")]
+    ///
+    /// This option limits `--wait`, `--follow` and `--quiet --wait`.
+    #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
     #[command(flatten)]
@@ -431,16 +481,22 @@ pub struct WaitArgs {
     #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
-    /// Give control back when the FIRST job stops, and not when all stop.
+    /// Give control back when the NEXT job stops, and not when all stop.
     ///
     /// Use this option to read a result as soon as it arrives, in place of the
     /// order of submission.
+    ///
+    /// This option gives control back ONE TIME. The jobs that did not stop then
+    /// have no watcher, so wait again for them. qex names them when it returns.
     #[arg(long)]
-    pub any: bool,
+    pub next: bool,
 
-    /// Exit with the exit code of the job.
-    #[arg(long)]
-    pub passthrough: bool,
+    /// Write no result for each job. Give the exit code only.
+    ///
+    /// qex still reports a FAULT of the wait, and those lines give the id that
+    /// attaches to the job again.
+    #[arg(long, short, conflicts_with = "json")]
+    pub quiet: bool,
 
     /// Write the output as JSON.
     #[arg(long)]
@@ -1026,6 +1082,32 @@ mod tests {
         );
     }
 
+    /// `subcommand_word` in main.rs reads the first argument that does not
+    /// start with a dash. That is the subcommand ONLY while `qex` itself takes
+    /// no option with a value: `qex --config FILE submit` would otherwise give
+    /// the word `FILE`, and the exit code for a usage error would then follow
+    /// the wrong rule.
+    #[test]
+    fn qex_takes_no_global_option_with_a_value() {
+        let command = crate::cli::Cli::command();
+        for arg in command.get_arguments() {
+            assert!(
+                matches!(
+                    arg.get_action(),
+                    clap::ArgAction::Help
+                        | clap::ArgAction::HelpShort
+                        | clap::ArgAction::HelpLong
+                        | clap::ArgAction::Version
+                        | clap::ArgAction::SetTrue
+                        | clap::ArgAction::SetFalse
+                ),
+                "the option `{}` takes a value, so the first word that is not an option is no \
+                 longer the subcommand. See `subcommand_word` in main.rs.",
+                arg.get_id()
+            );
+        }
+    }
+
     /// The topic must show the pattern that operates inside a harness.
     ///
     /// `qex wait` blocks, and the harness of an agent reports the end of a
@@ -1052,7 +1134,9 @@ mod tests {
     fn the_help_text_steers_away_from_a_test_job() {
         let agents = crate::help::AGENTS;
         assert!(
-            agents.contains("Do not run a small test job"),
+            agents
+                .to_lowercase()
+                .contains("do not run a small test job"),
             "the topic must tell an agent not to measure a task first"
         );
         assert!(

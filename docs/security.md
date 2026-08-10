@@ -3,7 +3,7 @@ title: qex security
 description: What qex writes to the disk, who can read it, and where the trust boundaries are.
 ---
 
-*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md)*
+*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md) · [Sandbox](sandbox.md)*
 
 # Security
 

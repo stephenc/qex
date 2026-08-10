@@ -11,6 +11,60 @@ use crate::units::{count_of, format_duration, format_size, parse_duration};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
+/// The lowest exit code that qex keeps for itself.
+///
+/// A job can exit with any code from 0 to 255, so every code that qex gives
+/// itself is a code that a job can give as well. A reserved BAND with a
+/// sentinel removes that collision, and one free number cannot:
+///
+/// - a code from 0 to 96 comes from the job, and nothing else gives one;
+/// - a code from 97 to 255 comes from qex, and it describes the queue, the
+///   wait, or qex itself;
+/// - the sentinel 97 says that the job gave a code in the reserved band. The
+///   record then holds the true code of the job.
+///
+/// See `EXIT_CODES` in `help.rs` for the table that a reader sees.
+pub const EXIT_BAND_FLOOR: i32 = 97;
+/// The exit code when the job gave a code that qex keeps for itself.
+///
+/// Read `qex status` for the code of the job. Without this sentinel, a job that
+/// exits 124 of its own accord looks the same as a wait that reached its time
+/// limit.
+pub const EXIT_JOB_RESERVED: i32 = 97;
+/// The exit code when a signal stopped the job, and qex did not send it.
+///
+/// The usual form is `128 + N`, and it collides with the band: a job that the
+/// out-of-memory killer stops gives 137, and a WAIT that the out-of-memory
+/// killer stops gives 137 also. The two need different actions, so qex gives
+/// the job its own code and puts the name of the signal in the record.
+pub const EXIT_JOB_SIGNAL: i32 = 98;
+/// The exit code when the kernel stopped the job because the machine ran out of
+/// memory.
+///
+/// This code is not 125. A script that reads 125 knows that something stopped
+/// the job, and every one of the four causes takes a different action. This one
+/// takes MORE MEMORY: the same job, with a larger `--mem`, on the same machine.
+/// A time limit takes more time, and a cancel takes no new run at all.
+pub const EXIT_OOM: i32 = 99;
+/// The exit code when the job has not stopped, so there is no result.
+///
+/// `qex status --quiet` with no wait gives it. This code is not 122: 122 says
+/// that a WAIT stopped, and this reader never waited. The two need different
+/// words, because a code with two meanings is the fault that the band removes.
+pub const EXIT_NO_RESULT: i32 = 100;
+/// The exit code when qex could not do what the command line asked.
+///
+/// A command that gives the exit code of a job must not report a fault of its
+/// own with a code from the job band. The code 1 is the most common code of a
+/// program that failed, so `qex run` that could not start would otherwise look
+/// exactly like a job that failed.
+pub const EXIT_QEX_FAILED: i32 = 121;
+/// The exit code when the wait stopped and the job did not.
+///
+/// The job continues, and the caller must attach to it again. This code is not
+/// 124: 124 says that the READER set a time limit and the limit passed, and
+/// this code says that the reader lost the wait with no decision of its own.
+pub const EXIT_WAIT_BROKEN: i32 = 122;
 /// The exit code of `qex wait` when the job never started.
 ///
 /// The job waited more time than its `--max-queue-time` value. This code is not
@@ -38,7 +92,37 @@ pub const EXIT_NO_SUCH_JOB: i32 = 127;
 const AUTO_CLEAN_AGE: u64 = 3600;
 
 pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
+    // `--quiet` describes the end of a wait, so it needs a wait. Say so here,
+    // and not through a required-argument error of the command line reader:
+    // `qex run -q` gave "the argument --wait was not provided" for a command
+    // that refuses `--wait`.
+    if args.quiet && !args.wait && !args.follow {
+        bail!(
+            "`--quiet` needs `--wait`. It says that qex writes no record when the job \
+             stops.\n\n\
+             \x20   qex submit --wait --quiet -- COMMAND"
+        );
+    }
+
+    // `--follow` is `qex run` in a longer form, so it IS `qex run`. One
+    // behaviour has one implementation.
+    if args.follow {
+        return run(cli::RunArgs { submit: args });
+    }
+
     if args.each_line.is_some() {
+        // `--wait` gives the exit code of ONE job, and `--each-line` makes
+        // many. A command cannot give one code for many jobs, so refuse the
+        // pair and give the two commands that do it.
+        if args.wait {
+            bail!(
+                "`qex submit --each-line` does not accept `--wait`, because it makes many jobs \
+                 and one exit code cannot describe them all.\n\n\
+                 Submit them, then wait for the group:\n\
+                 \x20   GROUP=$(qex submit --each-line inputs.txt -- ./process {{}})\n\
+                 \x20   qex wait $GROUP"
+            );
+        }
         return submit_each_line(args);
     }
 
@@ -112,8 +196,21 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
-            if let Some(path) = &args.id_file {
-                write_id_file(path, &format!("{id}\n"))?;
+            // With `--wait`, stdout carries the RESULT of the job, so the id
+            // goes to stderr. Two answers on one stream would give
+            // `ID=$(qex submit --wait ...)` the whole record. Use `--id-file`
+            // to keep the id, which also survives an interruption.
+            //
+            // The file reaches the disk BEFORE the wait, and it is closed, so
+            // it is a handle after a crash and not after a tidy stop only.
+            if args.wait {
+                say_the_id_and_write_the_file(id, args.id_file.as_ref());
+                return wait_after_submit(
+                    &id.to_string(),
+                    args.wait_timeout.as_deref(),
+                    args.json,
+                    args.quiet,
+                );
             }
             if args.json {
                 println!(
@@ -127,9 +224,121 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             } else {
                 println!("{id}");
             }
+            // The id is on stdout already, so a file that fails takes nothing
+            // from the caller. Say the fault, and give the code of the fault:
+            // the caller asked for that file, and a later command reads it.
+            if let Some(path) = &args.id_file {
+                write_id_file(path, &format!("{id}\n"))?;
+            }
             Ok(0)
         }
-        other => report(other),
+        other => report_for_a_job(other),
+    }
+}
+
+/// Says the id, and then writes the id file.
+///
+/// THE ID GOES FIRST, AND A FILE THAT FAILS DOES NOT TAKE IT.
+///
+/// The job exists at this moment: the coordinator answered, and it waits or it
+/// operates. A write that fails cannot undo that, so a command that stops here
+/// leaves a job that runs with nobody who knows its id — which is the fault
+/// that `--id-file` exists to remove. A full disk and a read-only directory are
+/// exactly the conditions in which a caller needs the handle most.
+///
+/// The failure is still loud, because the caller asked for that file and a
+/// later command will read it.
+fn say_the_id_and_write_the_file(id: uuid::Uuid, path: Option<&std::path::PathBuf>) {
+    eprintln!("qex: job {id}");
+    if let Some(path) = path {
+        if let Err(e) = write_id_file(path, &format!("{id}\n")) {
+            eprintln!(
+                "qex: the id file did not reach the disk: {e:#}\n\
+                 qex: the job {id} still operates. Keep the id from the line above, or read \
+                 `qex list --cwd .`"
+            );
+        }
+    }
+}
+
+/// Writes the record of one job, in the form of `qex status`.
+///
+/// Every command that waits for ONE job ends with this, so a caller needs no
+/// second command to learn the state, the exit code and the last lines of the
+/// error output. One renderer also means that the four commands cannot show
+/// one job four ways.
+fn report_the_record(id: &str, json: bool) {
+    let args = cli::StatusArgs {
+        id: id.to_string(),
+        json,
+        show_env: false,
+        no_logs: false,
+        wait: false,
+        follow: false,
+        quiet: false,
+        timeout: None,
+        select: crate::logsel::LogSelect::default(),
+    };
+    // The exit code comes from the wait, and not from this report. A record
+    // that qex cannot read does not change the result of the job, so the
+    // message goes to stderr and the caller keeps its code.
+    if let Err(e) = status(args) {
+        eprintln!("qex: qex could not read the record of the job {id}: {e:#}");
+    }
+}
+
+/// Waits for the job that `qex submit --wait` started.
+///
+/// # Why this option exists
+///
+/// A submission and a wait in two commands make the wait a thing to remember,
+/// and an agent that forgets it never learns that the job stopped: the job
+/// succeeds and nobody reads the result (issue #47).
+///
+/// `qex run` also waits, and it writes the output of the job to the terminal,
+/// so a long job fills the context of an agent. `qex submit --wait` gives both
+/// properties: the harness of the agent waits, and the output stays in the log
+/// file.
+///
+/// One command also closes a race. Between a submission and a wait a short job
+/// can stop, and a `qex clean` in that window deletes the record.
+fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: bool) -> Result<i32> {
+    let deadline = match timeout {
+        Some(t) => parse_duration(t)
+            .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
+            .map(|d| Instant::now() + d),
+        None => None,
+    };
+
+    catch_signals_while_waiting();
+    // `--quiet` silences the REPORT and the narration of the queue. It does not
+    // silence a fault of the wait: those lines name the fault and give the id
+    // that attaches to the job again, and a caller that loses them holds
+    // nothing. See `qex help exit-codes`.
+    let mut reporter = ReasonReporter::new(json || quiet);
+    let ids = [raw_id.to_string()];
+
+    match wait_one(raw_id, deadline, &mut reporter)? {
+        WaitOutcome::Finished(status) => {
+            let code = exit_code_for(&status);
+            if !quiet {
+                report_the_record(raw_id, json);
+            }
+            Ok(code)
+        }
+        // A FAULT of the wait always reaches stderr. stdout keeps its JSON,
+        // and `--quiet` keeps the record away; neither hides the line that
+        // carries the id.
+        WaitOutcome::TimedOut => {
+            eprintln!("qex: the wait reached its time limit. The job continues.");
+            eprintln!("qex: attach to it again:  qex status {raw_id} --wait");
+            Ok(EXIT_TIMEOUT)
+        }
+        WaitOutcome::NoSuchJob => {
+            eprintln!("qex: there is no job with the id {raw_id}");
+            Ok(EXIT_NO_SUCH_JOB)
+        }
+        WaitOutcome::Interrupted => Ok(report_broken_wait(&ids, false)),
     }
 }
 
@@ -374,7 +583,7 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
                     group,
                     &submitted,
                 );
-                return report(other);
+                return report_for_a_job(other);
             }
         }
     }
@@ -575,6 +784,53 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     let is_pipeline = found.group.is_some();
     let ids = found.ids;
 
+    if args.timeout.is_some() && !args.wait && !args.follow {
+        bail!(
+            "`--timeout` limits a WAIT, and this command does not wait. Add `--wait` or \
+             `--follow`.\n\n\
+             \x20   qex status <id> --wait --timeout 30m\n\n\
+             Use `qex submit --timeout` to limit the JOB."
+        );
+    }
+
+    // A limit for the wait, whatever form the wait takes.
+    let deadline = match &args.timeout {
+        Some(t) => parse_duration(t)
+            .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
+            .map(|d| Instant::now() + d),
+        None => None,
+    };
+
+    // `--follow` is the way back to a job of `qex run`, from any session.
+    //
+    // It writes the output of the job and no text of its own on stdout, and it
+    // gives the exit code of the job. This command did not start the job, so a
+    // signal stops this wait and never the job.
+    if args.follow {
+        // This command writes the output of the job on stdout. A JSON object
+        // there would mix with that output, and neither part could be read.
+        // `qex run` refuses `--json` for the same reason.
+        if args.json {
+            bail!(
+                "`qex status --follow` does not accept --json, because it writes the output \
+                 of the job to stdout.\n\n\
+                 Use `qex status <id> --wait --json` for the record, or `qex logs <id> --json` \
+                 for the output."
+            );
+        }
+        if ids.len() != 1 {
+            bail!(
+                "`--follow` takes one job, and `{}` gives {}. Name the stage that you want.",
+                args.id,
+                ids.len()
+            );
+        }
+        let id = ids[0];
+        catch_run_signals();
+        let dir = paths::job_dir(&id)?;
+        return stream_until_done(&mut client, id, &dir, false, deadline);
+    }
+
     // Wait for the job first, if the user asked for that.
     //
     // An agent runs this command in the background of its harness. The harness
@@ -582,24 +838,31 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     // exit code and the cause of a failure. One command gives everything.
     let mut wait_code = 0;
     if args.wait {
-        let deadline = match &args.timeout {
-            Some(t) => parse_duration(t)
-                .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
-                .map(|d| Instant::now() + d),
-            None => None,
-        };
+        // A signal must not look like a result of the job. See
+        // `catch_signals_while_waiting`.
+        catch_signals_while_waiting();
+
         // The deadline is one moment, and not a limit for each job, so a
         // pipeline of ten stages does not get ten times the time of the user.
+        let mut waited = 0usize;
         for id in &ids {
-            match wait_one(&id.to_string(), deadline)? {
+            // ONE REPORTER FOR EACH JOB. A reporter stops when its job starts,
+            // so a reporter that many jobs share goes silent for all of them
+            // at the first job that is not queued. In a pipeline the LAST
+            // stage is the one that waits, and it is the one that must speak.
+            let mut reporter = ReasonReporter::new(args.json || args.quiet);
+            match wait_one(&id.to_string(), deadline, &mut reporter)? {
                 WaitOutcome::Finished(s) => {
+                    waited += 1;
                     // Report the FIRST fault. A later stage that qex skipped
                     // would otherwise hide the stage that failed.
-                    let code = exit_code_for(&s, ExitMode::State);
+                    let code = exit_code_for(&s);
                     if code != 0 && wait_code == 0 {
                         wait_code = code;
                     }
                 }
+                // A FAULT of the wait always reaches stderr. See
+                // `wait_after_submit`.
                 WaitOutcome::TimedOut => {
                     eprintln!("qex: the wait for {id} reached its time limit. The job continues.");
                     wait_code = EXIT_TIMEOUT;
@@ -609,8 +872,46 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                     eprintln!("qex: there is no job with the id {id}");
                     return Ok(EXIT_NO_SUCH_JOB);
                 }
+                // Give the code of a wait that stopped, and NOT `128 + N`. The
+                // job continues, so the caller must attach to it again.
+                WaitOutcome::Interrupted => {
+                    let names: Vec<String> =
+                        ids.iter().skip(waited).map(|i| i.to_string()).collect();
+                    return Ok(report_broken_wait(&names, false));
+                }
             }
         }
+    }
+
+    // `--quiet` gives the exit code and nothing else. A script that tests the
+    // result needs no text, and an agent that reads the text pays for it.
+    if args.quiet {
+        if args.wait {
+            return Ok(wait_code);
+        }
+        // With no wait, the code comes from the records as they stand now.
+        //
+        // Read EVERY job. A pipeline handle gives every stage, and a code that
+        // describes the first stage alone says that a build succeeded when a
+        // later stage failed.
+        let mut worst = 0;
+        for id in &ids {
+            let status = match client.call(&Request::Status { id: *id })? {
+                Response::Status { status } => status,
+                other => return report_for_a_job(other),
+            };
+            let code = if status.state.is_terminal() {
+                exit_code_for(&status)
+            } else {
+                // The job did not stop, so it has no result. This reader set no
+                // wait, so the code is not 122: nothing stopped a wait here.
+                EXIT_NO_RESULT
+            };
+            if code != 0 && worst == 0 {
+                worst = code;
+            }
+        }
+        return Ok(worst);
     }
 
     let mut values: Vec<serde_json::Value> = Vec::new();
@@ -618,7 +919,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         let id = *id;
         let status = match client.call(&Request::Status { id })? {
             Response::Status { status } => status,
-            other => return report(other),
+            other => return report_for_a_job(other),
         };
         // From here the record is for a READER. See `for_display`.
         let status = Box::new(for_display(*status));
@@ -1047,11 +1348,9 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     let ids = match expand_ids(&args.ids) {
         Ok(ids) => ids,
         Err(e) => {
-            // Keep the silence of `--json`, in the same way as the two answers
-            // below. A reader that asked for JSON reads the exit code.
-            if !args.json {
-                eprintln!("qex: {e}");
-            }
+            // A fault, and not a report. `--quiet` keeps it: the reader has no
+            // result and no id, so silence would leave it with a number only.
+            eprintln!("qex: {e}");
             return Ok(EXIT_NO_SUCH_JOB);
         }
     };
@@ -1065,42 +1364,56 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     //
     // `--json` keeps its silence, in the same way as the answers below: a
     // reader that asked for JSON reads the exit code.
-    if !args.json {
+    if !args.json && !args.quiet {
         if let Ok(mut client) = Client::connect() {
             warn_if_paused(&mut client);
         }
     }
 
-    // With `--any`, give control back when the FIRST job stops. An agent that
+    // A signal must not look like a result of the job. See
+    // `catch_signals_while_waiting`.
+    catch_signals_while_waiting();
+
+    // With `--next`, give control back when the NEXT job stops. An agent that
     // started several jobs can then read a result as soon as it arrives, in
     // place of the order of submission.
-    if args.any {
-        return wait_for_any(&args, &ids, deadline);
+    if args.next {
+        return wait_for_the_next(&args, &ids, deadline);
     }
 
     let mut results: Vec<JobStatus> = Vec::new();
     let mut worst = 0i32;
 
     for raw_id in &ids {
-        let status = match wait_one(raw_id, deadline)? {
+        // One reporter for each job. See `status`.
+        let mut reporter = ReasonReporter::new(args.json || args.quiet);
+        let status = match wait_one(raw_id, deadline, &mut reporter)? {
             WaitOutcome::Finished(s) => s,
             WaitOutcome::TimedOut => {
-                if !args.json {
-                    eprintln!(
-                        "qex: the wait for {raw_id} reached its time limit. The job continues."
-                    );
-                }
+                eprintln!("qex: the wait for {raw_id} reached its time limit. The job continues.");
                 return Ok(EXIT_TIMEOUT);
             }
             WaitOutcome::NoSuchJob => {
-                if !args.json {
-                    eprintln!("qex: there is no job with the id {raw_id}");
-                }
+                eprintln!(
+                    "qex: there is no job with the id {raw_id}. A `qex clean` deletes the \
+                     record of a job that stopped, so a job that succeeded a moment ago can \
+                     give this answer."
+                );
                 return Ok(EXIT_NO_SUCH_JOB);
+            }
+            // A signal stopped this wait. Name every job that this command
+            // still watched, so the user attaches to all of them again.
+            WaitOutcome::Interrupted => {
+                let rest: Vec<String> = ids
+                    .iter()
+                    .skip(results.len())
+                    .map(|i| i.to_string())
+                    .collect();
+                return Ok(report_broken_wait(&rest, false));
             }
         };
 
-        let code = exit_code_for(&status, wait_mode(args.passthrough));
+        let code = exit_code_for(&status);
         if code != 0 && worst == 0 {
             worst = code;
         }
@@ -1108,9 +1421,15 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         results.push(for_display(*status));
     }
 
-    if args.json {
+    if args.quiet {
+        // The exit code and nothing else.
+    } else if args.json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
+        // ONE LINE for each job. This command takes many jobs, so it gives a
+        // short report of each. Use `qex status $ID --wait` for the record of
+        // one job: the state, the exit code, the cause and the last lines of
+        // the error output.
         for s in &results {
             // Use punctuation. Without it, the line reads as one sentence:
             // "a1b2c3d4 completed the job succeeded".
@@ -1126,22 +1445,48 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
 /// This function tests each job in turn with a short limit, so no job holds the
 /// wait while a different job is ready. It is the one place where qex polls,
 /// and it polls its own records, which always answer.
-fn wait_for_any(args: &cli::WaitArgs, ids: &[String], deadline: Option<Instant>) -> Result<i32> {
+///
+/// This wait gives control back ONE time. The jobs that did not stop then have
+/// no watcher, so the function names them and gives the command that watches
+/// them again (issue #47).
+fn wait_for_the_next(
+    args: &cli::WaitArgs,
+    ids: &[String],
+    deadline: Option<Instant>,
+) -> Result<i32> {
     let mut delay = Duration::from_millis(50);
+    // One reporter for each job, in the same way as every other wait. This
+    // loop reads the record of each job already, so the reason costs nothing.
+    let mut reporters: Vec<ReasonReporter> = ids
+        .iter()
+        .map(|_| ReasonReporter::new(args.json || args.quiet))
+        .collect();
 
     loop {
-        for raw in ids {
-            let status = match Client::connect_existing() {
-                Some(mut client) => match resolve_id(&mut client, raw) {
-                    Ok(id) => match client.call(&Request::Status { id })? {
-                        Response::Status { status } => Some(*status),
-                        _ => None,
+        if wait_was_interrupted() {
+            return Ok(report_broken_wait(ids, false));
+        }
+        for (n, raw) in ids.iter().enumerate() {
+            // Ask the coordinator, and read the record when the coordinator
+            // does not answer. A coordinator that stops must not make this
+            // command say that a job which operates does not exist.
+            let from_coordinator = match Client::connect_existing() {
+                Some(mut client) => match resolve_id_for_wait(&mut client, raw) {
+                    Ok(Some(id)) => match client.call(&Request::Status { id }) {
+                        Ok(Response::Status { status }) => Some(Some(*status)),
+                        // The coordinator answered, and it holds no such job.
+                        Ok(_) => Some(None),
+                        Err(_) => None,
                     },
+                    Ok(None) => Some(None),
                     Err(_) => None,
                 },
-                None => find_id_on_disk(raw)?
-                    .and_then(|id| paths::job_dir(&id).ok())
-                    .and_then(|dir| crate::job::read_status(&dir).ok()),
+                None => None,
+            };
+
+            let status = match from_coordinator {
+                Some(answer) => answer,
+                None => read_status_on_disk(raw)?,
             };
 
             let Some(status) = status else {
@@ -1149,10 +1494,14 @@ fn wait_for_any(args: &cli::WaitArgs, ids: &[String], deadline: Option<Instant>)
                 return Ok(EXIT_NO_SUCH_JOB);
             };
 
+            reporters[n].note(&status);
+
             if status.state.is_terminal() {
                 // From here the record is for a READER. See `for_display`.
                 let status = for_display(status);
-                if args.json {
+                if args.quiet {
+                    // The exit code and nothing else.
+                } else if args.json {
                     println!("{}", serde_json::to_string_pretty(&vec![&status])?);
                 } else {
                     println!(
@@ -1162,15 +1511,14 @@ fn wait_for_any(args: &cli::WaitArgs, ids: &[String], deadline: Option<Instant>)
                         describe_result(&status)
                     );
                 }
-                return Ok(exit_code_for(&status, wait_mode(args.passthrough)));
+                warn_about_the_jobs_that_stay(args, ids, raw);
+                return Ok(exit_code_for(&status));
             }
         }
 
         if let Some(d) = deadline {
             if Instant::now() >= d {
-                if !args.json {
-                    eprintln!("qex: no job stopped before the time limit. They continue.");
-                }
+                eprintln!("qex: no job stopped before the time limit. They continue.");
                 return Ok(EXIT_TIMEOUT);
             }
         }
@@ -1180,6 +1528,31 @@ fn wait_for_any(args: &cli::WaitArgs, ids: &[String], deadline: Option<Instant>)
     }
 }
 
+/// Names the jobs that `--next` leaves with no watcher.
+///
+/// `--next` gives control back one time. Every other job continues, and no
+/// command watches it. An agent that reads one result and stops thus loses the
+/// result of every other job. The remedy is one more wait, so give it here.
+fn warn_about_the_jobs_that_stay(args: &cli::WaitArgs, ids: &[String], done: &str) {
+    if args.json || args.quiet {
+        return;
+    }
+    let rest: Vec<&str> = ids
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|id| *id != done)
+        .collect();
+    if rest.is_empty() {
+        return;
+    }
+    let names = rest.join(" ");
+    eprintln!(
+        "qex: {} job(s) did not stop, and no command watches them now. Wait again:",
+        rest.len()
+    );
+    eprintln!("qex:   qex wait --next {names}");
+}
+
 enum WaitOutcome {
     // `JobStatus` is large, and the other two answers hold nothing. A box keeps
     // this type small, because each value of it would otherwise take the space
@@ -1187,6 +1560,175 @@ enum WaitOutcome {
     Finished(Box<JobStatus>),
     TimedOut,
     NoSuchJob,
+    /// A signal stopped the wait. The job continues.
+    Interrupted,
+}
+
+/// True when a signal stopped the wait of this command.
+static WAIT_INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_wait_signal(_signal: libc::c_int) {
+    // A signal handler may use an atomic store and very little else.
+    //
+    // The disposition goes back to the system through SA_RESETHAND, and not
+    // through a call here. The system makes that change at the moment of the
+    // delivery, so a SECOND signal that arrives immediately after the first one
+    // always meets the default behaviour: it stops this command. A handler that
+    // calls `signal()` itself leaves a window in which the second signal meets
+    // the handler again, and a trap that a user cannot escape is worse than no
+    // trap.
+    WAIT_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Catches SIGINT and SIGTERM while this command waits for a job.
+///
+/// Without this, Ctrl-C during a wait gives `128 + 2`. That form says "the JOB
+/// died from a signal", and the job did not: the wait died and the job
+/// continues. A dead process writes no exit code, so only a process that stays
+/// alive can say which of the two happened.
+///
+/// This function is for a command that WATCHES a job and does not own it.
+/// `qex run` owns its job, so it uses its own handler and it stops the job.
+fn catch_signals_while_waiting() {
+    // `sigaction` and not `signal`: `signal` gives different rules on
+    // different systems, and this code needs two of them exactly.
+    // SA_RESETHAND gives the disposition back to the system at the delivery, so
+    // the second signal stops the command. The absence of SA_RESTART lets a
+    // system call end with EINTR, which is what wakes the wait.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_wait_signal as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESETHAND;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
+}
+
+fn wait_was_interrupted() -> bool {
+    WAIT_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Writes the message of a wait that a signal stopped, and gives its code.
+///
+/// The message is worth as much as the code. An agent or a person that stops a
+/// wait must learn that the job survived, and must get the command that
+/// attaches to it again.
+fn report_broken_wait(ids: &[String], quiet: bool) -> i32 {
+    if !quiet {
+        eprintln!("qex: your wait stopped. The job continues.");
+        // ONE job gives the command that also gives the record, because that is
+        // what the reader wanted. MANY jobs give `qex wait`, which is the
+        // command that takes many.
+        if let [one] = ids {
+            eprintln!("qex: attach to it again:  qex status {one} --wait");
+        } else {
+            eprintln!("qex: attach to them again:  qex wait {}", ids.join(" "));
+        }
+    }
+    EXIT_WAIT_BROKEN
+}
+
+/// How long the wait sleeps between two tests of the signal flag.
+const WAIT_SLICE: Duration = Duration::from_millis(250);
+
+/// How often the wait asks why the job does not start.
+const REASON_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long the wait looks for a coordinator that replaced the earlier one.
+///
+/// The wait watches the RECORD of the job at the same time, so a job that stops
+/// in this time gives its result at once. After this limit the wait reads the
+/// record alone, which always answers, so the limit changes the speed of an
+/// answer and never the answer.
+const RECONNECT_LIMIT: Duration = Duration::from_secs(10);
+
+/// Says why a job does not start, and says it again when the cause changes.
+///
+/// A queue that does nothing and does not say why is the fault that this tool
+/// exists to remove, and that rule holds for every command that waits
+/// (issue #28).
+struct ReasonReporter {
+    last: Option<String>,
+    quiet: bool,
+    /// True when the job started. The queue has nothing more to say.
+    done: bool,
+    next_test: Instant,
+}
+
+impl ReasonReporter {
+    fn new(quiet: bool) -> Self {
+        Self {
+            last: None,
+            quiet,
+            done: false,
+            next_test: Instant::now(),
+        }
+    }
+
+    /// Asks for the state of the job, and reports a cause that changed.
+    ///
+    /// This is the ONE place where a wait asks a question of its own, and it
+    /// stops at the moment that the job starts. A job that waits four hours in
+    /// the queue and then runs for four more must not cost 14400 questions.
+    fn poll(&mut self, raw_id: &str) {
+        if self.quiet || self.done || Instant::now() < self.next_test {
+            return;
+        }
+        self.next_test = Instant::now() + REASON_INTERVAL;
+
+        // Use a SECOND connection. The first one holds the wait request, and
+        // the coordinator answers that request when the job stops.
+        let status = match Client::connect_existing() {
+            Some(mut client) => {
+                client.set_read_timeout(Some(REASON_INTERVAL)).ok();
+                match resolve_id_for_wait(&mut client, raw_id) {
+                    Ok(Some(id)) => match client.call(&Request::Status { id }) {
+                        Ok(Response::Status { status }) => Some(*status),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            None => read_status_on_disk(raw_id).unwrap_or(None),
+        };
+        if let Some(status) = status {
+            self.note(&status);
+        }
+    }
+
+    /// Reports the cause that the record holds.
+    fn note(&mut self, status: &JobStatus) {
+        // A job that started has no queue reason, and it takes no new one.
+        // Ask no more.
+        if status.state != JobState::Queued {
+            self.done = true;
+            return;
+        }
+        if self.quiet {
+            return;
+        }
+        let Some(reason) = &status.blocked_reason else {
+            return;
+        };
+        if self.last.as_deref() == Some(reason.as_str()) {
+            return;
+        }
+        eprintln!("qex: {}", crate::job::printable(reason));
+        self.last = Some(reason.clone());
+    }
+}
+
+/// Reads the record of a job from the disk.
+///
+/// The supervisor writes that record, and it continues after the coordinator
+/// stops. The record is thus the answer that always exists.
+fn read_status_on_disk(raw_id: &str) -> Result<Option<JobStatus>> {
+    let Some(id) = find_id_on_disk(raw_id)? else {
+        return Ok(None);
+    };
+    let dir = paths::job_dir(&id)?;
+    Ok(crate::job::read_status(&dir).ok())
 }
 
 /// Waits for one job.
@@ -1194,51 +1736,213 @@ enum WaitOutcome {
 /// If a coordinator operates, this function sends one request and sleeps. If no
 /// coordinator operates, it reads the status file of the job. The second path
 /// is necessary because the supervisor continues after the coordinator stops.
-fn wait_one(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
-    if let Some(mut client) = Client::connect_existing() {
-        let id = match resolve_id(&mut client, raw_id) {
-            Ok(id) => id,
-            Err(_) => return Ok(WaitOutcome::NoSuchJob),
-        };
-
-        // Give the socket the time limit of the user. The coordinator answers
-        // when the job stops, so this call blocks and uses no CPU time.
-        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        if remaining == Some(Duration::ZERO) {
-            return Ok(WaitOutcome::TimedOut);
-        }
-        client.set_read_timeout(remaining)?;
-
-        client.send(&Request::Wait { id })?;
-        match client.recv() {
-            Ok(Response::Status { status }) => return Ok(WaitOutcome::Finished(status)),
-            Ok(Response::Error {
-                kind: ErrorKind::NoSuchJob,
-                ..
-            }) => return Ok(WaitOutcome::NoSuchJob),
-            Ok(other) => {
-                report(other)?;
-                bail!("the coordinator gave an answer that qex did not expect")
-            }
-            Err(e) => {
-                // Separate the two causes. A read that reaches its limit is the
-                // time limit of the user. Every other fault means that the
-                // coordinator stopped.
-                //
-                // Without this test, `qex wait` reports the code 124 when the
-                // coordinator fails, and the user reads "your wait reached its
-                // time limit" for a wait that had no time limit.
-                if is_read_timeout(&e) {
-                    return Ok(WaitOutcome::TimedOut);
+///
+/// A coordinator that STOPS in the middle of the wait does not end the wait.
+/// qex replaces a coordinator on every update of the program, so that event is
+/// the normal upgrade path and not an exotic case. The job continues, and its
+/// result must reach the caller (issue #45).
+fn wait_one(
+    raw_id: &str,
+    deadline: Option<Instant>,
+    reporter: &mut ReasonReporter,
+) -> Result<WaitOutcome> {
+    loop {
+        match wait_through_coordinator(raw_id, deadline, reporter)? {
+            Some(outcome) => return Ok(outcome),
+            // The coordinator stopped. Its answer never arrives, so find the
+            // answer somewhere else.
+            None => {
+                // The job can have stopped already. The record holds the
+                // result, and the supervisor wrote it.
+                if let Some(status) = read_status_on_disk(raw_id)? {
+                    if status.state.is_terminal() {
+                        return Ok(WaitOutcome::Finished(Box::new(status)));
+                    }
                 }
-                // The coordinator stopped. The supervisor of the job continues
-                // and writes the result, so read that file instead.
+
+                // A job that has no record and no coordinator does not exist.
+                //
+                // Say so NOW. The coordinator makes the directory of a job at
+                // the submission, so a job with none never reached a queue, and
+                // a search for a new coordinator would cost the reader ten
+                // seconds before the same answer. The test is for an ID only: a
+                // NAME lives in the coordinator, and the disk cannot resolve
+                // one.
+                if raw_id.parse::<uuid::Uuid>().is_ok() && find_id_on_disk(raw_id)?.is_none() {
+                    return Ok(WaitOutcome::NoSuchJob);
+                }
+
+                if !reporter.quiet {
+                    eprintln!(
+                        "qex: the coordinator stopped. The job continues, and this wait \
+                         continues with it."
+                    );
+                }
+                match reconnect(raw_id, deadline) {
+                    // A new coordinator answers. Ask it the same question.
+                    //
+                    // Sleep first. A coordinator that accepts a connection and
+                    // then fails every request would otherwise make this loop
+                    // spin, and the message above would repeat with it.
+                    Reconnect::Ready => {
+                        std::thread::sleep(WAIT_SLICE);
+                        continue;
+                    }
+                    Reconnect::Finished(status) => return Ok(WaitOutcome::Finished(status)),
+                    Reconnect::TimedOut => return Ok(WaitOutcome::TimedOut),
+                    Reconnect::Interrupted => return Ok(WaitOutcome::Interrupted),
+                    // No coordinator came back. The record of the job is the
+                    // truth, so read it. Nothing about the JOB changed.
+                    Reconnect::None => return wait_on_file(raw_id, deadline, reporter),
+                }
             }
         }
     }
+}
 
-    // There is no coordinator. Read the file of the job.
-    wait_on_file(raw_id, deadline)
+/// The result of a search for a coordinator that replaced the earlier one.
+enum Reconnect {
+    Ready,
+    None,
+    TimedOut,
+    Interrupted,
+    /// The job stopped while qex looked for a coordinator.
+    Finished(Box<JobStatus>),
+}
+
+/// Looks for a coordinator that replaced the one that stopped.
+///
+/// It watches the RECORD at the same time. A job frequently stops while no
+/// coordinator operates, and the record then holds the answer: a wait that
+/// looked for a coordinator first would give that answer ten seconds late.
+fn reconnect(raw_id: &str, deadline: Option<Instant>) -> Reconnect {
+    let limit = Instant::now() + RECONNECT_LIMIT;
+    loop {
+        if wait_was_interrupted() {
+            return Reconnect::Interrupted;
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return Reconnect::TimedOut;
+            }
+        }
+        if let Ok(Some(status)) = read_status_on_disk(raw_id) {
+            if status.state.is_terminal() {
+                return Reconnect::Finished(Box::new(status));
+            }
+        }
+        if Client::connect_existing().is_some() {
+            return Reconnect::Ready;
+        }
+        if Instant::now() >= limit {
+            return Reconnect::None;
+        }
+        std::thread::sleep(WAIT_SLICE);
+    }
+}
+
+/// Finds the id of a job for a wait.
+///
+/// `Ok(None)` says that the coordinator ANSWERED, and that it holds no such
+/// job. An `Err` says that the coordinator did not answer, and the caller then
+/// tries the record on the disk or a new coordinator. The two must stay apart:
+/// "there is no job with that id" about a job that operates is the worst answer
+/// that a wait can give.
+fn resolve_id_for_wait(client: &mut Client, raw_id: &str) -> Result<Option<uuid::Uuid>> {
+    let Response::Jobs { jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    match resolve_targets_in(&jobs, raw_id) {
+        Ok(found) if found.group.is_none() && found.ids.len() == 1 => Ok(Some(found.ids[0])),
+        // A name that gives many jobs is not a fault of the transport. This
+        // command takes one job, so it says so through the caller.
+        _ => Ok(None),
+    }
+}
+
+/// Waits for one job through the coordinator.
+///
+/// Gives `None` when the coordinator stopped. The caller then finds the answer
+/// in the record of the job, or through a new coordinator.
+fn wait_through_coordinator(
+    raw_id: &str,
+    deadline: Option<Instant>,
+    reporter: &mut ReasonReporter,
+) -> Result<Option<WaitOutcome>> {
+    let Some(mut client) = Client::connect_existing() else {
+        return Ok(None);
+    };
+    // Give every read a limit.
+    //
+    // `wait_readable` holds the deadline of the user, and the reads around it
+    // do not. A coordinator that accepts the connection and then says nothing
+    // would hold `qex wait --timeout 30m` for ever, and the first Ctrl-C would
+    // not reach the test above.
+    client
+        .set_read_timeout(Some(WAIT_SLICE.max(REASON_INTERVAL)))
+        .ok();
+
+    // Separate "the coordinator says that there is no such job" from "the
+    // coordinator did not answer".
+    //
+    // `resolve_id` asks the coordinator for the job list, so a coordinator that
+    // stops in this moment gives an error here. To read that error as
+    // "no such job" tells the caller that its RUNNING job does not exist, and
+    // the caller then stops watching work that continues.
+    let id = match resolve_id_for_wait(&mut client, raw_id) {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(Some(WaitOutcome::NoSuchJob)),
+        // The coordinator did not answer. Find the answer without it.
+        Err(_) => return Ok(None),
+    };
+
+    // The coordinator answers when the job stops, so this request waits. A
+    // coordinator that stops before it reads the request gives an error here,
+    // and the caller then finds the answer without it.
+    if client.send(&Request::Wait { id }).is_err() {
+        return Ok(None);
+    }
+
+    // Look at the socket in short steps.
+    //
+    // The steps cost one system call each, and they let this command do three
+    // things that a blocking read cannot: obey a signal from the user, say why
+    // the job waits, and see a coordinator that stopped.
+    loop {
+        if wait_was_interrupted() {
+            return Ok(Some(WaitOutcome::Interrupted));
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return Ok(Some(WaitOutcome::TimedOut));
+            }
+        }
+        match client.wait_readable(WAIT_SLICE) {
+            Ok(true) => break,
+            Ok(false) => {
+                reporter.poll(raw_id);
+                continue;
+            }
+            // The socket itself failed. The coordinator is gone.
+            Err(_) => return Ok(None),
+        }
+    }
+
+    match client.recv() {
+        Ok(Response::Status { status }) => Ok(Some(WaitOutcome::Finished(status))),
+        Ok(Response::Error {
+            kind: ErrorKind::NoSuchJob,
+            ..
+        }) => Ok(Some(WaitOutcome::NoSuchJob)),
+        // One message for one fault. `report_for_a_job` writes the message of
+        // the coordinator, and a second line here would say the same thing
+        // twice in different words.
+        Ok(other) => bail!("the coordinator gave an answer that qex did not expect: {other:?}"),
+        // The coordinator closed the connection, or the read failed. Both mean
+        // that the coordinator stopped: the deadline above ends a wait that
+        // reached its time limit, so a fault here is not a time limit.
+        Err(_) => Ok(None),
+    }
 }
 
 /// Writes a warning when the coordinator holds a different version.
@@ -1456,7 +2160,11 @@ fn is_read_timeout(e: &anyhow::Error) -> bool {
 ///
 /// The supervisor writes that file in one operation, so a reader sees the old
 /// contents or the new contents, and never a part of them.
-fn wait_on_file(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> {
+fn wait_on_file(
+    raw_id: &str,
+    deadline: Option<Instant>,
+    reporter: &mut ReasonReporter,
+) -> Result<WaitOutcome> {
     let Some(id) = find_id_on_disk(raw_id)? else {
         return Ok(WaitOutcome::NoSuchJob);
     };
@@ -1468,6 +2176,11 @@ fn wait_on_file(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> 
             if status.state.is_terminal() {
                 return Ok(WaitOutcome::Finished(Box::new(status)));
             }
+            reporter.note(&status);
+        }
+
+        if wait_was_interrupted() {
+            return Ok(WaitOutcome::Interrupted);
         }
 
         if let Some(d) = deadline {
@@ -1476,10 +2189,11 @@ fn wait_on_file(raw_id: &str, deadline: Option<Instant>) -> Result<WaitOutcome> 
             }
         }
 
+        // The delay grows to `WAIT_SLICE`. A short job thus gives a fast
+        // answer, a long job does not use CPU time, and a signal from the user
+        // reaches the test above in a quarter of a second.
         std::thread::sleep(delay);
-        // The delay grows to one second. A short job thus gives a fast answer,
-        // and a long job does not use CPU time.
-        delay = (delay * 2).min(Duration::from_secs(1));
+        delay = (delay * 2).min(WAIT_SLICE);
     }
 }
 
@@ -2152,68 +2866,40 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     Ok(worst)
 }
 
-/// How a command turns the result of a job into its own exit code.
-///
-/// Every command that waits for a job uses this one function. A second rule in
-/// a second command is how two commands start to answer one question two ways.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ExitMode {
-    /// The code names the STATE of the job. `qex wait` uses this mode.
-    State,
-    /// The code is the exit code of the job. `qex wait --passthrough` uses it.
-    Passthrough,
-    /// The code is the exit code of the job when the job RAN, and the code of
-    /// the state when the job gave no code of its own. `qex run` uses it.
-    Run,
-}
-
-/// Gives the mode of `qex wait`, with or without `--passthrough`.
-fn wait_mode(passthrough: bool) -> ExitMode {
-    if passthrough {
-        ExitMode::Passthrough
-    } else {
-        ExitMode::State
-    }
-}
-
 /// Gives the exit code for a job result.
-fn exit_code_for(status: &JobStatus, mode: ExitMode) -> i32 {
-    // `qex run` needs a mode between the other two, because neither of them
-    // alone is correct for it:
-    //
-    // - `qex run` writes the output of the job, so a caller expects the exit
-    //   code of the job when the job ran. `ExitMode::State` gives 1 for every
-    //   job that failed, and it thus loses the code 7 of `sh -c 'exit 7'`.
-    // - A job that something stopped gave no exit code, and
-    //   `ExitMode::Passthrough` gives 1 for it. The caller reads 1, which is
-    //   the most common code of a program that failed, and concludes that its
-    //   own command failed. The true answer is that ANOTHER command on the
-    //   machine stopped the job, and that is an ordinary event on a machine
-    //   that several agents share.
-    //
-    // `ExitMode::Run` thus passes the code of the job through for the two
-    // states in which the job ran to its own end, and it gives the code of the
-    // state for every other state. Those are the codes of `qex wait`.
-    let passthrough = match mode {
-        ExitMode::State => false,
-        ExitMode::Passthrough => true,
-        ExitMode::Run => matches!(status.state, JobState::Completed | JobState::Failed),
-    };
-
-    if passthrough {
-        // A job that did not run has no exit code of its own. Give the code for
-        // the state instead, so the caller still learns that an earlier job is
-        // the cause and this job never ran.
-        if status.state == JobState::Skipped {
-            return EXIT_SKIPPED;
+///
+/// EVERY command that waits for a job uses this one function, so two commands
+/// cannot answer one question two ways.
+///
+/// The rule is the band. A job that RAN to its own end gives its own code, and
+/// qex maps a code that the band keeps onto the sentinel. Every other state
+/// belongs to the queue or to the wait, so it takes a code from the band.
+fn exit_code_for(status: &JobStatus) -> i32 {
+    // A job that ran to its own end gives its own exit code. The caller of
+    // `qex run` and of `qex submit --wait` expects the code of the command
+    // that it replaced.
+    if matches!(status.state, JobState::Completed | JobState::Failed) {
+        // A signal stopped the job, so the job gave no code of its own. The
+        // record names the signal.
+        if status.exit_code.is_none() && status.signal.is_some() {
+            return EXIT_JOB_SIGNAL;
         }
-        if status.state == JobState::Expired {
-            return EXIT_EXPIRED;
+        let Some(code) = status.exit_code.or(match status.state {
+            JobState::Completed => Some(0),
+            // The job stopped, and qex holds neither an exit code nor a signal
+            // for it. qex does not know, and 1 would say that the JOB knew and
+            // gave 1.
+            _ => None,
+        }) else {
+            return EXIT_QEX_FAILED;
+        };
+        // The job gave a code that qex keeps for itself. Give the sentinel, so
+        // the caller reads the record and does not read the code of the job as
+        // an answer about the queue or about the wait.
+        if code >= EXIT_BAND_FLOOR {
+            return EXIT_JOB_RESERVED;
         }
-        return status.exit_code.unwrap_or(match status.state {
-            JobState::Completed => 0,
-            _ => 1,
-        });
+        return code;
     }
 
     match status.state {
@@ -2223,7 +2909,10 @@ fn exit_code_for(status: &JobStatus, mode: ExitMode) -> i32 {
         // caller must not read it as a fault in the work: the work did not
         // start. The code is the same for `qex run` and for `qex wait`,
         // because one state gives one answer.
-        JobState::Killed | JobState::Timeout | JobState::Oom | JobState::Cancelled => EXIT_KILLED,
+        // The kernel stopped this job for memory. The remedy is a larger claim,
+        // and it is not the remedy of the other three, so the code is its own.
+        JobState::Oom => EXIT_OOM,
+        JobState::Killed | JobState::Timeout | JobState::Cancelled => EXIT_KILLED,
         // A job that never started has its own code. A script can then separate
         // "my job ran too long" from "my job never got the machine".
         JobState::Expired => EXIT_EXPIRED,
@@ -2231,7 +2920,14 @@ fn exit_code_for(status: &JobStatus, mode: ExitMode) -> i32 {
         // "my job failed" from "a job before mine failed", and it does not read
         // the JSON output.
         JobState::Skipped => EXIT_SKIPPED,
-        _ => 1,
+        // A state that is not the end of a job, or a job that ended with
+        // neither an exit code nor a signal. qex has no result to give, and 1
+        // would say that the job ran and gave 1. No code in the table fits
+        // exactly: 121 says "qex could not do what you asked", and the part
+        // that qex could not do is the RESULT. The record holds the state, and
+        // the rule of the band holds here by construction, and not by the
+        // states that happen to reach this function.
+        _ => EXIT_QEX_FAILED,
     }
 }
 
@@ -2278,6 +2974,18 @@ fn describe_result(s: &JobStatus) -> String {
 }
 
 /// Writes an error from the coordinator and gives an exit code.
+/// Writes an error of the coordinator for a command that gives the exit code of
+/// a JOB.
+///
+/// The code 1 says "the job ran and it failed". A coordinator that refuses a
+/// request is a fault of qex, and no job gave a code for it, so it takes the
+/// code of the band. `qex kill` and the other commands never speak for a job,
+/// so they keep the conventional 1.
+fn report_for_a_job(response: Response) -> Result<i32> {
+    let code = report(response)?;
+    Ok(if code == 1 { EXIT_QEX_FAILED } else { code })
+}
+
 fn report(response: Response) -> Result<i32> {
     match response {
         Response::Error { message, kind } => {
@@ -3923,6 +4631,26 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
     RUN_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Catches SIGINT and SIGTERM while a command streams the output of a job.
+///
+/// `qex run` stops its own job with them. `qex status --follow` did not start
+/// the job, so it stops its wait only, and `stream_until_done` knows the
+/// difference.
+fn catch_run_signals() {
+    // `qex run` keeps its handler after the first signal, because a second
+    // Ctrl-C must stop the job again when the first stop did not succeed. It
+    // thus takes no SA_RESETHAND. `sigaction` gives the same rules on every
+    // system that qex supports.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_interrupt as *const () as libc::sighandler_t;
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+    }
+}
+
 /// Runs a command through the queue and waits for it here.
 ///
 /// This command exists for one reason: an agent uses the tools that it already
@@ -3948,13 +4676,22 @@ extern "C" fn on_interrupt(_signal: libc::c_int) {
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for
 /// work that must live longer than the command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
-    // `qex run` takes the options of `qex submit`, and `--each-line` is the one
-    // option that it cannot obey: `qex run` waits for ONE job and gives the
-    // output and the exit code of that job. To accept the option here and use
-    // one line only would give the user a result that is not the file.
+    // Name the command that the READER typed. `qex submit --follow` is this
+    // same command in a longer form, and a message about `qex run` names a
+    // command that such a reader never used.
+    let name = if args.submit.follow {
+        "qex submit --follow"
+    } else {
+        "qex run"
+    };
+
+    // This command takes the options of `qex submit`, and `--each-line` is the
+    // one option that it cannot obey: it waits for ONE job and gives the output
+    // and the exit code of that job. To accept the option here and use one line
+    // only would give the user a result that is not the file.
     if args.submit.each_line.is_some() {
         bail!(
-            "`qex run` does not accept `--each-line`, because it waits for one job and \
+            "`{name}` does not accept `--each-line`, because it waits for one job and \
              gives the output and the exit code of that job.\n\n\
              Use `qex submit --each-line`, then wait for the group:\n\
              \x20   GROUP=$(qex submit --each-line inputs.txt -- ./process {{}})"
@@ -3964,11 +4701,30 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     let cfg = Config::load()?;
     cfg.validate()?;
 
+    // `qex run` waits always, so `--wait` says nothing that this command does
+    // not do. Refuse it, and do not accept it in silence: a user that gives it
+    // expects a difference.
+    if args.submit.quiet {
+        bail!(
+            "`{name}` does not accept `--quiet`, because it writes the output of the job to \
+             your terminal.\n\n\
+             Use `qex submit --wait --quiet` for the exit code with no output."
+        );
+    }
+
+    if args.submit.wait {
+        bail!(
+            "`{name}` does not accept `--wait`, because it always waits for the job.\n\n\
+             `qex run` writes the output of the job to your terminal. Use \
+             `qex submit --wait` to keep the output in the log file."
+        );
+    }
+
     // `qex run` gives the output of the job on stdout. A JSON object there
     // would mix with that output, and neither part could be read.
     if args.submit.json {
         bail!(
-            "`qex run` does not accept --json.\n\n\
+            "`{name}` does not accept --json.\n\n\
              This command writes the output of the job to stdout, so a JSON object there \
              would mix with that output.\n\n\
              Use two commands:\n\
@@ -4031,26 +4787,21 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
             }
             (id, deduplicated)
         }
-        other => return report(other),
+        other => return report_for_a_job(other),
     };
 
-    if let Some(path) = &args.submit.id_file {
-        write_id_file(path, &format!("{id}\n"))?;
-    }
-    if args.show_id {
-        eprintln!("qex: job {id}");
-    }
+    // ALWAYS SAY THE ID. This command writes the output of the job on stdout,
+    // so the id has no other place to go, and a caller that loses this command
+    // has no handle for a job that continues. One line on stderr costs nothing
+    // and it cannot mix with the output of the job.
+    say_the_id_and_write_the_file(id, args.submit.id_file.as_ref());
 
     // Catch Ctrl-C, and stop the job with it.
     //
     // Without this, Ctrl-C would stop this command and leave the job in the
     // queue. A user expects Ctrl-C to stop the work, because `qex run` looks
     // like the command that it replaces.
-    unsafe {
-        let handler = on_interrupt as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
-    }
+    catch_run_signals();
 
     // Say now what Ctrl-C will do, because a dedupe key changed it.
     //
@@ -4070,7 +4821,8 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     }
 
     let dir = paths::job_dir(&id)?;
-    stream_until_done(&mut client, id, &dir, !deduplicated)
+    // `qex run` sets no limit on its own wait. `--timeout` limits the JOB.
+    stream_until_done(&mut client, id, &dir, !deduplicated, None)
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
@@ -4137,11 +4889,13 @@ fn stream_until_done(
     id: uuid::Uuid,
     dir: &std::path::Path,
     owns_job: bool,
+    deadline: Option<Instant>,
 ) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let mut handles: Vec<(bool, Option<std::fs::File>)> = vec![(false, None), (true, None)];
     let mut announced_wait = false;
+    let mut announced_loss = false;
     // Keep a record of who stopped the job. A user who pressed Ctrl-C knows
     // already why the job stopped, but a user whose job ANOTHER command stopped
     // knows nothing, and that user needs the sentence most.
@@ -4159,9 +4913,12 @@ fn stream_until_done(
                     "\nqex: this wait stops. The job {id} continues, because this command \
                      did not start it.\n\
                      qex: to stop the job, run `qex kill {id}`. \
-                     To wait again, run `qex status {id} --wait`."
+                     To read the output again, run `qex status {id} --follow`."
                 );
-                return Ok(EXIT_TIMEOUT);
+                // The code says that the WAIT stopped, and not that a limit of
+                // the reader passed. 124 says the reader set a limit and the
+                // limit came; this reader set none and lost the wait.
+                return Ok(EXIT_WAIT_BROKEN);
             }
 
             eprintln!("\nqex: stopping the job {id}");
@@ -4201,24 +4958,16 @@ fn stream_until_done(
             }
         }
 
-        // Name the job in a transport failure.
+        // A coordinator that stops must not end this command.
         //
-        // A coordinator that stops while `qex run` waits gives an error here,
-        // and `qex run` then exits with the code 1. The job can still operate,
-        // so the message must give the reader the id and the next command.
-        // Without them the reader has the code of a job that failed and no
-        // way to learn that the job continues.
-        // Put the cause INSIDE the message, and do not add a context that
-        // anyhow writes before it. A context that ends in a full stop gives
-        // `...answers again.: Broken pipe`, and the remedy then stands before
-        // the fault that it corrects.
+        // qex replaces the coordinator at every update of the program, so this
+        // is the normal upgrade path. The job continues, because its supervisor
+        // continues, and the supervisor writes the record. Read that record, or
+        // attach to the coordinator that replaced this one.
         let status = match client.call(&Request::Status { id }) {
             Ok(Response::Status { status }) => status,
-            Ok(other) => return report(other),
-            Err(e) => bail!(
-                "the coordinator did not give the state of the job {id}: {e:#}. The job can \
-                 still operate. Use `qex status {id}` when the coordinator answers again."
-            ),
+            Ok(other) => return report_for_a_job(other),
+            Err(_) => status_without_the_coordinator(client, id, dir, &mut announced_loss)?,
         };
 
         // Say why nothing happens yet. A user of `qex run` sees no output while
@@ -4232,13 +4981,64 @@ fn stream_until_done(
         }
 
         if status.state.is_terminal() && !moved {
-            let code = exit_code_for(&status, ExitMode::Run);
+            let code = exit_code_for(&status);
             report_run_stop(&status, stopped_here);
             return Ok(code);
         }
 
+        // The limit of the reader stops the WAIT, and never the job.
+        //
+        // A job that ALREADY stopped never gives this code. The test above
+        // leaves a terminal job here when it still moved output in this step,
+        // so a limit that comes in that same step would report 124 for a job
+        // that has a result.
+        if let Some(d) = deadline.filter(|_| !status.state.is_terminal()) {
+            if Instant::now() >= d {
+                eprintln!(
+                    "qex: your wait reached its time limit. The job {id} continues.\n\
+                     qex: attach to it again:  qex status {id} --follow"
+                );
+                return Ok(EXIT_TIMEOUT);
+            }
+        }
+
         std::thread::sleep(Duration::from_millis(80));
     }
+}
+
+/// Gives the state of the job when the coordinator stopped.
+///
+/// The record on the disk is the truth. The supervisor writes it, and the
+/// supervisor continues after the coordinator stops (issue #45).
+fn status_without_the_coordinator(
+    client: &mut Client,
+    id: uuid::Uuid,
+    dir: &std::path::Path,
+    announced: &mut bool,
+) -> Result<Box<JobStatus>> {
+    if !*announced {
+        eprintln!(
+            "qex: the coordinator stopped. The job {id} continues, and this command continues \
+             with it."
+        );
+        *announced = true;
+    }
+
+    // A new coordinator can listen already. Take it, so the following requests
+    // go the fast way again.
+    if let Some(fresh) = Client::connect_existing() {
+        *client = fresh;
+        if let Ok(Response::Status { status }) = client.call(&Request::Status { id }) {
+            return Ok(status);
+        }
+    }
+
+    crate::job::read_status(dir).map(Box::new).with_context(|| {
+        format!(
+            "the coordinator stopped, and qex could not read the record of the job {id}. The \
+             job can still operate. Use `qex status {id}` when the coordinator answers again"
+        )
+    })
 }
 
 /// Writes why `qex run` stopped, when the job gave no exit code of its own.
@@ -4297,11 +5097,14 @@ fn report_run_stop(status: &JobStatus, stopped_here: bool) {
             "the job {id} reached its time limit, and qex stopped it. Give a longer `--timeout` \
              when the work needs more time."
         ),
+        // Say what the RECORD says. `describe_result` holds the full story of
+        // a kill for memory — the claim that qex tried, and whether it raised
+        // it — and two commands must not explain one state two ways. The words
+        // "the machine ran out of memory" also sent readers to the machine
+        // when the fault was in the claim.
         JobState::Oom => format!(
-            "the machine ran out of memory, and the job {id} stopped. The job claimed {} and \
-             used {}. Give a larger `--mem`, or make the work smaller.",
-            format_size(status.mem),
-            format_size(status.usage.max_rss)
+            "the job {id} stopped: {}. Give a larger `--mem`, or make the work smaller.",
+            describe_result(status)
         ),
         JobState::Skipped => describe_result(status),
         other => format!("the job {id} is {other}"),
@@ -5153,93 +5956,92 @@ mod tests {
     }
 
     /// These codes are a contract with the agents. The help text gives them.
+    ///
+    /// Pin the LITERALS, and not the constants alone. The documents, the skill
+    /// file and every script of a user name the numbers, so a change to a
+    /// constant is a change to a published interface. A test that reads the
+    /// constant on both sides agrees with itself and with nothing else.
     #[test]
     fn the_exit_codes_follow_the_documentation() {
+        assert_eq!(EXIT_BAND_FLOOR, 97);
+        assert_eq!(EXIT_JOB_RESERVED, 97);
+        assert_eq!(EXIT_JOB_SIGNAL, 98);
+        assert_eq!(EXIT_OOM, 99);
+        assert_eq!(EXIT_NO_RESULT, 100);
+        assert_eq!(EXIT_QEX_FAILED, 121);
+        assert_eq!(EXIT_WAIT_BROKEN, 122);
+        assert_eq!(EXIT_EXPIRED, 123);
+        assert_eq!(EXIT_TIMEOUT, 124);
+        assert_eq!(EXIT_KILLED, 125);
+        assert_eq!(EXIT_SKIPPED, 126);
+        assert_eq!(EXIT_NO_SUCH_JOB, 127);
+
+        assert_eq!(exit_code_for(&status_with(JobState::Completed, Some(0))), 0);
+        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(1))), 1);
         assert_eq!(
-            exit_code_for(&status_with(JobState::Completed, Some(0)), ExitMode::State),
-            0
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(1)), ExitMode::State),
-            1
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(42)), ExitMode::State),
-            1
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Killed, None), ExitMode::State),
+            exit_code_for(&status_with(JobState::Killed, None)),
             EXIT_KILLED
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Timeout, None), ExitMode::State),
+            exit_code_for(&status_with(JobState::Timeout, None)),
             EXIT_KILLED
         );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Oom, None), ExitMode::State),
-            EXIT_KILLED
-        );
+        // The kernel stopped the job for memory. The remedy is a larger claim,
+        // so the code is not the 125 of a kill, a cancel or a time limit.
+        assert_eq!(exit_code_for(&status_with(JobState::Oom, None)), EXIT_OOM);
         // A job that never started has its own code. It must not be 125: a job
         // with the code 125 ran and wrote output, and this job did neither.
-        //
-        // Pin the LITERAL, and not the constant alone. The documents, the skill
-        // file and every script of a user name the number 123, so a change to
-        // the constant is a change to a published interface. A test that reads
-        // the constant on both sides agrees with itself and with nothing else.
-        assert_eq!(EXIT_EXPIRED, 123);
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Expired, None), ExitMode::State),
-            123
-        );
-        // `--passthrough` gives the code of the state here as well. A job that
-        // never started has no exit code of its own, so the alternative is 1,
-        // and 1 says that the work ran and failed.
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Expired, None), ExitMode::Passthrough),
-            123
-        );
+        assert_eq!(exit_code_for(&status_with(JobState::Expired, None)), 123);
     }
 
-    /// The option `--passthrough` gives the exit code of the job.
+    /// A job that ran gives its own exit code. Without this, an agent cannot
+    /// separate the code 7 of its test tool from any other failure.
     #[test]
-    fn the_passthrough_option_gives_the_exit_code_of_the_job() {
-        assert_eq!(
-            exit_code_for(
-                &status_with(JobState::Failed, Some(42)),
-                ExitMode::Passthrough
-            ),
-            42
-        );
-        assert_eq!(
-            exit_code_for(
-                &status_with(JobState::Completed, Some(0)),
-                ExitMode::Passthrough
-            ),
-            0
-        );
-        // A signal gives no exit code. The result must still show a failure.
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Killed, None), ExitMode::Passthrough),
-            1
-        );
+    fn a_job_that_ran_gives_its_own_exit_code() {
+        assert_eq!(exit_code_for(&status_with(JobState::Completed, Some(0))), 0);
+        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(7))), 7);
+        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(1))), 1);
     }
 
-    /// `qex run` writes the output of the job, so it gives the exit code of the
-    /// job. Without this, `qex run -- sh -c 'exit 7'` would give 1, and the
-    /// command that `qex run` goes in front of would change its result.
+    /// A code that the band keeps gives the sentinel, and the record keeps the
+    /// true code.
+    ///
+    /// This test is the whole feature. Without the sentinel, a job that exits
+    /// 124 of its own accord looks exactly like a wait that reached its time
+    /// limit, and the two need different actions.
     #[test]
-    fn qex_run_gives_the_exit_code_of_a_job_that_ran() {
+    fn a_job_code_in_the_band_gives_the_sentinel() {
+        let s = status_with(JobState::Failed, Some(124));
+        assert_eq!(exit_code_for(&s), EXIT_JOB_RESERVED);
         assert_eq!(
-            exit_code_for(&status_with(JobState::Completed, Some(0)), ExitMode::Run),
-            0
+            s.exit_code,
+            Some(124),
+            "the record keeps the code of the job"
+        );
+
+        // The two boundaries. An error of one moves a job code into the band,
+        // or a band code out of it.
+        assert_eq!(exit_code_for(&status_with(JobState::Failed, Some(96))), 96);
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(97))),
+            EXIT_JOB_RESERVED
+        );
+        // The sentinel value itself. The answer must be the sentinel, so the
+        // rule stays true for every code in the band.
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(EXIT_JOB_RESERVED))),
+            EXIT_JOB_RESERVED
+        );
+        // The usual code of a job that a signal stopped, 128 + N. It is in the
+        // band, so it gives the sentinel as well. Only qex itself gives a code
+        // above 127.
+        assert_eq!(
+            exit_code_for(&status_with(JobState::Failed, Some(128))),
+            EXIT_JOB_RESERVED
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(7)), ExitMode::Run),
-            7
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Failed, Some(1)), ExitMode::Run),
-            1
+            exit_code_for(&status_with(JobState::Failed, Some(137))),
+            EXIT_JOB_RESERVED
         );
     }
 
@@ -5253,33 +6055,36 @@ mod tests {
     #[test]
     fn qex_run_gives_the_code_of_the_state_when_something_stopped_the_job() {
         assert_eq!(
-            exit_code_for(&status_with(JobState::Killed, None), ExitMode::Run),
+            exit_code_for(&status_with(JobState::Killed, None)),
             EXIT_KILLED
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Cancelled, None), ExitMode::Run),
+            exit_code_for(&status_with(JobState::Cancelled, None)),
             EXIT_KILLED
         );
         assert_eq!(
-            exit_code_for(&status_with(JobState::Timeout, None), ExitMode::Run),
+            exit_code_for(&status_with(JobState::Timeout, None)),
             EXIT_KILLED
         );
+        assert_eq!(exit_code_for(&status_with(JobState::Oom, None)), EXIT_OOM);
         assert_eq!(
-            exit_code_for(&status_with(JobState::Oom, None), ExitMode::Run),
-            EXIT_KILLED
-        );
-        assert_eq!(
-            exit_code_for(&status_with(JobState::Skipped, None), ExitMode::Run),
+            exit_code_for(&status_with(JobState::Skipped, None)),
             EXIT_SKIPPED
         );
     }
 
-    /// `qex run` and `qex wait` must never answer one question two ways. For
-    /// each state in which the job gave no exit code, the two commands give one
-    /// code. The test compares them against each other, so they cannot drift.
+    /// Every code that qex gives is 0 to 96, or 97 to 127. A code of 128 or
+    /// above says that the qex PROCESS died from a signal, so no answer of qex
+    /// may use one.
+    ///
+    /// A dead process writes no exit code, so `128 + N` from a qex command can
+    /// only mean that the command itself died. The job is then not described,
+    /// and the caller must attach to it again.
     #[test]
-    fn qex_run_and_qex_wait_agree_for_a_job_that_did_not_give_a_code() {
+    fn no_answer_of_qex_reaches_the_codes_of_a_signal() {
         for state in [
+            JobState::Completed,
+            JobState::Failed,
             JobState::Killed,
             JobState::Cancelled,
             JobState::Timeout,
@@ -5287,23 +6092,91 @@ mod tests {
             JobState::Skipped,
             JobState::Expired,
         ] {
-            let s = status_with(state, None);
-            assert_eq!(
-                exit_code_for(&s, ExitMode::Run),
-                exit_code_for(&s, ExitMode::State),
-                "the state {state} gives two codes"
+            for code in [None, Some(0), Some(1), Some(96), Some(97), Some(255)] {
+                let s = status_with(state, code);
+                let answer = exit_code_for(&s);
+                assert!(
+                    (0..=127).contains(&answer),
+                    "the state {state} with the code {code:?} gives {answer}"
+                );
+            }
+        }
+    }
+
+    /// The trap of a wait gives the disposition back to the system, so a
+    /// SECOND signal always stops the command.
+    ///
+    /// This is a unit test, and not an end-to-end test, because the property
+    /// cannot be seen from outside: the first signal ends the wait in less
+    /// than a millisecond, so no second signal can arrive while the command
+    /// still waits. A test that sends two signals in one moment passes with a
+    /// trap that a user CANNOT escape, which is the fault that the second
+    /// signal exists to prevent.
+    ///
+    /// The test thus sends ONE signal to itself and reads the disposition that
+    /// the system holds after it. A disposition of `SIG_DFL` is the whole of
+    /// the rule: the next signal of that number stops this process.
+    ///
+    /// It reads the DISPOSITION and not the flags. macOS gives `SA_RESETHAND`
+    /// its effect and does not report the flag back, so a test of the flags
+    /// measures the system and not the behaviour of qex.
+    #[test]
+    fn the_trap_of_a_wait_gives_the_disposition_back_to_the_system() {
+        use std::sync::atomic::Ordering;
+
+        WAIT_INTERRUPTED.store(false, Ordering::SeqCst);
+        catch_signals_while_waiting();
+
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // The FIRST signal reaches the trap, and the trap holds it.
+            WAIT_INTERRUPTED.store(false, Ordering::SeqCst);
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            assert!(
+                wait_was_interrupted(),
+                "the trap must catch the first signal {signal}"
             );
+
+            // The SECOND signal of that number now meets the system.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
+                0
+            );
+            assert_eq!(
+                action.sa_sigaction,
+                libc::SIG_DFL,
+                "the trap of the signal {signal} must give the disposition back at the \
+                 delivery, so a second signal stops the command"
+            );
+        }
+
+        // Leave the process as it was. A test that keeps a flag or a handler
+        // changes the tests that come after it.
+        WAIT_INTERRUPTED.store(false, Ordering::SeqCst);
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
         }
     }
 
     /// A signal that is not a stop command leaves the job in the state `failed`
-    /// with no exit code. `qex run` gives 1 there, and `qex wait` gives 1 too.
+    /// with no exit code. The job then takes the code of a signal death, and
+    /// the record names the signal.
+    ///
+    /// A signal that qex KNOWS about is different. A kill, a cancel, a time
+    /// limit and an out-of-memory kill each give a state of their own, and the
+    /// code is then 125: qex knows why the job stopped, and 125 says more than
+    /// "a signal came".
+    ///
+    /// The usual form `128 + N` cannot serve here. A job that the
+    /// out-of-memory killer stops gives 137, and a WAIT that the out-of-memory
+    /// killer stops gives 137 as well. The two need different actions.
     #[test]
-    fn a_signal_that_the_job_took_gives_one_from_both_commands() {
+    fn a_signal_that_the_job_took_gives_the_code_of_a_signal_death() {
         let mut s = status_with(JobState::Failed, None);
         s.signal = Some(libc::SIGSEGV);
-        assert_eq!(exit_code_for(&s, ExitMode::Run), 1);
-        assert_eq!(exit_code_for(&s, ExitMode::State), 1);
+        assert_eq!(exit_code_for(&s), EXIT_JOB_SIGNAL);
+        assert_eq!(s.signal, Some(libc::SIGSEGV), "the record names the signal");
     }
 
     #[test]

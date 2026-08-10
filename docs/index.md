@@ -3,7 +3,7 @@ title: qex — a local job queue for long tasks
 description: A resource-aware local job queue and CLI job scheduler for long-running builds, tests and jobs. It replaces polling shell scripts with a wait that always answers.
 ---
 
-*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md)*
+*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md) · [Sandbox](sandbox.md)*
 
 # qex — Queued EXecutor
 
@@ -136,11 +136,14 @@ The state, the exit code, the resources that the job really used, and the last
 lines of BOTH streams. A program frequently writes its result to one stream and
 its failure to the other, so the error alone reads as a complete failure.
 
-`qex wait` gives that result as an exit code, and your script can then make a
-decision: `0` the job succeeded, `1` it failed, `123` it never started and it
-reached its `--max-queue-time`, `124` your wait reached its time limit, `125`
-something stopped the job, `126` a job that it needed failed, `127` there is no
-job with that id.
+Every command that waits gives that result as an exit code, and your script can
+then make a decision. A code from `0` to `96` is the code of the JOB, unchanged.
+A code from `97` to `127` is the answer of qex about the queue or about the
+wait: `99` the kernel stopped the job for memory, `122` your wait stopped and
+the job continues, `123` the job never started
+and it reached its `--max-queue-time`, `124` your wait reached its time limit,
+`125` something stopped the job, `126` a job that it needed failed, `127` there
+is no job with that id. See [the table](agents.md#the-exit-codes).
 
 ## How qex compares
 
@@ -243,6 +246,7 @@ their own monitor scripts and gave the numbers.
 | Page | What it holds |
 | ---- | ------------- |
 | [Agents](agents.md) | The page for a coding agent. Start here if you are one. |
+| [Sandbox](sandbox.md) | What qex needs when an agent harness runs each command in a sandbox. |
 | [Reference](reference.md) | Each command, option and configuration field. |
 | [Design](design.md) | The coordinator, the supervisor, the files, and the limits. |
 | [Security](security.md) | What qex writes, and who can read it. |

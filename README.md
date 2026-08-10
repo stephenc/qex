@@ -8,10 +8,13 @@ on one machine each start work, and no agent sees the load of the others. The
 machine then runs out of memory. qex gives those agents one queue.
 
 ```sh
-ID=$(qex submit --cpu guess --mem guess -- uv run train.py)
-qex wait $ID
-qex logs $ID
+qex submit --wait --cpu guess --mem guess --id-file train.id -- uv run train.py
+qex logs "$(cat train.id)" --grep 'ERROR|FAIL'
 ```
+
+`--wait` holds the command until the job stops, gives you the exit code of the
+job, and ends with the record: the state, the code and the last lines of both
+streams. The output of the job stays in the log file.
 
 **Agents: run `qex help agents` first.** It is one page and it covers everything.
 
@@ -84,11 +87,18 @@ the background coordinator for you, and you do not configure a service.
 ## Five minutes
 
 ```sh
-ID=$(qex submit --cpu guess --mem guess -- make test)   # gives the id at once
-qex list                                                # what operates now
-qex status $ID --wait                                   # wait, then the result
-qex logs $ID --tail 50                                  # the output
-qex kill $ID                                            # stop it
+qex submit --wait --cpu guess --mem guess --id-file t.id -- make test
+```
+
+That command blocks until the job stops, and it ends with the record. From
+another shell, while it runs:
+
+```sh
+ID=$(cat t.id)
+qex list                    # what operates now, and why anything waits
+qex logs $ID --follow       # the output as it arrives
+qex kill $ID                # stop it
+qex status $ID --wait       # attach again, from any session
 ```
 
 Put `qex run -- make test` in front of a command when the work is **short and
@@ -115,7 +125,7 @@ A pipeline gives each stage its own log, its own exit code and its own claim:
 ```sh
 BUILD=$(qex submit --name build -- make)
 TEST=$(qex submit --name test --needs $BUILD -- make test)
-qex wait $TEST      # 1 if the test failed, 126 if the build failed
+qex wait $TEST      # the code of the test, or 126 if the build failed
 ```
 
 ## Your session can stop, and the work continues
@@ -130,7 +140,7 @@ This is about `qex submit`; a job of `qex run` also stops when Ctrl-C or a
 SIGTERM stops the command that waits for it.
 
 ```sh
-qex submit --id-file build.id -- make    # session 1
+qex submit --wait --id-file build.id -- make    # session 1
 # a person stops the agent here. `make` continues.
 qex status "$(cat build.id)" --wait      # session 2, and the result is there
 ```
@@ -149,7 +159,7 @@ An agent that loses its context runs its script again. Give the submission a
 key, and the second run starts nothing:
 
 ```sh
-ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
+qex submit --wait --dedupe-key train:$(pwd) -- uv run train.py
 ```
 
 While a job with that key waits or operates, a second submission with the same
@@ -229,6 +239,7 @@ The full documentation is at
 | Page | What it holds |
 | ---- | ------------- |
 | [Agents](docs/agents.md) | The page for an agent. Start here. |
+| [Sandbox](docs/sandbox.md) | What qex needs when a harness runs each command in a sandbox. |
 | [Reference](docs/reference.md) | Each command, option and configuration field. |
 | [Design](docs/design.md) | The coordinator, the supervisor and the files. |
 | [Security](docs/security.md) | What qex writes, and who can read it. |
