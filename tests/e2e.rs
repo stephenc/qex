@@ -11002,3 +11002,173 @@ fn a_mark_from_one_attempt_does_not_decide_the_next_attempt() {
         "a kill for memory must not spend a `--retries` credit: {s}"
     );
 }
+
+/// `--max-queue-time` MUST NOT EXPIRE A RETRY after a kill for memory.
+///
+/// # The fault that this test prevents
+///
+/// `--max-queue-time` measures the wait from the submission of the job. A job
+/// that the kernel stops for memory goes back to the QUEUE, so every second
+/// that the job RAN is a second of wait by that arithmetic. The case of the
+/// README is a run of four hours: the job would come back to the queue and
+/// expire in the first pass of the scheduler, and the correction that this
+/// feature exists to make would never happen.
+///
+/// `sched::expire` refuses every job that already ran, from the start time in
+/// the record. That rule was written for a job between two attempts of
+/// `--retries`, and it holds this job for the same reason. This test holds the
+/// two features together: with that rule taken away, this job becomes
+/// `expired` and never makes its second attempt.
+#[test]
+fn a_retry_after_a_kill_for_memory_is_never_expired_by_the_wait_limit() {
+    let h = Harness::new(
+        "oomqueuetime",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n",
+    );
+    let job = OomJob::new(&h);
+    let c = job.control.display();
+
+    // The first attempt runs for LONGER than the limit on the wait, and then it
+    // makes the evidence of a kill for memory. The second attempt succeeds.
+    let script = format!(
+        "until [ -f {c}/dir ]; do sleep 0.1; done; \
+         n=$(cat {c}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}/n; \
+         echo attempt $n; \
+         if [ $n -le 1 ]; then sleep 7; echo job > \"$(cat {c}/dir)/oom\"; kill -9 $$; fi; \
+         exit 0"
+    );
+
+    // THE RETRY MUST WAIT IN THE QUEUE, or it never meets the test that
+    // expires a job: the scheduler starts a job that it chose in the same pass,
+    // and that job cannot expire. This job holds 800MB of the budget of 1GB.
+    // The first claim of 128MB fits beside it, and the raised claim of 256MB
+    // does not, so the second attempt waits for this job to stop.
+    let blocker = h.submit(&[
+        "submit", "--mem", "800MB", "--cpu", "1", "--", "sleep", "12",
+    ]);
+
+    let id = h.submit(&[
+        "submit",
+        "--mem",
+        "128MB",
+        "--cpu",
+        "1",
+        "--max-queue-time",
+        "5s",
+        "--",
+        "bash",
+        "-c",
+        &script,
+    ]);
+    job.release(&h, &id);
+
+    h.ok(&["wait", &id, "--timeout", "90s"]);
+    h.ok(&["wait", &blocker, "--timeout", "90s"]);
+    let s = h.status_json(&id);
+
+    // The anti-vacuity assert. Without it, a job that the queue never started
+    // would give `attempts` of 0 and this test would prove nothing.
+    assert_eq!(
+        job.attempts(),
+        2,
+        "the job itself must run two times, and it ran {} time(s): {s}",
+        job.attempts()
+    );
+    assert_ne!(
+        s["state"], "expired",
+        "a job that RAN for longer than its wait limit must not expire when qex gives it back \
+         to the queue: {s}"
+    );
+    assert_eq!(
+        s["state"], "completed",
+        "the second attempt must succeed: {s}"
+    );
+    assert_eq!(s["attempts"], 2, "qex must start the job again: {s}");
+    assert_eq!(
+        s["mem"].as_u64().unwrap(),
+        256 * 1024 * 1024,
+        "the claim must double: {s}"
+    );
+}
+
+/// THE JOB ITSELF must hear the raised claim.
+///
+/// # The fault that this test prevents
+///
+/// qex writes the claim into the environment of the job at the submission, and
+/// that environment is in the specification, which does not change. The claim
+/// in force after a raise is in the RECORD. Without a step that writes the new
+/// claim into the environment, a Go job keeps `GOMEMLIMIT` at the claim that
+/// already failed, collects at that size again, and the kernel stops it in the
+/// same place — while the queue holds twice the memory for it. The ladder of
+/// attempts would then correct nothing at all.
+#[test]
+fn a_raised_claim_reaches_the_environment_of_the_job() {
+    let h = Harness::new(
+        "oomclaimenv",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"2\"\nmem = \"1GB\"\n",
+    );
+    let job = OomJob::new(&h);
+    let c = job.control.display();
+
+    // Each attempt writes the claim that IT heard. qex writes these variables
+    // when the user gives both `--cpu` and `--mem`, which this job does.
+    let script = format!(
+        "until [ -f {c}/dir ]; do sleep 0.1; done; \
+         n=$(cat {c}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}/n; \
+         echo \"$n QEX_MEM=$QEX_MEM GOMEMLIMIT=$GOMEMLIMIT\" >> {c}/heard; \
+         if [ $n -le 1 ]; then echo job > \"$(cat {c}/dir)/oom\"; kill -9 $$; fi; \
+         exit 0"
+    );
+
+    // `--env-capture minimal` keeps the environment of the CALLER out of the
+    // job. qex never replaces a value that is already there, so a suite that
+    // itself runs inside a qex job would give this test its own `QEX_MEM`, qex
+    // would write none here, and the test would measure the wrong thing.
+    let id = h.submit(&[
+        "submit",
+        "--mem",
+        "128MB",
+        "--cpu",
+        "1",
+        "--env-capture",
+        "minimal",
+        "--",
+        "bash",
+        "-c",
+        &script,
+    ]);
+    job.release(&h, &id);
+
+    h.ok(&["wait", &id, "--timeout", "60s"]);
+    let s = h.status_json(&id);
+    assert_eq!(
+        s["state"], "completed",
+        "the second attempt must succeed: {s}"
+    );
+
+    let heard = std::fs::read_to_string(job.control.join("heard")).unwrap_or_default();
+    let lines: Vec<&str> = heard.lines().collect();
+    // The anti-vacuity assert. A job that never ran writes no line, and every
+    // test below would then pass on an empty file.
+    assert_eq!(lines.len(), 2, "the job must run two times: {heard}");
+
+    let first = 128 * 1024 * 1024u64;
+    let raised = 256 * 1024 * 1024u64;
+    assert!(
+        lines[0].contains(&format!("QEX_MEM={first}")),
+        "attempt 1 must hear the first claim: {heard}"
+    );
+    assert!(
+        lines[1].contains(&format!("QEX_MEM={raised}")),
+        "attempt 2 must hear the RAISED claim: {heard}"
+    );
+    assert!(
+        lines[1].contains(&format!("GOMEMLIMIT={raised}")),
+        "a runtime limit must move with the claim: {heard}"
+    );
+}

@@ -1487,6 +1487,31 @@ mod tests {
         ok.validate().unwrap();
     }
 
+    /// A growth of 1.0 or below gives the claim that already failed.
+    ///
+    /// The file would otherwise be accepted, and each attempt of the ladder
+    /// would run with the same claim and stop in the same place. The user would
+    /// see three attempts, three kills and no correction, and nothing would say
+    /// that the number in the file was the cause.
+    #[test]
+    fn validate_refuses_a_growth_that_raises_no_claim() {
+        let c: Config = toml::from_str("[retry]\ngrowth = 1.0\n").unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(
+            e.contains("[retry] growth"),
+            "the error must name the field: {e}"
+        );
+
+        // A file that turns the correction off puts no number in force, so it
+        // must pass whatever the growth says.
+        let off: Config = toml::from_str("[retry]\non_oom = 0\ngrowth = 1.0\n").unwrap();
+        off.validate().unwrap();
+
+        // The default values must pass.
+        let ok: Config = toml::from_str("[retry]\non_oom = 2\ngrowth = 2.0\n").unwrap();
+        ok.validate().unwrap();
+    }
+
     /// A value that means nothing must still give an error that names the
     /// field, and not the type of the value in the program.
     #[test]

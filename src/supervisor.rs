@@ -363,6 +363,22 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let out_cap = crate::logcap::CapWriter::new(&out_path, stdout, out_len, log_limit);
     let err_cap = crate::logcap::CapWriter::new(&err_path, stderr, err_len, log_limit);
 
+    // The environment of THIS attempt.
+    //
+    // The claim in the record is the claim in force, and it is larger than the
+    // claim in the specification after qex answered a kill for memory. The job
+    // must hear the raised claim: a Go job that keeps `GOMEMLIMIT` at the claim
+    // that failed collects at that size again, and the new attempt dies in the
+    // same place with a larger claim held for it. See `spec::reexport_claim`.
+    let mut job_env = spec.env.clone();
+    crate::spec::reexport_claim(
+        &mut job_env,
+        status.cpu,
+        spec.mem,
+        status.mem,
+        &cfg.claims.also,
+    );
+
     let mut cmd = std::process::Command::new(&spec.command[0]);
     cmd.args(&spec.command[1..])
         .current_dir(&spec.cwd)
@@ -376,7 +392,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         // Give the job the environment that the CLI captured. Remove the
         // environment of this process, which came from the coordinator.
         .env_clear()
-        .envs(&spec.env);
+        .envs(&job_env);
 
     // The new process group goes in the SAME `pre_exec` as the politeness of
     // the job, below. That call needs the configuration, which this function
@@ -806,8 +822,15 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 crate::units::format_size(status.mem)
             );
             log(&format!("job {id}: {note}"));
-            status.error = Some(note);
+            // JOIN, and do not replace. This field can already hold "the
+            // memory limit is not active for this job", which is the reason
+            // that qex has the weaker evidence and the fact that the reader
+            // needs most.
+            add_fault(&mut status.error, note);
             job::write_status(&dir, &status)?;
+            // `oom` is a final state here, so the stop hook must run. A hook
+            // fires one time for each job that STOPS, and not for each attempt.
+            crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
             return Ok(code.unwrap_or(1));
         }
 
@@ -838,9 +861,25 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
                 // sees that qex made the number, and not the agent.
                 status.claim_source = "raised".to_string();
                 status.state = JobState::Queued;
-                status.error = Some(message);
+                // JOIN, and do not replace. The field can hold a fault of the
+                // configuration or of the memory limit, and it holds the raise
+                // of the attempt before this one. A ladder of three attempts
+                // thus gives the reader each step of it, in order.
+                add_fault(&mut status.error, message);
                 status.pid = None;
                 status.finished_at = None;
+
+                // `--max-queue-time` DOES NOT EXPIRE THIS JOB, and this code
+                // needs no line to make that true.
+                //
+                // `sched::expire` refuses every job that already ran, from the
+                // start time in the record, and this job holds the start time
+                // of the attempt that the kernel stopped. That rule already
+                // covers a job between two attempts of `--retries`, and it
+                // covers this job in the same way and for the same reason: a
+                // limit on the WAIT must not delete a job that RAN. The e2e
+                // test `a_retry_after_a_kill_for_memory_is_never_expired_by_the_wait_limit`
+                // holds that behaviour.
                 // This process stops now, so it holds the record no longer.
                 status.supervisor_pid = None;
                 job::write_status(&dir, &status)?;
@@ -877,8 +916,12 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
             }
             Raise::Stop(reason) => {
                 log(&format!("job {id}: {reason}"));
-                status.error = Some(reason);
+                add_fault(&mut status.error, reason);
                 job::write_status(&dir, &status)?;
+                // The ladder stopped, so `oom` is the final state of this job
+                // and the stop hook must run. The hook fires one time, for the
+                // job, and not one time for each attempt.
+                crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
                 return Ok(code.unwrap_or(1));
             }
         }

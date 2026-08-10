@@ -1196,6 +1196,13 @@ budget keeps the state `oom`, and the record says that you need a larger machine
 or a larger budget. The job also goes through the QUEUE again, because the queue
 never admitted the new claim.
 
+A new attempt is the SAME job: one id, one record and one log file. The job
+hears the raised claim in `QEX_MEM` and in the other claim values, the log holds
+each attempt behind a line `--- attempt 2 ---`, and `qex status` gives the count
+in `attempts`. `--max-queue-time` expires no new attempt, because that value
+limits the WAIT of a job and this job already ran. The stop hook runs one time,
+for the state that the job STOPS in.
+
 qex acts on the evidence of THIS JOB only. With `mode = \"soft\"` or
 `mode = \"hard\"` above, qex makes a cgroup for each job and reads the count of
 that cgroup: the kernel stopped the job at the claim, so the claim was too

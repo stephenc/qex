@@ -784,6 +784,65 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 /// the behaviour that it has with no qex at all.
 const HEAP_FLOOR_MB: u64 = 4;
 
+/// Writes a RAISED claim into the environment of a job that runs again.
+///
+/// # Why
+///
+/// qex writes the claim into the environment at the submission, and that
+/// environment is in the specification. The specification does not change. When
+/// the kernel stops a job for memory, qex raises the claim in the RECORD and
+/// starts the job again, and the environment of the new attempt would still
+/// hold the claim that already failed: `GOMEMLIMIT` would keep a Go job at
+/// 128MB while the queue held 256MB for it. The kernel would then stop the same
+/// job in the same place, and the ladder of attempts would give no correction
+/// at all.
+///
+/// # The rule about a value that somebody chose
+///
+/// This function REPLACES a value only when that value is the value that qex
+/// itself wrote for the earlier claim. A value from the shell of the user, from
+/// the job file or from `--env` is a decision, it is not equal to the value
+/// that qex would have written, and it stays. A claim that qex never wrote —
+/// `[claims] export_env = false`, `--no-limit-env-hints`, `--env-capture none`,
+/// or a claim that the user did not choose — puts no key in the environment, so
+/// nothing here matches and this function adds nothing.
+pub fn reexport_claim(
+    env: &mut std::collections::BTreeMap<String, String>,
+    cpu: u64,
+    old_mem: u64,
+    new_mem: u64,
+    also: &[ClaimHint],
+) {
+    // A RAISE ONLY. qex calls this function when it made the claim LARGER, and
+    // a smaller claim would need a different rule: `export_claim` writes no
+    // `GOMEMLIMIT` for a claim of zero, and no `NODE_OPTIONS` below its floor,
+    // so a decrease could have to TAKE AWAY a value. Nothing decreases a claim
+    // today, and a branch that no caller reaches is a branch that no test
+    // proves.
+    if new_mem <= old_mem {
+        return;
+    }
+
+    // What qex wrote for the earlier claim, and what it would write now. Both
+    // come from `export_claim`, so this function can never go out of step with
+    // the list of variables that qex owns. The larger claim writes every key
+    // that the smaller claim wrote, so each key here has a new value.
+    let mut old = std::collections::BTreeMap::new();
+    export_claim(&mut old, cpu, old_mem, also);
+    let mut new = std::collections::BTreeMap::new();
+    export_claim(&mut new, cpu, new_mem, also);
+
+    for (key, was) in old {
+        if env.get(&key) != Some(&was) {
+            // Somebody else owns this value. Leave it.
+            continue;
+        }
+        if let Some(now) = new.get(&key) {
+            env.insert(key, now.clone());
+        }
+    }
+}
+
 /// Writes the size of the claim into the environment of a job.
 ///
 /// # Why
@@ -1157,6 +1216,53 @@ mod tests {
         assert_eq!(env["OMP_NUM_THREADS"], "2");
     }
 
+    /// A raised claim replaces the value that QEX wrote, and nothing else.
+    ///
+    /// The e2e test `a_raised_claim_reaches_the_environment_of_the_job` drives
+    /// this through the command. This test covers the rule that the e2e test
+    /// cannot reach: a value that somebody chose must survive the raise.
+    #[test]
+    fn a_raised_claim_replaces_the_value_of_qex_and_keeps_the_value_of_a_user() {
+        use std::collections::BTreeMap;
+
+        let first = 128u64 << 20;
+        let raised = 256u64 << 20;
+
+        let mut env = BTreeMap::new();
+        // The user chose this one, before qex wrote anything.
+        env.insert("GOMEMLIMIT".to_string(), "77".to_string());
+        export_claim(&mut env, 2, first, &[]);
+        assert_eq!(env["QEX_MEM"], first.to_string());
+        assert_eq!(
+            env["GOMEMLIMIT"], "77",
+            "the value of the user must be here"
+        );
+
+        reexport_claim(&mut env, 2, first, raised, &[]);
+
+        assert_eq!(
+            env["QEX_MEM"],
+            raised.to_string(),
+            "the job must hear the raised claim"
+        );
+        assert_eq!(env["QEX_MEM_MB"], "256");
+        assert_eq!(
+            env["GOMEMLIMIT"], "77",
+            "a value that somebody chose must survive the raise"
+        );
+        // The core count did not move, so nothing about it moves here.
+        assert_eq!(env["QEX_CPU"], "2");
+
+        // A claim that qex never wrote gives nothing. `export_env = false` and
+        // `--env-capture none` make such an environment.
+        let mut bare = BTreeMap::new();
+        reexport_claim(&mut bare, 2, first, raised, &[]);
+        assert!(
+            bare.is_empty(),
+            "a raise must add no variable that the submission did not write: {bare:?}"
+        );
+    }
+
     use super::*;
 
     use crate::testutil::{env_lock, EnvVar};
@@ -1191,6 +1297,73 @@ mod tests {
         let d = std::env::temp_dir().join(format!("qex-spec-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A LEARNED CLAIM NEVER GOES ABOVE THE BUDGET.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// A job that the kernel stops for memory at the budget leaves a lower
+    /// bound AT the budget, and the margin of 1.5 above that bound gives a
+    /// claim of one and one half budgets. qex made that number itself, and it
+    /// must not make a number that it then refuses: with
+    /// `[queue] oversized = "reject"` the next submission of the command was
+    /// refused with "Decrease the claim", and the user had given no claim to
+    /// decrease. The claim stops at the budget instead, the job starts, and a
+    /// job that still needs more memory says that the machine is too small.
+    #[test]
+    fn a_learned_claim_stops_at_the_budget() {
+        let _guard = env_lock();
+        let home = tmpdir("learnbudget");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).unwrap();
+        let _env = EnvVar::set("XDG_STATE_HOME", home.to_str().unwrap());
+
+        let cwd = std::env::current_dir().unwrap();
+        let command: Vec<String> = vec!["train-at-the-budget".into()];
+
+        // The evidence of a job that the kernel stopped AT the budget.
+        let budget = 1u64 << 30;
+        let mut store = crate::usage::Store::default();
+        store.commands.insert(
+            crate::usage::key(&cwd, &command),
+            crate::usage::Entry {
+                name: "train".into(),
+                samples: vec![crate::usage::Sample {
+                    kind: crate::usage::Measurement::LowerBound,
+                    max_rss: budget,
+                    cpu_secs: 1.0,
+                    elapsed_secs: 10,
+                    at: 0,
+                }],
+            },
+        );
+        std::fs::create_dir_all(home.join("qex")).unwrap();
+        std::fs::write(
+            home.join("qex/usage.json"),
+            serde_json::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg: Config = toml::from_str("[budget]\ncpu = \"2\"\nmem = \"1GB\"\n").unwrap();
+        cfg.learn.enabled = true;
+
+        // The anti-vacuity assert. The claim must come from the measurement,
+        // and not from `[defaults]`: a default claim would sit below the budget
+        // on its own, and this test would then prove nothing.
+        let spec = JobSpec::resolve(&opts(&["train-at-the-budget"]), &cfg).unwrap();
+        assert_eq!(
+            spec.claim_source, "learned",
+            "the claim must come from the measurement"
+        );
+        assert_eq!(
+            spec.mem,
+            budget,
+            "a learned claim must stop at the budget, and it was {}",
+            crate::units::format_size(spec.mem)
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// The specification must carry the command that qex measures the job

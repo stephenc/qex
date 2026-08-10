@@ -327,6 +327,23 @@ never admitted that claim, so qex tests it against the budget in the same way as
 a new job. A raised job thus waits while other jobs hold the budget, and the sum
 of the claims stays inside the budget.
 
+#### One job, and not two
+
+A new attempt is the SAME job. It keeps its id, its record and its log file, and
+these rules follow from that:
+
+| Question | Answer |
+| -------- | ------ |
+| `--max-queue-time` | It expires no new attempt. That value limits the WAIT of a job, and qex expires no job that already ran. The rule is the rule that holds a job between two attempts of `--retries`. |
+| A paused queue | A new attempt waits in the queue in the usual way. A pause starts no job, and it credits the wait that it added. |
+| `--dedupe-key` | The key names this job, and the job keeps its id, so a new attempt takes no key and meets no key. |
+| `[hooks] on_stop` | The hook runs ONE TIME, for the state that the job STOPS in. An attempt that the kernel stopped is not a stop of the job, so it gives no hook. |
+| `qex events` | A reader sees the states of one id: `running`, then `queued` again, then `running`, then the final state. Each line names the state before it, so a new attempt is a change of state and never a new job. |
+| `--each-line` | Every line of one fan-out measures against its template, and a lower bound goes to that same record. |
+| The log | A new attempt ADDS to the log file. The line `--- attempt 2 ---` separates the attempts, and the output that `[logs] max_bytes` removed is the sum of the attempts. |
+| `QEX_MEM`, `GOMEMLIMIT` and the other claim values | A new attempt hears the RAISED claim. qex replaces the values that qex wrote, and it keeps every value that you chose. |
+| `qex status` | The line `attempts:` gives the number, and the line `note:` gives the reason for each raise. `claim_source` is then `raised`. |
+
 #### When qex acts, and when it only reports
 
 qex finds a kill for memory with the count in `memory.events`, which Linux keeps

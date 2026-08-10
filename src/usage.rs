@@ -693,6 +693,49 @@ mod tests {
             "the claim is the larger evidence"
         );
 
+        // A LADDER OF ATTEMPTS MUST LEAVE ONE BOUND, and it must not push the
+        // measurements of the jobs that completed out of the store.
+        //
+        // qex keeps five samples for a command. One job of three attempts
+        // writes a bound at each raise, so three of the five places went to one
+        // job and the peaks of the jobs that behave went away. The largest
+        // bound holds every fact that the smaller bounds of the same ladder
+        // hold, so the store keeps that one only.
+        spec.command = vec!["ladder".into()];
+        let ladder = key(&spec.cwd, &spec.command);
+        let mut peak = crate::job::JobStatus::new(&spec);
+        peak.state = crate::job::JobState::Completed;
+        peak.usage.max_rss = 2 << 30;
+        record(&spec, &peak);
+        for claim in [1u64 << 30, 2 << 30, 4 << 30] {
+            let mut oom = crate::job::JobStatus::new(&spec);
+            oom.state = crate::job::JobState::Oom;
+            oom.mem = claim;
+            oom.usage.max_rss = claim;
+            record_lower_bound(&spec, &oom);
+        }
+        let entry = &load().commands[&ladder];
+        let bounds: Vec<&Sample> = entry
+            .samples
+            .iter()
+            .filter(|s| s.kind == Measurement::LowerBound)
+            .collect();
+        assert_eq!(
+            bounds.len(),
+            1,
+            "a ladder of three attempts must leave one bound: {:?}",
+            entry.samples
+        );
+        assert_eq!(bounds[0].max_rss, 4 << 30, "the largest bound must win");
+        assert!(
+            entry
+                .samples
+                .iter()
+                .any(|s| s.kind == Measurement::Peak && s.max_rss == (2 << 30)),
+            "the measurement of the job that completed must stay: {:?}",
+            entry.samples
+        );
+
         // A job that somebody stopped teaches nothing. The memory that it
         // reached says nothing about the memory that it needs.
         spec.command = vec!["other".into()];
