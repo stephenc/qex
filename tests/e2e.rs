@@ -31,6 +31,37 @@ struct Harness {
     extra_env: Vec<(String, String)>,
 }
 
+/// Gives one stream of a command in a form for a failure message.
+///
+/// A command that wrote NOTHING is a different fault from a command that wrote
+/// a part of its output and then stopped. A reader must see which one
+/// happened, so an empty stream says `no output` with a word. An empty space
+/// in a message reads as an accident of the format.
+///
+/// A long output keeps the LAST lines, because the end of the output shows the
+/// state of the command when it stopped. The message names the count of the
+/// lines that it does not show, so a reader knows that more exist.
+fn describe_stream(name: &str, bytes: &[u8]) -> String {
+    /// The count of lines that a message holds for one stream.
+    const KEEP: usize = 20;
+
+    let raw = String::from_utf8_lossy(bytes);
+    let text = raw.trim_end_matches('\n');
+    if text.is_empty() {
+        return format!("{name}: no output");
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= KEEP {
+        return format!("{name}:\n{}", lines.join("\n"));
+    }
+    format!(
+        "{name}: the last {KEEP} lines of {}, and {} more above:\n{}",
+        lines.len(),
+        lines.len() - KEEP,
+        lines[lines.len() - KEEP..].join("\n")
+    )
+}
+
 impl Harness {
     /// Makes a new installation with the given config file.
     fn new(name: &str, config: &str) -> Self {
@@ -63,17 +94,104 @@ impl Harness {
         )
     }
 
-    fn qex(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(args)
+    /// Builds a command for this test.
+    ///
+    /// Every environment value of a test lives here. With a second place, a
+    /// reader must change both, and a miss is silent.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+        cmd.args(args)
             .env("XDG_CONFIG_HOME", self.root.join("cfg"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             // Keep the coordinator for the length of the test only.
             .env("QEX_IDLE_EXIT_SECS", "120")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd
+    }
+
+    fn qex(&self, args: &[&str]) -> Output {
+        self.command(args)
             .output()
-            .expect("qex did not start")
+            .unwrap_or_else(|e| panic!("`qex {}` did not start: {e}", args.join(" ")))
+    }
+
+    /// Runs a command and requires an answer inside a time limit.
+    ///
+    /// Use this for each command that WAITS. A test that hangs reports
+    /// nothing, and the reader must find the cause by hand. This helper stops
+    /// the command at the limit and FAILS.
+    ///
+    /// The failure message carries what the command wrote. On a build machine
+    /// nobody can run the command again, so that output is the only evidence
+    /// of the fault. See `describe_stream` for the form of it.
+    ///
+    /// The limit belongs to the TEST. A `--timeout` of qex acts after qex
+    /// resolves the id, so it cannot bound a fault before that point.
+    fn qex_within(&self, args: &[&str], limit: Duration) -> Output {
+        let shown = args.join(" ");
+        let mut child = self
+            .command(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("`qex {shown}` did not start: {e}"));
+
+        // Read both streams while the command runs. A pipe that fills stops
+        // the command, and this test must not make that condition itself.
+        let mut out_pipe = child
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("`qex {shown}` gives no stdout"));
+        let mut err_pipe = child
+            .stderr
+            .take()
+            .unwrap_or_else(|| panic!("`qex {shown}` gives no stderr"));
+        let read_out = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut out_pipe, &mut buf);
+            buf
+        });
+        let read_err = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err_pipe, &mut buf);
+            buf
+        });
+
+        // This function holds the child and reaps it. The process thus stays
+        // in the table of processes until the kill, and the number always
+        // names this command. A number that a test reads after a different
+        // process reaps the child can name a later process.
+        let started = Instant::now();
+        let status = loop {
+            match child
+                .try_wait()
+                .unwrap_or_else(|e| panic!("the test cannot read `qex {shown}`: {e}"))
+            {
+                Some(status) => break status,
+                None if started.elapsed() >= limit => {
+                    // Stop the command first. The pipes then close, so each
+                    // reader ends and gives what the command wrote.
+                    child.kill().ok();
+                    child.wait().ok();
+                    let out = read_out.join().unwrap_or_default();
+                    let err = read_err.join().unwrap_or_default();
+                    panic!(
+                        "`qex {shown}` gave no answer in {limit:?}. A wait that \
+                         nothing can satisfy is the fault that qex removes.\n{}\n{}",
+                        describe_stream("stdout", &out),
+                        describe_stream("stderr", &err),
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        Output {
+            status,
+            stdout: read_out.join().unwrap_or_default(),
+            stderr: read_err.join().unwrap_or_default(),
+        }
     }
 
     /// Runs a command and requires that it succeeds.
@@ -3939,6 +4057,98 @@ fn every_command_gives_one_code_for_a_job_that_does_not_exist() {
             "`qex {command}` must give the code 127 for a job that does not exist"
         );
     }
+}
+
+/// A command that WAITS must answer at once for a job that does not exist.
+///
+/// A wait that nothing can satisfy is the fault that qex exists to remove. An
+/// agent that meets one holds a terminal until a person looks. It has no exit
+/// code to act on, and no message that says the wait cannot end.
+///
+/// The limit of qex and the limit of `qex_within` bound each form together. A
+/// guard that goes away thus gives a failure, and never a suite that stops.
+#[test]
+fn a_command_that_waits_answers_at_once_for_a_job_that_does_not_exist() {
+    let h = Harness::with_default_config("waitnojob");
+    let unknown = "11111111-2222-3333-4444-666666666666";
+
+    // Each form that takes a time limit carries one BELOW the limit of
+    // `qex_within`, because the two limits catch two faults.
+    //
+    // A fault that qex can bound ends at the limit of qex and gives 124, and
+    // that code names the cause. A fault BEFORE qex resolves the id ends at
+    // `qex_within`, which reports only that no answer arrived.
+    //
+    // `logs --follow` takes no time limit, so `qex_within` alone stops it.
+    let forms: [&[&str]; 5] = [
+        &["wait", unknown, "--timeout", "10s"],
+        &["wait", unknown, "--next", "--timeout", "10s"],
+        &["status", unknown, "--wait", "--timeout", "10s", "--no-logs"],
+        &[
+            "status",
+            unknown,
+            "--follow",
+            "--timeout",
+            "10s",
+            "--no-logs",
+        ],
+        &["logs", unknown, "--follow"],
+    ];
+
+    for form in forms {
+        let started = Instant::now();
+        let out = h.qex_within(form, Duration::from_secs(30));
+        let took = started.elapsed();
+        assert_eq!(
+            out.status.code(),
+            Some(127),
+            "`qex {}` must give the code 127, and it gave this: {}",
+            form.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            took < Duration::from_secs(8),
+            "`qex {}` took {took:?}, and the answer was ready at once",
+            form.join(" ")
+        );
+    }
+}
+
+/// A wait for a job whose RECORD a `qex clean` deleted must end, and it must
+/// say that the work happened.
+///
+/// The two states need two answers. A job that never existed is a fault of the
+/// id that the reader gave. A record that qex deleted names work that RAN, so
+/// an agent that submits it again repeats it. Both give the code 127, because
+/// the code answers one question: qex holds no job with that id now.
+#[test]
+fn a_wait_for_a_record_that_clean_deleted_says_the_work_happened() {
+    let h = Harness::with_default_config("waitcleaned");
+    let id = h.submit(&["submit", "--name", "gone", "--", "true"]);
+    h.until("the job stops", Duration::from_secs(45), || {
+        h.state_of(&id) == "completed"
+    });
+    h.ok(&["clean", &id]);
+
+    let started = Instant::now();
+    let out = h.qex_within(&["wait", &id, "--timeout", "10s"], Duration::from_secs(30));
+    let took = started.elapsed();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(out.status.code(), Some(127), "the answer is 127: {said}");
+    assert!(
+        took < Duration::from_secs(8),
+        "the wait took {took:?}, and the answer was ready at once"
+    );
+    assert!(
+        said.contains("HAPPENED"),
+        "the message must say that the work happened, so that an agent does \
+         not repeat it: {said}"
+    );
+    assert!(
+        said.contains("gone"),
+        "the message must name the job: {said}"
+    );
 }
 
 /// The record of a job that failed must not send the reader to a log file that
@@ -13776,5 +13986,46 @@ fn a_locked_pid_file_stops_a_new_coordinator() {
     assert!(
         !std::os::unix::fs::FileTypeExt::is_socket(&kind),
         "the coordinator bound its own socket while a different process holds the lock"
+    );
+}
+
+/// `describe_stream` must separate a command that wrote NOTHING from a command
+/// that stopped in the middle of its output.
+///
+/// The failure message of `qex_within` is the only evidence of a fault on a
+/// build machine, because nobody runs the command again there. A message that
+/// loses the difference between "no output" and "some output" sends the reader
+/// to look for a fault of the wrong shape.
+#[test]
+fn a_message_names_what_a_command_wrote() {
+    // No bytes, and bytes that hold no text, both say `no output`. An empty
+    // space in a message reads as an accident of the format.
+    assert_eq!(describe_stream("stdout", b""), "stdout: no output");
+    assert_eq!(describe_stream("stderr", b"\n\n\n"), "stderr: no output");
+
+    // A short output goes in whole, and it keeps the name of the stream.
+    assert_eq!(
+        describe_stream("stdout", b"one\ntwo\n"),
+        "stdout:\none\ntwo"
+    );
+
+    // A long output keeps the LAST lines, because the end of the output shows
+    // the state of the command when it stopped.
+    let many: String = (1..=50).map(|i| format!("line-{i}\n")).collect();
+    let text = describe_stream("stdout", many.as_bytes());
+
+    // The counts must be true. A message that names a count it does not hold
+    // is worse than a message with no count: a reader acts on the number.
+    assert!(
+        text.starts_with("stdout: the last 20 lines of 50, and 30 more above:"),
+        "the message must name both counts: {text}"
+    );
+    let lines: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(lines.len(), 20, "the message must hold 20 lines: {text}");
+    assert_eq!(lines[0], "line-31", "the first line kept: {text}");
+    assert_eq!(lines[19], "line-50", "the last line kept: {text}");
+    assert!(
+        !text.contains("line-30\n"),
+        "a line above the last 20 must not appear: {text}"
     );
 }
