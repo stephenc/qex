@@ -6574,8 +6574,13 @@ fn a_write_that_is_not_finished_does_not_change_the_budget() {
             Some(2),
             "a write that is not finished must never give the default budget: {info}"
         );
+        // The file is correct each time it is complete, so qex must report no
+        // FAULT of it. A note that qex WAITS for the writer is not a fault:
+        // qex says that while a writer holds the file, so that a person who
+        // reads `qex info` learns why the new values did not arrive yet.
+        let reported = info["config_error"].as_str().unwrap_or_default();
         assert!(
-            info["config_error"].is_null(),
+            reported.is_empty() || reported.contains("waits for it"),
             "the file is correct each time it is complete: {info}"
         );
     }
@@ -6694,7 +6699,10 @@ fn a_file_that_goes_back_and_forth_does_not_change_the_budget() {
 /// machine — while the file said 2, with `config_error: null`. The test above
 /// cannot find this, because an idle coordinator never shows it.
 ///
-/// The guard is now a TIME. This test holds the words and the guard together.
+/// The guard was then a TIME between two LOOKS, and that rests on the rate of
+/// the looks: this test met the same fault again on a loaded machine and on
+/// macOS in CI. The guard is now the AGE OF THE FILE, which no rate of looks
+/// can miss. This test holds the words and the guard together.
 #[test]
 fn a_write_that_is_not_finished_does_not_change_the_budget_under_load() {
     let file = "[peers]\nenabled = false\n\

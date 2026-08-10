@@ -235,10 +235,25 @@ fn config_fingerprint(read: &ConfigFile) -> u64 {
 /// A file that STAYS half-written is a different thing again, and this function
 /// takes it. A file that gives the same content at every look for
 /// `CONFIG_SETTLE` is the configuration, whatever the user meant.
+/// What `config_error` says while a writer holds the configuration file.
+///
+/// It is a WAIT, and not a fault of the file: the values that the coordinator
+/// holds are still the values of the last complete file.
+const WAITING_FOR_A_WRITER: &str =
+    "a writer changes the configuration file now, so qex waits for it. The coordinator keeps \
+     the values that it had.";
+
 pub fn reload_config(state: &mut State, read: ConfigFile) {
     let now = config_fingerprint(&read);
     if now == state.config_seen {
         state.config_settling = None;
+        // The file gives what the coordinator holds, so no writer is in the
+        // middle of it now. A message about a wait must not stay after the
+        // wait ends: a writer that stops with the content that qex already has
+        // would otherwise leave that sentence in `qex info` for ever.
+        if state.config_error.as_deref() == Some(WAITING_FOR_A_WRITER) {
+            state.config_error = None;
+        }
         return;
     }
 
@@ -255,9 +270,11 @@ pub fn reload_config(state: &mut State, read: ConfigFile) {
     //
     // The age of the file has no such window. A file that a writer changed a
     // moment ago is young, whatever this coordinator is doing, and qex waits
-    // for it to become old. The granularity of the time of a file is a few
-    // milliseconds, and `CONFIG_SETTLE` is 500, so that coarseness costs
-    // nothing here.
+    // for it to become old. The time of a file is coarse — a few milliseconds
+    // on the file systems of Linux and macOS, and as much as two seconds on
+    // some others — and it rounds DOWN. A file system with a granularity above
+    // `CONFIG_SETTLE` can thus give a young file an age that passes this test,
+    // which leaves qex on the older guard below and no worse than it was.
     //
     // A system that gives no time for the file leaves the test below alone.
     let the_file_says_it_settled = match &read {
@@ -265,7 +282,18 @@ pub fn reload_config(state: &mut State, read: ConfigFile) {
             if *age < CONFIG_SETTLE {
                 // A writer touched this file a moment ago. Wait, and hold no
                 // candidate: the next look decides.
+                //
+                // SAY SO. A file that a writer changes for ever — a slow
+                // program, a backup tool that touches it, a clock that moves
+                // — is refused at every look, and a user who reads `qex info`
+                // would otherwise see the old values with nothing to say why
+                // the new ones did not arrive.
                 state.config_settling = None;
+                // Say it one time for each wait, and not at every look.
+                if state.config_error.as_deref() != Some(WAITING_FOR_A_WRITER) {
+                    log(WAITING_FOR_A_WRITER);
+                }
+                state.config_error = Some(WAITING_FOR_A_WRITER.to_string());
                 return;
             }
             // The file itself proves that it held this content for long
@@ -1740,6 +1768,37 @@ mod tests {
         assert_ne!(
             state.config_seen, before,
             "a file that settled must become the configuration"
+        );
+    }
+
+    /// The fault of issue #64, in the shape that it really had.
+    ///
+    /// Two looks give the SAME half-written file, and `CONFIG_SETTLE` of wall
+    /// time passes between them, because the coordinator was busy and the
+    /// whole file between the two writes was never seen. The older test takes
+    /// that file. The age refuses it.
+    #[test]
+    fn two_looks_at_one_young_file_far_apart_still_do_not_take_it() {
+        let young = ConfigFile::Text(b"[budget]\ncpu = \"1\"\n".to_vec(), Some(Duration::ZERO));
+        let mut state = State::for_a_test();
+        let before = state.config_seen;
+
+        reload_config(&mut state, clone_of(&young));
+        // The coordinator did not look again for longer than the settle time.
+        if let Some((_, since)) = &mut state.config_settling {
+            *since = Instant::now() - CONFIG_SETTLE * 2;
+        }
+        reload_config(&mut state, clone_of(&young));
+
+        assert_eq!(
+            state.config_seen, before,
+            "a file that a writer touched a moment ago must not become the configuration, \
+             whatever time passed between two looks"
+        );
+        // The user must be able to see why the new values did not arrive.
+        assert!(
+            state.config_error.is_some(),
+            "qex must say that it waits for a writer"
         );
     }
 

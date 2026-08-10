@@ -1057,22 +1057,25 @@ pub fn run(coord: Arc<Coordinator>) {
         // Wait for a change, or test the machine again after a short time. The
         // free memory changes without a message, so a timer is necessary.
         //
-        // WHILE THE CONFIGURATION FILE SETTLES, LOOK OFTEN. `reload_config`
-        // takes the content when every look in `CONFIG_SETTLE` gave that
-        // content. With one look every 500ms there are TWO looks in the window,
-        // and a writer with a period near one second gives them both the same
-        // half-written file. A test on macOS met that, and the coordinator took
-        // the file. Ten looks make that writer far less likely to pass.
+        // WHILE THE CONFIGURATION FILE SETTLES, LOOK OFTEN.
         //
-        // TEN LOOKS DO NOT CLOSE THE HOLE. They move it to a writer with a
-        // period near a tenth of a second, and no fixed period closes it: a
-        // sampler always has a frequency that walks past it. Measured on this
-        // branch: a writer that changed the file every 25ms with a rename made
-        // the coordinator take a half-written file in 3 trials of 5. Do not
+        // THIS IS THE OLD GUARD, AND IT IS NOW THE SECOND ONE. `reload_config`
+        // takes a file by its AGE where the system gives one, and the age says
+        // that no writer touched the file for `CONFIG_SETTLE`, whatever this
+        // loop does. A sampler cannot miss a window that it does not use.
+        //
+        // The looks below still matter on a system that gives no time for a
+        // file. There, `reload_config` takes the content when every look in
+        // `CONFIG_SETTLE` gave that content: with one look every 500ms there
+        // are TWO looks in the window, and a writer with a period near one
+        // second gives them both the same half-written file. Ten looks make
+        // that writer far less likely to pass, and they DO NOT CLOSE THE HOLE:
+        // a sampler always has a frequency that walks past some period. Do not
         // write that this loop makes the content certain. See `reload_config`.
         //
-        // The cost is nothing when the file is not changing, because
-        // `config_settling` is `None` and the wait is 500ms as before.
+        // With an age, `config_settling` stays `None` while a writer works, so
+        // this loop keeps its 500ms wait and the fast look never starts. That
+        // is correct: one look at an old file is the whole of the answer.
         let state = coord.state.lock().unwrap();
         let wait = if state.config_settling.is_some() {
             Duration::from_millis(50)

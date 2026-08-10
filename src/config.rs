@@ -1157,17 +1157,28 @@ pub fn read_config_file() -> ConfigFile {
         Ok(_) => {}
         Err(e) => return ConfigFile::Unreadable(e),
     }
-    // Take the age from the SAME handle that gives the bytes, and take it
-    // BEFORE the read. A file that a writer changes during this read gives a
-    // young age, and a young file is one that qex does not take.
-    let age = file
+    // Take the age from the same handle, AFTER the read.
+    //
+    // The order is the whole of the guarantee. A read of a large file is not
+    // one operation of the system, and a coordinator that the machine takes
+    // off the processor can hold this read open for a long time. An age from
+    // BEFORE the read would then describe the file as it was, and the bytes
+    // would come from a writer that arrived after it: an old age with torn
+    // content, which `daemon::reload_config` takes on ONE look.
+    //
+    // An age from AFTER the read covers the read as well. A writer that
+    // touched the file at any moment up to this line gives a young age, and a
+    // young file is one that qex does not take.
+    let mut handle = file;
+    let mut bytes = Vec::new();
+    let read = std::io::Read::read_to_end(&mut handle, &mut bytes);
+    let age = handle
         .metadata()
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| SystemTime::now().duration_since(t).ok());
 
-    let mut bytes = Vec::new();
-    match std::io::Read::read_to_end(&mut { file }, &mut bytes) {
+    match read {
         Ok(_) => ConfigFile::Text(bytes, age),
         Err(e) => ConfigFile::Unreadable(e),
     }
