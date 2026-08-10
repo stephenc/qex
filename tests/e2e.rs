@@ -13318,17 +13318,39 @@ fn info_reports_the_pools_and_their_devices() {
     assert!(human.contains("pool gpu"), "got: {human}");
 }
 
+/// Closes the sockets of a test when the test ends, and also when it panics.
+struct OpenSockets(Vec<libc::c_int>);
+
+impl Drop for OpenSockets {
+    fn drop(&mut self) {
+        for fd in self.0.drain(..) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
 /// Opens a socket that accepts no connection, and fills its backlog.
 ///
 /// A connect to this socket gives no answer. The standard `UnixListener` asks
 /// for a large backlog, so this test uses `libc` and asks for a backlog of one.
 ///
-/// The result holds the listener and the connections. The caller must keep
-/// them, because a closed socket answers at once with a refusal.
+/// The result holds the listener and the connections. The caller must keep it,
+/// because a closed socket answers at once with a refusal.
+///
+/// THE RESULT IS `None` ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE QUEUE OF
+/// THE SOCKET IS FULL. Such a system gives no way to make a socket that never
+/// answers, so a test that needs one cannot run there.
+///
+/// THIS IS THE REASON THAT THE LOCK IS THE EVIDENCE, AND THE ANSWER OF THE
+/// SOCKET IS NOT. On such a system a socket with a full queue and a socket
+/// whose owner is gone give ONE answer: a refusal. The answer of a socket thus
+/// cannot separate a coordinator that operates from a coordinator that stopped,
+/// and only the lock on the pid file can. The tests that need a socket which
+/// gives no answer stop there, and the tests of the lock carry the property.
 ///
 /// `src/paths.rs` holds a copy of this helper for its own tests. An integration
 /// test cannot read a test item of the library, so the two must stay apart.
-fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
+fn a_socket_that_never_answers(path: &Path) -> Option<OpenSockets> {
     use std::os::unix::ffi::OsStrExt;
 
     let bytes = path.as_os_str().as_bytes();
@@ -13345,7 +13367,7 @@ fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
     let target = &address as *const libc::sockaddr_un as *const libc::sockaddr;
     let mut open = Vec::new();
 
-    unsafe {
+    let can_wait = unsafe {
         let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         assert!(listener >= 0, "the test cannot open a socket");
         open.push(listener);
@@ -13358,7 +13380,7 @@ fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
         assert_eq!(libc::listen(listener, 1), 0, "the test cannot listen");
 
         // Fill the backlog. The listener accepts nothing, so each connection
-        // stays in the queue. A further connect then gives no answer.
+        // stays in the queue.
         let mut full = false;
         for _ in 0..256 {
             let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -13368,15 +13390,24 @@ fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
             if libc::connect(client, target, size) != 0 {
                 let error = std::io::Error::last_os_error().raw_os_error();
                 libc::close(client);
-                full = error == Some(libc::EAGAIN);
+                // A queue that is full gives one of these two answers, and the
+                // test can then hold the connect open. Each other answer is a
+                // refusal, and this system gives no such socket.
+                full = matches!(error, Some(libc::EAGAIN) | Some(libc::EINPROGRESS));
                 break;
             }
             open.push(client);
         }
-        assert!(full, "the test needs a socket with a full backlog");
-    }
+        full
+    };
 
-    open
+    // Make the guard before the test of `can_wait`, so that a system which
+    // cannot hold a connect open still closes every socket of this test.
+    let sockets = OpenSockets(open);
+    if !can_wait {
+        return None;
+    }
+    Some(sockets)
 }
 
 /// Makes a pid file and holds the lock on it, as a coordinator does.
@@ -13409,6 +13440,12 @@ fn a_held_pid_file(path: &Path) -> std::fs::File {
 /// The coordinator deletes the short socket directories of the coordinators
 /// that stopped, and it asks each socket to answer. A socket that gives no
 /// answer must neither stop the command nor lose its directory.
+///
+/// THIS TEST DOES NOT RUN ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE QUEUE
+/// OF A SOCKET IS FULL, because no socket there gives "no answer". The sweep
+/// keeps the directory of a coordinator by the LOCK on such a system, and
+/// `paths::tests::the_sweep_keeps_the_directory_of_a_coordinator_that_operates`
+/// holds that on every system.
 #[test]
 fn a_socket_that_never_answers_does_not_stop_a_command() {
     let mut h = Harness::with_default_config("stucksock");
@@ -13417,7 +13454,17 @@ fn a_socket_that_never_answers_does_not_stop_a_command() {
     let uid = unsafe { libc::getuid() };
     let stuck = tmp.join(format!("qex-{uid}-stuck"));
     std::fs::create_dir_all(&stuck).unwrap();
-    let open = a_socket_that_never_answers(&stuck.join("s"));
+    let Some(_open) = a_socket_that_never_answers(&stuck.join("s")) else {
+        // This system refuses a connection when the queue of a socket is full,
+        // so no socket here can give "no answer". The state that this test
+        // measures does not exist on it, and the lock on the pid file carries
+        // the property instead.
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
     h.extra_env
         .push(("TMPDIR".into(), tmp.display().to_string()));
 
@@ -13438,10 +13485,6 @@ fn a_socket_that_never_answers_does_not_stop_a_command() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
-
-    for fd in open {
-        unsafe { libc::close(fd) };
     }
 
     assert!(
@@ -13500,6 +13543,11 @@ fn a_coordinator_holds_the_lock_on_its_pid_file() {
 /// The socket file is present and it gives no answer, so a coordinator can
 /// operate there. Two coordinators on one state directory each hold the full
 /// budget, and together they start twice the permitted work.
+///
+/// THIS TEST DOES NOT RUN ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE QUEUE
+/// OF A SOCKET IS FULL, because no socket there gives "no answer". A different
+/// coordinator is stopped by the LOCK on such a system, and
+/// `a_locked_pid_file_stops_a_new_coordinator` holds that on every system.
 #[test]
 fn a_socket_with_no_answer_stops_a_new_coordinator() {
     let mut h = Harness::with_default_config("ownstuck");
@@ -13509,15 +13557,20 @@ fn a_socket_with_no_answer_stops_a_new_coordinator() {
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let socket = run.join("s");
-    let open = a_socket_that_never_answers(&socket);
+    let Some(_open) = a_socket_that_never_answers(&socket) else {
+        // This system refuses a connection when the queue of a socket is full,
+        // so no socket here can give "no answer". The lock on the pid file
+        // stops a new coordinator there, and its own tests hold that.
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
     let before = std::fs::symlink_metadata(&socket).unwrap();
 
     let out = h.qex(&["daemon"]);
     let after = std::fs::symlink_metadata(&socket);
-
-    for fd in open {
-        unsafe { libc::close(fd) };
-    }
 
     assert!(
         out.status.success(),
@@ -13605,6 +13658,51 @@ fn a_pid_file_that_qex_cannot_open_names_the_way_out() {
     assert!(
         log.contains("Delete that file if no coordinator operates"),
         "the message must name the one step that clears this state, and it says: {log}"
+    );
+}
+
+/// A socket that ANSWERS must stop a new coordinator, with no lock to help.
+///
+/// A coordinator that started before qex made a pid file leaves this state: its
+/// socket answers, and no process holds a lock. The answer of the socket is
+/// then the one guard, and it must stop a second coordinator.
+///
+/// This test runs on every system, because a socket that a coordinator accepts
+/// answers on every system. It gives the property cover where a socket cannot
+/// give "no answer".
+#[test]
+fn a_socket_that_answers_stops_a_new_coordinator() {
+    let h = Harness::with_default_config("ownanswer");
+
+    // Start a coordinator in the ordinary way.
+    let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    let first = info["pid"].as_i64().expect("info must give the pid");
+
+    // Delete the pid file. The coordinator keeps its lock on a file with no
+    // name, so a new coordinator takes the lock of a NEW file and the lock
+    // cannot stop it. Only the answer of the socket can.
+    let run = h.root.join("state/qex/run");
+    std::fs::remove_file(run.join("pid")).unwrap();
+
+    let out = h.qex(&["daemon"]);
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("a different coordinator operates"),
+        "the log must say that a different coordinator operates, and it says: {log}"
+    );
+
+    // The first coordinator must still be the one that operates.
+    let after: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    assert_eq!(
+        after["pid"].as_i64(),
+        Some(first),
+        "a second coordinator took the queue of the first one"
     );
 }
 
