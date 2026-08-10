@@ -10221,3 +10221,228 @@ fn an_oversized_job_in_a_paused_queue_says_the_pause() {
 
     h.ok(&["resume"]);
 }
+
+/// Every command that reports a pause must name the SAME pid, and it must be
+/// the pid of the process that paused.
+///
+/// # The fault that this test prevents
+///
+/// `Response::Info` carried the moment, the reason and the end of a pause, and
+/// no pauser pid. The two readers of that answer therefore invented one: `qex
+/// top` gave 0, and `qex info` gave the pid of the COORDINATOR. One paused
+/// queue thus gave three answers to "who paused this".
+///
+/// The `qex info` invention is the dangerous one. Each pause message tells the
+/// reader that a pid can be killed, so a second person reads `qex info`,
+/// believes that the coordinator is the pauser, and runs `kill <pid>` on the
+/// one process that must keep operating.
+///
+/// A unit test on `pause::queue_line` cannot see this: it builds the record
+/// itself, so it measures the formatter and never the caller. This test goes
+/// through the commands.
+#[test]
+fn every_command_names_the_same_pauser_and_not_the_coordinator() {
+    let h = Harness::with_default_config("pausewho");
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    // The pid of the coordinator. No report of the pause may give this number.
+    let coordinator = h.ok(&["info", "--no-start", "--json"]);
+    let coordinator: serde_json::Value = serde_json::from_str(&coordinator).unwrap();
+    let coordinator_pid = coordinator["pid"].as_i64().expect("the coordinator pid");
+
+    let pauser = coordinator["paused_by_pid"]
+        .as_i64()
+        .expect("`qex info --json` must give the pid that asked for the pause");
+    assert_ne!(
+        pauser, coordinator_pid,
+        "the pauser is the CLI process, and never the coordinator"
+    );
+    assert!(pauser > 0, "a pid of 0 is not a process: {pauser}");
+
+    // Every text report must name that same pid, and none of them may name the
+    // coordinator. `qex list` and `qex wait` write the pause to STDERR, so this
+    // loop reads both streams.
+    for args in [
+        vec!["pause"],
+        vec!["info"],
+        vec!["top", "--once"],
+        vec!["list"],
+    ] {
+        let out = h.qex(&args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains(&format!("pid {pauser}")),
+            "`qex {}` must name the process that paused: {text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.contains(&format!("by pid {coordinator_pid}")),
+            "`qex {}` must not name the coordinator as the pauser: {text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.contains("by an unknown process"),
+            "this coordinator reports the pid, so no report may say unknown: {text}",
+        );
+    }
+
+    h.ok(&["resume"]);
+}
+
+/// A pause that reaches its `--for` while NO coordinator operates must still
+/// give the time back.
+///
+/// # The fault that this test prevents
+///
+/// A pause of the queue ends in three places, and only two of them were
+/// covered. The third is a coordinator that is not there: qex itself tells a
+/// user to run `kill <pid>` on it, a new build replaces it, and a reboot or an
+/// out-of-memory kill removes it. `recover` read the pause and expired it, and
+/// it gave no credit — and it could not, because the job records are read after
+/// that point, so there was nobody to credit yet.
+///
+/// The whole queue-deleting behaviour came back through this door: the job
+/// below reached its `--max-queue-time` on time that the pause took, and its
+/// message blamed the person for the wait.
+#[test]
+fn a_pause_that_ends_while_the_coordinator_is_down_still_gives_the_time_back() {
+    let h = Harness::with_default_config("pausedown");
+
+    // A job that holds the machine, so the job below waits for the queue and
+    // not for a moment of capacity.
+    let holder = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    h.ok(&["pause", "queue", "--for", "8s"]);
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--needs",
+        &holder,
+        "--max-queue-time",
+        "4s",
+        "--",
+        "true",
+    ]);
+
+    // Take the pid from the coordinator itself, and never from a process list.
+    let info = h.ok(&["info", "--no-start", "--json"]);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let pid = info["pid"].as_i64().expect("the coordinator pid") as i32;
+
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+
+    // Let the pause reach its end with no coordinator to see it.
+    std::thread::sleep(Duration::from_secs(12));
+
+    // The next command starts a new coordinator, which runs `recover`.
+    let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
+    assert!(
+        credited >= 6,
+        "a pause that ended while no coordinator operated must still give the \
+         time back; got {credited} seconds"
+    );
+
+    // The credit must not exceed the pause. The time between the end of the
+    // pause and the restart was time that the queue was free to run.
+    assert!(
+        credited <= 10,
+        "the credit must be the length of the PAUSE, and not the time until \
+         the restart; got {credited} seconds"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+}
+
+/// A job that ALREADY waited when the pause began must learn the pause too.
+///
+/// # The fault that this test prevents
+///
+/// Two different pieces of code put the pause into the reason of a job.
+/// `handle_submit` covers a job that arrives DURING a pause. `sched::choose`
+/// covers a job that was already in the queue when the pause began, and only
+/// that one — the job keeps whatever it waited for before, "waits for cores: 1
+/// of 1 is in use", for the whole length of the pause.
+///
+/// That is the worse of the two. The reader takes the sentence at its word,
+/// looks at a budget that is not the cause, and can wait for hours before
+/// anything says the true reason. Deleting the loop in `choose` left the whole
+/// suite green.
+#[test]
+fn a_job_that_already_waited_learns_the_pause() {
+    let h = Harness::new(
+        "pausealready",
+        "[budget]
+cpu = \"1\"
+mem = \"1GB\"
+\
+         [peers]
+enabled = false
+\
+         [system]
+reserve_mem = \"0\"
+max_pressure = 100
+",
+    );
+
+    // A job that holds the machine, and a job behind it. The second job waits
+    // for the first, and its reason says so.
+    let holder = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+    let waiter = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.until(
+        "the second job has a reason",
+        Duration::from_secs(45),
+        || !h.status_json(&waiter)["blocked_reason"].is_null(),
+    );
+
+    // The reason before the pause. Without this the test cannot tell a reason
+    // that CHANGED from a reason that was always the pause.
+    let before = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !before.contains("paused"),
+        "the job must wait for something other than a pause first: {before}"
+    );
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    h.until("the job learns the pause", Duration::from_secs(30), || {
+        h.status_json(&waiter)["blocked_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("the queue is paused")
+    });
+
+    let after = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        after.contains("qex resume queue"),
+        "the reason must give the remedy: {after}"
+    );
+
+    h.ok(&["resume"]);
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+}

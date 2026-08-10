@@ -874,8 +874,12 @@ clock of that limit stops at the pause and runs again at the resume, so a pause
 of 30 minutes does not kill every job with a smaller limit. `qex status` gives
 that time in `queue_pause_secs`.
 
+This holds when the pause ends by itself while no coordinator operates. The next
+coordinator finds it and gives the time back.
+
 A pause of a LOCK does not stop that clock. A job that waits for a lock already
-expires in the same way, whatever holds it.
+expires in the same way, whatever holds it. Give such a job a
+`--max-queue-time` that covers the hold, or no limit at all.
 
 A pause refuses no command. `qex submit` gives you a job id and the exit code 0,
 and the job waits with the pause as its reason.

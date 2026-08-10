@@ -173,6 +173,19 @@ pub enum Response {
         /// The moment when a person paused the queue.
         #[serde(default)]
         paused_at: Option<u64>,
+        /// The pid of the process that asked for the pause.
+        ///
+        /// A queue is shared, so a report of a pause must say WHO. Without this
+        /// field the two readers of this answer had to invent a pid: `qex top`
+        /// gave 0, and `qex info` gave the pid of the COORDINATOR. The second
+        /// one is the dangerous invention — a person who reads it and runs
+        /// `kill <pid>` stops the coordinator, which is the one process that
+        /// must not be stopped to end a pause.
+        ///
+        /// `None` means that this coordinator does not say. Every command
+        /// prints `unknown` for it, and never a number.
+        #[serde(default)]
+        paused_by_pid: Option<i32>,
         /// The text that the person gave with `--reason`.
         #[serde(default)]
         paused_reason: Option<String>,

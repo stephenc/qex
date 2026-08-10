@@ -164,11 +164,18 @@ impl Paused {
 
 /// Ends a pause of the QUEUE, whatever ended it.
 ///
-/// `qex resume queue` and a `--for` that reached its time are the same event,
-/// and both must do the same two things. They were two blocks of code, and two
-/// blocks drift: the deletion of either one left the whole test suite green.
-/// This function is the one place, so a later change cannot correct one path
-/// and forget the other.
+/// A pause of the queue ends in THREE places, and all three are the same event:
+/// `qex resume queue`, a `--for` that reached its time while the coordinator
+/// operates, and a `--for` that reached its time while NO coordinator operates
+/// — `daemon::recover` finds that one at the next start. They were separate
+/// blocks of code, and separate blocks drift: the deletion of the credit in the
+/// second one left the whole test suite green, and the third one never had it
+/// at all, so a `kill <pid>` brought the queue-deleting behaviour straight
+/// back. This function is the one place, so a later change cannot correct one
+/// path and forget the others.
+///
+/// `recover` calls it LAST, after the job records are read: the queue is empty
+/// until then, so there is nobody to credit.
 ///
 /// The caller has ALREADY removed the record from `state.paused`, and it gives
 /// the record here. `now` is the moment when the pause ended.
@@ -245,6 +252,21 @@ pub fn path() -> Result<std::path::PathBuf> {
     Ok(paths::runtime_dir()?.join("paused.json"))
 }
 
+/// Names the process that asked for a pause.
+///
+/// A pid of 0 means "this answer does not say". No process has the pid 0, and
+/// an earlier coordinator gives no pid at all in `Response::Info`, so the two
+/// readers of that answer must be able to say so. They must NEVER print a pid
+/// that they invented: `qex info` printed the pid of the COORDINATOR, and a
+/// person who read it and ran `kill <pid>` stopped the one process that must
+/// keep operating.
+fn who(by_pid: i32) -> String {
+    if by_pid <= 0 {
+        return "an unknown process".to_string();
+    }
+    format!("pid {by_pid}")
+}
+
 /// Gives the form of a `--reason` that a terminal may print.
 ///
 /// The reason is text that a person or an agent typed, and every function below
@@ -300,8 +322,15 @@ pub fn queue_reason(record: &PauseRecord) -> String {
         text.push_str(&format!(" Reason: {}.", shown_reason(reason)));
     }
     text.push_str(&format!(
-        " The process {} paused it at {}. Run `qex resume queue` to start the queue again.",
-        record.by_pid,
+        " {} paused it at {}. Run `qex resume queue` to start the queue again.",
+        {
+            let w = who(record.by_pid);
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => w,
+            }
+        },
         crate::sys::clock_text(record.paused_at)
     ));
     text
@@ -338,12 +367,12 @@ pub fn queue_line(record: &PauseRecord, now: u64) -> String {
     // is the only "who" that qex holds, and a pid that no longer exists is
     // itself an answer: the command that paused the queue has gone away.
     let mut text = format!(
-        "paused since {} ({}) by pid {}",
+        "paused since {} ({}) by {}",
         crate::sys::clock_text(record.paused_at),
         crate::units::format_duration(std::time::Duration::from_secs(
             now.saturating_sub(record.paused_at)
         )),
-        record.by_pid
+        who(record.by_pid)
     );
     match record.until {
         Some(end) => text.push_str(&format!(
@@ -364,13 +393,13 @@ pub fn queue_line(record: &PauseRecord, now: u64) -> String {
 /// Gives one line for a lock that a person holds.
 pub fn lock_line(name: &str, record: &PauseRecord, held_by: Option<&str>, now: u64) -> String {
     let mut text = format!(
-        "lock `{}`: paused since {} ({}) by pid {}",
+        "lock `{}`: paused since {} ({}) by {}",
         shown_lock(name),
         crate::sys::clock_text(record.paused_at),
         crate::units::format_duration(std::time::Duration::from_secs(
             now.saturating_sub(record.paused_at)
         )),
-        record.by_pid
+        who(record.by_pid)
     );
     match held_by {
         Some(job) => text.push_str(&format!(

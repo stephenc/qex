@@ -2885,6 +2885,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             mem_claimed,
             queue_state,
             paused_at,
+            paused_by_pid,
             paused_reason,
             paused_until,
             paused_locks,
@@ -2897,6 +2898,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "pid": pid,
                         "queue_state": queue_state,
                         "paused_at": paused_at,
+                        "paused_by_pid": paused_by_pid,
                         "paused_reason": paused_reason,
                         "paused_until": paused_until,
                         "paused_locks": paused_locks,
@@ -2969,7 +2971,10 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 (Some(state @ ("paused" | "paused-by-fault")), Some(at)) => {
                     let record = crate::pause::PauseRecord {
                         paused_at: at,
-                        by_pid: pid,
+                        // The pid of the PAUSER, and never the pid of the
+                        // coordinator. `0` says "this coordinator does not
+                        // report it", and `pause::who` prints that as words.
+                        by_pid: paused_by_pid.unwrap_or(0),
                         reason: paused_reason,
                         until: paused_until,
                         fault: state == "paused-by-fault",

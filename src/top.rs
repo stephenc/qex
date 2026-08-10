@@ -112,6 +112,7 @@ fn render(
         jobs_queued,
         queue_state,
         paused_at,
+        paused_by_pid,
         paused_reason,
         paused_until,
         paused_locks,
@@ -155,7 +156,11 @@ fn render(
         ) {
             let record = crate::pause::PauseRecord {
                 paused_at: *at,
-                by_pid: 0,
+                // The pid of the PAUSER. This page gave 0 for every pause,
+                // which `pause::who` prints as "an unknown process" — the
+                // honest answer for a coordinator that does not report it, and
+                // the wrong answer for one that does.
+                by_pid: paused_by_pid.unwrap_or(0),
                 reason: paused_reason.clone(),
                 until: *paused_until,
                 fault,
@@ -488,6 +493,7 @@ mod tests {
             mem_claimed: 4 << 30,
             queue_state: Some("running".into()),
             paused_at: None,
+            paused_by_pid: None,
             paused_reason: None,
             paused_until: None,
             paused_locks: Some(vec![]),
@@ -531,6 +537,7 @@ mod tests {
             config_error: None,
             queue_state: Some("paused".into()),
             paused_at: Some(crate::sys::now_secs() - 360),
+            paused_by_pid: Some(3704694),
             paused_reason: Some("recording a demo".into()),
             paused_until: None,
             paused_locks: Some(vec![]),

@@ -663,7 +663,27 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     // that instruction loses the pause in silence, and the machine starts work
     // again while that person believes it is quiet.
     state.paused = crate::pause::Paused::read();
-    if state.paused.expire(sys::now_secs()) {
+
+    // A pause of the queue can reach its `--for` WHILE NO COORDINATOR OPERATES.
+    //
+    // That is the third place where a pause of the queue ends, beside
+    // `qex resume queue` and `sched::step`, and it is not a corner case: qex
+    // itself tells a user to run `kill <pid>` on the coordinator, and a reboot
+    // or an out-of-memory kill does the same. Measured before this step
+    // existed: a `--for 20s` pause, a `kill -9`, and a job with a
+    // `--max-queue-time` of 5s came back `expired` with `queue_pause_secs` of
+    // 0, blaming the person for a wait that the pause caused.
+    //
+    // The credit CANNOT go here. The job directories are read below, so
+    // `state.jobs` and `state.queue` are still empty and there is nobody to
+    // credit. Hold the record, and pay it after the jobs are in the state.
+    let now = sys::now_secs();
+    let ended_while_down = state
+        .paused
+        .queue
+        .clone()
+        .filter(|record| record.expired(now));
+    if state.paused.expire(now) {
         state.save_pause();
     }
     match &state.paused.queue {
@@ -781,6 +801,22 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     // Put the queue back in its order: the priority first, then the time.
     queued.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
     state.queue = queued.into_iter().map(|(id, _, _)| id).collect();
+
+    // Pay the pause that ended while no coordinator operated.
+    //
+    // The queue exists only now, so this is the first moment that has somebody
+    // to credit. `end_queue_pause` is the same function that the other two ends
+    // of a pause call, so the three cannot drift.
+    //
+    // The end of the pause is the moment that the record gave, and NOT this
+    // moment: the pause stopped at its `--for`, and the time between that end
+    // and this restart is time that the queue was free to run. To credit it
+    // would give a job more time than the pause took.
+    if let Some(record) = ended_while_down {
+        let ended_at = record.until.unwrap_or(now).min(now);
+        crate::pause::end_queue_pause(&mut state, &record, ended_at);
+        log("a pause reached its end while no coordinator operated");
+    }
 
     // Give each dedupe key back to a job.
     //
@@ -1079,6 +1115,7 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
             .to_string(),
         ),
         paused_at: state.paused.queue.as_ref().map(|p| p.paused_at),
+        paused_by_pid: state.paused.queue.as_ref().map(|p| p.by_pid),
         paused_reason: state.paused.queue.as_ref().and_then(|p| p.reason.clone()),
         paused_until: state.paused.queue.as_ref().and_then(|p| p.until),
         paused_locks: Some(state.paused_locks()),
