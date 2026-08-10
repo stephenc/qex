@@ -110,22 +110,46 @@ fn with_the_record_in(dir: &std::path::Path, change: impl FnOnce(&mut Record)) -
     use std::os::unix::io::AsRawFd;
 
     paths::ensure_dir(dir, 0o700)?;
+    let path = dir.join("update.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
-        .open(dir.join("update.lock"))?;
-    let held = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0;
+        .open(&path)?;
+
+    // FAIL WITH NO LOCK, AND NEVER WORK WITH NO LOCK.
+    //
+    // A lock that qex cannot take leaves this function with two choices: read
+    // and write anyway, or stop. To go on would give back exactly the fault
+    // that the lock removes — the coordinator and a command writing the whole
+    // record over each other — and it would do it in silence, at the moment
+    // when something is already wrong with the machine.
+    //
+    // Nothing is lost by stopping. A command gives no line and gives one
+    // later; the coordinator writes nothing and asks again at its next turn.
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal
+        // arrives, and qex catches SIGINT and SIGTERM in every command that
+        // waits, so this is an ordinary event and not a fault.
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        bail!("qex could not lock {}: {e}", path.display());
+    }
 
     let mut record = read_record_in(dir);
     change(&mut record);
     let answer = write_record_in(dir, &record);
 
-    if held {
-        unsafe {
-            libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
-        }
+    // The lock goes back here, and the close of the file gives it back as
+    // well: a process that stops in the middle leaves nothing locked.
+    unsafe {
+        libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
     }
     answer.map(|_| record)
 }
@@ -745,6 +769,40 @@ mod tests {
         let record = read_record_in(&dir);
         assert_eq!(record.last_checked, 99, "a command must keep the time");
         assert_eq!(record.told.as_deref(), Some("0.25.0"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A lock file that qex cannot OPEN stops the write.
+    ///
+    /// To go on with no lock gives back the fault that the lock removes: the
+    /// coordinator and a command writing the whole record over each other.
+    ///
+    /// The test makes the lock a DIRECTORY, so the open fails. It does not
+    /// reach the `flock` call itself: a blocking `flock` fails with EINTR,
+    /// which the code retries, or with a fault of the system that a test
+    /// cannot make. The rule for BOTH is the same and it is one line — stop,
+    /// and write nothing — and this test holds the half that a test can
+    /// reach.
+    #[test]
+    fn a_lock_file_that_qex_cannot_open_stops_the_write() {
+        let dir = a_directory("nolock");
+        write_record_in(&dir, &record_of("0.24.0", None)).unwrap();
+        std::fs::create_dir(dir.join("update.lock")).unwrap();
+
+        let answer = with_the_record_in(&dir, |r| r.told = Some("0.24.0".into()));
+        assert!(
+            answer.is_err(),
+            "a lock that qex cannot take must stop the write"
+        );
+        // The record on the disk kept every field.
+        let record = read_record_in(&dir);
+        assert_eq!(record.newest.as_deref(), Some("0.24.0"));
+        assert!(record.told.is_none(), "nothing may reach the disk");
+
+        // A command says nothing, and it does not fail the command that it
+        // runs in.
+        assert!(note_for_a_command_in(&dir, "0.23.0", &Config::default()).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
