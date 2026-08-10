@@ -229,6 +229,25 @@ impl Harness {
         self.root.join("state/qex/jobs").join(id)
     }
 
+    /// Starts a qex command beside this test, and gives the child.
+    ///
+    /// A test that sends a signal to a WAIT needs the command to be alive while
+    /// the test decides what to do, so the test cannot use `qex()`, which waits
+    /// for the command to stop.
+    #[allow(clippy::zombie_processes)]
+    fn spawn(&self, args: &[&str]) -> std::process::Child {
+        Command::new(env!("CARGO_BIN_EXE_qex"))
+            .args(args)
+            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
+            .env("XDG_STATE_HOME", self.root.join("state"))
+            .env("XDG_RUNTIME_DIR", self.root.join("run"))
+            .env("QEX_IDLE_EXIT_SECS", "120")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("qex did not start")
+    }
+
     /// Starts `qex run` beside this test, and gives the child and the job id.
     ///
     /// A test that stops the job of a `qex run` needs the id while the command
@@ -370,13 +389,312 @@ fn a_job_that_fails_gives_the_exit_code_one() {
     assert_eq!(status["exit_code"], 1);
 }
 
-/// The option `--passthrough` gives the exit code of the job.
+/// Every wait gives the exit code of the job. `--passthrough` is accepted, and
+/// it changes nothing.
 #[test]
 fn the_passthrough_option_gives_the_exit_code_of_the_job() {
     let h = Harness::with_default_config("pass");
     let id = h.submit(&["submit", "--", "sh", "-c", "exit 42"]);
-    let out = h.qex(&["wait", &id, "--passthrough"]);
-    assert_eq!(out.status.code(), Some(42));
+    assert_eq!(h.qex(&["wait", &id]).status.code(), Some(42));
+    assert_eq!(
+        h.qex(&["wait", &id, "--passthrough"]).status.code(),
+        Some(42)
+    );
+}
+
+/// A job that gives a code that qex keeps for itself gives the sentinel 97, and
+/// the record holds the true code.
+///
+/// THIS TEST IS THE WHOLE FEATURE. Without the sentinel, a job that exits 124 of
+/// its own accord looks exactly like a wait that reached its time limit, and the
+/// two need different actions from the reader.
+#[test]
+fn a_job_code_that_qex_keeps_gives_the_sentinel() {
+    let h = Harness::with_default_config("band124");
+    let id = h.submit(&["submit", "--", "sh", "-c", "exit 124"]);
+
+    let out = h.qex(&["wait", &id]);
+    assert_eq!(
+        out.status.code(),
+        Some(97),
+        "a job that exits 124 must not look like a wait that reached its limit"
+    );
+    assert_eq!(h.status_json(&id)["exit_code"], 124);
+}
+
+/// The two boundaries of the band. An error of one moves a job code into the
+/// band of qex, or a code of qex out of it.
+#[test]
+fn the_boundaries_of_the_band_hold() {
+    let h = Harness::with_default_config("bandedge");
+
+    let low = h.submit(&["submit", "--", "sh", "-c", "exit 96"]);
+    assert_eq!(h.qex(&["wait", &low]).status.code(), Some(96));
+
+    // The sentinel value itself. The answer is the sentinel, so the rule stays
+    // true for every code in the band.
+    let sentinel = h.submit(&["submit", "--", "sh", "-c", "exit 97"]);
+    assert_eq!(h.qex(&["wait", &sentinel]).status.code(), Some(97));
+    assert_eq!(h.status_json(&sentinel)["exit_code"], 97);
+}
+
+/// A signal that stopped the job gives 98, and the record names the signal.
+///
+/// The usual form `128 + N` cannot serve: a job that the out-of-memory killer
+/// stops gives 137, and a WAIT that the out-of-memory killer stops gives 137 as
+/// well. The two need different actions.
+#[test]
+fn a_signal_that_stopped_the_job_gives_its_own_code() {
+    let h = Harness::with_default_config("jobsignal");
+    let id = h.submit(&["submit", "--", "sh", "-c", "kill -SEGV $$"]);
+
+    let out = h.qex(&["wait", &id]);
+    assert_eq!(
+        out.status.code(),
+        Some(98),
+        "a signal in the job must not give `128 + N`, which qex keeps for itself"
+    );
+    let status = h.status_json(&id);
+    assert_eq!(
+        status["signal"],
+        libc::SIGSEGV,
+        "the record names the signal"
+    );
+}
+
+/// A signal to the WAIT gives 122, and the job continues.
+///
+/// Ctrl-C on a wait gives 130 from the shell, which is `128 + 2`, and that form
+/// says "the job died from a signal". The job did not: the wait died. A dead
+/// process cannot label its own exit, so qex catches the signal.
+#[test]
+fn a_signal_to_the_wait_gives_the_code_of_a_broken_wait() {
+    let h = Harness::with_default_config("waitsig");
+    let id = h.submit(&["submit", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+
+    let child = h.spawn(&["wait", &id]);
+    // Give the command time to reach its wait, so the signal meets the trap
+    // and not the moments before it.
+    std::thread::sleep(Duration::from_millis(800));
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let out = child.wait_with_output().expect("the wait did not stop");
+    assert_eq!(
+        out.status.code(),
+        Some(122),
+        "a wait that a signal stopped must not give 130"
+    );
+
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains("qex wait"),
+        "the message must give the command that attaches again: {said}"
+    );
+
+    // The job is the thing that matters. It must still operate.
+    assert_eq!(
+        h.state_of(&id),
+        "running",
+        "a signal to the wait must not stop the job"
+    );
+    h.ok(&["kill", &id, "--grace", "1s"]);
+}
+
+/// `qex submit --wait` gives the exit code of the job, and it writes the id file
+/// BEFORE the wait begins.
+///
+/// The id file is the handle after a crash, and not after a tidy stop only. A
+/// user lost the result of a job that had succeeded, because the id was in the
+/// memory of a command that died.
+#[test]
+fn submit_with_a_wait_gives_the_code_of_the_job_and_writes_the_id_first() {
+    let h = Harness::with_default_config("submitwait");
+    let id_file = h.root.join("job.id");
+    let path = id_file.to_str().unwrap().to_string();
+
+    let child = h.spawn(&[
+        "submit",
+        "--wait",
+        "--id-file",
+        &path,
+        "--",
+        "sh",
+        "-c",
+        "sleep 3; exit 7",
+    ]);
+
+    // The file must hold the id while the job still operates.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut id = String::new();
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&id_file) {
+            if text.trim().parse::<uuid::Uuid>().is_ok() {
+                id = text.trim().to_string();
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !id.is_empty(),
+        "`--id-file` must reach the disk before the wait begins"
+    );
+    assert!(
+        !matches!(h.state_of(&id).as_str(), "completed" | "failed"),
+        "the test must read the id file while the job still operates"
+    );
+
+    let out = child.wait_with_output().expect("the command did not stop");
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "`qex submit --wait` must give the exit code of the job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The id still goes to stdout, so `ID=$(qex submit --wait ...)` operates.
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), id);
+}
+
+/// `qex run` and `qex submit --wait` must never answer one question two ways.
+#[test]
+fn submit_with_a_wait_and_qex_run_give_one_code() {
+    let h = Harness::with_default_config("waitagree");
+    for code in [0, 3, 96] {
+        let command = format!("exit {code}");
+        let submit = h.qex(&["submit", "--wait", "--", "sh", "-c", &command]);
+        let (child, _) = h.run_bg(&["--", "sh", "-c", &command]);
+        let run = wait_run(child, "the job gives its own exit code");
+        assert_eq!(
+            submit.status.code(),
+            run.status.code(),
+            "`qex submit --wait` and `qex run` gave two codes for the code {code}"
+        );
+        assert_eq!(submit.status.code(), Some(code));
+    }
+}
+
+/// A command line that qex cannot read must not speak in the voice of the job.
+///
+/// The code 2 says "the job exited 2" under the table of the band, and no job
+/// ran. An agent that gives a wrong option meets this on its first call.
+#[test]
+fn a_usage_error_of_a_command_that_speaks_for_a_job_uses_the_band() {
+    let h = Harness::with_default_config("usage");
+
+    for args in [
+        vec!["status"],
+        vec!["wait"],
+        vec!["submit", "--wait", "--cpu", "not-a-number", "--", "true"],
+    ] {
+        let out = h.qex(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(121),
+            "`qex {}` must give a code from the band: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A command that never speaks for a job keeps the conventional code 2. The
+    // band binds the commands that pass the code of a job through, and no more.
+    let out = h.qex(&["list", "--no-such-option"]);
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// A wait must say why the job does not start, and `qex run` already did.
+///
+/// Issue #28: the documentation tells an agent to use a wait, so the command
+/// that qex recommends was the command that went silent. A queue that does
+/// nothing and does not say why is the fault that this tool exists to remove.
+#[test]
+fn a_wait_says_why_the_job_does_not_start() {
+    let h = Harness::new(
+        "waitreason",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    let holder = h.submit(&["submit", "--cpu", "2", "--", "sleep", "20"]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&holder)
+    });
+    let waiter = h.submit(&["submit", "--cpu", "2", "--", "true"]);
+    h.until("the second job waits", Duration::from_secs(30), || {
+        !h.status_json(&waiter)["blocked_reason"].is_null()
+    });
+
+    let child = h.spawn(&["wait", &waiter, "--timeout", "6s"]);
+    std::thread::sleep(Duration::from_secs(5));
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let out = child.wait_with_output().expect("the wait did not stop");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.lines().any(|l| l.starts_with("qex: ") && l.len() > 10),
+        "the wait must say why the job does not start: {said}"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.qex(&["cancel", &waiter]);
+}
+
+/// A coordinator that stops in the middle of a wait must not end the wait.
+///
+/// Issue #45: the wait died with the code 1, which is the code of a job that
+/// failed, and a pipeline of two hours that had entirely succeeded reported a
+/// failure. qex replaces the coordinator at every update of the program, so
+/// this is the normal upgrade path and not an exotic case.
+#[test]
+fn a_wait_survives_a_coordinator_that_stops() {
+    let h = Harness::with_default_config("waitcrash");
+    let id = h.submit(&["submit", "--", "sh", "-c", "sleep 6; exit 0"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.state_of(&id) == "running"
+    });
+
+    let child = h.spawn(&["wait", &id, "--timeout", "60s"]);
+    // Let the wait reach the coordinator before the coordinator stops.
+    std::thread::sleep(Duration::from_millis(800));
+
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+
+    let out = child.wait_with_output().expect("the wait did not stop");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a coordinator that stops must not report a failure of the job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.state_of(&id), "completed");
+}
+
+/// `--any` gives control back one time, so it must name the jobs that stay.
+#[test]
+fn wait_with_any_names_the_jobs_that_have_no_watcher() {
+    let h = Harness::with_default_config("anyrest");
+    let fast = h.submit(&["submit", "--", "true"]);
+    let slow = h.submit(&["submit", "--", "sleep", "20"]);
+
+    let out = h.qex(&["wait", "--any", &fast, &slow]);
+    assert_eq!(out.status.code(), Some(0));
+
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains(&slow) && said.contains("qex wait --any"),
+        "`--any` must name the job that stays, and the command that waits for it: {said}"
+    );
+
+    h.ok(&["kill", &slow, "--grace", "1s"]);
 }
 
 /// A wait that reaches its limit gives the code 124, and the job continues.
@@ -941,7 +1259,7 @@ fn a_signal_to_a_deduplicated_run_stops_the_wait_and_not_the_job() {
     let code = child.wait().unwrap().code();
     assert_eq!(
         code,
-        Some(124),
+        Some(122),
         "the wait must give the code that says `the job continues`"
     );
 
@@ -1303,7 +1621,7 @@ fn a_job_survives_the_failure_of_the_coordinator() {
 
     // `qex wait` must read the status file when no coordinator operates.
     let out = h.qex(&["wait", &id, "--timeout", "30s"]);
-    assert_eq!(out.status.code(), Some(1), "the job exits with the code 7");
+    assert_eq!(out.status.code(), Some(7), "the job exits with the code 7");
 
     let status = h.status_json(&id);
     assert_eq!(status["state"], "failed");
@@ -4851,7 +5169,7 @@ fn a_job_that_stops_runs_the_stop_hook_one_time_with_its_result() {
 
     let id = h.submit(&["submit", "--name", "report", "--", "sh", "-c", "exit 7"]);
     let out = h.qex(&["wait", &id]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(7));
     assert_eq!(h.state_of(&id), "failed");
 
     // The hook starts after the record says that the job stopped, so `qex wait`

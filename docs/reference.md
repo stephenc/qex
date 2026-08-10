@@ -13,9 +13,10 @@ description: Every command, option, claim word and configuration field.
 qex submit [--cpu N] [--mem SIZE] [--gpu N] [--vram SIZE] [--claim NAME=N]
            [--lock NAME] [--timeout TIME] [--max-queue-time TIME]
            [--needs ID,ID] [--after ID,ID] [--name NAME] [--job FILE] [--json]
-           [--dedupe-key KEY] [--dedupe-window TIME] -- COMMAND...
+           [--dedupe-key KEY] [--dedupe-window TIME] [--id-file FILE]
+           [--wait] [--wait-timeout TIME] -- COMMAND...
 qex submit --each-line FILE [--max-jobs N] -- COMMAND...
-qex wait   <id>... [--timeout TIME] [--passthrough]
+qex wait   <id>... [--timeout TIME] [--any]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--json] [--show-env]
 qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
@@ -37,62 +38,127 @@ qex help <topic>
 
 Every command that reads data accepts `--json`.
 
-### Exit codes of `qex wait`
+### Exit codes
+
+**One table.** Every command that gives you the result of a job obeys it:
+`qex run`, `qex submit --wait`, `qex wait` and `qex status --wait`.
 
 | Code | Meaning |
 | ---- | ------- |
-| 0    | The job succeeded. |
-| 1    | The job failed. |
-| 123  | The job never started. It reached its `--max-queue-time`. |
-| 124  | Your wait reached its time limit. The job continues. |
-| 125  | Something stopped the job: kill, cancel, timeout or out-of-memory. |
-| 126  | The job did not run, because a job that it needed failed. |
-| 127  | There is no job with that id. |
+| 0 to 96 | **The job.** qex gives the exit code of the job, unchanged. `qex run -- sh -c 'exit 7'` gives 7. |
+| 97 to 127 | **qex.** The code describes the queue or the wait, never the job. |
+| 97 | The job gave a code from 97 to 255. Read the record for it. |
+| 98 | A signal stopped the job. Read the record for the signal. |
+| 121 | qex could not do what you asked. No job ran. |
+| 122 | Your wait stopped, and the job did not. Attach to it again. |
+| 123 | The job gave up in the queue. It reached its `--max-queue-time`. |
+| 124 | Your wait reached its time limit. The job continues. |
+| 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
+| 126 | The job did not run, because a job that it needed failed. |
+| 127 | There is no job with that id. |
+| 128 and up | **qex itself died from a signal.** The job is not described. It can still operate, so attach to it again. |
 
-The code 124 has the same meaning as the code of the `timeout` command. A
-timeout on `qex wait` stops your wait only. It does not stop the job.
+**The code answers `pass or fail`. The record answers `why`.** A caller that
+acts on the difference between "the job failed" and "my wait stopped" reads
+`qex status`. A caller that needs pass or fail reads the code.
 
-The code 123 is not 125. A job with the code 125 ran and wrote output. A job with
-the code 123 never got the machine, so it wrote nothing.
+Every other command gives 0 for success, 1 for a failure, 2 for a command line
+that qex cannot read, and 127 for a job that does not exist. `qex list` never
+speaks for a job, so those codes are not ambiguous there.
 
-Add `--passthrough` to exit with the exit code of the job.
+`--passthrough` on `qex wait` is accepted and it is no longer necessary. Every
+wait gives the code of the job.
 
-### Exit codes of `qex run`
+#### Why a band, and why a sentinel
 
-| Code | Meaning |
-| ---- | ------- |
-| the exit code of the job | The job ran. `qex run -- sh -c 'exit 7'` gives 7. |
-| 123  | The job never started. It reached its `--max-queue-time`. |
-| 124  | Your wait stopped, and the job continues. See the dedupe key. |
-| 125  | Something stopped the job: kill, cancel, Ctrl-C, timeout, out-of-memory. |
-| 126  | The job did not run, because a job that it needed failed. |
-| 127  | There is no job with that id. |
+A job can exit with any code from 0 to 255. Every code that qex gives itself is
+thus a code that a job can give as well, and no single free number escapes that.
+A job that exits 124 of its own accord gives you **97**, and `qex status` holds
+the 124. A wait that reached its time limit gives you **124**. The two are now
+different, and before the band they were one number.
 
-`qex run` writes the output of the job, so it gives the exit code of the job
-when the job RAN.
+The cost is small and it is real: a job that exits between 97 and 255 loses its
+exact code **at the shell**, and keeps it in the record.
 
-A job of `qex run` is a job like any other, so `qex kill` and `qex cancel` from
-a different command can stop it. Such a job gave no exit code of its own, and
-`qex run` then gives 125. `qex run` also writes a line to stderr that names the
-cause, and that line says when this command did not stop the job.
+#### Why 128 and above is qex, and not the job
 
-The code 1 has two causes. Your work ran and it gave the exit code 1, or qex
-could not finish its own work: the coordinator stopped while `qex run` waited,
-for example. qex writes the second cause on stderr, and the job can then still
-operate.
+A program that a signal stops conventionally gives `128 + N`, so an
+out-of-memory kill gives 137. A dead process writes no exit code, so `128 + N`
+from a qex command can only mean that the qex command itself died — and the job
+is then not described at all. qex gives **98** for a job that a signal stopped,
+and the record names the signal.
 
-For each state in which the job gave NO exit code of its own, `qex run` gives
-the same code as `qex wait`. For a job that RAN, `qex run` gives the exit code
-of the job, and `qex wait` gives 0 or 1 unless you add `--passthrough`.
+qex catches Ctrl-C and SIGTERM during a wait, so the usual case gives **122**
+with a sentence, and not 130 in silence. A **second** Ctrl-C stops the command
+immediately, in the usual way. A SIGKILL cannot be caught, so a wait that the
+out-of-memory killer takes still gives 137, and by this table that says exactly
+what happened: your command died, and your job did not.
 
-`qex run` gives 124 in ONE case: a dedupe key gave it the job of a different
-caller, and a signal then arrived. This command did not start that job, so
-Ctrl-C stops this wait and the job continues. Run `qex status $ID --wait` to
-wait again, or `qex kill $ID` to stop the job.
+#### Read 125 with care
 
-`qex run` gives 124 for no other reason. It waits with no limit of its own, and
-a job that reaches the time limit of `--timeout` gives 125, because something
-stopped that job.
+A job of `qex run` or of `qex submit --wait` is a job like any other, so
+`qex kill` and `qex cancel` from a different command can stop it. Such a job
+gave no exit code of its own, and the command then gives 125. Both commands also
+write a line to stderr that names the cause, and that line says when this
+command did not stop the job.
+
+A dedupe key can give `qex run` the job of a different caller. A signal then
+stops your wait and not the job, and the code is 122. Run
+`qex status $ID --wait` to wait again, or `qex kill $ID` to stop the job.
+
+A job that reaches the time limit of `--timeout` gives 125, because something
+stopped that job. It never gives 124: 124 says that a limit of the READER came.
+
+## Wait for the job in the same command
+
+```sh
+qex submit --wait --id-file build.id -- make test
+```
+
+`--wait` holds the command until the job stops, and it gives the exit code of
+the job from the table above. The id still goes to stdout before the wait
+begins.
+
+| Option | Meaning |
+| ------ | ------- |
+| `--wait` | Wait here until the job stops. The output of the job stays in the log file. |
+| `--wait-timeout TIME` | Stop **your wait** after this time. The job continues, and the code is 124. `--timeout` stops the **job** instead. |
+| `--id-file FILE` | Write the id to this file. qex writes the file, sends the data to the disk and closes it **before** the wait begins. |
+
+**Why one command and not two.** `qex submit` and then `qex wait` is two
+commands, and the second is a thing to remember. An agent that forgets it never
+learns that the job stopped: the job succeeds, and nobody reads the result.
+
+One command also closes a race. Between `qex submit` and `qex wait` a short job
+can stop, and a `qex clean` in that window deletes the record; the wait then
+fails for a job that ran perfectly. One command has no such window.
+
+`qex run` has neither fault, because it also waits. It writes the output of the
+job to your terminal, and a long job thus fills the context of an agent.
+`qex submit --wait` keeps that output in the log file, so you read the part that
+you want with `qex logs --grep`.
+
+The id file survives a crash and not a tidy stop only. qex writes it, sends it
+to the disk and closes it before the wait begins, so
+`qex wait $(cat build.id)` attaches to the job again after any interruption.
+
+`--each-line` refuses `--wait`, because it makes many jobs and one exit code
+cannot describe them all. Wait for the group instead: `qex wait $GROUP`.
+
+## `qex wait --any` returns one time
+
+```sh
+qex wait --any $A $B $C $D    # gives control back when the FIRST job stops
+qex wait --any $B $C $D       # the jobs that stay need another wait
+```
+
+`--any` gives control back **one time**. The jobs that did not stop then have no
+watcher, and they finish with nobody to read them. qex names those jobs on
+stderr when it returns, with the command that waits for them again.
+
+With a harness that reports a background command, prefer one
+`qex submit --wait` for each job. Each notification then names its own job, and
+no job is left unwatched.
 
 ## A job that never starts
 
@@ -802,8 +868,9 @@ the chain.
 
 Use `--after` for a cleanup step that must run also when the build fails.
 
-`qex wait` gives 126 for a skipped job and 1 for a job that failed, so a script
-can separate a failure of its own stage from a failure of an earlier stage.
+`qex wait` gives 126 for a skipped job, and the exit code of the job for a job
+that failed, so a script can separate a failure of its own stage from a failure
+of an earlier stage.
 
 Each option accepts an id or a name, and the two have different rules.
 

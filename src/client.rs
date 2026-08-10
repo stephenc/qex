@@ -103,6 +103,49 @@ impl Client {
             .with_context(|| format!("reading this answer of the coordinator: {}", line.trim()))
     }
 
+    /// Waits until the coordinator has something to say, or until the time
+    /// passes. Gives `true` when an answer is ready.
+    ///
+    /// A command that waits for a job must stay awake for two other events: a
+    /// signal from the user, and a coordinator that stops. A blocking read sees
+    /// neither. `read_line` continues through a signal, because the system
+    /// restarts the read, so a Ctrl-C during `qex wait` would do nothing until
+    /// the job stopped.
+    ///
+    /// This function looks at the socket and reads nothing, so a short limit
+    /// costs one system call and it cannot divide an answer in two. A short
+    /// read limit cannot give that: it takes the first part of a line and it
+    /// loses that part.
+    pub fn wait_readable(&self, timeout: Duration) -> std::io::Result<bool> {
+        use std::os::unix::io::AsRawFd;
+
+        let mut fds = libc::pollfd {
+            fd: self.stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The system takes milliseconds, and it takes an `i32`.
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let rc = unsafe { libc::poll(&mut fds, 1, ms) };
+        match rc {
+            // The time passed and the coordinator said nothing.
+            0 => Ok(false),
+            // A signal stopped the call. The caller tests its own flag and
+            // calls this function again, so this answer is not a fault.
+            -1 => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+            // The socket holds an answer, or the coordinator closed it. The
+            // caller reads it, and the read reports the difference.
+            _ => Ok(true),
+        }
+    }
+
     /// Removes the read timeout, for a request that waits a long time.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
         self.stream

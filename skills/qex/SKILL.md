@@ -38,16 +38,30 @@ until [ -f done.marker ]; do sleep 30; done         # nobody will write that fil
 Four monitors of this kind on one machine slept for 95 hours between them. Use
 qex, which is the parent of the task and waits for the process itself.
 
-## The three commands
+## The two commands
 
 ```sh
-ID=$(qex submit --cpu 2 --mem 4GB -- make release)   # gives the id at once
-qex status "$ID" --wait                              # blocks; state, code and logs
-qex logs "$ID" --tail 100
+qex submit --wait --cpu 2 --mem 4GB --id-file .qex-build.id -- make release
+qex logs "$(cat .qex-build.id)" --tail 100
 ```
 
-`qex submit` writes the id to stdout and nothing else, so `ID=$(...)` is safe. A
-warning goes to stderr.
+`--wait` holds the command until the job stops, and it gives you the exit code
+of the job. **One command cannot be forgotten.** `qex submit` and then a wait is
+two commands, and the second is a thing to remember: an agent that forgets it
+never learns that the job stopped, and the result waits for nobody. Discipline
+is not the remedy — the agent that reported this fault made the same mistake
+twice more in the same session after writing the rule down.
+
+**Every submission joins a wait or gets its own.** A job runs whether or not
+anybody watches it.
+
+The output of the job goes to the log file and not to your terminal, so a job of
+two hours does not fill your context. `--id-file` writes the id to the disk
+**before** the wait begins, so `qex wait "$(cat .qex-build.id)"` attaches to the
+job again after any interruption.
+
+`qex submit` without `--wait` writes the id to stdout and nothing else, so
+`ID=$(...)` is safe. A warning goes to stderr.
 
 For work that is **short and heavy** and that you wait for right now, put
 `qex run` in front instead. The output arrives as it happens and the exit code
@@ -71,33 +85,65 @@ of `qex run` that continued, and `qex kill <id>` stops it.
 
 | Your situation | Use |
 | --- | --- |
-| You wait now, in this command, and the work is short | `qex run -- CMD` (Ctrl-C or SIGTERM stops the job; a SIGKILL does not) |
-| Your harness reports background commands | `qex status <id> --wait` in the background |
+| You start the job now, and you want the result | `qex submit --wait -- CMD` |
+| You wait now, the work is short, and you want the output on your terminal | `qex run -- CMD` (Ctrl-C or SIGTERM stops the job; a SIGKILL does not) |
+| A **different** command started the job, or the id comes from an earlier session | `qex status <id> --wait` |
 | A script needs the exit code only | `qex wait <id>` |
 
-`qex status --wait` blocks in the same way as `qex wait` and gives the same exit
-code, and its output also holds the state, the exit code and the last lines of
-BOTH streams. Prefer it: one command gives everything.
+All four give the same exit code. `qex submit --wait` and `qex run` differ in
+one thing: `qex run` writes the output of the job to your terminal, and
+`qex submit --wait` leaves it in the log file.
+
+**One wait for each job.** Give one `qex submit --wait` for each job that you
+start, and each notification from your harness names its own job.
+
+**`qex wait --any` returns one time.** The jobs that did not stop then have
+**no watcher**, and they finish with nobody to read them:
+
+```sh
+qex wait --any "$A" "$B" "$C" "$D"   # one result
+qex wait --any "$B" "$C" "$D"        # the rest still need a wait
+```
+
+qex names the jobs that stay when it returns.
 
 ## The exit codes
 
+**One table.** `qex run`, `qex submit --wait`, `qex wait` and
+`qex status --wait` all obey it.
+
 | Code | Meaning |
 | --- | --- |
-| 0 | The job succeeded. |
-| 1 | The job failed. |
+| 0 to 96 | **The job.** qex gives the exit code of the job, unchanged. |
+| 97 to 127 | **qex.** The code describes the queue or the wait, never the job. |
+| 97 | The job gave a code from 97 to 255. Read the record for it. |
+| 98 | A signal stopped the job. Read the record for the signal. |
+| 121 | qex could not do what you asked. No job ran. |
+| 122 | Your wait stopped, and **the job continues.** Attach to it again. |
 | 123 | The job never started. It reached its `--max-queue-time`. |
-| 124 | Your wait stopped, and **the job continues.** A `qex wait` that reached its time limit, or a `qex run` that a dedupe key gave the job of somebody else. |
+| 124 | Your wait reached its time limit. **The job continues.** |
 | 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
 | 126 | The job did not run, because a job that it needed failed. |
 | 127 | There is no job with that id. |
+| 128 and up | **qex itself died from a signal.** The job is not described, and it can still operate. Attach to it again. |
 
-`qex run` gives the exit code of the job when the job RAN, and for every other
-state it gives the same code as the table above. It never gives 124: that code
-says that YOUR WAIT stopped while the job continued, and `qex run` sets no limit
-on its own wait. **125 from `qex run` does not
-say that your work failed.** A job of `qex run` is a job like any other, so
-another agent on this machine can run `qex kill` or `qex cancel` on it. Read the
-line on stderr before you start the work again.
+**The code answers `pass or fail`. The record answers `why`.** Read
+`qex status` whenever you act on the difference between "the job failed" and
+"my wait stopped".
+
+A code below 97 comes from the job, and nothing else gives one. A job that exits
+124 of its own accord thus gives you **97**, and the record holds the 124; a
+wait that reached its time limit gives you **124**. Every other command of qex —
+`qex list`, `qex logs`, `qex top` — never speaks for a job, so it uses the usual
+0, 1, 2 and 127.
+
+**125 does not say that your work failed.** A job of `qex run` or of
+`qex submit --wait` is a job like any other, so another agent on this machine
+can run `qex kill` or `qex cancel` on it. Read the line on stderr before you
+start the work again.
+
+**Ctrl-C during a wait gives 122**, and qex names the job that continues. A
+second Ctrl-C stops the command immediately.
 
 ## Your session can stop, and the work continues
 
@@ -111,8 +157,8 @@ attaches to it with the id.
 **Keep the id in a file that lasts longer than your session:**
 
 ```sh
-qex submit --id-file .qex-build.id -- make       # in the project, not in a scratch directory
-qex status "$(cat .qex-build.id)" --wait         # a later session, and the result is there
+qex submit --wait --id-file .qex-build.id -- make   # session 1. A person stops you here.
+qex status "$(cat .qex-build.id)" --wait            # session 2, and the result is there
 ```
 
 Put that file in the project or the home directory. **Not** in a scratch
@@ -124,8 +170,7 @@ place.
 **Give each submission a key, and a second run of your script starts nothing:**
 
 ```sh
-ID=$(qex submit --dedupe-key train:$(pwd) -- uv run train.py)
-qex wait "$ID"
+qex submit --wait --dedupe-key train:$(pwd) -- uv run train.py
 ```
 
 While a job with that key waits or operates, a second submission with the same
@@ -144,7 +189,7 @@ know if **it** started the work.
 
 `qex run --dedupe-key` waits for the job that the key gives, and Ctrl-C then
 stops your wait only: a different agent can be the owner of that job. `qex run`
-then gives **124**, which says that your wait stopped and the job continues. Use
+then gives **122**, which says that your wait stopped and the job continues. Use
 `qex kill <id>` to stop the job itself, or `qex status <id> --wait` to wait
 again.
 
@@ -208,7 +253,7 @@ to find the cause. Give each step its own job.
 ```sh
 BUILD=$(qex submit --name build -- make)
 TEST=$(qex submit --name test --needs "$BUILD" -- make test)
-qex wait "$TEST"    # 1 if the test failed, 126 if the build failed
+qex wait "$TEST"    # the code of the test if it failed, 126 if the build failed
 ```
 
 A job that is skipped names the FIRST job that failed, so you read the cause and
@@ -236,7 +281,10 @@ Every command that reads data accepts `--json`.
 ## Things that will catch you
 
 - **`qex wait --timeout` limits YOUR WAIT and not the job.** Code 124 means the
-  job continues. Use `--timeout` on `qex submit` to limit the job itself.
+  job continues. Use `--timeout` on `qex submit` to limit the job itself, and
+  `--wait-timeout` to limit the wait of `qex submit --wait`.
+- **`qex wait --any` leaves the other jobs unwatched.** It returns one time.
+  Wait again for the rest, or give each job its own `qex submit --wait`.
 - **A job waits until the machine has capacity.** Add `--max-queue-time 30m` to
   `qex submit` when you must have an answer inside a time. The job then does not
   start after that wait: its state becomes `expired` and `qex wait` gives 123.

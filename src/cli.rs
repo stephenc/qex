@@ -295,6 +295,24 @@ pub struct SubmitArgs {
     #[arg(long, value_name = "FILE")]
     pub id_file: Option<PathBuf>,
 
+    /// Wait here until the job stops, and give the exit code of the job.
+    ///
+    /// Use this option in place of `qex submit` and then `qex wait`. One
+    /// command cannot be forgotten, and the harness of an agent waits for it.
+    /// The output of the job goes to the log file, so read it with `qex logs`
+    /// and take the part that you want.
+    ///
+    /// The id still goes to stdout before the wait begins. Use `--id-file` as
+    /// well, and `qex wait $(cat FILE)` attaches to the job again.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Stop the wait of --wait after this time. The job continues. Example: 30m.
+    ///
+    /// This option limits YOUR WAIT. `--timeout` limits the JOB.
+    #[arg(long, value_name = "TIME", requires = "wait")]
+    pub wait_timeout: Option<String>,
+
     /// Write the id and the result of the dedupe test as JSON.
     ///
     /// Use this option when your script must know if IT started the work.
@@ -435,11 +453,14 @@ pub struct WaitArgs {
     ///
     /// Use this option to read a result as soon as it arrives, in place of the
     /// order of submission.
+    ///
+    /// This option gives control back ONE TIME. The jobs that did not stop then
+    /// have no watcher, so wait again for them. qex names them when it returns.
     #[arg(long)]
     pub any: bool,
 
-    /// Exit with the exit code of the job.
-    #[arg(long)]
+    /// Accepted, and no longer necessary. Every wait gives the code of the job.
+    #[arg(long, hide = true)]
     pub passthrough: bool,
 
     /// Write the output as JSON.
