@@ -663,6 +663,7 @@ mod tests {
             learn_key: None,
             group: None,
             group_name: None,
+            claims: Default::default(),
             locks: vec![],
             retries: 0,
             nice: None,

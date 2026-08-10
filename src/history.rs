@@ -266,6 +266,7 @@ mod tests {
             group: None,
             group_name: None,
             locks: vec![],
+            claims: Default::default(),
             retries: 0,
             nice: None,
             needs: vec![],

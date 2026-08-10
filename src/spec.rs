@@ -92,6 +92,104 @@ pub struct Resources {
     pub cpu: Option<crate::claim::Claim>,
     /// The memory. Give a size such as `8GB`, or `half`, `guess`, `full`, `max`.
     pub mem: Option<crate::claim::Claim>,
+    /// The number of devices from the pool `gpu`.
+    pub gpu: Option<u64>,
+    /// The quantity on EACH device that this job gets.
+    ///
+    /// qex never adds the memory of the devices together. See `qex help
+    /// resources`.
+    pub vram: Option<String>,
+    /// The claims on the other pools. The key is the pool name.
+    pub claims: BTreeMap<String, ClaimEntry>,
+}
+
+/// One pool claim, as a job file gives it.
+///
+/// The value is a number, or a table with a count and a size:
+///
+/// ```toml
+/// [resources.claims]
+/// net = 1
+/// tpu = { count = 2, size = "8GB" }
+/// ```
+///
+/// The table form is the general way to claim a quantity on each device of an
+/// indexed pool. `--vram` is the same thing for the pool `gpu`, with a name
+/// that an agent gets correct on the first try.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClaimEntry {
+    Count(u64),
+    Sized {
+        count: u64,
+        #[serde(default)]
+        size: Option<String>,
+    },
+}
+
+impl ClaimEntry {
+    pub fn count(&self) -> u64 {
+        match self {
+            Self::Count(n) => *n,
+            Self::Sized { count, .. } => *count,
+        }
+    }
+
+    pub fn size(&self) -> Option<&str> {
+        match self {
+            Self::Count(_) => None,
+            Self::Sized { size, .. } => size.as_deref(),
+        }
+    }
+}
+
+/// The claim of one job on one pool, as the coordinator receives it.
+///
+/// This type is on the wire. See the note on [`JobSpec::locks`] for the reason
+/// that `locks` did not become one of these.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PoolClaim {
+    /// The number of units, or of devices for an indexed pool.
+    pub count: u64,
+    /// The quantity on EACH device that the job gets, in bytes.
+    ///
+    /// The value `None` means the whole of each device. qex NEVER adds the
+    /// capacity of the devices together: four devices of 24GB are not 96GB for
+    /// one job.
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+/// Reads one `NAME=N` or `NAME=N:SIZE` value from the `--claim` option.
+pub fn parse_claim_pair(s: &str) -> Result<(String, PoolClaim), String> {
+    let help = "Use the form NAME=N, or NAME=N:SIZE for a quantity on each device. \
+                Example: --claim net=1";
+    let Some((name, value)) = s.split_once('=') else {
+        return Err(format!("incorrect --claim value `{s}`. {help}"));
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("incorrect --claim value `{s}`. {help}"));
+    }
+    let (count, size) = match value.split_once(':') {
+        Some((c, sz)) => (c, Some(sz)),
+        None => (value, None),
+    };
+    let count: u64 = count
+        .trim()
+        .parse()
+        .map_err(|_| format!("incorrect --claim value `{s}`. {help}"))?;
+    if count == 0 {
+        return Err(format!(
+            "the claim `{s}` asks for 0 of `{name}`. A claim of zero holds nothing, so \
+             delete the option, or give 1 or more."
+        ));
+    }
+    let size = match size {
+        Some(sz) => Some(crate::units::parse_size(sz.trim()).map_err(|e| format!("--claim: {e}"))?),
+        None => None,
+    };
+    Ok((name.to_string(), PoolClaim { count, size }))
 }
 
 impl JobFile {
@@ -176,6 +274,12 @@ pub struct SubmitOptions {
     ///
     /// See `JobSpec::learn_key` for the reason.
     pub learn_key: Option<Vec<String>>,
+    /// The number of devices from the pool `gpu`.
+    pub gpu: Option<u64>,
+    /// The quantity on EACH device that this job gets.
+    pub vram: Option<String>,
+    /// The claims on the other pools, from `--claim NAME=N`.
+    pub claims: Vec<(String, PoolClaim)>,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -237,6 +341,16 @@ pub struct JobSpec {
     /// quantity of memory as one, and they still destroy each other.
     #[serde(default)]
     pub locks: Vec<String>,
+    /// The counted claims of this job. The key is the pool name.
+    ///
+    /// `locks` above is NOT written here on the wire, and it never will be. A
+    /// coordinator that has `locks` but not `pools` reads `locks` and obeys it.
+    /// If `--lock` travelled as a claim, that coordinator would ignore the lock
+    /// IN SILENCE, which is the exact fault that the capability handshake
+    /// exists to prevent. The coordinator changes each lock into a pool of one
+    /// unit after the capability test, where it is safe.
+    #[serde(default)]
+    pub claims: BTreeMap<String, PoolClaim>,
     /// The number of times to run the job again when it fails.
     #[serde(default)]
     pub retries: u32,
@@ -568,6 +682,84 @@ impl JobSpec {
             source = "fan-out";
         }
 
+        // Collect the pool claims: the job file first, then the command line.
+        //
+        // `--gpu` and `--vram` are fixed names for the pool `gpu`. They are
+        // aliases in the command line only. The scheduler sees one claim map
+        // and one arithmetic, so the next accelerator is a config entry and not
+        // a code change.
+        let mut claims: BTreeMap<String, PoolClaim> = BTreeMap::new();
+        for (name, entry) in &file.resources.claims {
+            let size = match entry.size() {
+                Some(s) => Some(
+                    crate::units::parse_size(s)
+                        .map_err(|e| anyhow::anyhow!("[resources.claims] {name}: {e}"))?,
+                ),
+                None => None,
+            };
+            claims.insert(
+                name.clone(),
+                PoolClaim {
+                    count: entry.count(),
+                    size,
+                },
+            );
+        }
+        for (name, claim) in &opts.claims {
+            claims.insert(name.clone(), claim.clone());
+        }
+
+        let gpu = opts.gpu.or(file.resources.gpu);
+        let vram = opts.vram.as_deref().or(file.resources.vram.as_deref());
+        if gpu.is_some() || vram.is_some() {
+            let size = match vram {
+                Some(s) => {
+                    Some(crate::units::parse_size(s).map_err(|e| anyhow::anyhow!("--vram: {e}"))?)
+                }
+                // With no `--vram`, the job takes the whole of each device that
+                // it gets. `[defaults] vram` lets a site change that. An
+                // unstated claim that consumed nothing would let qex put four
+                // unlimited jobs on one card.
+                None => cfg.default_vram()?,
+            };
+            claims.insert(
+                crate::config::GPU_POOL.to_string(),
+                PoolClaim {
+                    // A count of zero says "this job asked for VRAM and asked
+                    // for no device". The coordinator refuses that, and its
+                    // message says how to correct it.
+                    count: gpu.unwrap_or(0),
+                    size,
+                },
+            );
+        }
+
+        // Refuse an environment variable that qex itself writes.
+        //
+        // qex gives the devices to the job and writes the variable of the pool.
+        // A value that the author wrote would disagree with the devices that
+        // qex gave, and the job would then use a card that qex gave to another
+        // job.
+        //
+        // This test reads the job file and `--env` only, and NOT the captured
+        // environment of the shell. A person who exports CUDA_VISIBLE_DEVICES
+        // in a login file must still be able to submit a GPU job; the
+        // supervisor replaces the value for that job.
+        for (name, claim) in &claims {
+            let Some(pool) = cfg.pool(name) else { continue };
+            let Some(var) = pool.env.as_deref() else {
+                continue;
+            };
+            if file.env.contains_key(var) || opts.env.iter().any(|(k, _)| k == var) {
+                bail!(
+                    "this job claims {} {name}, and it also sets {var} in its environment. \
+                     qex gives the devices to the job and writes that variable, so the two \
+                     values would disagree. Delete the variable, or delete the claim.",
+                    claim.count
+                );
+            }
+        }
+
         let timeout = match opts.timeout.as_ref().or(file.timeout.as_ref()) {
             Some(s) => {
                 crate::units::parse_duration(s).map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
@@ -701,6 +893,7 @@ impl JobSpec {
                     all.dedup();
                     all
                 },
+                claims,
                 retries: opts.retries.or(file.retries).unwrap_or(0),
                 nice,
                 dedupe_key,
@@ -1889,6 +2082,151 @@ mod tests {
         let spec =
             JobSpec::resolve(&opts(&["/usr/bin/python3", "x.py"]), &Config::default()).unwrap();
         assert_eq!(spec.name, "python3");
+    }
+
+    /// Gives a configuration with a pool of two devices.
+    fn cfg_with_gpu() -> Config {
+        let mut cfg: Config = toml::from_str(
+            "[[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\", \"24GB\"]\n\
+             env = \"CUDA_VISIBLE_DEVICES\"\n",
+        )
+        .unwrap();
+        cfg.learn.enabled = false;
+        cfg
+    }
+
+    /// `--gpu` and `--vram` are names for one claim on the pool `gpu`. The
+    /// scheduler thus sees one claim map and holds no special case.
+    #[test]
+    fn the_gpu_options_become_a_claim_on_the_pool_gpu() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.gpu = Some(2);
+        o.vram = Some("20GB".into());
+        let spec = JobSpec::resolve(&o, &cfg_with_gpu()).unwrap();
+        assert_eq!(
+            spec.claims.get("gpu"),
+            Some(&PoolClaim {
+                count: 2,
+                size: Some(20 << 30)
+            })
+        );
+        // `locks` stays empty. A claim never travels as a lock, and a lock
+        // never travels as a claim.
+        assert!(spec.locks.is_empty());
+    }
+
+    /// `--gpu` with no `--vram` takes the WHOLE of each device that the job
+    /// gets. A claim that consumed nothing would let qex put four unlimited
+    /// jobs on one card.
+    #[test]
+    fn a_gpu_claim_with_no_vram_takes_the_whole_device() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.gpu = Some(1);
+        let spec = JobSpec::resolve(&o, &cfg_with_gpu()).unwrap();
+        assert_eq!(spec.claims["gpu"].size, None);
+    }
+
+    /// `[defaults] vram` lets a site give a smaller value than the whole
+    /// device.
+    #[test]
+    fn the_config_default_supplies_the_vram_claim() {
+        let _guard = env_lock();
+        let mut cfg = cfg_with_gpu();
+        cfg.defaults.vram = Some("8GB".into());
+        let mut o = opts(&["true"]);
+        o.gpu = Some(1);
+        let spec = JobSpec::resolve(&o, &cfg).unwrap();
+        assert_eq!(spec.claims["gpu"].size, Some(8 << 30));
+    }
+
+    /// A job file gives the same claims as the command line.
+    #[test]
+    fn a_job_file_gives_the_gpu_and_the_other_pools() {
+        let _guard = env_lock();
+        let dir = tmpdir("pools");
+        let p = job_file(
+            &dir,
+            "j.toml",
+            "command = [\"true\"]\n[resources]\ngpu = 1\nvram = \"20GB\"\n\
+             [resources.claims]\nnet = 2\n",
+        );
+        let o = SubmitOptions {
+            job_file: Some(p),
+            ..Default::default()
+        };
+        let spec = JobSpec::resolve(&o, &cfg_with_gpu()).unwrap();
+        assert_eq!(spec.claims["gpu"].count, 1);
+        assert_eq!(spec.claims["gpu"].size, Some(20 << 30));
+        assert_eq!(spec.claims["net"].count, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// qex owns the assignment. A value that the author wrote would disagree
+    /// with the device that qex gave, and the job would then use a card that
+    /// qex gave to a different job.
+    #[test]
+    fn a_job_that_sets_the_device_variable_itself_is_refused() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.gpu = Some(2);
+        o.env = vec![("CUDA_VISIBLE_DEVICES".into(), "0".into())];
+        let err = JobSpec::resolve(&o, &cfg_with_gpu())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would disagree"), "got: {err}");
+        assert!(err.contains("CUDA_VISIBLE_DEVICES"), "got: {err}");
+
+        // A job that claims no device may set the variable itself. qex is then
+        // not accounting for the card, and it says nothing.
+        let mut o = opts(&["true"]);
+        o.env = vec![("CUDA_VISIBLE_DEVICES".into(), "0".into())];
+        assert!(JobSpec::resolve(&o, &cfg_with_gpu()).is_ok());
+    }
+
+    /// The test above reads the job file and `--env` only. A person who
+    /// exports the variable in a login file must still submit a GPU job, and
+    /// the supervisor replaces the value for that job.
+    #[test]
+    fn a_captured_device_variable_does_not_refuse_the_job() {
+        let _guard = env_lock();
+        let _m = EnvVar::set("CUDA_VISIBLE_DEVICES", "0");
+        let mut o = opts(&["true"]);
+        o.gpu = Some(1);
+        assert!(
+            JobSpec::resolve(&o, &cfg_with_gpu()).is_ok(),
+            "a variable from the shell must not refuse the job"
+        );
+    }
+
+    #[test]
+    fn claim_options_parse_and_refuse_a_bad_value() {
+        assert_eq!(
+            parse_claim_pair("net=2").unwrap(),
+            (
+                "net".to_string(),
+                PoolClaim {
+                    count: 2,
+                    size: None
+                }
+            )
+        );
+        assert_eq!(
+            parse_claim_pair("tpu=2:8GB").unwrap(),
+            (
+                "tpu".to_string(),
+                PoolClaim {
+                    count: 2,
+                    size: Some(8 << 30)
+                }
+            )
+        );
+        // A claim of zero holds nothing, and qex must not accept it in silence.
+        assert!(parse_claim_pair("net=0").unwrap_err().contains("zero"));
+        assert!(parse_claim_pair("net").is_err());
+        assert!(parse_claim_pair("=2").is_err());
+        assert!(parse_claim_pair("net=lots").is_err());
     }
 
     #[test]

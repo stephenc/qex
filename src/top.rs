@@ -483,6 +483,8 @@ mod tests {
             needs: vec![],
             after: vec![],
             locks: vec![],
+            claims: Default::default(),
+            assigned: Default::default(),
             attempts: 1,
             retries_left: 0,
             oom_raises: 0,
@@ -496,6 +498,7 @@ mod tests {
     fn info() -> Response {
         Response::Info {
             config_error: None,
+            pools: None,
             pid: 1,
             version: "test".into(),
             started_at: 0,
@@ -548,6 +551,7 @@ mod tests {
             panic!("expected an info response")
         };
         let paused = Response::Info {
+            pools: None,
             pid,
             version,
             started_at,

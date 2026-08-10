@@ -568,6 +568,14 @@ Other useful options
                        operates. qex gives the id of that job and exits with
                        the code 0. Use it in a script that can run a second
                        time: `--dedupe-key build:$(pwd)`.
+    --gpu N            claim N devices from the pool `gpu`. qex says WHICH
+                       index the job gets and writes CUDA_VISIBLE_DEVICES.
+    --vram SIZE        claim SIZE on EACH GPU that this job gets. qex does
+                       NOT add the memory of the devices together.
+    --claim NAME=N     claim N units of the pool NAME. `--lock NAME` is the
+                       same as `--claim NAME=1`.
+
+                       Run `qex help resources` for the pools.
 
     --id-file FILE     write the job id to a file as well as to stdout.
 
@@ -736,11 +744,16 @@ A full file
     dedupe_window = \"0\"           # keep the key after a job that succeeded
 
     [resources]
-    cpu = 3
-    mem = \"8GB\"
+    cpu  = 3
+    mem  = \"8GB\"
+    gpu  = 2                      # devices from the pool `gpu`
+    vram = \"20GB\"                 # on EACH device that this job gets
+
+    [resources.claims]
+    net = 1                       # 1 unit of the pool `net`
 
     [env]
-    CUDA_VISIBLE_DEVICES = \"0\"
+    HF_HOME = \"/data/hf\"
 
 Fields
 ------
@@ -752,6 +765,17 @@ a shell feature such as a pipe, name the shell:
     command = [\"bash\", \"-lc\", \"a | b > c.txt\"]
 
 `mem` accepts `8GB`, `8G`, `512MB` or a number of bytes. One unit step is 1024.
+
+`gpu` and `vram` claim the pool `gpu`. `vram` is the quantity on EACH device
+that the job gets, and qex does NOT add the memory of the devices together.
+With no `vram`, the job takes the whole of each device that it gets.
+
+`[resources.claims]` claims the other pools. Give a number, or a table with a
+count and a size: `tpu = { count = 2, size = \"8GB\" }`.
+
+DO NOT SET `CUDA_VISIBLE_DEVICES` IN `[env]` FOR A JOB THAT CLAIMS A GPU. qex
+gives the devices to the job and writes that variable, so the two values would
+disagree. qex refuses such a job and says so.
 
 `timeout` accepts `30s`, `5m`, `4h`, `2d`, or `0` for no limit.
 
@@ -984,6 +1008,18 @@ that qex uses now.
     mem = \"2GB\"           # the default is the machine memory / the core count
     timeout = \"0\"         # the default is no limit
     max_queue_time = \"0\"  # the default is no limit on the wait
+    vram = \"0\"            # 0 means: a job with no --vram takes the whole device
+    # A pool with devices. qex says WHICH one each job gets.
+    [[pool]]
+    name    = \"gpu\"
+    size    = \"vram\"                          # the quantity each device holds
+    devices = [\"24GB\", \"24GB\", \"24GB\", \"24GB\"]
+    env     = \"CUDA_VISIBLE_DEVICES\"
+
+    # A pool with no devices. The number is sufficient.
+    [[pool]]
+    name  = \"net\"
+    count = 4
 
     [hooks]
     on_stop = []          # the command that qex runs when a job stops
@@ -1100,6 +1136,28 @@ coordinator.
 The output goes to `hook.log` in the directory of the job. Read it with
 `qex logs <id> --hook`, which also gives the verdict of qex: a hook that did not
 start, a hook that was too slow, or a hook that stopped with an error.
+Pools
+-----
+
+A pool is a name and a total. A job claims units of a pool with `--claim
+NAME=N`, and `--lock NAME` is the same as `--claim NAME=1`.
+
+A pool with `devices` also gives a capacity to each device. qex then says WHICH
+device each job gets, writes the index into `QEX_<NAME>_DEVICES`, and writes it
+into the variable that `env` names.
+
+Give `count` or `devices`, and not both. Use `devices` when qex must say WHICH
+one a job gets. Use `count` when the number is sufficient.
+
+A pool cannot use the name `cpu` or `mem`. Those two are in `[budget]`.
+
+A pool that this file declares is shared with the other users of the machine:
+each coordinator publishes the units and the device indices that it gave away.
+A name that this file does NOT declare is a lock, and a lock stays inside one
+queue.
+
+qex reads no driver. The devices come from this file only, so a machine with no
+CUDA and no driver library schedules GPU claims correctly.
 
 Default job size
 ----------------
@@ -1331,6 +1389,76 @@ the number of cores.
 By default a claim sets no limit on the job. See `qex help config` to make qex
 apply the claim as a limit.
 
+Pools: GPUs, VRAM and counted locks
+-----------------------------------
+
+The cores and the memory are two quantities. Everything else that a machine can
+count is a POOL: a name, a total, and, when qex must say WHICH one, a list of
+devices.
+
+    --gpu N            claim N devices from the pool `gpu`.
+    --vram SIZE        claim SIZE on EACH GPU that this job gets.
+    --claim NAME=N     claim N units of the pool NAME.
+    --lock NAME        the same as `--claim NAME=1`.
+
+    qex submit --cpu 4 --mem 16GB --gpu 1 --vram 20GB -- uv run train.py
+    qex submit --cpu 8 --mem 32GB --gpu 2 -- uv run train.py    # 2 whole devices
+    qex submit --claim net=1 -- ./download.sh
+    qex run --lock target -- cargo test
+
+Declare a pool in `~/.config/qex.toml`. Run `qex help config` for the form.
+
+qex does not add the VRAM of the devices together
+-------------------------------------------------
+
+A job that needs 40GB on one device cannot run on two devices of 24GB. qex
+refuses such a job and says that it can never start.
+
+`--vram SIZE` is the quantity on EACH device that the job gets. With no
+`--vram`, the job takes the whole of each device that it gets. That is the safe
+default: a claim that consumed nothing would let qex put four unlimited jobs on
+one card. `[defaults] vram` lets you change it.
+
+qex says which device, and it tells the job
+-------------------------------------------
+
+qex gives the devices with the most free capacity first, and the lowest index
+for a tie. The job then sees both:
+
+    CUDA_VISIBLE_DEVICES=2,3      # because the pool `gpu` names this variable
+    QEX_GPU_DEVICES=2,3           # always, for every indexed pool
+    QEX_GPU_VRAM=21474836480      # the quantity on each device, in bytes
+    QEX_CLAIM_NET=1               # for a pool with no devices
+
+    qex status <id>               # the line `devices: gpu 2,3`
+    qex status <id> --json        # the field `assigned`
+
+The variable is what a framework reads with no change to its code. The record is
+what you read AFTERWARDS to explain a failure: the record stays, and the
+environment goes with the job.
+
+Do not set `CUDA_VISIBLE_DEVICES` yourself for a job that claims a GPU. qex
+refuses that job, because the two values would disagree.
+
+qex does not read a driver
+--------------------------
+
+The devices come from the configuration only. A machine with no CUDA and no
+driver library thus schedules GPU claims correctly: a count in the file, a claim
+on the job, and the same arithmetic that admits a job today.
+
+Two users who give different device counts disagree, in the same way and for the
+same reason that they can disagree about `[budget]`. The accounting is
+cooperative.
+
+A claim above the pool total is always refused
+----------------------------------------------
+
+This behaviour is different from the cores and the memory. A memory job that is
+too large can run alone and swap, and that result is data. An empty machine does
+not make a fifth GPU, so `qex submit --gpu 8` against a pool of 4 gives an error
+at the submission, whatever `[queue] oversized` says.
+
 When does a job start
 ---------------------
 
@@ -1338,7 +1466,9 @@ qex starts a job when all these conditions are true:
 
   1. The claims of the jobs that operate, plus this claim, are in the budget.
   2. The claims of the other users leave sufficient capacity.
-  3. The free memory stays above `reserve_mem` and the memory pressure is below
+  3. Each pool that the job claims has free units, or free devices with
+     sufficient capacity.
+  4. The free memory stays above `reserve_mem` and the memory pressure is below
      `max_pressure`.
 
 If a job waits, `qex status` gives the reason in the `blocked_reason` field.
@@ -1832,7 +1962,18 @@ so `GROUP=$(qex pipeline ci.toml)` operates.
     after = [\"ship\"]
 
 Each job in the file takes every field of a job file: `cwd`, `env`, `timeout`,
-`max_queue_time`, `tags`, `priority`, `env_capture`, `nice` and `[resources]`.
+`max_queue_time`, `tags`, `priority`, `env_capture`, `nice`, `locks`, `retries` and
+`[resources]`. A stage thus claims a GPU in the same way as a job file:
+    [[jobs]]
+    name = \"train\"
+    command = [\"uv\", \"run\", \"train.py\"]
+    needs = [\"build\"]
+
+    [jobs.resources]
+    cpu  = 4
+    mem  = \"16GB\"
+    gpu  = 1
+    vram = \"20GB\"
 
 A stage that waits for an earlier stage also uses its `max_queue_time`, because
 that clock counts every wait. Give a value that covers the whole pipeline, or
