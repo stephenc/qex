@@ -6,6 +6,7 @@
 use crate::{paths, sys, units};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::time::{Duration, SystemTime};
 
 /// Selects the quantity of the environment that a job receives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1092,8 +1093,12 @@ fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) 
 
 /// What one look at the configuration file gave.
 pub enum ConfigFile {
-    /// The bytes of the file. An empty file gives an empty value here.
-    Text(Vec<u8>),
+    /// The bytes of the file, and the AGE of the file when qex read it.
+    ///
+    /// The age is the measurement that says whether a writer finished. See
+    /// `daemon::reload_config`. It is `None` where the system gives no time
+    /// for the file, and the coordinator then uses its other test.
+    Text(Vec<u8>, Option<Duration>),
     /// The file does not exist. That is not a fault: every field is optional.
     Missing,
     /// The path is there, and it is not a regular file.
@@ -1152,9 +1157,18 @@ pub fn read_config_file() -> ConfigFile {
         Ok(_) => {}
         Err(e) => return ConfigFile::Unreadable(e),
     }
+    // Take the age from the SAME handle that gives the bytes, and take it
+    // BEFORE the read. A file that a writer changes during this read gives a
+    // young age, and a young file is one that qex does not take.
+    let age = file
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok());
+
     let mut bytes = Vec::new();
     match std::io::Read::read_to_end(&mut { file }, &mut bytes) {
-        Ok(_) => ConfigFile::Text(bytes),
+        Ok(_) => ConfigFile::Text(bytes, age),
         Err(e) => ConfigFile::Unreadable(e),
     }
 }
@@ -1202,7 +1216,7 @@ impl Config {
     fn read(detail: Detail) -> Result<Self> {
         let path = paths::config_file()?;
         match read_config_file() {
-            ConfigFile::Text(bytes) => {
+            ConfigFile::Text(bytes, _) => {
                 let text = String::from_utf8(bytes).map_err(|_| {
                     anyhow::anyhow!(
                         "the configuration file {} is not text. qex cannot take any value \
