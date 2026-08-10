@@ -191,6 +191,36 @@ operating system directly still sees the whole machine.
 which limits the damage, but an accurate claim is better. qex measures each job
 and uses the measurement for the next job of the same command.
 
+## When the kernel stops a job for memory
+
+A training run with `--mem guess` that the kernel stops at hour four gets the
+state `oom`. That state says one thing: **the claim was too small**.
+
+qex corrects it. It multiplies the claim, starts the job again with the same id
+and the same record, and says in the record what it did:
+
+```
+claim:     1 core(s), 16GB  (qex raised it, because the earlier claim was too small)
+note:      the kernel stopped attempt 1 of this job, because the job used more
+           memory than its claim of 8GB. THE CLAIM WAS TOO SMALL. qex raised
+           the claim to 16GB and starts the job again.
+```
+
+The job goes through the queue again, so its new claim meets the budget in the
+same way as a new job. qex also keeps the lesson: that kill says that the
+command needs **more than** 8GB, so the next run of the same command starts
+above that value and does not die in the same way.
+
+qex makes this correction when it applied the memory limit itself, with
+`[enforce] mode`. The kernel then stopped the job at the claim, and the kill is
+proof. With no limit — the default — qex can read the count of the login session
+only, and that count also rises when the kernel stops a different program of the
+same user. qex then reports the state `oom`, says what you can do, and starts no
+new attempt: the machine can be full while your claim is correct.
+
+See [the reference](docs/reference.md#a-job-that-the-kernel-stops-for-memory)
+for the limit on the raises.
+
 ## The documentation
 
 The full documentation is at

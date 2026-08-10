@@ -273,10 +273,104 @@ qex submit -- cargo test    # run 2: the claim comes from run 1
 the name, because `cargo build` and `cargo test` need different sizes. qex uses
 the **largest** measurement it holds plus a margin, because a claim that is too
 small stops the job while a claim that is a little large costs only capacity.
-A job that did not complete is never recorded: it shows the memory it reached,
-not the memory it needs.
+
+qex records two kinds of measurement, and it keeps them apart:
+
+| The job | What the sample says |
+| ------- | -------------------- |
+| completed | The memory that the job needs. |
+| the kernel stopped it at its own limit | A **lower bound**. The need is above this value. |
+
+qex keeps one lower bound for a command, because a ladder of attempts makes one
+at each step and they would fill the store. The learned claim also never goes
+above `[budget] mem`: qex makes that number itself, and it must not make a
+number that it then refuses.
+
+A lower bound costs a whole run to obtain, so qex never averages it away. The
+next claim is above it, and a smaller run that succeeds later does not remove
+it. A job that you stopped, or that reached its time limit, is never recorded:
+it shows the memory it reached, not the memory it needs.
 
 Turn it off with `[learn] enabled = false`.
+
+### A job that the kernel stops for memory
+
+The kernel stops a job that uses more memory than its claim, and the job gets
+the state `oom`. That state says one thing: **the claim was too small**.
+
+qex corrects it. It multiplies the claim, starts the job again with the same id
+and the same record, and writes in the record what it did:
+
+```
+$ qex status $ID
+state:     completed
+claim:     1 core(s), 16GB  (qex raised it, because the earlier claim was too small)
+note:      the kernel stopped attempt 1 of this job, because the job used more
+           memory than its claim of 8GB. THE CLAIM WAS TOO SMALL. qex raised
+           the claim to 16GB and starts the job again.
+attempts:  2
+```
+
+| Rule | Value |
+| ---- | ----- |
+| How many raises | `[retry] on_oom`, 2 by default. |
+| The multiplier | `[retry] growth`, 2.0 by default. |
+| The limit | The claim never goes above `[budget] mem`. |
+| The count | Separate from `--retries`, which stays for your own faults. |
+
+Each attempt costs the full time of the job, which is why the ladder has a
+limit. A job that stops for memory at the limit keeps the state `oom`, and the
+record tells you to give a larger `--mem` value or to use a larger machine.
+
+The job goes through the **queue** again. Its claim is now larger, and the queue
+never admitted that claim, so qex tests it against the budget in the same way as
+a new job. A raised job thus waits while other jobs hold the budget, and the sum
+of the claims stays inside the budget.
+
+#### One job, and not two
+
+A new attempt is the SAME job. It keeps its id, its record and its log file, and
+these rules follow from that:
+
+| Question | Answer |
+| -------- | ------ |
+| `--max-queue-time` | It expires no new attempt. That value limits the WAIT of a job, and qex expires no job that already ran. The rule is the rule that holds a job between two attempts of `--retries`. |
+| A paused queue | A new attempt waits in the queue in the usual way. A pause starts no job, and it credits the wait that it added. |
+| `--dedupe-key` | The key names this job, and the job keeps its id, so a new attempt takes no key and meets no key. |
+| `[hooks] on_stop` | The hook runs ONE TIME, for the state that the job STOPS in. An attempt that the kernel stopped is not a stop of the job, so it gives no hook. |
+| `qex events` | A reader sees the states of one id: `running`, then `queued` again, then `running`, then the final state. Each line names the state before it, so a new attempt is a change of state and never a new job. |
+| `--each-line` | Every line of one fan-out measures against its template, and a lower bound goes to that same record. |
+| The log | A new attempt ADDS to the log file. The line `--- attempt 2 ---` separates the attempts, and the output that `[logs] max_bytes` removed is the sum of the attempts. |
+| `QEX_MEM`, `GOMEMLIMIT` and the other claim values | A new attempt hears the RAISED claim. qex replaces the values that qex wrote, and it keeps every value that you chose. |
+| `qex status` | The line `attempts:` gives the number, and the line `note:` gives the reason for each raise. `claim_source` is then `raised`. |
+
+#### When qex acts, and when it only reports
+
+qex finds a kill for memory with the count in `memory.events`, which Linux keeps
+for each cgroup. The counter of a cgroup counts the kills in each cgroup below
+it, so **where qex reads it decides what qex may do**:
+
+| `[enforce] mode` | What qex reads | What qex does |
+| ---------------- | -------------- | ------------- |
+| `soft` or `hard` | The cgroup that qex made for this job. | Reports `oom`, raises the claim, runs the job again, and teaches the learner. |
+| `off` (default)  | The cgroup of your login session. | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
+
+With no limit, the count also rises when the kernel stops a **different program
+of the same user**. A machine that is short of memory is also the machine on
+which a person uses `kill -9`, so the two events arrive together. That evidence
+does not prove that the claim of this job was too small: the machine can be full
+while the claim is correct. qex therefore reports the state and stops.
+
+To get the correction, set `[enforce] mode`. The kernel then stops the job at
+the claim, and a kill is proof that the claim was too small.
+
+`qex kill` writes a mark before it sends the signal, and that mark always wins.
+A job that you stopped never runs again with a larger claim, and it teaches the
+learner nothing.
+
+On a machine with no cgroup, such as macOS, qex has no count. A `SIGKILL` that
+no qex command sent then gives the state `killed`, which starts no new attempt,
+and the record says that qex could not tell the cause.
 
 Do not run a small test job to measure a task. Give `guess` and start the real
 task. qex measures each job, and you can read the true use later:
@@ -916,6 +1010,10 @@ oversized = "run-when-idle"   # run-when-idle, reject or queue
 
 [logs]
 max_bytes = "32MB"    # the output that qex keeps for each stream of each job
+
+[retry]
+on_oom = 2            # times to raise the claim after a kill for memory
+growth = 2.0          # the multiplier for the claim at each raise
 
 [defaults]
 cpu = 1               # the default is 1 core

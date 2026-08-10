@@ -235,7 +235,18 @@ pub const STATUS: &str = r##"{
     "started_at": { "type": ["integer", "null"], "description": "The start time, in seconds after the Unix epoch." },
     "finished_at": { "type": ["integer", "null"], "description": "The stop time, in seconds after the Unix epoch." },
     "cpu": { "type": "integer", "description": "The number of cores that the job claimed." },
-    "mem": { "type": "integer", "description": "The memory in bytes that the job claimed." },
+    "mem": { "type": "integer", "description": "The memory in bytes that the job claims NOW. The value starts as the claim in the submission, and qex raises it when the kernel stops the job for memory." },
+    "claim_source": {
+      "type": "string",
+      "enum": ["explicit", "learned", "default", "raised"],
+      "description": "Where the claim came from. `raised` means that the kernel stopped an earlier attempt for memory and qex made the claim larger."
+    },
+    "attempts": { "type": "integer", "description": "The number of times that qex started this job." },
+    "retries_left": { "type": "integer", "description": "The number of times that qex may still start this job again after a failure. See --retries." },
+    "oom_raises": {
+      "type": "integer",
+      "description": "The number of times that qex raised the memory claim of this job, because the kernel stopped an attempt at the memory limit that qex applied. This count is separate from retries_left. qex raises the claim only when it applied the limit itself, with [enforce] mode; with no limit it reports the state oom and starts no new attempt. See [retry] on_oom in the config file."
+    },
     "usage": {
       "type": "object",
       "description": "The resources that the job used. Compare these values with the claim, then correct your next claim.",
@@ -262,7 +273,7 @@ pub const STATUS: &str = r##"{
     },
     "error": {
       "type": ["string", "null"],
-      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause."
+      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause. A job that the kernel stopped for memory holds here the claim that failed, the new claim and the attempt, and that text stays in the record when a later attempt succeeds."
     },
     "needs": {
       "type": "array",

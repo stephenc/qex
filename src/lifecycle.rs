@@ -82,6 +82,19 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
         }
     };
 
+    // Record the cause BEFORE the signal.
+    //
+    // The kernel uses SIGKILL for an out-of-memory kill, and this command uses
+    // the same signal. qex answers an out-of-memory kill with a larger claim
+    // and a new attempt, so a job that a person stopped must never receive that
+    // answer: it would repeat work that somebody stopped on purpose.
+    //
+    // The mark goes to the disk first, because the supervisor can read the
+    // record in the moment after the signal.
+    if let Ok(dir) = paths::job_dir(&id) {
+        crate::enforce::mark_user_kill(&dir);
+    }
+
     // Signal the process group. The supervisor put the job in its own group,
     // so this call reaches each child of the job.
     let sent = unsafe { libc::killpg(pid, signal) };
