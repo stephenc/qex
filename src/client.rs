@@ -284,7 +284,7 @@ fn classify_refusal(dir: &Path, bind: impl Fn(&Path) -> std::io::Result<()>) -> 
     let name = format!("probe-{}", std::process::id());
     let file = dir.join(format!("{name}.tmp"));
     if let Err(e) = std::fs::write(&file, b"qex") {
-        return Some(Refusal::Directory(e));
+        return a_refusal(e).map(Refusal::Directory);
     }
     std::fs::remove_file(&file).ok();
 
@@ -292,7 +292,39 @@ fn classify_refusal(dir: &Path, bind: impl Fn(&Path) -> std::io::Result<()>) -> 
     std::fs::remove_file(&socket).ok();
     let answer = bind(&socket);
     std::fs::remove_file(&socket).ok();
-    answer.err().map(Refusal::Socket)
+    answer.err().and_then(a_refusal).map(Refusal::Socket)
+}
+
+/// Keeps the errors that mean "you may not", and no others.
+///
+/// The messages of this module tell a reader that a SANDBOX stopped qex, and
+/// that a different person must correct it. A disk that filled, or a process
+/// that holds too many files, makes the same SHAPE — a write that fails, or a
+/// socket that fails after a file that worked — and the words would then assert
+/// a cause that the error itself contradicts. An agent acts on the words.
+///
+/// A fault that is not in this list gives no message here, and the caller then
+/// reports the error that it has.
+fn a_refusal(error: std::io::Error) -> Option<std::io::Error> {
+    let refused = matches!(
+        error.raw_os_error(),
+        Some(libc::EACCES)
+            | Some(libc::EPERM)
+            | Some(libc::EROFS)
+            | Some(libc::EAFNOSUPPORT)
+            | Some(libc::EPROTONOSUPPORT)
+            | Some(libc::EOPNOTSUPP)
+            | Some(libc::ENOSYS)
+    );
+    // A test gives an error with no number of the system, so take the kind as
+    // well. `PermissionDenied` is EACCES or EPERM by definition.
+    let refused = refused
+        || (error.raw_os_error().is_none()
+            && matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ));
+    refused.then_some(error)
 }
 
 /// Binds a socket and connects to it.
@@ -529,6 +561,28 @@ mod tests {
         assert!(answer.is_none(), "a socket that works is not a fault");
     }
 
+    /// A fault that is not a refusal gives no message at all.
+    ///
+    /// A disk that filled makes the same shape as a sandbox: a write that
+    /// fails. The words of this module say that a sandbox stopped qex and that
+    /// a person must change its permissions, and an agent acts on the words.
+    #[test]
+    fn a_disk_that_filled_is_not_a_sandbox() {
+        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert!(a_refusal(full).is_none());
+
+        let too_many_files = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(a_refusal(too_many_files).is_none());
+
+        // The refusals stay.
+        for code in [libc::EACCES, libc::EPERM, libc::EROFS, libc::EAFNOSUPPORT] {
+            assert!(
+                a_refusal(std::io::Error::from_raw_os_error(code)).is_some(),
+                "the code {code} must count as a refusal"
+            );
+        }
+    }
+
     /// A directory that qex cannot write gives the message of a DIRECTORY.
     ///
     /// A sandbox that filters system calls answers `bind` with "operation not
@@ -537,8 +591,27 @@ mod tests {
     #[test]
     fn a_directory_that_qex_cannot_write_is_not_the_socket() {
         // A path that does not exist, which no permission can make writable.
-        let dir = std::env::temp_dir().join(format!("qx-none-{}/deeper", std::process::id()));
-        let message = classify_refusal(&dir, |_| Ok(()))
+        // A directory inside a file, which the system refuses with ENOTDIR...
+        // and that is not a refusal. Take a real one: a directory with no
+        // permission to write.
+        let Some(parent) = writable_dir("deny") else {
+            return;
+        };
+        let dir = parent.join("locked");
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let answer = classify_refusal(&dir, |_| Ok(()));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&parent).ok();
+
+        // A test that runs as root writes anywhere, so it cannot make this
+        // fault.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let message = answer
             .expect("a directory that qex cannot write must give a message")
             .message(&dir);
         assert!(message.contains("cannot write"), "got: {message}");

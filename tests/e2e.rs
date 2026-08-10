@@ -1044,11 +1044,51 @@ fn qex_inside_bubblewrap_names_the_sandbox() {
     );
     // The CAUSE comes first, and the remedy after it. A reader that meets the
     // remedy first does not know what it corrects.
-    let cause = said.find("Read-only").unwrap_or(usize::MAX);
-    let page = said.find("docs/sandbox.md").unwrap_or(0);
+    //
+    // Find the cause by the PATH that the system names, and not by the words
+    // of the error: those words come from the language of the machine.
+    let cause = said
+        .find(state.to_str().unwrap())
+        .expect("the message must name the directory");
+    let page = said
+        .find("docs/sandbox.md")
+        .expect("the message must give the page");
     assert!(
         cause < page,
         "the message must give the fault before the remedy: {said}"
+    );
+}
+
+/// A job that does not exist gives 127 at once, and never after ten seconds.
+///
+/// With no coordinator, a wait looked for a new one for ten seconds before it
+/// read the disk. A job with no record never reached a queue, so the answer is
+/// ready immediately.
+#[test]
+fn a_job_that_does_not_exist_answers_at_once_with_no_coordinator() {
+    let h = Harness::with_default_config("nojobfast");
+    // Start a coordinator, then stop it. Nothing else runs qex here, so
+    // nothing starts another one.
+    h.ok(&["info", "--json"]);
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator is gone", Duration::from_secs(10), || {
+        (unsafe { libc::kill(pid, 0) }) != 0
+    });
+
+    // `--quiet` is the form that shows the fault: it writes no line about a
+    // pause, so it starts no coordinator on the way, and the wait then has
+    // none to ask.
+    let missing = "3f2b1c0d-0000-4000-8000-000000000000";
+    let started = Instant::now();
+    let out = h.qex(&["wait", missing, "--quiet", "--timeout", "60s"]);
+    assert_eq!(out.status.code(), Some(127));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the answer took {:?}, and the record was ready at once",
+        started.elapsed()
     );
 }
 

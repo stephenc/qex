@@ -1751,6 +1751,19 @@ fn wait_one(
                         return Ok(WaitOutcome::Finished(Box::new(status)));
                     }
                 }
+
+                // A job that has no record and no coordinator does not exist.
+                //
+                // Say so NOW. The coordinator makes the directory of a job at
+                // the submission, so a job with none never reached a queue, and
+                // a search for a new coordinator would cost the reader ten
+                // seconds before the same answer. The test is for an ID only: a
+                // NAME lives in the coordinator, and the disk cannot resolve
+                // one.
+                if raw_id.parse::<uuid::Uuid>().is_ok() && find_id_on_disk(raw_id)?.is_none() {
+                    return Ok(WaitOutcome::NoSuchJob);
+                }
+
                 if !reporter.quiet {
                     eprintln!(
                         "qex: the coordinator stopped. The job continues, and this wait \
