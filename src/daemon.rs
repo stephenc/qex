@@ -608,7 +608,21 @@ pub fn run() -> Result<()> {
         unsafe {
             libc::umask(previous);
         }
-        result.with_context(|| format!("opening the socket {}", socket_path.display()))?
+        result.map_err(|e| {
+            // Name the usual cause. This message goes to the log file of the
+            // coordinator, which is where a person looks after the CLI says
+            // that the coordinator did not start.
+            let note = if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) {
+                "\nA sandbox that refuses a Unix socket gives this fault. See \
+                 https://github.com/stephenc/qex/blob/main/docs/sandbox.md"
+            } else {
+                ""
+            };
+            anyhow::anyhow!("opening the socket {}: {e}{note}", socket_path.display())
+        })?
     };
     restrict_socket(&socket_path)?;
 

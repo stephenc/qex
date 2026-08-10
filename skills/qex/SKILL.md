@@ -13,6 +13,16 @@ first command starts the coordinator, and there is no service to configure.
 
 `qex help agents` is the complete page inside the binary.
 
+## If qex cannot start at all
+
+Some harnesses run each command in a **sandbox**, and a sandbox can refuse the
+Unix socket that qex needs. qex says so and names the directory.
+
+You cannot correct that yourself: the permissions belong to the person who
+starts you. Give them
+[the sandbox page](https://github.com/stephenc/qex/blob/main/docs/sandbox.md),
+and stop.
+
 ## The rule
 
 **Never write a loop that waits for evidence of a task.** Each of these waits

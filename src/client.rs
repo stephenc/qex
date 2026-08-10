@@ -173,12 +173,92 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
     }
 
     let log = paths::daemon_log_path()?;
+
+    // Say WHY, and do not send the reader to a file for the usual cause.
+    //
+    // A sandbox that refuses a Unix socket gives this same silence: the
+    // coordinator starts, its `bind` fails, and it stops. The reader then has
+    // "the coordinator did not start" and a log file, and nothing that names
+    // the cause or the remedy.
+    if let Some(message) = socket_is_refused() {
+        bail!("{message}");
+    }
+
+    // Give the last lines of the log here as well. A reader that must open a
+    // file to learn the cause frequently does not open it.
+    let tail = last_lines_of(&log, 5);
     bail!(
         "the coordinator did not start in {} seconds.\n\
-         Read its log file: {}",
+         Its log file is {}{}",
         timeout.as_secs(),
-        log.display()
+        log.display(),
+        tail
     )
+}
+
+/// Tests whether this process may make a Unix socket at all.
+///
+/// Gives the message for a reader when it may not. qex needs one socket for the
+/// coordinator, and a sandbox that refuses `bind` or `connect` on a Unix socket
+/// stops qex completely. bubblewrap, which Codex and other agent harnesses use,
+/// can be configured in that way.
+fn socket_is_refused() -> Option<String> {
+    socket_refused_in(&paths::runtime_dir().ok()?)
+}
+
+/// The test above, for one directory. See `socket_is_refused`.
+fn socket_refused_in(dir: &Path) -> Option<String> {
+    let probe = dir.join(format!("probe-{}", std::process::id()));
+    std::fs::remove_file(&probe).ok();
+
+    // Test BOTH halves. A sandbox can allow `bind` and refuse `connect`, and
+    // qex needs the two: the coordinator binds, and every command connects.
+    let error = match std::os::unix::net::UnixListener::bind(&probe) {
+        Ok(listener) => {
+            let answer = UnixStream::connect(&probe).err();
+            drop(listener);
+            std::fs::remove_file(&probe).ok();
+            answer?
+        }
+        Err(e) => {
+            std::fs::remove_file(&probe).ok();
+            e
+        }
+    };
+
+    // A directory that qex cannot write is a different fault, and the message
+    // for it is the one that the caller already gives.
+    if !matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+    ) {
+        return None;
+    }
+
+    Some(format!(
+        "qex cannot make a Unix socket in {}: {error}.\n\n\
+         qex keeps one coordinator process, and every qex command talks to it through a Unix \
+         socket. A sandbox that refuses that socket stops qex completely, and this is the \
+         usual cause of this message.\n\n\
+         IF YOU ARE AN AGENT: tell the person that you work with. They must let qex run \
+         outside the sandbox, or give the sandbox permission for a Unix socket in that \
+         directory. The page for them is:\n\
+         \x20   https://github.com/stephenc/qex/blob/main/docs/sandbox.md",
+        dir.display()
+    ))
+}
+
+/// Gives the last lines of a file, for a message.
+fn last_lines_of(path: &Path, count: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let tail = lines[lines.len().saturating_sub(count)..].join("\n  ");
+    format!(", and it ends with:\n  {tail}")
 }
 
 /// Starts the coordinator as a separate process.
@@ -264,5 +344,57 @@ impl Drop for SpawnLock {
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory that refuses a socket must give the page for a person, and
+    /// not the message about a coordinator that did not start.
+    ///
+    /// This is the fault that a sandbox gives. An agent inside one meets it on
+    /// its FIRST qex command, so the message must name the cause and say who
+    /// can correct it.
+    #[test]
+    fn a_directory_that_refuses_a_socket_names_the_cause() {
+        let dir = std::env::temp_dir().join(format!("qx-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Take the write permission away. A `bind` then gives EACCES, which is
+        // the same class of fault as a sandbox that refuses the socket.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let answer = socket_refused_in(&dir);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A test that runs as root writes anywhere, so it cannot make this
+        // fault. Say so, and do not report a failure that is not one.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let message = answer.expect("a directory that refuses a socket must give a message");
+        assert!(
+            message.contains("docs/sandbox.md"),
+            "the message must send the person to the page: {message}"
+        );
+        assert!(
+            message.contains("Unix socket"),
+            "the message must name the cause: {message}"
+        );
+    }
+
+    /// A directory that does not exist is a different fault, and the caller
+    /// gives its own message for it. A wrong message here would send every
+    /// reader to a page about sandboxes.
+    #[test]
+    fn a_directory_that_does_not_exist_is_not_a_sandbox() {
+        let dir = std::env::temp_dir().join(format!("qx-none-{}", std::process::id()));
+        assert!(socket_refused_in(&dir).is_none());
     }
 }

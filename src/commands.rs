@@ -232,7 +232,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             }
             Ok(0)
         }
-        other => report(other),
+        other => report_for_a_job(other),
     }
 }
 
@@ -559,7 +559,7 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
                     group,
                     &submitted,
                 );
-                return report(other);
+                return report_for_a_job(other);
             }
         }
     }
@@ -760,6 +760,15 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     let is_pipeline = found.group.is_some();
     let ids = found.ids;
 
+    if args.timeout.is_some() && !args.wait && !args.follow {
+        bail!(
+            "`--timeout` limits a WAIT, and this command does not wait. Add `--wait` or \
+             `--follow`.\n\n\
+             \x20   qex status <id> --wait --timeout 30m\n\n\
+             Use `qex submit --timeout` to limit the JOB."
+        );
+    }
+
     // A limit for the wait, whatever form the wait takes.
     let deadline = match &args.timeout {
         Some(t) => parse_duration(t)
@@ -863,7 +872,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         for id in &ids {
             let status = match client.call(&Request::Status { id: *id })? {
                 Response::Status { status } => status,
-                other => return report(other),
+                other => return report_for_a_job(other),
             };
             let code = if status.state.is_terminal() {
                 exit_code_for(&status)
@@ -884,7 +893,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         let id = *id;
         let status = match client.call(&Request::Status { id })? {
             Response::Status { status } => status,
-            other => return report(other),
+            other => return report_for_a_job(other),
         };
         // From here the record is for a READER. See `for_display`.
         let status = Box::new(for_display(*status));
@@ -1428,12 +1437,18 @@ fn wait_for_the_next(
     deadline: Option<Instant>,
 ) -> Result<i32> {
     let mut delay = Duration::from_millis(50);
+    // One reporter for each job, in the same way as every other wait. This
+    // loop reads the record of each job already, so the reason costs nothing.
+    let mut reporters: Vec<ReasonReporter> = ids
+        .iter()
+        .map(|_| ReasonReporter::new(args.json || args.quiet))
+        .collect();
 
     loop {
         if wait_was_interrupted() {
             return Ok(report_broken_wait(ids, args.json));
         }
-        for raw in ids {
+        for (n, raw) in ids.iter().enumerate() {
             // Ask the coordinator, and read the record when the coordinator
             // does not answer. A coordinator that stops must not make this
             // command say that a job which operates does not exist.
@@ -1460,6 +1475,8 @@ fn wait_for_the_next(
                 eprintln!("qex: there is no job with the id {raw}");
                 return Ok(EXIT_NO_SUCH_JOB);
             };
+
+            reporters[n].note(&status);
 
             if status.state.is_terminal() {
                 // From here the record is for a READER. See `for_display`.
@@ -1583,9 +1600,15 @@ fn wait_was_interrupted() -> bool {
 /// attaches to it again.
 fn report_broken_wait(ids: &[String], quiet: bool) -> i32 {
     if !quiet {
-        let names = ids.join(" ");
         eprintln!("qex: your wait stopped. The job continues.");
-        eprintln!("qex: attach to it again:  qex wait {names}");
+        // ONE job gives the command that also gives the record, because that is
+        // what the reader wanted. MANY jobs give `qex wait`, which is the
+        // command that takes many.
+        if let [one] = ids {
+            eprintln!("qex: attach to it again:  qex status {one} --wait");
+        } else {
+            eprintln!("qex: attach to them again:  qex wait {}", ids.join(" "));
+        }
     }
     EXIT_WAIT_BROKEN
 }
@@ -1876,7 +1899,7 @@ fn wait_through_coordinator(
             ..
         }) => Ok(Some(WaitOutcome::NoSuchJob)),
         Ok(other) => {
-            report(other)?;
+            report_for_a_job(other)?;
             bail!("the coordinator gave an answer that qex did not expect")
         }
         // The coordinator closed the connection, or the read failed. Both mean
@@ -2911,6 +2934,18 @@ fn describe_result(s: &JobStatus) -> String {
 }
 
 /// Writes an error from the coordinator and gives an exit code.
+/// Writes an error of the coordinator for a command that gives the exit code of
+/// a JOB.
+///
+/// The code 1 says "the job ran and it failed". A coordinator that refuses a
+/// request is a fault of qex, and no job gave a code for it, so it takes the
+/// code of the band. `qex kill` and the other commands never speak for a job,
+/// so they keep the conventional 1.
+fn report_for_a_job(response: Response) -> Result<i32> {
+    let code = report(response)?;
+    Ok(if code == 1 { EXIT_QEX_FAILED } else { code })
+}
+
 fn report(response: Response) -> Result<i32> {
     match response {
         Response::Error { message, kind } => {
@@ -4703,7 +4738,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
             }
             (id, deduplicated)
         }
-        other => return report(other),
+        other => return report_for_a_job(other),
     };
 
     // Write the id file, and then say the id.
@@ -4887,7 +4922,7 @@ fn stream_until_done(
         // attach to the coordinator that replaced this one.
         let status = match client.call(&Request::Status { id }) {
             Ok(Response::Status { status }) => status,
-            Ok(other) => return report(other),
+            Ok(other) => return report_for_a_job(other),
             Err(_) => status_without_the_coordinator(client, id, dir, &mut announced_loss)?,
         };
 
@@ -4908,7 +4943,12 @@ fn stream_until_done(
         }
 
         // The limit of the reader stops the WAIT, and never the job.
-        if let Some(d) = deadline {
+        //
+        // A job that ALREADY stopped never gives this code. The test above
+        // leaves a terminal job here when it still moved output in this step,
+        // so a limit that comes in that same step would report 124 for a job
+        // that has a result.
+        if let Some(d) = deadline.filter(|_| !status.state.is_terminal()) {
             if Instant::now() >= d {
                 eprintln!(
                     "qex: your wait reached its time limit. The job {id} continues.\n\

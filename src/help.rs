@@ -143,6 +143,17 @@ machine can stop your job, so read the line on stderr before you run it again.
 0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the reason for
 the band.
 
+If qex cannot start at all
+--------------------------
+
+Some harnesses run each command in a SANDBOX, and a sandbox can refuse the Unix
+socket that qex needs. qex then says so, and it names the directory.
+
+You cannot correct that yourself: the permissions belong to the person who
+starts you. Give them this page, and stop:
+
+    https://github.com/stephenc/qex/blob/main/docs/sandbox.md
+
 Do not write a monitor script
 -----------------------------
 

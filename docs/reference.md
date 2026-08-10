@@ -3,7 +3,7 @@ title: qex reference
 description: Every command, option, claim word and configuration field.
 ---
 
-*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md)*
+*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md) · [Sandbox](sandbox.md)*
 
 # Reference
 

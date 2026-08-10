@@ -3,7 +3,7 @@ title: qex for agents
 description: The one page that an agent needs, and the property that makes qex safe to interrupt.
 ---
 
-*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md)*
+*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md) · [Sandbox](sandbox.md)*
 
 # qex for agents
 
@@ -15,6 +15,16 @@ starts the coordinator, and there is no service to configure.
 
 This page is also in the binary: run `qex help agents` to read it with no
 network, or [install it as a skill](#install-this-page-as-a-skill).
+
+## If qex cannot start at all
+
+Some harnesses run each command in a **sandbox**, and a sandbox can refuse the
+Unix socket that qex needs. qex says so and names the directory.
+
+You cannot correct that yourself: the permissions belong to the person who
+starts you. Give them
+[the sandbox page](https://github.com/stephenc/qex/blob/main/docs/sandbox.md),
+and stop.
 
 ## The rule
 

@@ -233,6 +233,7 @@ The full documentation is at
 | Page | What it holds |
 | ---- | ------------- |
 | [Agents](docs/agents.md) | The page for an agent. Start here. |
+| [Sandbox](docs/sandbox.md) | What qex needs when a harness runs each command in a sandbox. |
 | [Reference](docs/reference.md) | Each command, option and configuration field. |
 | [Design](docs/design.md) | The coordinator, the supervisor and the files. |
 | [Security](docs/security.md) | What qex writes, and who can read it. |

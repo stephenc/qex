@@ -3,7 +3,7 @@ title: qex — a local job queue for long tasks
 description: A resource-aware local job queue and CLI job scheduler for long-running builds, tests and jobs. It replaces polling shell scripts with a wait that always answers.
 ---
 
-*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md)*
+*[Home](index.md) · [Agents](agents.md) · [Reference](reference.md) · [Design](design.md) · [Security](security.md) · [Sandbox](sandbox.md)*
 
 # qex — Queued EXecutor
 
@@ -246,6 +246,7 @@ their own monitor scripts and gave the numbers.
 | Page | What it holds |
 | ---- | ------------- |
 | [Agents](agents.md) | The page for a coding agent. Start here if you are one. |
+| [Sandbox](sandbox.md) | What qex needs when an agent harness runs each command in a sandbox. |
 | [Reference](reference.md) | Each command, option and configuration field. |
 | [Design](design.md) | The coordinator, the supervisor, the files, and the limits. |
 | [Security](security.md) | What qex writes, and who can read it. |

@@ -486,7 +486,7 @@ fn a_signal_to_the_wait_gives_the_code_of_a_broken_wait() {
 
     let said = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        said.contains("qex wait"),
+        said.contains("qex status") && said.contains("--wait"),
         "the message must give the command that attaches again: {said}"
     );
 
@@ -909,6 +909,77 @@ fn quiet_keeps_the_faults_of_the_wait() {
     assert!(
         !String::from_utf8_lossy(&out.stderr).is_empty(),
         "`--quiet` must say that there is no such job"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.qex(&["cancel", &waiter]);
+}
+
+/// `--follow` must not give the code of a wait for a job that stopped.
+///
+/// The loop leaves a terminal job in the step that still moved output, so a
+/// limit that comes in that same step reported 124 for a job that had a result.
+#[test]
+fn follow_gives_the_code_of_the_job_and_not_the_limit_of_the_reader() {
+    let h = Harness::with_default_config("followrace");
+    for _ in 0..6 {
+        let id = h.submit(&["submit", "--", "sh", "-c", "echo out; exit 5"]);
+        // A limit that lands near the end of the job.
+        let out = h.qex(&["status", &id, "--follow", "--timeout", "1s"]);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "a job that stopped must give its own code: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A limit with no wait says nothing that qex can obey, so qex refuses it.
+#[test]
+fn a_limit_with_no_wait_is_refused() {
+    let h = Harness::with_default_config("nolimit");
+    let id = h.submit(&["submit", "--", "true"]);
+    h.qex(&["wait", &id, "--timeout", "30s"]);
+
+    let out = h.qex(&["status", &id, "--timeout", "5s"]);
+    assert_eq!(out.status.code(), Some(121));
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains("--wait") && said.contains("--follow"),
+        "the message must give the options that wait: {said}"
+    );
+}
+
+/// `--next` must say why a job waits, in the same way as every other wait.
+#[test]
+fn wait_with_next_says_why_a_job_waits() {
+    let h = Harness::new(
+        "nextreason",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let holder = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "100MB", "--", "sleep", "20",
+    ]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&holder)
+    });
+    let waiter = h.submit(&["submit", "--cpu", "2", "--mem", "100MB", "--", "true"]);
+    h.until("the second job waits", Duration::from_secs(30), || {
+        !h.status_json(&waiter)["blocked_reason"].is_null()
+    });
+    let reason = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    let out = h.qex(&["wait", "--next", &waiter, "--timeout", "4s"]);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains(&reason),
+        "`--next` must say why the job waits `{reason}`: {said}"
     );
 
     h.ok(&["kill", &holder, "--grace", "1s"]);
