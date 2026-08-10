@@ -13320,11 +13320,14 @@ fn info_reports_the_pools_and_their_devices() {
 
 /// Opens a socket that accepts no connection, and fills its backlog.
 ///
-/// A connect to this socket blocks. The standard `UnixListener` asks for a
-/// backlog of 128, so this test uses `libc` and asks for a backlog of one.
+/// A connect to this socket gives no answer. The standard `UnixListener` asks
+/// for a large backlog, so this test uses `libc` and asks for a backlog of one.
 ///
 /// The result holds the listener and the connections. The caller must keep
 /// them, because a closed socket answers at once with a refusal.
+///
+/// `src/paths.rs` holds a copy of this helper for its own tests. An integration
+/// test cannot read a test item of the library, so the two must stay apart.
 fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -13355,7 +13358,7 @@ fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
         assert_eq!(libc::listen(listener, 1), 0, "the test cannot listen");
 
         // Fill the backlog. The listener accepts nothing, so each connection
-        // stays in the queue. A further connect then blocks.
+        // stays in the queue. A further connect then gives no answer.
         let mut full = false;
         for _ in 0..256 {
             let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -13374,6 +13377,17 @@ fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
     }
 
     open
+}
+
+/// Starts a program that operates until the test stops it.
+///
+/// The test uses the number of this process as the number of a coordinator that
+/// operates.
+fn a_process_that_operates() -> std::process::Child {
+    Command::new("/bin/sh")
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .expect("the test cannot start a program")
 }
 
 /// A socket that a live process holds, and never accepts, must not stop qex.
@@ -13395,6 +13409,7 @@ fn a_socket_that_never_answers_does_not_stop_a_command() {
         .push(("TMPDIR".into(), tmp.display().to_string()));
 
     let out = h.qex(&["info", "--json"]);
+    let survived = stuck.exists();
 
     for fd in open {
         unsafe { libc::close(fd) };
@@ -13404,5 +13419,115 @@ fn a_socket_that_never_answers_does_not_stop_a_command() {
         out.status.success(),
         "the command failed: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        survived,
+        "the sweep deleted the directory of a coordinator that operates"
+    );
+}
+
+/// The coordinator names its process beside its socket.
+///
+/// The sweep of a different coordinator reads that file. Without the file, a
+/// system that refuses a connection when the queue of the socket is full lets
+/// that sweep delete the directory of a coordinator that operates.
+#[test]
+fn a_coordinator_writes_its_process_number_beside_its_socket() {
+    let h = Harness::with_default_config("pidfile");
+    let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    let pid = info["pid"].as_i64().expect("info must give the pid");
+
+    let written = std::fs::read_to_string(h.root.join("state/qex/run/pid"))
+        .expect("the coordinator must write its process number beside its socket");
+
+    assert_eq!(
+        written.trim().parse::<i64>().unwrap(),
+        pid,
+        "the pid file must name the coordinator that operates"
+    );
+}
+
+/// A coordinator must not bind a socket that a different coordinator holds.
+///
+/// The socket file is present and it gives no answer, so a coordinator can
+/// operate there. Two coordinators on one state directory each hold the full
+/// budget, and together they start twice the permitted work.
+#[test]
+fn a_socket_with_no_answer_stops_a_new_coordinator() {
+    let mut h = Harness::with_default_config("ownstuck");
+    // A coordinator that starts here is a failure of this test. Give it a
+    // short life, so the test reports that failure and does not wait.
+    h.extra_env
+        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    let open = a_socket_that_never_answers(&socket);
+    let before = std::fs::symlink_metadata(&socket).unwrap();
+
+    let out = h.qex(&["daemon"]);
+    let after = std::fs::symlink_metadata(&socket);
+
+    for fd in open {
+        unsafe { libc::close(fd) };
+    }
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = after.expect("the coordinator deleted a socket that it could not test");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&before),
+        std::os::unix::fs::MetadataExt::ino(&after),
+        "the coordinator deleted the socket of a different coordinator and bound its own"
+    );
+}
+
+/// A live process named in the pid file must stop a new coordinator.
+///
+/// A system that refuses a connection when the queue of the socket is full
+/// gives the same answer as a socket that nobody holds. The pid file is thus
+/// the test that does not change with the system.
+#[test]
+fn a_live_pid_file_stops_a_new_coordinator() {
+    let mut h = Harness::with_default_config("ownpid");
+    // A coordinator that starts here is a failure of this test. Give it a
+    // short life, so the test reports that failure and does not wait.
+    h.extra_env
+        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    // A socket file that no process holds. Alone, it lets a coordinator start.
+    std::fs::write(&socket, b"").unwrap();
+    let mut child = a_process_that_operates();
+    std::fs::write(run.join("pid"), child.id().to_string()).unwrap();
+
+    let out = h.qex(&["daemon"]);
+    let kind = std::fs::symlink_metadata(&socket).map(|m| m.file_type());
+
+    child.kill().ok();
+    child.wait().ok();
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kind = kind.expect("the coordinator deleted the socket of a live process");
+    assert!(
+        !std::os::unix::fs::FileTypeExt::is_socket(&kind),
+        "the coordinator bound its own socket while a different process operates"
+    );
+
+    // The coordinator writes its log to the standard output. The CLI sends that
+    // output to `daemon.log` when the CLI starts a coordinator.
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("delete the two files"),
+        "the log must say what the reader does to correct a number that is not a \
+         coordinator, and it says: {log}"
     );
 }
