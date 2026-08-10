@@ -27,6 +27,18 @@ const IDLE_EXIT: Duration = Duration::from_secs(3600);
 /// The name of the variable that changes the idle time. The tests use it.
 const IDLE_EXIT_VAR: &str = "QEX_IDLE_EXIT_SECS";
 
+/// The time that this process waits for a socket file that is already present.
+///
+/// The limit must exist: a connect without a limit waits for ever for a socket
+/// that a stuck process holds, and this test comes before the socket of this
+/// coordinator exists. Every qex command on the machine then waits, and each
+/// one reports that the coordinator did not start.
+///
+/// The length of this limit is safe, because the limit gives the answer
+/// `Unknown`, and this process stops on that answer. A refusal is the one
+/// answer that lets this process delete the socket file.
+const OWN_SOCKET_ANSWER_LIMIT: Duration = Duration::from_secs(1);
+
 /// One job, as the coordinator holds it.
 pub struct Job {
     pub spec: JobSpec,
@@ -722,23 +734,71 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Delete the short socket directories of the coordinators that stopped.
-    // Without this step, each unusual state directory leaves one in /tmp.
-    paths::reap_stale_socket_dirs();
-
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
 
     let socket_path = paths::socket_path()?;
-    // A socket file can stay after a failure. Test it, then delete it. The CLI
-    // holds the spawn lock now, so no other coordinator can start here.
-    if socket_path.exists() {
-        if UnixStream::connect(&socket_path).is_ok() {
+
+    // TAKE THE LOCK ON THE PID FILE FIRST, AND BEFORE ANY TEST OF THE SOCKET
+    // FILE.
+    //
+    // The lock says that a different coordinator operates, and the socket file
+    // does not. A socket file can go while its coordinator operates: a cleaner
+    // of the temporary directory deletes it, or a person deletes it, and the
+    // coordinator deletes its own socket file one moment before it stops. A
+    // test that starts at the socket file thus tests nothing in each of those
+    // states, and this process becomes a second coordinator.
+    //
+    // Two coordinators on one state directory each hold the full budget, and
+    // together they start twice the permitted work. That result is the fault
+    // that qex prevents, and it is worse than a start that does not happen. A
+    // lock that a different process holds is therefore an END of this process,
+    // and never a warning.
+    //
+    // The spawn lock does not give this promise. A CLI process holds that lock,
+    // and `qex daemon` is a command that a person or a systemd unit starts
+    // directly, with no lock at all.
+    let _pid_lock = match paths::hold_pid_file(&socket_path, paths::PID_LOCK_PATIENCE) {
+        paths::PidHold::Held(lock) => lock,
+        paths::PidHold::Busy => {
             log("a different coordinator operates; this process stops");
             return Ok(());
         }
-        std::fs::remove_file(&socket_path).ok();
+        paths::PidHold::Unusable(why) => {
+            log(&format!("{why} This process stops."));
+            return Ok(());
+        }
+    };
+
+    // A socket file can stay after a failure. Delete such a file, and then bind
+    // a new socket at the same path.
+    //
+    // THIS PROCESS MUST DELETE THAT FILE ONLY WITH THE PROOF THAT NO
+    // COORDINATOR USES IT. The lock above is the strong proof, and this test
+    // covers a coordinator that started before qex made a pid file.
+    // A test of the LINK, and not of the target. A symbolic link with no target
+    // occupies the path, and `exists` follows the link and says that the path is
+    // free. `bind` then fails, and qex cannot start at all.
+    if std::fs::symlink_metadata(&socket_path).is_ok() {
+        match paths::ask_socket(&socket_path, OWN_SOCKET_ANSWER_LIMIT) {
+            paths::SocketAnswer::NobodyListens => {
+                std::fs::remove_file(&socket_path).ok();
+            }
+            paths::SocketAnswer::Answers => {
+                log("a different coordinator operates; this process stops");
+                return Ok(());
+            }
+            paths::SocketAnswer::Unknown => {
+                log(&format!(
+                    "the socket {} gives an answer that does not identify the process \
+                     that holds it. A different coordinator can operate, so this process \
+                     stops. Delete that file if no coordinator operates.",
+                    socket_path.display()
+                ));
+                return Ok(());
+            }
+        }
     }
 
     // Set the umask before the socket exists.
@@ -762,13 +822,37 @@ pub fn run() -> Result<()> {
             ) {
                 "\nA sandbox that refuses a Unix socket gives this fault. See \
                  https://github.com/stephenc/qex/blob/main/docs/sandbox.md"
+                    .to_string()
+            } else if e.kind() == std::io::ErrorKind::AddrInUse {
+                // Something that is not a socket of this coordinator holds
+                // this path: a directory, or an entry that arrived after the
+                // test above, or an entry that qex could not test. Name the
+                // path, and do not say what holds it: without a remedy, qex
+                // cannot start on this machine again, and a reader must look.
+                format!(
+                    "\nSomething that is not a socket of qex holds that path. Look at it, \
+                     and remove it if no coordinator uses it: {}",
+                    socket_path.display()
+                )
             } else {
-                ""
+                String::new()
             };
             anyhow::anyhow!("opening the socket {}: {e}{note}", socket_path.display())
         })?
     };
     restrict_socket(&socket_path)?;
+
+    // Delete the short socket directories of the coordinators that stopped.
+    // Without this step, each unusual state directory leaves one in /tmp.
+    //
+    // THIS STEP COMES AFTER `bind`, AND IT RUNS ON ITS OWN THREAD. The sweep
+    // asks each socket in the temporary directory to answer, and a socket that
+    // a stuck process holds is slow. Before the socket of this coordinator
+    // exists, every qex command on the machine waits for that sweep, and each
+    // command then reports that the coordinator did not start. The sweep
+    // touches the directories of other coordinators only, so the start
+    // sequence needs no result from it.
+    std::thread::spawn(paths::reap_stale_socket_dirs);
 
     // Warn now if the config asks for a limit that this system cannot apply. A
     // silent failure is dangerous: the user reads the config file and believes
@@ -844,6 +928,17 @@ pub fn run() -> Result<()> {
     // command then reports a coordinator with no version and no pid. Without
     // the file, that command starts a coordinator, which is correct.
     std::fs::remove_file(&socket_path).ok();
+
+    // KEEP THE PID FILE, AND KEEP THE LOCK ON IT, UNTIL THIS PROCESS STOPS.
+    //
+    // This process lives for a moment after it deletes the socket file. A new
+    // coordinator that starts in that moment must find the lock and stop, and a
+    // file that this process deleted would let that coordinator make a new file,
+    // take the lock on it, and operate beside this one.
+    //
+    // The file stays after this process stops, and that is safe: the kernel
+    // gives the lock back, so a later sweep finds the lock free and asks the
+    // socket.
 
     // Let each reader of the event stream receive the goodbye.
     //

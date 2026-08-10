@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 /// One isolated qex installation.
 struct Harness {
     root: PathBuf,
+    /// Variables that each command of this test gets in addition.
+    extra_env: Vec<(String, String)>,
 }
 
 impl Harness {
@@ -45,7 +47,10 @@ impl Harness {
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::create_dir_all(root.join("run")).unwrap();
         std::fs::write(root.join("cfg/qex.toml"), config).unwrap();
-        Self { root }
+        Self {
+            root,
+            extra_env: Vec::new(),
+        }
     }
 
     fn with_default_config(name: &str) -> Self {
@@ -66,6 +71,7 @@ impl Harness {
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             // Keep the coordinator for the length of the test only.
             .env("QEX_IDLE_EXIT_SECS", "120")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .expect("qex did not start")
     }
@@ -13310,4 +13316,465 @@ fn info_reports_the_pools_and_their_devices() {
 
     let human = h.ok(&["info"]);
     assert!(human.contains("pool gpu"), "got: {human}");
+}
+
+/// Closes the sockets of a test when the test ends, and also when it panics.
+struct OpenSockets(Vec<libc::c_int>);
+
+impl Drop for OpenSockets {
+    fn drop(&mut self) {
+        for fd in self.0.drain(..) {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+/// Opens a socket that accepts no connection, and fills its backlog.
+///
+/// A connect to this socket gives no answer. The standard `UnixListener` asks
+/// for a large backlog, so this test uses `libc` and asks for a backlog of one.
+///
+/// The result holds the listener and the connections. The caller must keep it,
+/// because a closed socket answers at once with a refusal.
+///
+/// THE RESULT IS `None` ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE QUEUE OF
+/// THE SOCKET IS FULL. Such a system gives no way to make a socket that never
+/// answers, so a test that needs one cannot run there.
+///
+/// THIS IS THE REASON THAT THE LOCK IS THE EVIDENCE, AND THE ANSWER OF THE
+/// SOCKET IS NOT. On such a system a socket with a full queue and a socket
+/// whose owner is gone give ONE answer: a refusal. The answer of a socket thus
+/// cannot separate a coordinator that operates from a coordinator that stopped,
+/// and only the lock on the pid file can. The tests that need a socket which
+/// gives no answer stop there, and the tests of the lock carry the property.
+///
+/// `src/paths.rs` holds a copy of this helper for its own tests. An integration
+/// test cannot read a test item of the library, so the two must stay apart.
+fn a_socket_that_never_answers(path: &Path) -> Option<OpenSockets> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    assert!(
+        bytes.len() < address.sun_path.len(),
+        "the path of the test socket is too long"
+    );
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let size = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let target = &address as *const libc::sockaddr_un as *const libc::sockaddr;
+    let mut open = Vec::new();
+
+    let can_wait = unsafe {
+        let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(listener >= 0, "the test cannot open a socket");
+        open.push(listener);
+        assert_eq!(
+            libc::bind(listener, target, size),
+            0,
+            "the test cannot bind {}",
+            path.display()
+        );
+        assert_eq!(libc::listen(listener, 1), 0, "the test cannot listen");
+
+        // Fill the backlog. The listener accepts nothing, so each connection
+        // stays in the queue.
+        let mut full = false;
+        for _ in 0..256 {
+            let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(client >= 0, "the test cannot open a socket");
+            let flags = libc::fcntl(client, libc::F_GETFL);
+            libc::fcntl(client, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if libc::connect(client, target, size) != 0 {
+                let error = std::io::Error::last_os_error().raw_os_error();
+                libc::close(client);
+                // A queue that is full gives one of these two answers, and the
+                // test can then hold the connect open. Each other answer is a
+                // refusal, and this system gives no such socket.
+                full = matches!(error, Some(libc::EAGAIN) | Some(libc::EINPROGRESS));
+                break;
+            }
+            open.push(client);
+        }
+        full
+    };
+
+    // Make the guard before the test of `can_wait`, so that a system which
+    // cannot hold a connect open still closes every socket of this test.
+    let sockets = OpenSockets(open);
+    if !can_wait {
+        return None;
+    }
+    Some(sockets)
+}
+
+/// Makes a pid file and holds the lock on it, as a coordinator does.
+///
+/// The caller must keep the result. A file that closes gives the lock back.
+fn a_held_pid_file(path: &Path) -> std::fs::File {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap();
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test cannot lock the pid file");
+    write!(file, "{}", std::process::id()).unwrap();
+    file.flush().unwrap();
+    file
+}
+
+/// A socket that a live process holds, and never accepts, must not stop qex.
+///
+/// THIS TEST HOLDS TWO PROPERTIES TOGETHER: the command finishes, and the
+/// directory of the process that holds that socket stays. It does not hold the
+/// time limit or the thread on its own, because either one alone is enough to
+/// let the command finish. `src/paths.rs` holds each mechanism with its own
+/// test.
+///
+/// The coordinator deletes the short socket directories of the coordinators
+/// that stopped, and it asks each socket to answer. A socket that gives no
+/// answer must neither stop the command nor lose its directory.
+///
+/// THIS TEST DOES NOT RUN ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE QUEUE
+/// OF A SOCKET IS FULL, because no socket there gives "no answer". The sweep
+/// keeps the directory of a coordinator by the LOCK on such a system, and
+/// `paths::tests::the_sweep_keeps_the_directory_of_a_coordinator_that_operates`
+/// holds that on every system.
+#[test]
+fn a_socket_that_never_answers_does_not_stop_a_command() {
+    let mut h = Harness::with_default_config("stucksock");
+    let tmp = h.root.join("t");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let uid = unsafe { libc::getuid() };
+    let stuck = tmp.join(format!("qex-{uid}-stuck"));
+    std::fs::create_dir_all(&stuck).unwrap();
+    let Some(_open) = a_socket_that_never_answers(&stuck.join("s")) else {
+        // This system refuses a connection when the queue of a socket is full,
+        // so no socket here can give "no answer". The state that this test
+        // measures does not exist on it, and the lock on the pid file carries
+        // the property instead.
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+    h.extra_env
+        .push(("TMPDIR".into(), tmp.display().to_string()));
+
+    let out = h.qex(&["info", "--json"]);
+
+    // WATCH THE DIRECTORY, AND DO NOT READ IT ONE TIME. The command gives an
+    // answer in a few milliseconds, and the sweep runs on a thread of the
+    // coordinator. A test that reads the directory at once reads it before the
+    // sweep looks at it, and it then holds nothing.
+    //
+    // The time is longer than the limit of a whole sweep, so the sweep reaches
+    // its verdict inside it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut survived = true;
+    while Instant::now() < deadline {
+        if !stuck.exists() {
+            survived = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        out.status.success(),
+        "the command failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        survived,
+        "the sweep deleted the directory of a coordinator that operates"
+    );
+}
+
+/// The coordinator holds the lock on its pid file for its whole life.
+///
+/// The sweep of a different coordinator tries that lock. Without it, a system
+/// that refuses a connection when the queue of the socket is full lets that
+/// sweep delete the directory of a coordinator that operates.
+#[test]
+fn a_coordinator_holds_the_lock_on_its_pid_file() {
+    use std::os::unix::io::AsRawFd;
+
+    let h = Harness::with_default_config("pidfile");
+    let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    let pid = info["pid"].as_i64().expect("info must give the pid");
+    let path = h.root.join("state/qex/run/pid");
+
+    // The lock is the evidence that the coordinator operates.
+    // Open for writing as well: an exclusive lock needs a descriptor that can
+    // write on some systems and on some file systems.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("the coordinator must make a pid file beside its socket");
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    assert_ne!(
+        taken, 0,
+        "the coordinator must hold the lock on its pid file while it operates"
+    );
+
+    // The number is for a reader, and no decision uses it.
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        written.trim().parse::<i64>().unwrap(),
+        pid,
+        "the pid file must name the coordinator that operates"
+    );
+}
+
+/// A coordinator must not bind a socket that a different coordinator holds.
+///
+/// The socket file is present and it gives no answer, so a coordinator can
+/// operate there. Two coordinators on one state directory each hold the full
+/// budget, and together they start twice the permitted work.
+///
+/// THIS TEST DOES NOT RUN ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE QUEUE
+/// OF A SOCKET IS FULL, because no socket there gives "no answer". A different
+/// coordinator is stopped by the LOCK on such a system, and
+/// `a_locked_pid_file_stops_a_new_coordinator` holds that on every system.
+#[test]
+fn a_socket_with_no_answer_stops_a_new_coordinator() {
+    let mut h = Harness::with_default_config("ownstuck");
+    // A coordinator that starts here is a failure of this test. Give it a
+    // short life, so the test reports that failure and does not wait.
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    let Some(_open) = a_socket_that_never_answers(&socket) else {
+        // This system refuses a connection when the queue of a socket is full,
+        // so no socket here can give "no answer". The lock on the pid file
+        // stops a new coordinator there, and its own tests hold that.
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+    let before = std::fs::symlink_metadata(&socket).unwrap();
+
+    let out = h.qex(&["daemon"]);
+    let after = std::fs::symlink_metadata(&socket);
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = after.expect("the coordinator deleted a socket that it could not test");
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&before),
+        std::os::unix::fs::MetadataExt::ino(&after),
+        "the coordinator deleted the socket of a different coordinator and bound its own"
+    );
+}
+
+/// A symbolic link with no target must not stop qex for ever.
+///
+/// Such a link occupies the socket path. A test that follows the link says that
+/// the path is free, and `bind` then fails with "Address already in use" at
+/// every start. qex tests the LINK, so it clears the link and starts.
+#[test]
+fn a_symbolic_link_with_no_target_does_not_stop_a_coordinator() {
+    let h = Harness::with_default_config("danglink");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::os::unix::fs::symlink(h.root.join("no-such-target"), run.join("s")).unwrap();
+
+    // The coordinator must start, and the command must give its answer.
+    let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+
+    assert!(
+        info["pid"].as_i64().unwrap_or(0) > 0,
+        "a coordinator must start when a link with no target holds the socket path"
+    );
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_socket(
+            &std::fs::symlink_metadata(run.join("s"))
+                .unwrap()
+                .file_type()
+        ),
+        "the coordinator must replace the link with its own socket"
+    );
+}
+
+/// A file that qex cannot use must not stop qex for ever with no way out.
+///
+/// qex keeps the directory and stops, because it cannot prove that no
+/// coordinator operates. That state stays until a person acts, so the message
+/// must name the file and the one step that clears it.
+#[test]
+fn a_pid_file_that_qex_cannot_open_names_the_way_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The root user opens every file, so this test measures nothing there.
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+
+    let mut h = Harness::with_default_config("badpid");
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let pid = run.join("pid");
+    std::fs::write(&pid, b"").unwrap();
+    std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = h.qex(&["daemon"]);
+    let made_a_socket = run.join("s").exists();
+
+    std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !made_a_socket,
+        "qex cannot test the file, so it must not start a second coordinator"
+    );
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains(&pid.display().to_string()),
+        "the message must name the file, and it says: {log}"
+    );
+    assert!(
+        log.contains("Delete that file if no coordinator operates"),
+        "the message must name the one step that clears this state, and it says: {log}"
+    );
+}
+
+/// A socket that ANSWERS must stop a new coordinator, with no lock to help.
+///
+/// A coordinator that started before qex made a pid file leaves this state: its
+/// socket answers, and no process holds a lock. The answer of the socket is
+/// then the one guard, and it must stop a second coordinator.
+///
+/// This test runs on every system, because a socket that a coordinator accepts
+/// answers on every system. It gives the property cover where a socket cannot
+/// give "no answer".
+#[test]
+fn a_socket_that_answers_stops_a_new_coordinator() {
+    let h = Harness::with_default_config("ownanswer");
+
+    // Start a coordinator in the ordinary way.
+    let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    let first = info["pid"].as_i64().expect("info must give the pid");
+
+    // Delete the pid file. The coordinator keeps its lock on a file with no
+    // name, so a new coordinator takes the lock of a NEW file and the lock
+    // cannot stop it. Only the answer of the socket can.
+    let run = h.root.join("state/qex/run");
+    std::fs::remove_file(run.join("pid")).unwrap();
+
+    let out = h.qex(&["daemon"]);
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("a different coordinator operates"),
+        "the log must say that a different coordinator operates, and it says: {log}"
+    );
+
+    // The first coordinator must still be the one that operates.
+    let after: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+    assert_eq!(
+        after["pid"].as_i64(),
+        Some(first),
+        "a second coordinator took the queue of the first one"
+    );
+}
+
+/// A lock alone must stop a new coordinator, with NO socket file present.
+///
+/// A socket file can go while its coordinator operates: a cleaner of the
+/// temporary directory deletes it, a person deletes it, and the coordinator
+/// deletes its own socket file one moment before it stops. A test that starts
+/// at the socket file thus tests nothing in each of those states.
+#[test]
+fn a_lock_with_no_socket_file_stops_a_new_coordinator() {
+    let mut h = Harness::with_default_config("nosocket");
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    // NO socket file. The lock is the only evidence.
+    let held = a_held_pid_file(&run.join("pid"));
+
+    let out = h.qex(&["daemon"]);
+    let made_a_socket = socket.exists();
+
+    drop(held);
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !made_a_socket,
+        "a second coordinator started and bound a socket while a different process \
+         held the lock"
+    );
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("a different coordinator operates"),
+        "the log must say that a different coordinator operates, and it says: {log}"
+    );
+}
+
+/// A lock on the pid file must stop a new coordinator.
+///
+/// A system that refuses a connection when the queue of the socket is full
+/// gives the same answer as a socket that nobody holds. The lock is thus the
+/// test that does not change with the system.
+#[test]
+fn a_locked_pid_file_stops_a_new_coordinator() {
+    let mut h = Harness::with_default_config("ownpid");
+    // A coordinator that starts here is a failure of this test. Give it a
+    // short life, so the test reports that failure and does not wait.
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    // A socket file that no process holds. Alone, it lets a coordinator start.
+    std::fs::write(&socket, b"").unwrap();
+    let held = a_held_pid_file(&run.join("pid"));
+
+    let out = h.qex(&["daemon"]);
+    let kind = std::fs::symlink_metadata(&socket).map(|m| m.file_type());
+
+    drop(held);
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let kind = kind.expect("the coordinator deleted the socket of a process that operates");
+    assert!(
+        !std::os::unix::fs::FileTypeExt::is_socket(&kind),
+        "the coordinator bound its own socket while a different process holds the lock"
+    );
 }
