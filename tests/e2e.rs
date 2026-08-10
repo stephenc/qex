@@ -1146,12 +1146,20 @@ fn version_check_asks_the_service_and_says_what_it_found() {
         "a development build must be named as one: {said}"
     );
 
+    // `--check` ADDS to the answer of `qex version`, so the version and the
+    // coordinator stay where a reader of that command expects them.
     let value: serde_json::Value =
         serde_json::from_slice(&h.qex(&["version", "--check", "--json"]).stdout).unwrap();
-    assert_eq!(value["newest"], "9.9.9");
-    assert_eq!(value["development"], true);
-    assert_eq!(value["newer"], false, "a development build is never behind");
-    assert!(value["error"].is_null());
+    assert!(value["version"].is_string(), "got: {value}");
+    assert!(value["coordinator"].is_object(), "got: {value}");
+    let update = &value["update"];
+    assert_eq!(update["newest"], "9.9.9");
+    assert_eq!(update["development"], true);
+    assert_eq!(
+        update["newer"], false,
+        "a development build is never behind"
+    );
+    assert!(update["error"].is_null());
 }
 
 /// A service that does not answer gives 1, and it changes nothing.
