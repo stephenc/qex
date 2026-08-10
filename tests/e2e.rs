@@ -13422,7 +13422,23 @@ fn a_socket_that_never_answers_does_not_stop_a_command() {
         .push(("TMPDIR".into(), tmp.display().to_string()));
 
     let out = h.qex(&["info", "--json"]);
-    let survived = stuck.exists();
+
+    // WATCH THE DIRECTORY, AND DO NOT READ IT ONE TIME. The command gives an
+    // answer in a few milliseconds, and the sweep runs on a thread of the
+    // coordinator. A test that reads the directory at once reads it before the
+    // sweep looks at it, and it then holds nothing.
+    //
+    // The time is longer than the limit of a whole sweep, so the sweep reaches
+    // its verdict inside it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut survived = true;
+    while Instant::now() < deadline {
+        if !stuck.exists() {
+            survived = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     for fd in open {
         unsafe { libc::close(fd) };
@@ -13454,8 +13470,8 @@ fn a_coordinator_holds_the_lock_on_its_pid_file() {
     let path = h.root.join("state/qex/run/pid");
 
     // The lock is the evidence that the coordinator operates.
-    let file = std::fs::File::open(&path)
-        .expect("the coordinator must make a pid file beside its socket");
+    let file =
+        std::fs::File::open(&path).expect("the coordinator must make a pid file beside its socket");
     let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if taken == 0 {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
@@ -13484,8 +13500,7 @@ fn a_socket_with_no_answer_stops_a_new_coordinator() {
     let mut h = Harness::with_default_config("ownstuck");
     // A coordinator that starts here is a failure of this test. Give it a
     // short life, so the test reports that failure and does not wait.
-    h.extra_env
-        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let socket = run.join("s");
@@ -13512,6 +13527,35 @@ fn a_socket_with_no_answer_stops_a_new_coordinator() {
     );
 }
 
+/// A symbolic link with no target must not stop qex for ever.
+///
+/// Such a link occupies the socket path. A test that follows the link says that
+/// the path is free, and `bind` then fails with "Address already in use" at
+/// every start. qex tests the LINK, so it clears the link and starts.
+#[test]
+fn a_symbolic_link_with_no_target_does_not_stop_a_coordinator() {
+    let h = Harness::with_default_config("danglink");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::os::unix::fs::symlink(h.root.join("no-such-target"), run.join("s")).unwrap();
+
+    // The coordinator must start, and the command must give its answer.
+    let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+
+    assert!(
+        info["pid"].as_i64().unwrap_or(0) > 0,
+        "a coordinator must start when a link with no target holds the socket path"
+    );
+    assert!(
+        std::os::unix::fs::FileTypeExt::is_socket(
+            &std::fs::symlink_metadata(run.join("s"))
+                .unwrap()
+                .file_type()
+        ),
+        "the coordinator must replace the link with its own socket"
+    );
+}
+
 /// A file that qex cannot use must not stop qex for ever with no way out.
 ///
 /// qex keeps the directory and stops, because it cannot prove that no
@@ -13527,8 +13571,7 @@ fn a_pid_file_that_qex_cannot_open_names_the_way_out() {
     }
 
     let mut h = Harness::with_default_config("badpid");
-    h.extra_env
-        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let pid = run.join("pid");
@@ -13569,8 +13612,7 @@ fn a_pid_file_that_qex_cannot_open_names_the_way_out() {
 #[test]
 fn a_lock_with_no_socket_file_stops_a_new_coordinator() {
     let mut h = Harness::with_default_config("nosocket");
-    h.extra_env
-        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let socket = run.join("s");
@@ -13609,8 +13651,7 @@ fn a_locked_pid_file_stops_a_new_coordinator() {
     let mut h = Harness::with_default_config("ownpid");
     // A coordinator that starts here is a failure of this test. Give it a
     // short life, so the test reports that failure and does not wait.
-    h.extra_env
-        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    h.extra_env.push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let socket = run.join("s");

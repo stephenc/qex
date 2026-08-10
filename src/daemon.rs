@@ -39,7 +39,6 @@ const IDLE_EXIT_VAR: &str = "QEX_IDLE_EXIT_SECS";
 /// answer that lets this process delete the socket file.
 const OWN_SOCKET_ANSWER_LIMIT: Duration = Duration::from_secs(1);
 
-
 /// One job, as the coordinator holds it.
 pub struct Job {
     pub spec: JobSpec,
@@ -778,7 +777,10 @@ pub fn run() -> Result<()> {
     // THIS PROCESS MUST DELETE THAT FILE ONLY WITH THE PROOF THAT NO
     // COORDINATOR USES IT. The lock above is the strong proof, and this test
     // covers a coordinator that started before qex made a pid file.
-    if socket_path.exists() {
+    // A test of the LINK, and not of the target. A symbolic link with no target
+    // occupies the path, and `exists` follows the link and says that the path is
+    // free. `bind` then fails, and qex cannot start at all.
+    if std::fs::symlink_metadata(&socket_path).is_ok() {
         match paths::ask_socket(&socket_path, OWN_SOCKET_ANSWER_LIMIT) {
             paths::SocketAnswer::NobodyListens => {
                 std::fs::remove_file(&socket_path).ok();
@@ -820,8 +822,19 @@ pub fn run() -> Result<()> {
             ) {
                 "\nA sandbox that refuses a Unix socket gives this fault. See \
                  https://github.com/stephenc/qex/blob/main/docs/sandbox.md"
+                    .to_string()
+            } else if e.kind() == std::io::ErrorKind::AddrInUse {
+                // A directory, or a file that qex could not test, holds this
+                // path. qex tested the path for a socket that answers, so no
+                // coordinator uses it. Name the path: without a remedy, qex
+                // cannot start on this machine again.
+                format!(
+                    "\nSomething that is not a socket of qex holds that path. Look at it, \
+                     and remove it if no coordinator uses it: {}",
+                    socket_path.display()
+                )
             } else {
-                ""
+                String::new()
             };
             anyhow::anyhow!("opening the socket {}: {e}{note}", socket_path.display())
         })?

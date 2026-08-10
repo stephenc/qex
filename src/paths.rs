@@ -117,6 +117,32 @@ fn short_socket_dir(preferred: &std::path::Path) -> Result<PathBuf> {
         Err(_) => ensure_dir(&dir, 0o700)?,
     }
 
+    // MAKE THE PID FILE WITH THE DIRECTORY, AND NOT LATER.
+    //
+    // The sweep of a different coordinator takes the lock on this file and
+    // holds it across the deletion of the directory. A directory with no such
+    // file gives the sweep nothing to lock, so the sweep and a coordinator that
+    // starts here have no common lock, and the sweep can delete a directory
+    // that the coordinator is about to use.
+    //
+    // The CLI calls this function as well, and it takes no lock, so the time
+    // between the new directory and the lock of a coordinator is long. This
+    // file makes that time two calls of the system.
+    //
+    // The file holds no number yet. The lock is the evidence, and the lock is
+    // free until a coordinator takes it.
+    let pid = dir.join(PID_FILE);
+    if !pid.exists() {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&pid)
+            .ok();
+    }
+
     Ok(dir)
 }
 
@@ -239,9 +265,15 @@ fn sweep_socket_dirs(dir: &std::path::Path, own: &[PathBuf], limit: std::time::D
 /// directory. Each other answer gives `None`, and the caller keeps the
 /// directory.
 ///
-/// THE RESULT HOLDS THE LOCK. The caller deletes the directory and then drops
-/// the claim. A coordinator that starts between the test and the deletion must
-/// take the same lock, so it cannot lose its directory.
+/// THE RESULT HOLDS THE LOCK, when the directory has a pid file. The caller
+/// deletes the directory and then drops the claim. A coordinator that starts
+/// between the test and the deletion must take the same lock, so it cannot lose
+/// its directory. `short_socket_dir` makes the file with the directory, so
+/// every directory that qex makes now has one.
+///
+/// A directory with NO pid file comes from a coordinator that started before
+/// qex made this file. The claim holds no lock there, and the socket alone
+/// answers for the directory.
 ///
 /// The lock on the pid file is the strong test, and it comes first. A process
 /// that holds that lock operates, so the directory stays and the socket needs no
@@ -249,11 +281,14 @@ fn sweep_socket_dirs(dir: &std::path::Path, own: &[PathBuf], limit: std::time::D
 /// errors for a socket that a live coordinator holds but does not accept, and
 /// the safety of this code must not depend on that difference.
 fn claim_unused_dir(dir: &std::path::Path, limit: std::time::Duration) -> Option<Claim> {
-    let file = match std::fs::OpenOptions::new().read(true).open(dir.join(PID_FILE)) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .open(dir.join(PID_FILE))
+    {
         Ok(file) => match try_lock(&file) {
             // This process holds the lock now, and it keeps the file to hold it.
-            PidFile::Free => Some(file),
-            PidFile::Held | PidFile::Unknown => return None,
+            LockTry::Taken => Some(file),
+            LockTry::Held | LockTry::Failed(_) => return None,
         },
         // A directory with no pid file comes from a coordinator that started
         // before this file existed. The socket must answer for it.
@@ -293,6 +328,10 @@ pub enum SocketAnswer {
 }
 
 /// The state of the pid file of a socket directory.
+///
+/// The product decides with `try_lock` and with `hold_pid_file`. This value
+/// gives the same answer in one word, for a test that reads the state.
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PidFile {
     /// A process holds the lock on the file. That process operates.
@@ -306,11 +345,18 @@ pub enum PidFile {
 
 /// The time that a coordinator tries for the lock before it gives up.
 ///
-/// A PROBE OF THIS FILE TAKES THE LOCK FOR A MOMENT, AND A MOMENT MUST NOT READ
-/// AS A COORDINATOR. The sweep of a different user takes the lock to test it and
-/// gives it back at once, so a single attempt can meet that moment and report a
-/// coordinator that does not exist. A coordinator holds the lock for its whole
-/// life, so this time separates the two with no other mechanism.
+/// A SWEEP TAKES THIS LOCK FOR A SHORT TIME, AND THAT TIME MUST NOT READ AS A
+/// COORDINATOR. The sweep of a different COORDINATOR of this user takes the
+/// lock of a directory that it can delete, and it keeps the lock across the
+/// question to the socket and across the removal of the directory. A single try
+/// can meet that time and report a coordinator that does not exist.
+///
+/// The budget: a question to a socket ends at `SOCKET_ANSWER_LIMIT`, and the
+/// removal of a directory of two small files costs microseconds. This time is
+/// thus ten times the longest hold that a sweep can make.
+///
+/// A coordinator holds the lock for its whole life, so this time separates a
+/// coordinator from a sweep with no other mechanism.
 pub const PID_LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Holds the pid file of this coordinator, and the lock on it.
@@ -333,25 +379,38 @@ pub enum PidHold {
     Unusable(String),
 }
 
+/// The result of one try for the lock.
+enum LockTry {
+    /// This process holds the lock now. It stays while the caller keeps the
+    /// file open.
+    Taken,
+    /// A different process holds the lock.
+    Held,
+    /// The try failed. The error says why.
+    Failed(std::io::Error),
+}
+
 /// One try for the lock, with no wait.
 ///
-/// The result carries the open file when this process takes the lock. The lock
-/// stays while the caller keeps that file.
-fn try_lock(file: &std::fs::File) -> PidFile {
+/// The result carries the error, so the caller never reads `errno` again. A
+/// second read gives the error of the last call of the system, and that call is
+/// not always this one.
+fn try_lock(file: &std::fs::File) -> LockTry {
     use std::os::unix::io::AsRawFd;
     // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal arrives,
     // and that is an ordinary event and not a fault.
     for _ in 0..5 {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return PidFile::Free;
+            return LockTry::Taken;
         }
-        match std::io::Error::last_os_error().kind() {
-            std::io::ErrorKind::WouldBlock => return PidFile::Held,
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => return LockTry::Held,
             std::io::ErrorKind::Interrupted => continue,
-            _ => return PidFile::Unknown,
+            _ => return LockTry::Failed(e),
         }
     }
-    PidFile::Unknown
+    LockTry::Failed(std::io::Error::from(std::io::ErrorKind::Interrupted))
 }
 
 /// Takes the lock on the pid file beside the socket, and writes the number of
@@ -376,7 +435,10 @@ pub fn hold_pid_file(socket: &std::path::Path, patience: std::time::Duration) ->
     use std::io::Write as _;
 
     let Some(dir) = socket.parent() else {
-        return PidHold::Unusable(format!("the socket path {} has no directory", socket.display()));
+        return PidHold::Unusable(format!(
+            "the socket path {} has no directory",
+            socket.display()
+        ));
     };
     let path = dir.join(PID_FILE);
 
@@ -391,6 +453,14 @@ pub fn hold_pid_file(socket: &std::path::Path, patience: std::time::Duration) ->
         .open(&path)
     {
         Ok(file) => file,
+        // A file that is not there, in a directory that is not there. A
+        // deletion is a wrong instruction here, and the reader must not get it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return PidHold::Unusable(format!(
+                "qex cannot make the file {}: {e}. Start qex again.",
+                path.display()
+            ))
+        }
         Err(e) => {
             return PidHold::Unusable(format!(
                 "qex cannot open the file {}: {e}. Delete that file if no coordinator operates.",
@@ -402,19 +472,18 @@ pub fn hold_pid_file(socket: &std::path::Path, patience: std::time::Duration) ->
     let deadline = std::time::Instant::now() + patience;
     loop {
         match try_lock(&file) {
-            PidFile::Free => break,
-            PidFile::Held => {
+            LockTry::Taken => break,
+            LockTry::Held => {
                 if std::time::Instant::now() >= deadline {
                     return PidHold::Busy;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            PidFile::Unknown => {
+            LockTry::Failed(e) => {
                 return PidHold::Unusable(format!(
-                    "qex cannot lock the file {}: {}. Delete that file if no coordinator \
+                    "qex cannot lock the file {}: {e}. Delete that file if no coordinator \
                      operates.",
                     path.display(),
-                    std::io::Error::last_os_error()
                 ))
             }
         }
@@ -446,20 +515,26 @@ pub fn hold_pid_file(socket: &std::path::Path, patience: std::time::Duration) ->
 pub fn pid_file_state(dir: &std::path::Path) -> PidFile {
     use std::os::unix::io::AsRawFd;
 
-    let file = match std::fs::OpenOptions::new().read(true).open(dir.join(PID_FILE)) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .open(dir.join(PID_FILE))
+    {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PidFile::Free,
         // qex cannot read the file, so it cannot say that the directory is
         // free. The caller keeps the directory.
         Err(_) => return PidFile::Unknown,
     };
-    let state = try_lock(&file);
-    if state == PidFile::Free {
-        // Give the lock back at once. This process must not hold a lock on the
-        // file of a different coordinator.
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    match try_lock(&file) {
+        LockTry::Taken => {
+            // Give the lock back at once. This process must not hold a lock on
+            // the file of a different coordinator.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            PidFile::Free
+        }
+        LockTry::Held => PidFile::Held,
+        LockTry::Failed(_) => PidFile::Unknown,
     }
-    state
 }
 
 /// Asks a socket to answer inside `limit`.
@@ -475,7 +550,11 @@ pub fn pid_file_state(dir: &std::path::Path) -> PidFile {
 /// coordinator that is busy, so a caller must not read a slow answer as a dead
 /// coordinator.
 pub fn ask_socket(socket: &std::path::Path, limit: std::time::Duration) -> SocketAnswer {
-    if !socket.exists() {
+    // A test of the LINK, and not of the target. A symbolic link with no target
+    // is a path that qex must clear, and `exists` follows the link and says
+    // that the path is free. The connect below then gives `ENOENT`, which is
+    // the answer that lets a caller delete the link.
+    if std::fs::symlink_metadata(socket).is_err() {
         return SocketAnswer::NobodyListens;
     }
     // A path that is too long gives no address. The socket can still belong to
@@ -758,6 +837,14 @@ mod tests {
         // cannot find each other.
         assert_eq!(p, socket_path().unwrap());
 
+        // The pid file comes with the directory. A sweep locks that file and
+        // holds the lock across the deletion, so a directory with no such file
+        // gives the sweep and a new coordinator no common lock.
+        assert!(
+            p.parent().unwrap().join(PID_FILE).exists(),
+            "the short socket directory must hold a pid file from the moment it exists"
+        );
+
         // A different state directory must give a different socket.
         let _s2 = EnvVar::set("XDG_STATE_HOME", &format!("{long}other/"));
         assert_ne!(p, socket_path().unwrap());
@@ -1017,7 +1104,11 @@ mod tests {
 
         // A limit of no time must stop the sweep before the first directory.
         sweep_socket_dirs(base.path(), &[], std::time::Duration::ZERO);
-        assert_eq!(left(), count, "a sweep with no time must delete no directory");
+        assert_eq!(
+            left(),
+            count,
+            "a sweep with no time must delete no directory"
+        );
 
         // Sweeps with a small limit must finish the work between them. Each one
         // deletes what it can and leaves the rest.
@@ -1163,6 +1254,31 @@ mod tests {
         drop(held);
     }
 
+    /// A remedy must never name a step that the reader cannot take.
+    ///
+    /// A file that is not there cannot be deleted. An agent acts on the words
+    /// of a message, so a wrong step costs it a command and gives no progress.
+    #[test]
+    fn a_file_that_is_not_there_does_not_ask_the_reader_to_delete_it() {
+        let base = TestDir::make("qex-remedytest");
+        // A directory that is not there. The open of the pid file gives
+        // `NotFound`, and no deletion can correct that.
+        let socket = base.path().join("no-such-directory").join("s");
+
+        let answer = hold_pid_file(&socket, std::time::Duration::from_millis(50));
+        let PidHold::Unusable(text) = answer else {
+            panic!("a directory that is not there must give Unusable");
+        };
+        assert!(
+            !text.contains("Delete that file"),
+            "the message asks the reader to delete a file that is not there: {text}"
+        );
+        assert!(
+            text.contains("Start qex again"),
+            "the message must give a step that the reader can take: {text}"
+        );
+    }
+
     /// A coordinator must wait through the moment that a probe holds the lock.
     ///
     /// A sweep takes this lock to test it and gives it back at once. A single
@@ -1175,13 +1291,21 @@ mod tests {
         std::fs::write(base.path().join(PID_FILE), b"").unwrap();
 
         // A different thread holds the lock for a moment, as a probe does.
+        //
+        // The thread SIGNALS when it holds the lock. A test that waits for a
+        // time instead gives the lock to the main thread when the machine is
+        // busy, and the failure then names the test and not the product.
         let dir = base.path().to_path_buf();
+        let (ready, holds_the_lock) = std::sync::mpsc::channel();
         let probe = std::thread::spawn(move || {
             let file = a_held_pid_file(&dir);
+            ready.send(()).ok();
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(file);
         });
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        holds_the_lock
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the thread of the test did not take the lock");
 
         let answer = hold_pid_file(&socket, std::time::Duration::from_secs(5));
         probe.join().unwrap();
