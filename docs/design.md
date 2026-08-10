@@ -122,6 +122,21 @@ Each side thus ignores what it does not know, and that is correct: a field that
 a program does not know is a field that did not exist when somebody made that
 program, so no earlier behaviour depends on it.
 
+**A test holds this promise, and not a habit.** The rule is easy to break by
+accident: one `deny_unknown_fields`, added to a message for tidiness, turns
+every later addition into a fault on every machine whose CLI is older.
+`the_wire_format_stays_additive` in `src/proto.rs` speaks as a coordinator of a
+later version — it sends the fields of today with one field that does not exist
+yet — and the CLI of today must read it. The same test sends a request from a
+later CLI to the coordinator of today.
+
+**The window of a mixture is as long as the longest job.** A coordinator keeps
+the code that it started with until the last of its jobs stops, so the mixture
+is not a moment during an upgrade: a job of two hours holds an earlier
+coordinator for two hours, and a machine whose queue never empties holds one
+with no end. That is why the promise above is a promise, and not an
+expectation.
+
 **A newer coordinator is therefore safe, and an older coordinator is not.** An
 early CLI sends the fields that it knows, and a new coordinator understands each
 of them. In the opposite direction, a new CLI can send an option that an old

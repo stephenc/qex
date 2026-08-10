@@ -2,6 +2,34 @@
 //!
 //! Each message is one JSON object on one line. This format is simple to read
 //! in a log file, and it needs no length field.
+//!
+//! # THIS FORMAT IS ADDITIVE ONLY
+//!
+//! A CLI and a coordinator of DIFFERENT versions talk to each other every day.
+//! A new build replaces the program while a coordinator carries jobs, and that
+//! coordinator keeps the earlier code until the last of those jobs stops: the
+//! window is as long as the longest job, and on a machine whose queue never
+//! empties it has no end.
+//!
+//! The capability handshake covers one direction. A NEWER CLI asks what the
+//! coordinator can do and refuses a flag that it cannot honour. The other
+//! direction has no handshake and needs none, because an OLDER CLI cannot ask
+//! about a field that it does not know exists. It must simply not break when
+//! it meets one.
+//!
+//! So a change to this module obeys three rules:
+//!
+//! 1. ADD a field, and give it `#[serde(default)]`. An older CLI then ignores
+//!    it, and a newer CLI reads a message from an older coordinator that does
+//!    not send it.
+//! 2. Never REMOVE a field, never rename one, and never change the type of
+//!    one. Each of those turns an older reader into a reader that fails.
+//! 3. Never put `deny_unknown_fields` on a message of this module. That
+//!    attribute makes every future addition a fault for every older CLI, and
+//!    `the_wire_format_stays_additive` in the tests below refuses it.
+//!
+//! A change that cannot obey these rules needs a new request name, and the
+//! capability handshake then keeps an older coordinator away from it.
 
 use crate::job::JobStatus;
 use crate::spec::JobSpec;
@@ -320,6 +348,99 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older CLI must read a message from a newer coordinator.
+    ///
+    /// This is the rule at the top of this module, and it is the rule that a
+    /// future change is most likely to break by accident: one
+    /// `deny_unknown_fields`, added for tidiness, turns every later addition
+    /// into a fault on every machine that did not update its CLI yet.
+    ///
+    /// The test speaks as a coordinator of a LATER version: it sends the
+    /// fields of today with one field that does not exist yet. The CLI of
+    /// today must take it.
+    #[test]
+    fn the_wire_format_stays_additive() {
+        let later = r#"{
+            "result": "info",
+            "version": "9.9.9",
+            "pid": 1,
+            "cpu_budget": 4,
+            "mem_budget": 1024,
+            "cpu_claimed": 0,
+            "mem_claimed": 0,
+            "jobs_running": 0,
+            "jobs_queued": 0,
+            "a_field_from_a_later_release": {"anything": [1, 2, 3]}
+        }"#;
+        let answer: Response =
+            serde_json::from_str(later).expect("an older CLI must read a newer answer");
+        match answer {
+            Response::Info { version, pid, .. } => {
+                assert_eq!(version, "9.9.9");
+                assert_eq!(pid, 1);
+            }
+            other => panic!("the answer became {other:?}"),
+        }
+
+        // The same rule for a REQUEST. A newer CLI can send a field that an
+        // older coordinator does not know, and that coordinator must still
+        // read the request.
+        let later = r#"{"op": "status", "id": "00000000-0000-4000-8000-000000000000",
+                        "a_field_from_a_later_release": true}"#;
+        let request: Request =
+            serde_json::from_str(later).expect("an older coordinator must read a newer request");
+        assert!(matches!(request, Request::Status { .. }));
+
+        // THE TYPES INSIDE A MESSAGE OBEY THE RULE AS WELL. `JobStatus` and
+        // `JobSpec` cross this socket inside `Response::Status`,
+        // `Response::Jobs` and `Request::Submit`, so a `deny_unknown_fields`
+        // on one of THOSE breaks an older CLI in the same way, and a test of
+        // the outer message alone never meets it.
+        //
+        // The record comes from the code and not from a text of this test. A
+        // field that a later release ADDS to `JobStatus` would otherwise make
+        // this test fail for a reason that is not the rule.
+        let spec = JobSpec {
+            id: uuid::Uuid::new_v4(),
+            name: "t".into(),
+            cwd: "/".into(),
+            command: vec!["true".into()],
+            env: Default::default(),
+            cpu: 1,
+            mem: 1 << 20,
+            timeout: None,
+            max_queue_time: None,
+            tags: vec![],
+            priority: 0,
+            env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
+            locks: vec![],
+            claims: Default::default(),
+            retries: 0,
+            nice: None,
+            needs: vec![],
+            after: vec![],
+            dedupe_key: None,
+            dedupe_window: 0,
+            learn_key: None,
+            submitted_at: 0,
+        };
+        let record = JobStatus::new(&spec);
+        let mut later = serde_json::to_value(&record).unwrap();
+        later["a_field_from_a_later_release"] = serde_json::json!({"anything": 1});
+        let answer: Response = serde_json::from_value(serde_json::json!({
+            "result": "status",
+            "status": later,
+        }))
+        .expect("an older CLI must read a newer record");
+        match answer {
+            Response::Status { status } => assert_eq!(status.name, record.name),
+            other => panic!("the answer became {other:?}"),
+        }
+    }
 
     #[test]
     fn each_message_survives_one_line_of_json() {

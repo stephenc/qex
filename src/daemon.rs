@@ -610,6 +610,56 @@ impl State {
     }
 }
 
+/// Looks for a newer release of qex, away from the work.
+///
+/// The interval of the config file is the time between two ASKS. This thread
+/// wakes more often than that, because a coordinator stops when the queue is
+/// empty and the answer must not need a coordinator that lives for a week.
+/// `update::check_if_due` holds the interval, and it reads the time of the
+/// last ask from the state directory, so the count survives a coordinator that
+/// stops.
+#[cfg(unix)]
+fn update_watch(coord: Arc<Coordinator>) {
+    // The FIRST look comes soon, and the ones after it follow the interval.
+    //
+    // The first look of a fresh install asks nothing: it writes the time, and
+    // that time starts the interval. A long wait here would start the interval
+    // a minute after the install for no gain. A coordinator that carries one
+    // short job stops before this, and it then writes nothing at all.
+    let mut step = Duration::from_secs(2);
+    loop {
+        std::thread::sleep(step);
+        // TAKE THE CONFIGURATION, AND GIVE THE LOCK BACK BEFORE THE ASK.
+        // `ask` talks to a web service, and no thread may hold the state of
+        // the queue while it waits for one.
+        let cfg = {
+            let state = match coord.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            if state.stop {
+                return;
+            }
+            state.cfg.clone()
+        };
+        crate::update::check_if_due(&cfg);
+
+        // THE STEP FOLLOWS THE INTERVAL. A user who asks for `10s` gets a look
+        // every 10 seconds, and the default of `7d` costs one look each
+        // minute: the limit above holds the cost of the default, and the limit
+        // below holds the cost of a very small interval.
+        //
+        // The step comes from the configuration at EVERY turn, so a change to
+        // the file reaches this thread in the same way as it reaches the rest
+        // of the coordinator.
+        step = crate::update::interval(&cfg)
+            .ok()
+            .flatten()
+            .unwrap_or(Duration::from_secs(60))
+            .clamp(Duration::from_secs(1), Duration::from_secs(60));
+    }
+}
+
 /// The coordinator. The threads share this value.
 pub struct Coordinator {
     pub state: Mutex<State>,
@@ -750,6 +800,17 @@ pub fn run() -> Result<()> {
         let coord = Arc::clone(&coord);
         let path = socket_path.clone();
         std::thread::spawn(move || idle_watch(coord, path));
+    }
+
+    // The thread that looks for a newer release of qex.
+    //
+    // IT IS ITS OWN THREAD, AND IT HOLDS NO LOCK WHILE IT ASKS. A web service
+    // that answers slowly, or never, must not hold the state of the queue: a
+    // job that a user submits in that moment waits for the queue and for
+    // nothing else. See `update::check_if_due`.
+    {
+        let coord = Arc::clone(&coord);
+        std::thread::spawn(move || update_watch(coord));
     }
 
     for stream in listener.incoming() {

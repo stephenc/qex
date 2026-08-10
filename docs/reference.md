@@ -28,6 +28,7 @@ qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
 qex pause  [queue|lock NAME] [--reason TEXT] [--for TIME] [--drain]
 qex resume [queue|lock NAME]
+qex version [--check] [--json]   the versions, and whether a newer one exists
 qex config show             the values that qex uses now
 qex schema job|status|pipeline|event    the JSON Schema of each format
 qex completions <shell>     the completions for bash, zsh or fish
@@ -608,6 +609,59 @@ job.
 
 A pipeline stage has no dedupe key. A key on one stage would answer for that
 stage alone, and the stages after it would wait for a job of an earlier run.
+
+## A newer qex
+
+qex looks for a newer release of itself and says one line when it finds one. It
+**never installs anything**: the person who installed qex chose how, and a
+package manager may own that file.
+
+```sh
+qex version --check          # ask now
+qex version --check --json   # the same answer for a program
+```
+
+| | |
+| --- | --- |
+| Exit code 0 | The answer arrived, whatever it says. A newer release is information, not a fault. |
+| Exit code 1 | qex could not ask. The message says why, and nothing changed. |
+| `--json` | The answer of `qex version`, with an `update` object added: `version`, `newest`, `newer`, `development`, `source`, `error`. |
+
+**The coordinator asks, and your command never does.** A check must not delay a
+command and must not fail one, so the network stays out of the path of a
+command: the coordinator asks on its own time in its own thread, and every
+command reads the answer from a file in the state directory. One call also
+serves every agent on the machine.
+
+**The first week is quiet.** A fresh install writes the time and asks nothing,
+because a person who installed qex a moment ago holds the newest release
+already. The first question comes after the first interval.
+
+The line comes **once for each release**, on stderr, so `ID=$(qex submit ...)`
+is unaffected.
+
+```toml
+[update]
+check   = "7d"        # a time, or `never`
+url     = "https://api.github.com/repos/stephenc/qex/releases/latest"
+timeout = "5s"
+```
+
+`never` stops the **automatic** check absolutely: no connection of its own, no
+file, no message, for ever. `qex version --check` still asks, because a person
+asked it to.
+
+qex runs `curl`, and `wget` where the machine has no curl. An HTTP client
+inside qex would bring a TLS stack to a tool with nine dependencies, and both
+programs are on Linux and macOS already; a machine with neither gets a message
+that says so. A curl that exists and fails is the answer: qex does not ask the
+same service again with the other program. `url` takes
+a mirror, and every answer names the service that gave it.
+
+**A development build is neither new nor old.** A build from a working copy
+carries `0.0.0-dev+g98513e2`, which is not a release and takes no place in the
+order. `qex version --check` says what it is, and the automatic line never
+appears for it.
 
 ## Pause the queue, or one lock
 

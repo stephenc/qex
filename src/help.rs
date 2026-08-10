@@ -702,6 +702,56 @@ that qex uses now.
     on_stop_states = [\"completed\", \"failed\", \"killed\", \"timeout\", \"expired\", \"oom\"]
     timeout = \"30s\"       # the time limit for that command
 
+    [update]
+    check   = \"7d\"        # how often qex looks for a newer release, or `never`
+    url     = \"https://api.github.com/repos/stephenc/qex/releases/latest\"
+    timeout = \"5s\"        # how long qex waits for that service
+
+A newer qex
+-----------
+
+qex looks for a newer release of itself, and it says one line when it finds
+one. It never installs anything: the person who installed qex chose how, and a
+package manager can own that file.
+
+`[update] check = \"never\"` stops the AUTOMATIC check completely. qex then opens
+no connection of its own, writes no file for it, and says nothing about a
+version, for ever.
+
+`qex version --check` still asks, because a person asked it to. A command that
+refused would leave that person with no way to answer the question at all.
+
+THE COORDINATOR ASKS, AND YOUR COMMAND NEVER DOES. A check must not delay a
+command and must not fail one, so the network stays out of the path of a
+command: the coordinator asks on its own time, in its own thread, and every
+command reads the answer from a file. One call also serves every agent on the
+machine.
+
+THE FIRST WEEK IS QUIET. A fresh install writes the time and asks nothing,
+because a person who installed qex a moment ago holds the newest release
+already. The first question comes after the first interval.
+
+qex says the line ONE TIME for each release, on stderr, so
+`ID=$(qex submit ...)` stays correct.
+
+    qex version --check          ask now, and say what the answer was
+    qex version --check --json   the same answer for a program
+
+That command asks at the moment that you run it, because you asked it to. It
+gives 0 when the answer arrived, whatever the answer says, and 1 when qex could
+not ask: a newer release is information and not a fault. Read `newer` in the
+JSON to act on it.
+
+qex runs `curl`, and then `wget`, and it says so when the machine has neither.
+An HTTP client inside qex would bring a TLS stack to a tool that holds nine
+dependencies. `url` takes a mirror, and every answer names the service that
+gave it.
+
+A DEVELOPMENT BUILD IS NEITHER NEW NOR OLD. A build from a working copy carries
+`0.0.0-dev+g98513e2`, which is not a release and takes no place in the order.
+`qex version --check` says what it is, and the automatic line never appears for
+it.
+
 Quotation marks around a number
 -------------------------------
 

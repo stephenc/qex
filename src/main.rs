@@ -94,6 +94,8 @@ mod top;
 #[cfg(unix)]
 mod units;
 #[cfg(unix)]
+mod update;
+#[cfg(unix)]
 mod usage;
 #[cfg(unix)]
 mod version;
@@ -127,7 +129,10 @@ fn main() {
     }
 
     let code = match run() {
-        Ok(code) => code,
+        Ok(code) => {
+            say_that_a_newer_qex_exists();
+            code
+        }
         Err(e) => {
             // Write the cause of each error. An agent then sees the full
             // sequence and does not need to run the command a second time.
@@ -146,6 +151,34 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// Writes one line when a newer release of qex exists.
+///
+/// THIS FUNCTION OPENS NO CONNECTION. The coordinator asks the service on its
+/// own time and writes what it learned; this reads that file. A command of a
+/// user thus never waits for a web service and never fails because of one.
+///
+/// It says nothing for the commands that qex gives to itself. `__complete`
+/// answers a press of the TAB key, and a line of advice there would arrive in
+/// the middle of a word that a person is typing.
+#[cfg(unix)]
+fn say_that_a_newer_qex_exists() {
+    let word = subcommand_word();
+    // `qex run` forwards the output of the JOB to these streams, so a line of
+    // advice here would arrive inside the output that a caller captured. That
+    // caller reads it again on its next command.
+    if matches!(word.as_str(), "daemon" | "supervise" | "__complete" | "run") {
+        return;
+    }
+    // A config file that qex cannot read is a fault of its own, and the
+    // command that met it already said so.
+    let Ok(cfg) = config::Config::load() else {
+        return;
+    };
+    if let Some(line) = update::note_for_a_command(&cfg) {
+        eprintln!("{line}");
+    }
 }
 
 /// True for a command that gives the exit code of a JOB.
@@ -869,6 +902,18 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
             units::format_duration(cfg.hook_timeout()?)
         ),
         None => println!("stop hook:    none"),
+    }
+    // Show the check for a newer qex, for the reason that the hook above is
+    // here: it reaches a web service on its own, and a reader who forgot it
+    // has no other sign of it.
+    match update::interval(cfg) {
+        Ok(Some(gap)) => println!(
+            "update check: every {}, from {}",
+            units::format_duration(gap),
+            cfg.update.url
+        ),
+        Ok(None) => println!("update check: never"),
+        Err(e) => println!("update check: {e}"),
     }
     Ok(())
 }
