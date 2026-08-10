@@ -4834,6 +4834,18 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     // like the command that it replaces.
     catch_run_signals();
 
+    // Give the job to this connection, so the coordinator cancels it when this
+    // command stops without notice.
+    //
+    // The handler above covers Ctrl-C and SIGTERM, and it cannot cover every
+    // way that a command stops. SIGKILL runs no code here, and a signal that
+    // arrives in the moment between the submit and the handler meets the
+    // default behaviour of the system. The connection covers each of those,
+    // because the kernel closes it when this process stops.
+    if !deduplicated {
+        own_the_job(&mut client, id);
+    }
+
     // Say now what Ctrl-C will do, because a dedupe key changed it.
     //
     // This command started no job, so it is not the owner of this job, and a
@@ -4854,6 +4866,27 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     let dir = paths::job_dir(&id)?;
     // `qex run` sets no limit on its own wait. `--timeout` limits the JOB.
     stream_until_done(&mut client, id, &dir, !deduplicated, None)
+}
+
+/// Asks the coordinator to cancel this job if this command stops.
+///
+/// The job of `qex run` has one reader, and it is this command. A job that
+/// keeps a place in the queue for a reader that went away holds every job
+/// behind it, and it later takes a claim for output that nobody reads.
+///
+/// A coordinator without this rule leaves such a job in the queue. This
+/// command still operates, and Ctrl-C and SIGTERM still stop the job, so it
+/// says the difference and continues. It does not refuse the work: the reader
+/// asked for a job, and not for this option.
+fn own_the_job(client: &mut Client, id: uuid::Uuid) {
+    match client.call(&Request::OwnJob { id }) {
+        Ok(Response::Ok) => {}
+        _ => eprintln!(
+            "qex: this coordinator cannot cancel the job {id} if this command stops without \
+             notice. Ctrl-C and SIGTERM still stop it. After a stop that this command cannot \
+             catch, run `qex cancel {id}`."
+        ),
+    }
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.

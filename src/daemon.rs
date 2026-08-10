@@ -1186,10 +1186,49 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     Ok(())
 }
 
+/// Holds the jobs that one connection owns, and gives them back when it ends.
+///
+/// The work happens in `Drop`, so every end of a connection reaches it: a
+/// request that qex cannot read, a write that fails, a socket that closes, and
+/// a process that a signal stopped. Cleanup that sits after the fallible part
+/// of a function runs only when nothing failed, and that is the moment when it
+/// is least needed.
+struct OwnedJobs {
+    coord: Arc<Coordinator>,
+    ids: Vec<uuid::Uuid>,
+}
+
+impl Drop for OwnedJobs {
+    fn drop(&mut self) {
+        for id in std::mem::take(&mut self.ids) {
+            if cancel_queued(
+                &self.coord,
+                id,
+                Some(String::from(
+                    "the command that started this job stopped, so the job did not start. \
+                     Submit it again with `qex submit` for work that must live longer than \
+                     the command that starts it.",
+                )),
+            ) {
+                log(&format!(
+                    "the job {id} is cancelled, because the command that owns it stopped"
+                ));
+            }
+        }
+    }
+}
+
 /// Answers the requests of one CLI process.
 fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
     let mut writer = stream.try_clone().context("copying the socket handle")?;
     let reader = BufReader::new(stream);
+
+    // This guard must live for the whole function. It cancels the jobs of this
+    // connection that never started, when the connection ends.
+    let mut owned = OwnedJobs {
+        coord: Arc::clone(&coord),
+        ids: Vec::new(),
+    };
 
     for line in reader.lines() {
         let line = line.context("reading a request")?;
@@ -1213,6 +1252,16 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
         }
 
         let response = match parsed {
+            // The ownership belongs to THIS connection, so this request cannot
+            // go to `handle`, which knows nothing about the connection.
+            Ok(Request::OwnJob { id }) => {
+                if coord.state.lock().unwrap().jobs.contains_key(&id) {
+                    owned.ids.push(id);
+                    Response::Ok
+                } else {
+                    no_such_job(id)
+                }
+            }
             Ok(request) => handle(&coord, request),
             Err(e) => Response::error(
                 ErrorKind::Internal,
@@ -1234,6 +1283,14 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
 fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
     match request {
         Request::Ping => Response::Ok,
+        // `serve` answers this one, because the ownership belongs to a
+        // connection and this function has none. A request that arrives here
+        // comes from a caller that qex does not have, so it gets a refusal and
+        // never a silent success.
+        Request::OwnJob { .. } => Response::error(
+            ErrorKind::Internal,
+            String::from("qex handles the ownership of a job on the connection that asks"),
+        ),
         Request::Info => handle_info(coord),
         Request::Capabilities => Response::Capabilities {
             names: crate::capabilities::ALL
@@ -1802,33 +1859,64 @@ fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     }
 }
 
-fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
+/// Cancels a job that still waits in the queue.
+///
+/// Gives `true` when this call cancelled the job. A job that started, or that
+/// stopped, keeps its state and gives `false`: a job that operates holds a
+/// claim and does work, and its output stays for a reader that attaches again.
+///
+/// `reason` says WHY qex cancelled the job, for a cancel that no person asked
+/// for. The state stays `cancelled`, so it never reads as a failure of the
+/// work, and the reason separates it from a cancel that a person typed.
+fn cancel_queued(coord: &Arc<Coordinator>, id: uuid::Uuid, reason: Option<String>) -> bool {
     let mut state = coord.state.lock().unwrap();
 
     let Some(job) = state.jobs.get_mut(&id) else {
+        return false;
+    };
+    if job.status.state != JobState::Queued {
+        return false;
+    }
+
+    job.status.state = JobState::Cancelled;
+    job.status.finished_at = Some(sys::now_secs());
+    job.status.blocked_reason = None;
+    if reason.is_some() {
+        job.status.error = reason;
+    }
+    let status = job.status.clone();
+    state.queue.retain(|q| *q != id);
+    state.publish_changes();
+    drop(state);
+
+    if let Ok(dir) = paths::job_dir(&id) {
+        job::write_status(&dir, &status).ok();
+        // A cancelled job is not in the default filter. A user who asks
+        // for `cancelled` gets it here.
+        crate::hook::fire_detached(&dir, &status);
+    }
+    coord.notify();
+    true
+}
+
+fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
+    // Try the cancel FIRST, and read the state only to explain a refusal. A job
+    // can start between a look and an action, so an answer that comes from a
+    // look can say that qex cancelled a job that now operates.
+    if cancel_queued(coord, id, None) {
+        return Response::Ok;
+    }
+
+    let state = coord.state.lock().unwrap();
+    let Some(job) = state.jobs.get(&id) else {
         return no_such_job(id);
     };
+    let state_now = job.status.state;
+    drop(state);
 
-    match job.status.state {
-        JobState::Queued => {
-            job.status.state = JobState::Cancelled;
-            job.status.finished_at = Some(sys::now_secs());
-            job.status.blocked_reason = None;
-            let status = job.status.clone();
-            state.queue.retain(|q| *q != id);
-            state.publish_changes();
-            drop(state);
-
-            if let Ok(dir) = paths::job_dir(&id) {
-                job::write_status(&dir, &status).ok();
-                // A cancelled job is not in the default filter. A user who asks
-                // for `cancelled` gets it here.
-                crate::hook::fire_detached(&dir, &status);
-            }
-            coord.notify();
-            Response::Ok
-        }
-        JobState::Starting | JobState::Running => Response::error(
+    match state_now {
+        // The job started in the moment between the two steps above.
+        JobState::Queued | JobState::Starting | JobState::Running => Response::error(
             ErrorKind::WrongState,
             format!("the job {id} operates now. Use `qex kill {id}` to stop it."),
         ),

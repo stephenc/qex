@@ -43,6 +43,18 @@ pub enum Request {
     Ping,
     /// Puts a job in the queue.
     Submit { spec: Box<JobSpec> },
+    /// Says that this connection owns a job until the job starts.
+    ///
+    /// `qex run` sends this for the job that it started. Such a job has one
+    /// reader, and that reader is the command itself. When the command stops,
+    /// the coordinator cancels the job while the job still waits, so that no
+    /// job keeps a place in the queue for a reader that went away.
+    ///
+    /// The CONNECTION carries the ownership, and not a process number. The
+    /// kernel closes the socket when the process stops, whatever stops it, so
+    /// this evidence holds for a signal that a process cannot catch. A number
+    /// that the system gives to a later process cannot say the same.
+    OwnJob { id: uuid::Uuid },
     /// Gives the state of every job.
     List,
     /// Gives the state of one job.

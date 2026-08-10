@@ -14029,3 +14029,82 @@ fn a_message_names_what_a_command_wrote() {
         "a line above the last 20 must not appear: {text}"
     );
 }
+
+/// A signal that this command cannot catch must not leave a job in the queue.
+///
+/// The job of `qex run` has one reader, and it is that command. A job that
+/// keeps a place in the queue for a reader that went away holds every job
+/// behind it, and it later takes a claim for output that nobody reads.
+///
+/// The test uses SIGKILL, because the client runs NO code for it. The signal
+/// handler of `qex run` cannot cover this case, and neither can any other code
+/// in the command. Only the coordinator can, and it reads the connection that
+/// the kernel closes.
+#[test]
+fn a_kill_of_qex_run_cancels_a_job_that_never_started() {
+    let h = Harness::new("runkill", "[budget]\ncpu = \"1\"\n");
+
+    // One core, and a job that holds it. The job under test thus stays in the
+    // queue for the whole test, and it never starts.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--", "sleep", "30"]);
+    h.until("the blocker operates", Duration::from_secs(30), || {
+        h.state_of(&blocker) == "running"
+    });
+
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--", "sleep", "5"]);
+    h.until("the job of qex run waits", Duration::from_secs(30), || {
+        h.state_of(&id) == "queued"
+    });
+
+    // SIGKILL. The command runs no code after this point.
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    h.until(
+        "the coordinator cancels the job of a command that stopped",
+        Duration::from_secs(30),
+        || h.state_of(&id) == "cancelled",
+    );
+
+    // The reason must separate this from a cancel that a person typed.
+    let status = h.status_json(&id);
+    let error = status["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("the command that started this job stopped"),
+        "the record must say why qex cancelled the job: {status}"
+    );
+
+    h.ok(&["kill", &blocker]);
+}
+
+/// A job that OPERATES must survive the loss of the command that started it.
+///
+/// The job holds a claim and does work, and its output stays in the log file
+/// for a reader that attaches again. A coordinator that stopped such a job
+/// would destroy work that a reader can still use.
+///
+/// This test holds the boundary of the rule above it. Both tests must pass
+/// together: one says that qex cancels a job that never started, and this one
+/// says that qex stops there.
+#[test]
+fn a_kill_of_qex_run_leaves_a_job_that_operates() {
+    let h = Harness::new("runkillrun", "");
+
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--", "sleep", "12"]);
+    h.until("the job operates", Duration::from_secs(30), || {
+        h.state_of(&id) == "running"
+    });
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    // Give the coordinator more time than it needs to make a wrong decision.
+    std::thread::sleep(Duration::from_secs(3));
+    let state = h.state_of(&id);
+    assert!(
+        state == "running" || state == "completed",
+        "a job that operates must continue when its reader stops, and it is `{state}`"
+    );
+
+    h.ok(&["kill", &id]);
+}
