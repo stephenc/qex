@@ -39,6 +39,7 @@ const IDLE_EXIT_VAR: &str = "QEX_IDLE_EXIT_SECS";
 /// answer that lets this process delete the socket file.
 const OWN_SOCKET_ANSWER_LIMIT: Duration = Duration::from_secs(1);
 
+
 /// One job, as the coordinator holds it.
 pub struct Job {
     pub spec: JobSpec,
@@ -739,42 +740,45 @@ pub fn run() -> Result<()> {
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
 
     let socket_path = paths::socket_path()?;
+
+    // TAKE THE LOCK ON THE PID FILE FIRST, AND BEFORE ANY TEST OF THE SOCKET
+    // FILE.
+    //
+    // The lock says that a different coordinator operates, and the socket file
+    // does not. A socket file can go while its coordinator operates: a cleaner
+    // of the temporary directory deletes it, or a person deletes it, and the
+    // coordinator deletes its own socket file one moment before it stops. A
+    // test that starts at the socket file thus tests nothing in each of those
+    // states, and this process becomes a second coordinator.
+    //
+    // Two coordinators on one state directory each hold the full budget, and
+    // together they start twice the permitted work. That result is the fault
+    // that qex prevents, and it is worse than a start that does not happen. A
+    // lock that a different process holds is therefore an END of this process,
+    // and never a warning.
+    //
+    // The spawn lock does not give this promise. A CLI process holds that lock,
+    // and `qex daemon` is a command that a person or a systemd unit starts
+    // directly, with no lock at all.
+    let _pid_lock = match paths::hold_pid_file(&socket_path, paths::PID_LOCK_PATIENCE) {
+        paths::PidHold::Held(lock) => lock,
+        paths::PidHold::Busy => {
+            log("a different coordinator operates; this process stops");
+            return Ok(());
+        }
+        paths::PidHold::Unusable(why) => {
+            log(&format!("{why} This process stops."));
+            return Ok(());
+        }
+    };
+
     // A socket file can stay after a failure. Delete such a file, and then bind
     // a new socket at the same path.
     //
     // THIS PROCESS MUST DELETE THAT FILE ONLY WITH THE PROOF THAT NO
-    // COORDINATOR USES IT. A live coordinator that does not answer at this
-    // moment keeps its socket file, and this process stops. Two coordinators on
-    // one state directory each hold the full budget, and together they start
-    // twice the permitted work. That result is the fault that qex prevents, and
-    // it is worse than a start that does not happen.
-    //
-    // The spawn lock does not give that promise. A CLI process holds the lock,
-    // and `qex daemon` is a command that a person or a systemd unit starts
-    // directly, with no lock at all.
+    // COORDINATOR USES IT. The lock above is the strong proof, and this test
+    // covers a coordinator that started before qex made a pid file.
     if socket_path.exists() {
-        // The lock on the pid file is the strong test. A process that holds it
-        // operates, and this process must not take its socket. The test also
-        // covers a system that refuses a connection when the queue of the
-        // socket is full, because such a refusal cannot be told from a socket
-        // that nobody holds.
-        if let Some(dir) = socket_path.parent() {
-            match paths::pid_file_state(dir) {
-                paths::PidFile::Held => {
-                    log("a different coordinator operates; this process stops");
-                    return Ok(());
-                }
-                paths::PidFile::Unknown => {
-                    log(&format!(
-                        "qex cannot test the file {}, so a different coordinator can \
-                         operate. This process stops.",
-                        dir.join(paths::PID_FILE).display()
-                    ));
-                    return Ok(());
-                }
-                paths::PidFile::Free => {}
-            }
-        }
         match paths::ask_socket(&socket_path, OWN_SOCKET_ANSWER_LIMIT) {
             paths::SocketAnswer::NobodyListens => {
                 std::fs::remove_file(&socket_path).ok();
@@ -785,10 +789,10 @@ pub fn run() -> Result<()> {
             }
             paths::SocketAnswer::Unknown => {
                 log(&format!(
-                    "the socket {} is present and it gives no answer in {} seconds. A \
-                     different coordinator can operate, so this process stops.",
-                    socket_path.display(),
-                    OWN_SOCKET_ANSWER_LIMIT.as_secs()
+                    "the socket {} gives an answer that does not identify the process \
+                     that holds it. A different coordinator can operate, so this process \
+                     stops. Delete that file if no coordinator operates.",
+                    socket_path.display()
                 ));
                 return Ok(());
             }
@@ -823,25 +827,6 @@ pub fn run() -> Result<()> {
         })?
     };
     restrict_socket(&socket_path)?;
-
-    // Take the lock on the pid file beside the socket, and hold it for the whole
-    // life of this coordinator.
-    //
-    // THE LOCK IS THE EVIDENCE THAT THIS COORDINATOR OPERATES. The sweep of a
-    // different coordinator tries that lock, and a lock that it cannot take
-    // keeps this directory. The kernel gives the lock back when this process
-    // stops, whatever stops it, so the evidence cannot outlive the process.
-    //
-    // `_pid_lock` must stay in this scope. A value that goes out of scope closes
-    // the file and gives the lock back, and a sweep would then delete the
-    // directory of this coordinator.
-    let _pid_lock = match paths::hold_pid_file(&socket_path) {
-        Ok(lock) => lock,
-        Err(e) => {
-            log(&format!("warning: {e:#}"));
-            None
-        }
-    };
 
     // Delete the short socket directories of the coordinators that stopped.
     // Without this step, each unusual state directory leaves one in /tmp.
@@ -930,12 +915,16 @@ pub fn run() -> Result<()> {
     // the file, that command starts a coordinator, which is correct.
     std::fs::remove_file(&socket_path).ok();
 
-    // Delete the pid file with the socket, to leave the directory clean. A file
-    // that stays is safe: the kernel gives the lock back when this process
-    // stops, so a later sweep finds the lock free and reads the socket.
-    if let Some(dir) = socket_path.parent() {
-        std::fs::remove_file(dir.join(paths::PID_FILE)).ok();
-    }
+    // KEEP THE PID FILE, AND KEEP THE LOCK ON IT, UNTIL THIS PROCESS STOPS.
+    //
+    // This process lives for a moment after it deletes the socket file. A new
+    // coordinator that starts in that moment must find the lock and stop, and a
+    // file that this process deleted would let that coordinator make a new file,
+    // take the lock on it, and operate beside this one.
+    //
+    // The file stays after this process stops, and that is safe: the kernel
+    // gives the lock back, so a later sweep finds the lock free and asks the
+    // socket.
 
     // Let each reader of the event stream receive the goodbye.
     //

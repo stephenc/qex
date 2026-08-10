@@ -13400,10 +13400,15 @@ fn a_held_pid_file(path: &Path) -> std::fs::File {
 
 /// A socket that a live process holds, and never accepts, must not stop qex.
 ///
+/// THIS TEST HOLDS TWO PROPERTIES TOGETHER: the command finishes, and the
+/// directory of the process that holds that socket stays. It does not hold the
+/// time limit or the thread on its own, because either one alone is enough to
+/// let the command finish. `src/paths.rs` holds each mechanism with its own
+/// test.
+///
 /// The coordinator deletes the short socket directories of the coordinators
-/// that stopped. It asks each socket to answer. Without a time limit, and
-/// before it opens its own socket, one such socket makes every qex command on
-/// the machine report that the coordinator did not start.
+/// that stopped, and it asks each socket to answer. A socket that gives no
+/// answer must neither stop the command nor lose its directory.
 #[test]
 fn a_socket_that_never_answers_does_not_stop_a_command() {
     let mut h = Harness::with_default_config("stucksock");
@@ -13504,6 +13509,93 @@ fn a_socket_with_no_answer_stops_a_new_coordinator() {
         std::os::unix::fs::MetadataExt::ino(&before),
         std::os::unix::fs::MetadataExt::ino(&after),
         "the coordinator deleted the socket of a different coordinator and bound its own"
+    );
+}
+
+/// A file that qex cannot use must not stop qex for ever with no way out.
+///
+/// qex keeps the directory and stops, because it cannot prove that no
+/// coordinator operates. That state stays until a person acts, so the message
+/// must name the file and the one step that clears it.
+#[test]
+fn a_pid_file_that_qex_cannot_open_names_the_way_out() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The root user opens every file, so this test measures nothing there.
+    if unsafe { libc::getuid() } == 0 {
+        return;
+    }
+
+    let mut h = Harness::with_default_config("badpid");
+    h.extra_env
+        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let pid = run.join("pid");
+    std::fs::write(&pid, b"").unwrap();
+    std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = h.qex(&["daemon"]);
+    let made_a_socket = run.join("s").exists();
+
+    std::fs::set_permissions(&pid, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !made_a_socket,
+        "qex cannot test the file, so it must not start a second coordinator"
+    );
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains(&pid.display().to_string()),
+        "the message must name the file, and it says: {log}"
+    );
+    assert!(
+        log.contains("Delete that file if no coordinator operates"),
+        "the message must name the one step that clears this state, and it says: {log}"
+    );
+}
+
+/// A lock alone must stop a new coordinator, with NO socket file present.
+///
+/// A socket file can go while its coordinator operates: a cleaner of the
+/// temporary directory deletes it, a person deletes it, and the coordinator
+/// deletes its own socket file one moment before it stops. A test that starts
+/// at the socket file thus tests nothing in each of those states.
+#[test]
+fn a_lock_with_no_socket_file_stops_a_new_coordinator() {
+    let mut h = Harness::with_default_config("nosocket");
+    h.extra_env
+        .push(("QEX_IDLE_EXIT_SECS".into(), "1".into()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    // NO socket file. The lock is the only evidence.
+    let held = a_held_pid_file(&run.join("pid"));
+
+    let out = h.qex(&["daemon"]);
+    let made_a_socket = socket.exists();
+
+    drop(held);
+
+    assert!(
+        out.status.success(),
+        "the coordinator must stop with no fault: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !made_a_socket,
+        "a second coordinator started and bound a socket while a different process \
+         held the lock"
+    );
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        log.contains("a different coordinator operates"),
+        "the log must say that a different coordinator operates, and it says: {log}"
     );
 }
 
