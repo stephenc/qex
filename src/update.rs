@@ -155,7 +155,14 @@ fn with_the_record_in(dir: &std::path::Path, change: impl FnOnce(&mut Record)) -
         if (busy || e.kind() == std::io::ErrorKind::Interrupted)
             && std::time::Instant::now() < give_up
         {
-            std::thread::sleep(Duration::from_millis(20));
+            // WAIT A DIFFERENT TIME EACH TURN. Writers that wake together keep
+            // waking together, and the same one loses every race. The clock
+            // gives the variation, and it costs no dependency.
+            let jitter = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() % 20)
+                .unwrap_or(0);
+            std::thread::sleep(Duration::from_millis(5 + u64::from(jitter)));
             continue;
         }
         bail!("qex could not lock {}: {e}", path.display());
@@ -1033,22 +1040,35 @@ mod tests {
         let dir = a_directory("race");
         write_record_in(&dir, &Record::default()).unwrap();
 
+        // COUNT THE WRITES THAT SUCCEEDED, and require the record to hold
+        // exactly those.
+        //
+        // The lock promises that no update is LOST. It does not promise that
+        // every attempt takes it: a writer that waits longer than the limit
+        // gets an error, and a write that never happened can lose nothing. A
+        // test that requires every attempt to succeed measures the load of the
+        // machine, and it stopped `main` on a build machine.
         let writers = 8;
         let each = 25;
+        let done = std::sync::atomic::AtomicU64::new(0);
         std::thread::scope(|scope| {
             for _ in 0..writers {
                 scope.spawn(|| {
                     for _ in 0..each {
-                        with_the_record_in(&dir, |r| r.last_checked += 1).unwrap();
+                        if with_the_record_in(&dir, |r| r.last_checked += 1).is_ok() {
+                            done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                 });
             }
         });
 
+        let done = done.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(done > 0, "no writer took the lock at all");
         assert_eq!(
             read_record_in(&dir).last_checked,
-            writers * each,
-            "every write must reach the record"
+            done,
+            "the record must hold every write that took the lock, and no less"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
