@@ -1111,6 +1111,142 @@ fn an_id_file_that_fails_does_not_lose_the_job() {
     assert_eq!(h.status_json(id.trim())["exit_code"], 4);
 }
 
+/// `qex version --check` asks the service that the config file names.
+///
+/// The test gives a `file://` address, so it measures qex and not a network.
+#[test]
+fn version_check_asks_the_service_and_says_what_it_found() {
+    let h = Harness::with_default_config("updatecheck");
+    let answer = h.root.join("latest.json");
+    std::fs::write(&answer, r#"{"tag_name": "v9.9.9"}"#).unwrap();
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [update]\nurl = \"file://{}\"\n",
+        answer.display()
+    ));
+
+    let out = h.qex(&["version", "--check"]);
+    assert_eq!(out.status.code(), Some(0), "the answer arrived");
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        said.contains("9.9.9"),
+        "the newest release must be named: {said}"
+    );
+    assert!(
+        said.contains(&answer.display().to_string()),
+        "the service that answered must be named: {said}"
+    );
+    // A test build is a development build, and that is neither new nor old.
+    assert!(
+        said.contains("development build"),
+        "a development build must be named as one: {said}"
+    );
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&h.qex(&["version", "--check", "--json"]).stdout).unwrap();
+    assert_eq!(value["newest"], "9.9.9");
+    assert_eq!(value["development"], true);
+    assert_eq!(value["newer"], false, "a development build is never behind");
+    assert!(value["error"].is_null());
+}
+
+/// A service that does not answer gives 1, and it changes nothing.
+#[test]
+fn version_check_says_what_stopped_it() {
+    let h = Harness::with_default_config("updatefail");
+    h.write_config(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [update]\nurl = \"file:///qex-no-such-file-9e3a\"\n",
+    );
+
+    let out = h.qex(&["version", "--check"]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "qex could not ask, and that is the only case that gives 1"
+    );
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        said.contains("could not ask"),
+        "the message must say that qex could not ask: {said}"
+    );
+    assert!(
+        said.contains("still operates") || said.contains("Nothing changed"),
+        "the message must say that nothing changed: {said}"
+    );
+
+    // A job still runs. A service that does not answer is not a fault of the
+    // queue.
+    let id = h.submit(&["submit", "--", "true"]);
+    assert_eq!(h.qex(&["wait", &id]).status.code(), Some(0));
+}
+
+/// `never` is absolute: no file, and no message.
+#[test]
+fn never_asks_nothing_and_writes_nothing() {
+    let h = Harness::with_default_config("updatenever");
+    h.write_config(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [update]\ncheck = \"never\"\nurl = \"file:///qex-no-such-file-9e3a\"\n",
+    );
+
+    let id = h.submit(&["submit", "--", "true"]);
+    assert_eq!(h.qex(&["wait", &id]).status.code(), Some(0));
+
+    // The coordinator ran, and it wrote no record of a check.
+    let record = h.root.join("state/qex/update.json");
+    assert!(
+        !record.exists(),
+        "`never` must write no file: {}",
+        record.display()
+    );
+}
+
+/// The first run of a fresh install asks nothing.
+///
+/// It writes the time and stays quiet, so qex opens no connection in its first
+/// interval. A `file://` address proves it: the file holds a release far above
+/// this build, and no message names it.
+#[test]
+fn a_fresh_install_asks_nothing_and_says_nothing() {
+    let h = Harness::with_default_config("updatefirst");
+    let answer = h.root.join("latest.json");
+    std::fs::write(&answer, r#"{"tag_name": "v9.9.9"}"#).unwrap();
+    h.write_config(&format!(
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [update]\ncheck = \"1s\"\nurl = \"file://{}\"\n",
+        answer.display()
+    ));
+
+    let id = h.submit(&["submit", "--", "true"]);
+    let out = h.qex(&["wait", &id]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("newer qex"),
+        "a fresh install must say nothing about a release"
+    );
+
+    // The record holds the time, and no version: qex wrote the time and asked
+    // nothing.
+    h.until(
+        "the coordinator wrote the record",
+        Duration::from_secs(45),
+        || h.root.join("state/qex/update.json").exists(),
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(h.root.join("state/qex/update.json")).unwrap())
+            .unwrap();
+    assert!(value["last_checked"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        value["newest"].is_null(),
+        "the first run must ask nothing: {value}"
+    );
+}
+
 /// `qex status --wait` ends with the record, so one command gives everything.
 #[test]
 fn status_with_wait_ends_with_the_record_of_the_job() {

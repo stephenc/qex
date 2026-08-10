@@ -4385,6 +4385,24 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
 pub fn version(args: cli::VersionArgs) -> Result<i32> {
     let mine = crate::version::VERSION;
 
+    // `--check` asks the service NOW. It is the one path in qex that opens a
+    // connection from a command of a user, and a person asked for it.
+    //
+    // The exit code is 0 when the answer arrived, whatever it says, and 1 when
+    // qex could not ask. A newer release is information: a code that says
+    // otherwise would fail every script that runs this command on the day of a
+    // release.
+    if args.check {
+        let cfg = Config::load()?;
+        let report = crate::update::report(&cfg);
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report.json())?);
+        } else {
+            println!("{}", report.text());
+        }
+        return Ok(if report.error.is_some() { 1 } else { 0 });
+    }
+
     // Do not start a coordinator. A question about a version must not change
     // the machine.
     let coordinator = Client::connect_existing().and_then(|mut c| match c.call(&Request::Info) {

@@ -988,9 +988,48 @@ pub struct Config {
     pub gc: GcConfig,
     pub logs: LogsConfig,
     pub hooks: HooksConfig,
+    pub update: UpdateConfig,
     /// The pools of countable resources. The key in the file is `[[pool]]`.
     #[serde(rename = "pool")]
     pub pools: Vec<PoolConfig>,
+}
+
+/// Whether qex looks for a newer release of itself, and how often.
+///
+/// THE COORDINATOR ASKS, AND THE CLI NEVER DOES. A check must not delay a
+/// command and must not fail one, and the one way to keep both rules
+/// absolutely is to take the network out of the path of a command. One call
+/// also serves every agent on the machine, which is the property that this
+/// queue exists for. `qex version --check` is the exception: a person asked
+/// for it, so it asks now.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// How often qex looks: a time such as `24h` or `7d`, or `never`.
+    ///
+    /// `never` is absolute. qex then opens no connection, writes no file for
+    /// this, and says nothing about a version, for ever.
+    #[serde(deserialize_with = "text_or_number")]
+    pub check: String,
+    /// The service that answers. Give a mirror here.
+    ///
+    /// The answer must be the JSON of a release of GitHub, which holds
+    /// `tag_name`. qex names this address when it reports, so a reader always
+    /// learns WHO answered.
+    pub url: String,
+    /// How long qex waits for that service.
+    #[serde(deserialize_with = "text_or_number")]
+    pub timeout: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: "7d".into(),
+            url: "https://api.github.com/repos/stephenc/qex/releases/latest".into(),
+            timeout: "5s".into(),
+        }
+    }
 }
 
 /// How much of the message about the config file the reader needs.

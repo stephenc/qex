@@ -825,6 +825,17 @@ pub struct WatchersArgs {
 
 #[derive(Debug, Args)]
 pub struct VersionArgs {
+    /// Ask whether a newer release of qex exists.
+    ///
+    /// This command reads. It never installs anything, and it never changes
+    /// the program that you have.
+    ///
+    /// The exit code is 0 when the answer arrived, whatever the answer says,
+    /// and 1 when qex could not ask. A newer release is information and not a
+    /// fault. Read `newer` in `--json` to act on it.
+    #[arg(long)]
+    pub check: bool,
+
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
