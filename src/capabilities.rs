@@ -189,6 +189,7 @@ pub const ALL: &[&str] = &[
     "learn",
     "locks",
     "max-queue-time",
+    "pause",
     "politeness",
     "retries",
 ];
@@ -305,12 +306,21 @@ pub fn check(
 /// that needs a request name, such as `qex events`. The two faults are the same
 /// fault: a coordinator that cannot obey must refuse, and it must never leave
 /// the user with a command that gives nothing and says nothing.
+///
+/// `danger` says why the refusal matters, and the caller gives it. It is not a
+/// fixed sentence, because one capability can gate two commands whose dangers
+/// are opposite: a `qex pause` that an earlier coordinator ignores starts work
+/// while the person believes that the machine is quiet, and a `qex resume` that
+/// it ignores changes nothing at all. One sentence for both would state a
+/// reason that is not true for one of them, and a reader who acts on it acts on
+/// a fault that does not exist.
 pub fn check_command(
     have: &[String],
     coordinator_version: &str,
     coordinator_pid: i32,
     capability: &str,
     command: &str,
+    danger: &str,
 ) -> Result<(), String> {
     if have.iter().any(|h| h == capability) {
         return Ok(());
@@ -318,8 +328,7 @@ pub fn check_command(
     Err(format!(
         "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and it \
          cannot obey `{command}`.\n\n\
-         qex refuses this command. That coordinator does not know this request, so the \
-         command would give you nothing and no reason.\n\n\
+         qex refuses this command. {danger}\n\n\
          The coordinator stops when no job operates, and the next command then starts one \
          that can obey. To change it now:\n\
          \x20   kill {coordinator_pid}\n\n\
@@ -673,7 +682,8 @@ mod tests {
             .filter(|c| **c != "events")
             .map(|c| c.to_string())
             .collect();
-        let err = check_command(&old, "0.7.1", 4321, "events", "qex events").unwrap_err();
+        let err =
+            check_command(&old, "0.7.1", 4321, "events", "qex events", "no reason").unwrap_err();
         assert!(
             err.contains("qex events"),
             "the message must name the command: {err}"
@@ -684,7 +694,67 @@ mod tests {
         );
 
         let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
-        assert!(check_command(&new, "0.8.0", 4321, "events", "qex events").is_ok());
+        assert!(check_command(&new, "0.8.0", 4321, "events", "qex events", "no reason").is_ok());
+    }
+
+    /// `qex pause` must be refused by a coordinator that cannot obey it.
+    ///
+    /// The failure to prevent is the silent one: the person types `qex pause
+    /// queue`, gets no clear reason, and believes that the machine is quiet
+    /// while the coordinator continues to start jobs.
+    #[test]
+    fn a_pause_is_refused_by_a_coordinator_that_cannot_pause() {
+        let old: Vec<String> = ALL
+            .iter()
+            .filter(|c| **c != "pause")
+            .map(|c| c.to_string())
+            .collect();
+        let err = check_command(
+            &old,
+            "0.7.1",
+            3507877,
+            "pause",
+            "qex pause queue",
+            "The coordinator would start the jobs of the queue, and you would believe that the \
+             machine is quiet.",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("qex pause queue"),
+            "the message must name the command: {err}"
+        );
+        assert!(
+            err.contains("kill 3507877"),
+            "the message must give the remedy: {err}"
+        );
+
+        let new: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        assert!(check_command(&new, "0.8.0", 1, "pause", "qex pause queue", "no reason").is_ok());
+
+        // The danger of a refused `qex resume` is the opposite of the danger of
+        // a refused `qex pause`. One fixed sentence would state a reason that
+        // is not true for one of the two commands.
+        let resume = check_command(
+            &old,
+            "0.7.1",
+            3507877,
+            "pause",
+            "qex resume queue",
+            "That coordinator does not read the pause record, so it already starts the jobs of \
+             the queue. This command would change nothing.",
+        )
+        .unwrap_err();
+        assert!(
+            !resume.contains("you would believe that the machine is quiet"),
+            "the resume message must not give the danger of a pause: {resume}"
+        );
+    }
+
+    /// This build must say that it can pause. Without the name in this list,
+    /// every new CLI refuses every new coordinator.
+    #[test]
+    fn this_build_says_that_it_can_pause() {
+        assert!(ALL.contains(&"pause"));
     }
 
     /// This build must say that it has the event stream. Without the name in

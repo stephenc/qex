@@ -84,6 +84,8 @@ pub struct State {
     /// The log is behind the same lock as the jobs. The stream and `qex list`
     /// thus read one map, and the two can never disagree.
     pub events: crate::events::EventLog,
+    /// What a person paused. The file `paused.json` holds the same values.
+    pub paused: crate::pause::Paused,
     pub stop: bool,
 }
 
@@ -414,6 +416,47 @@ impl State {
     pub fn count_state(&self, f: impl Fn(JobState) -> bool) -> usize {
         self.jobs.values().filter(|j| f(j.status.state)).count()
     }
+
+    /// Gives the job that holds one lock now, as `a1b2c3d4 (train)`.
+    ///
+    /// A person who asks for a lock that a job holds must learn which job, and
+    /// must learn that the wait has a known end.
+    pub fn lock_holder(&self, name: &str) -> Option<String> {
+        self.jobs
+            .values()
+            .find(|j| j.status.state.is_active() && j.spec.locks.iter().any(|l| l == name))
+            .map(|j| {
+                format!(
+                    "{} ({})",
+                    &j.status.id.to_string()[..8],
+                    j.status.name.clone()
+                )
+            })
+    }
+
+    /// Gives the locks that a person holds, with the job that still holds each.
+    pub fn paused_locks(&self) -> Vec<crate::proto::LockPause> {
+        self.paused
+            .locks
+            .iter()
+            .map(|(name, record)| crate::proto::LockPause {
+                name: name.clone(),
+                record: record.clone(),
+                held_by: self.lock_holder(name),
+            })
+            .collect()
+    }
+
+    /// Writes the pause file after a change.
+    ///
+    /// A pause that stays in this process only would go away with the
+    /// coordinator, and the queue would start work behind the person who asked
+    /// for a quiet machine. See the `pause` module.
+    pub fn save_pause(&self) {
+        if let Err(e) = self.paused.write() {
+            log(&format!("qex could not write the pause record: {e:#}"));
+        }
+    }
 }
 
 /// The coordinator. The threads share this value.
@@ -446,6 +489,7 @@ impl Coordinator {
                 config_settling: None,
                 config_error: None,
                 events: crate::events::EventLog::new(),
+                paused: crate::pause::Paused::default(),
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -612,6 +656,60 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     let mut recovered = 0usize;
     let mut queued = Vec::new();
 
+    // Read the pause before the jobs.
+    //
+    // A coordinator stops when the program file changes, and qex itself tells a
+    // user to run `kill <pid>` on it. Without this step, a person who follows
+    // that instruction loses the pause in silence, and the machine starts work
+    // again while that person believes it is quiet.
+    state.paused = crate::pause::Paused::read();
+
+    // A pause of the queue can reach its `--for` WHILE NO COORDINATOR OPERATES.
+    //
+    // That is the third place where a pause of the queue ends, beside
+    // `qex resume queue` and `sched::step`, and it is not a corner case: qex
+    // itself tells a user to run `kill <pid>` on the coordinator, and a reboot
+    // or an out-of-memory kill does the same. Measured before this step
+    // existed: a `--for 20s` pause, a `kill -9`, and a job with a
+    // `--max-queue-time` of 5s came back `expired` with `queue_pause_secs` of
+    // 0, blaming the person for a wait that the pause caused.
+    //
+    // The credit CANNOT go here. The job directories are read below, so
+    // `state.jobs` and `state.queue` are still empty and there is nobody to
+    // credit. Hold the record, and pay it after the jobs are in the state.
+    let now = sys::now_secs();
+    let ended_while_down = state
+        .paused
+        .queue
+        .clone()
+        .filter(|record| record.expired(now));
+    if state.paused.expire(now) {
+        state.save_pause();
+    }
+    match &state.paused.queue {
+        Some(record) if record.fault => {
+            // Say this in the log AND keep it in the file. The next command
+            // then reads a record that qex can parse, and the words that a
+            // person needs stay with it.
+            log(&format!(
+                "qex could not read its pause record, so it holds the queue: {}",
+                record.reason.as_deref().unwrap_or("unknown")
+            ));
+            state.save_pause();
+        }
+        Some(record) => log(&format!(
+            "the queue is paused; a person paused it at {}",
+            sys::clock_text(record.paused_at)
+        )),
+        None => {}
+    }
+    for name in state.paused.locks.keys() {
+        log(&format!(
+            "a person holds the lock `{}`",
+            crate::job::safe_name(name)
+        ));
+    }
+
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -703,6 +801,22 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     // Put the queue back in its order: the priority first, then the time.
     queued.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.cmp(&b.1)));
     state.queue = queued.into_iter().map(|(id, _, _)| id).collect();
+
+    // Pay the pause that ended while no coordinator operated.
+    //
+    // The queue exists only now, so this is the first moment that has somebody
+    // to credit. `end_queue_pause` is the same function that the other two ends
+    // of a pause call, so the three cannot drift.
+    //
+    // The end of the pause is the moment that the record gave, and NOT this
+    // moment: the pause stopped at its `--for`, and the time between that end
+    // and this restart is time that the queue was free to run. To credit it
+    // would give a job more time than the pause took.
+    if let Some(record) = ended_while_down {
+        let ended_at = record.until.unwrap_or(now).min(now);
+        crate::pause::end_queue_pause(&mut state, &record, ended_at);
+        log("a pause reached its end while no coordinator operated");
+    }
 
     // Give each dedupe key back to a job.
     //
@@ -842,7 +956,129 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
             grace_secs,
         } => crate::lifecycle::kill(coord, id, signal, grace_secs),
         Request::Clean { id } => crate::lifecycle::clean(coord, id),
+        Request::Pause {
+            target,
+            reason,
+            until,
+            by_pid,
+        } => handle_pause(coord, target, reason, until, by_pid),
+        Request::Resume { target } => handle_resume(coord, target),
+        Request::PauseState => {
+            let state = coord.state.lock().unwrap();
+            Response::PauseState {
+                queue: state.paused.queue.clone(),
+                locks: state.paused_locks(),
+            }
+        }
     }
+}
+
+/// Records a pause of the queue or of one lock.
+///
+/// A pause of a lock is never refused, whatever job holds that lock now. The
+/// request is safe to type at any moment: the job that holds the lock keeps it,
+/// no other job takes it, and the person receives it when that job stops.
+fn handle_pause(
+    coord: &Arc<Coordinator>,
+    target: crate::proto::PauseTarget,
+    reason: Option<String>,
+    until: Option<u64>,
+    by_pid: i32,
+) -> Response {
+    use crate::proto::PauseTarget;
+
+    let mut state = coord.state.lock().unwrap();
+
+    match target {
+        PauseTarget::Queue => {
+            let record = keep_the_end(state.paused.queue.take(), by_pid, reason, until);
+            state.paused.queue = Some(record);
+            log("a person paused the queue; qex starts no job");
+        }
+        PauseTarget::Lock { name } => {
+            let record = keep_the_end(state.paused.locks.remove(&name), by_pid, reason, until);
+            log(&format!(
+                "a person asked for the lock `{}`",
+                crate::job::safe_name(&name)
+            ));
+            state.paused.locks.insert(name, record);
+        }
+    }
+    state.save_pause();
+
+    let answer = Response::PauseState {
+        queue: state.paused.queue.clone(),
+        locks: state.paused_locks(),
+    };
+    drop(state);
+    // Wake the scheduler, so the jobs of the queue get the new reason at once.
+    coord.notify();
+    answer
+}
+
+/// Makes the record of a pause, and keeps what a second command did not give.
+///
+/// # The fault that this function prevents
+///
+/// `qex pause queue` looks like a command that a person can run twice. A second
+/// command that replaced the whole record would change a pause of 30 minutes
+/// into a pause with no end, because the second command gave no `--for`. An
+/// agent that pauses to protect itself would thus take the machine from a
+/// person for the rest of the day.
+///
+/// A second command therefore ADDS: it keeps the start, and it keeps the end
+/// and the reason that it does not give. To replace an end, run `qex resume`
+/// first.
+fn keep_the_end(
+    old: Option<crate::pause::PauseRecord>,
+    by_pid: i32,
+    reason: Option<String>,
+    until: Option<u64>,
+) -> crate::pause::PauseRecord {
+    let mut record = crate::pause::PauseRecord::new(by_pid, reason, until);
+    // A record that qex made because it could not read the file is not a pause
+    // that a person asked for, so a real pause replaces it in full.
+    if let Some(old) = old.filter(|o| !o.fault) {
+        record.paused_at = old.paused_at;
+        record.by_pid = old.by_pid;
+        record.reason = record.reason.or(old.reason);
+        record.until = record.until.or(old.until);
+    }
+    record
+}
+
+/// Removes a pause.
+fn handle_resume(coord: &Arc<Coordinator>, target: crate::proto::PauseTarget) -> Response {
+    use crate::proto::PauseTarget;
+
+    let mut state = coord.state.lock().unwrap();
+    match target {
+        PauseTarget::Queue => {
+            // A `--for` that reaches its time and this command are the same
+            // event. `pause::end_queue_pause` is the one place that says what
+            // that event does. See it for both of the things that it does.
+            if let Some(record) = state.paused.queue.take() {
+                crate::pause::end_queue_pause(&mut state, &record, crate::sys::now_secs());
+            }
+            log("a person started the queue again");
+        }
+        PauseTarget::Lock { name } => {
+            log(&format!(
+                "a person gave the lock `{}` back",
+                crate::job::safe_name(&name)
+            ));
+            state.paused.locks.remove(&name);
+        }
+    }
+    state.save_pause();
+
+    let answer = Response::PauseState {
+        queue: state.paused.queue.clone(),
+        locks: state.paused_locks(),
+    };
+    drop(state);
+    coord.notify();
+    answer
 }
 
 fn no_such_job(id: uuid::Uuid) -> Response {
@@ -867,6 +1103,22 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         config_error: state.config_error.clone(),
         cpu_claimed,
         mem_claimed,
+        // `paused-by-fault` is a state of its own, and not a flag beside
+        // `paused`. Two parallel fields drift, and a reader that learns the
+        // pause but not its cause cannot correct the cause.
+        queue_state: Some(
+            match &state.paused.queue {
+                Some(record) if record.fault => "paused-by-fault",
+                Some(_) => "paused",
+                None => "running",
+            }
+            .to_string(),
+        ),
+        paused_at: state.paused.queue.as_ref().map(|p| p.paused_at),
+        paused_by_pid: state.paused.queue.as_ref().map(|p| p.by_pid),
+        paused_reason: state.paused.queue.as_ref().and_then(|p| p.reason.clone()),
+        paused_until: state.paused.queue.as_ref().and_then(|p| p.until),
+        paused_locks: Some(state.paused_locks()),
     }
 }
 
@@ -883,6 +1135,12 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
     // This one lock operation also holds the dedupe key, the size test and the
     // reservation of the key. See the comment on `State::dedupe`: the test of
     // the key and the reservation of the key must not be two steps.
+    // A pause is the true cause of a wait, and it hides the capacity cause.
+    // `handle_submit` reads it under the same lock as the dedupe key and the
+    // size test, and it uses it after that lock goes.
+    let mut pause_warning: Option<String> = None;
+    let mut pause_reason: Option<String> = None;
+
     let warning = {
         let mut state = coord.state.lock().unwrap();
         for dep in spec.needs.iter().chain(spec.after.iter()) {
@@ -949,6 +1207,36 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
             state.dedupe.insert(key, id);
         }
 
+        // Say now that this job waits for a pause, and not for capacity.
+        //
+        // An agent that submits a job into a paused queue must learn the true
+        // cause at the moment of the submission. Without this text the agent
+        // reads `queued`, waits, and looks at the budget for a cause that is
+        // not there.
+        let mut lines = Vec::new();
+        if let Some(record) = &state.paused.queue {
+            pause_reason = Some(crate::pause::queue_reason(record));
+            lines.push(
+                "the queue is paused, so this job waits. Run `qex resume queue` to start the \
+                 queue again."
+                    .to_string(),
+            );
+        }
+        for name in &spec.locks {
+            if state.paused.locks.contains_key(name) {
+                // The lock name is text that a person typed. Show the safe
+                // form of it in a sentence that a terminal prints.
+                let shown = crate::job::safe_name(name);
+                lines.push(format!(
+                    "a person holds the lock `{shown}`, so this job waits. Run \
+                     `qex resume lock {shown}` to give it back."
+                ));
+            }
+        }
+        if !lines.is_empty() {
+            pause_warning = Some(lines.join("\n"));
+        }
+
         // Test the size of the job against the budget, and warn now. The agent
         // then learns immediately. It does not wait for the job to start.
         match crate::sched::size_check(&state.cfg, &spec) {
@@ -984,6 +1272,31 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
                 }
             }
         }
+    };
+
+    // The pause REPLACES the capacity reason in the record; it never stands
+    // beside one.
+    //
+    // A record that said "waits for memory" would send the reader to change the
+    // budget, and no budget starts a job while the queue is paused. This is one
+    // assignment, and it is AFTER the size test above: the oversized branch of
+    // that test writes its own reason, and the order of the two decides which
+    // reason the reader gets.
+    //
+    // `sched::choose` writes the same reason on its next pass, so this line
+    // covers the window before that pass — the record is correct from the first
+    // byte that qex writes for this job, and not 500ms later.
+    if let Some(reason) = &pause_reason {
+        status.blocked_reason = Some(reason.clone());
+    }
+
+    // The WARNING gives both. The person who typed the command must learn about
+    // the claim as well, because that claim is a fault of the command and the
+    // pause is not.
+    let warning = match (pause_warning, warning) {
+        (Some(pause), Some(size)) => Some(format!("{pause}\n{size}")),
+        (Some(pause), None) => Some(pause),
+        (None, size) => size,
     };
 
     let dir = match paths::job_dir(&id) {
@@ -1242,6 +1555,7 @@ mod tests {
             idle_since: None,
             next_sequence: 1,
             started_at: 0,
+            paused: crate::pause::Paused::default(),
             stop: false,
             config_seen: 0,
             config_settling: None,
@@ -1423,5 +1737,46 @@ mod tests {
         release_dedupe(&mut state, id);
         assert!(state.dedupe.is_empty());
         assert_eq!(state.dedupe_holder("k", 3600), None);
+    }
+
+    /// A second `qex pause queue` must not lose the end of the first one.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// `qex pause queue` looks like a command that a person can run twice. A
+    /// second command that replaced the whole record would change a pause of 30
+    /// minutes into a pause with no end, because the second command gave no
+    /// `--for`. An agent that pauses to protect itself would then take the
+    /// machine from a person for the rest of the day.
+    #[test]
+    fn a_second_pause_keeps_the_end_and_the_reason_of_the_first() {
+        let first = crate::pause::PauseRecord {
+            paused_at: 1_000,
+            by_pid: 11,
+            reason: Some("recording a demo".into()),
+            until: Some(2_800),
+            fault: false,
+        };
+
+        let second = keep_the_end(Some(first.clone()), 22, None, None);
+        assert_eq!(second.until, Some(2_800), "the end must stay");
+        assert_eq!(second.reason.as_deref(), Some("recording a demo"));
+        assert_eq!(second.paused_at, 1_000, "the pause began at the first one");
+
+        // A second command that GIVES a value uses it.
+        let third = keep_the_end(Some(first.clone()), 22, Some("a build".into()), Some(9_000));
+        assert_eq!(third.until, Some(9_000));
+        assert_eq!(third.reason.as_deref(), Some("a build"));
+
+        // A pause that qex made because it could not read the file is not a
+        // pause that a person asked for, so a real pause replaces it in full.
+        let fault = crate::pause::PauseRecord {
+            fault: true,
+            ..first
+        };
+        let real = keep_the_end(Some(fault), 22, None, None);
+        assert_eq!(real.until, None);
+        assert_eq!(real.by_pid, 22);
+        assert!(!real.fault);
     }
 }

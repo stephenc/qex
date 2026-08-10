@@ -23,6 +23,8 @@ qex cancel <id>...          remove a job from the queue
 qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
 qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
+qex pause  [queue|lock NAME] [--reason TEXT] [--for TIME] [--drain]
+qex resume [queue|lock NAME]
 qex config show             the values that qex uses now
 qex schema job|status|pipeline|event    the JSON Schema of each format
 qex completions <shell>     the completions for bash, zsh or fish
@@ -413,6 +415,86 @@ job.
 
 A pipeline stage has no dedupe key. A key on one stage would answer for that
 stage alone, and the stages after it would wait for a job of an earlier run.
+
+## Pause the queue, or one lock
+
+A person sometimes needs the machine back: a video call starts, the laptop goes
+on battery, or an interactive task needs the cores.
+
+```sh
+qex pause queue --reason "recording a demo"   # start no new job
+qex pause queue --for 30m                     # end the pause by itself
+qex pause queue --drain                       # wait for a quiet machine
+qex resume queue                              # start the queue again
+```
+
+A paused queue starts **nothing**. The jobs that operate now continue, because
+each one already holds its capacity and a stop would lose that work. Use
+`qex kill <id>` to stop one.
+
+A lock is the better half:
+
+```sh
+qex pause lock gpu0     # the lock goes to you, and every job that needs it waits
+qex resume lock gpu0    # the next job takes it
+```
+
+`qex pause lock` never fails when a job holds the lock now. qex records the
+request, that job keeps the lock, no other job takes it, and the lock comes to
+you when that job stops.
+
+```
+ID        STATE   NAME   ...  NOTE
+b0bb2614  queued  train  ...  waits for the lock `gpu0`, which a person holds
+```
+
+The pause is a file beside the job records, so it survives a coordinator that
+stops. It covers your queue only; it does not pause another user of the
+machine. A job with `--retries` waits too: its supervisor reads the same file.
+
+If qex cannot read that file, it holds the queue and says so. A file that qex
+cannot read can hold a pause, and qex does not know. `qex resume queue` writes
+a new file.
+
+A second `qex pause queue` keeps the end and the reason of the first one. To
+replace an end, run `qex resume queue` first.
+
+`qex pause` with no word says what is paused now. `qex info`, `qex top`,
+`qex list` and `qex wait` say it too, and a pause with no end is reported loudly
+each time. Each line names the pid that asked for the pause: a queue is shared,
+and the second person must be able to find the owner before that person types
+`qex resume queue` over the work of somebody else.
+
+Any command on this queue can end any pause on it. A pause is not a lock on the
+queue, and qex refuses nobody: the queue belongs to one user of the machine, and
+the people and the agents that reach it already share every job in it.
+
+**A pause does not expire a job.** `--max-queue-time` measures the time that a
+job waits for the QUEUE. A person who pauses the queue is not the queue, so the
+clock of that limit stops at the pause and runs again at the resume. Without
+this rule a pause of 30 minutes killed every job with a smaller limit, fired the
+stop hook of each one, and gave the person an empty queue on the return — from a
+command that exists to protect the machine. `qex status` gives the time in
+`queue_pause_secs`. This holds when the pause ends by itself while no
+coordinator operates: the next coordinator finds it and gives the time back.
+
+A pause of a LOCK does not stop that clock. A lock is one name, the person holds
+it in place of a job, and a job that waits for a lock already expires in the
+same way. A job that waits for a lock that a person holds therefore needs a
+`--max-queue-time` that covers the hold, or no limit at all.
+
+`qex submit` into a paused queue still gives a job id and the exit code 0. The
+job waits, and the reason of the job says the pause. No command is refused
+because the queue is paused. A command IS refused when the coordinator is too
+old to pause at all, and it then gives the code 1 with the pid to kill.
+
+`qex submit --each-line` into a paused queue says the pause one time, and not
+one time for each job.
+
+A pause of the queue changes the reason of every job that waits, so a reader of
+`qex events` sees one `job` line with `change: "reason"` for each of those jobs,
+and the same at the resume. The pause itself is not a job, so it has no event of
+its own; a reader that must know the pause reads `qex pause --json`.
 
 ## A pipeline of stages
 
@@ -1534,6 +1616,7 @@ qex help states      each job state and what causes it
 qex help events      the event stream, its numbers and its gaps
 qex help exit-codes  the exit code of each command
 qex help config      each configuration field
+qex help pause       stop the queue, or take a lock for yourself
 qex schema job       the JSON Schema of a job file
 qex schema status    the JSON Schema of status.json
 qex schema event     the JSON Schema of one line of `qex events`

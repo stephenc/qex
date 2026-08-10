@@ -82,6 +82,16 @@ pub enum Command {
     /// Show the coordinator: its process id, its budget and its load.
     Info(InfoArgs),
 
+    /// Stop qex from starting work, or take a lock for yourself.
+    ///
+    /// `qex pause` alone says what is paused now.
+    Pause(PauseArgs),
+
+    /// Start the queue again, or give a lock back.
+    ///
+    /// `qex resume` alone starts the queue again.
+    Resume(ResumeArgs),
+
     /// Show the configuration or its location.
     Config(ConfigArgs),
 
@@ -599,6 +609,90 @@ pub struct InfoArgs {
     /// the process that it wants to stop.
     #[arg(long)]
     pub no_start: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PauseArgs {
+    #[command(subcommand)]
+    pub target: Option<PauseTarget>,
+
+    /// Write the output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The things that a person can pause.
+///
+/// These are subcommands, and not options, so that the words read as what they
+/// do and so that qex can pause more things later.
+#[derive(Debug, Subcommand)]
+pub enum PauseTarget {
+    /// Start no new job. The jobs that operate now continue.
+    Queue {
+        /// Say why, for the person who reads the queue later.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+
+        /// End the pause by itself after this time. Example: 30m.
+        #[arg(long = "for", value_name = "TIME")]
+        duration: Option<String>,
+
+        /// Wait here until no job of this queue operates.
+        #[arg(long)]
+        drain: bool,
+
+        /// Write the output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Take this lock for yourself. Every job that needs it waits.
+    Lock {
+        /// The name of the lock, as `--lock NAME` gives it.
+        name: String,
+
+        /// Say why, for the person who reads the queue later.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+
+        /// Give the lock back by itself after this time. Example: 30m.
+        #[arg(long = "for", value_name = "TIME")]
+        duration: Option<String>,
+
+        /// Write the output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ResumeArgs {
+    #[command(subcommand)]
+    pub target: Option<ResumeTarget>,
+
+    /// Write the output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ResumeTarget {
+    /// Start the queue again.
+    Queue {
+        /// Write the output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Give this lock back. The next job that needs it takes it.
+    Lock {
+        /// The name of the lock.
+        name: String,
+
+        /// Write the output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]

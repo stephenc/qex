@@ -9391,3 +9391,1058 @@ fn a_reader_that_goes_away_leaves_no_thread_behind() {
         || count("task") <= threads + 1 && count("fd") <= handles + 2,
     );
 }
+
+/// A paused queue must start no job, and the jobs that operate must continue.
+///
+/// # The fault that this test prevents
+///
+/// A person pauses the queue to take the machine back. A pause that still
+/// started a small job would change the measurement that the person is trying
+/// to take. A pause that stopped the job which already operates would lose the
+/// work AND the capacity that the job holds, and no command gives that back.
+#[test]
+fn a_paused_queue_starts_no_job_and_the_jobs_that_operate_continue() {
+    let h = Harness::with_default_config("pausequeue");
+
+    let running = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&running) == "running"
+    });
+
+    h.ok(&["pause", "queue"]);
+
+    let waiter = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    // Measure for a period, and not one time. A job that starts late would pass
+    // a test that looks one time only.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        assert_eq!(
+            h.state_of(&waiter),
+            "queued",
+            "a paused queue must start no job"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert_eq!(
+        h.state_of(&running),
+        "running",
+        "a pause must not stop the job that already operates"
+    );
+
+    h.ok(&["resume", "queue"]);
+    h.until("the job starts again", Duration::from_secs(45), || {
+        h.has_started(&waiter)
+    });
+
+    h.ok(&["kill", &running, "--grace", "1s"]);
+}
+
+/// The pause must survive a coordinator that stops.
+///
+/// # The fault that this test prevents
+///
+/// This is the test that protects the whole feature. A coordinator stops when
+/// no job operates, and when a new build replaces the program file. qex itself
+/// tells a user to run `kill <pid>` on it. A pause that lived in the memory of
+/// that process would go away in silence, the next command would start a new
+/// coordinator, and the queue would start work while the person believes that
+/// the machine is quiet.
+#[test]
+fn the_pause_survives_a_coordinator_that_stops() {
+    let h = Harness::with_default_config("pausesurvives");
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    // Take the pid from the coordinator itself. A search of the process list
+    // also matches the command that holds those letters.
+    let first = h.ok(&["info", "--no-start", "--json"]);
+    let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let first = first["pid"].as_i64().unwrap() as i32;
+
+    unsafe {
+        libc::kill(first, libc::SIGKILL);
+    }
+    h.until("the coordinator stopped", Duration::from_secs(30), || {
+        let alive = unsafe { libc::kill(first, 0) } == 0;
+        !alive
+    });
+
+    // This command starts a new coordinator.
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    let second = h.ok(&["info", "--no-start", "--json"]);
+    let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(second["queue_state"], "paused", "the pause did not survive");
+    assert_eq!(second["paused_reason"], "recording a demo");
+    assert_ne!(
+        second["pid"].as_i64().unwrap() as i32,
+        first,
+        "the test must measure a NEW coordinator"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        assert_eq!(
+            h.state_of(&id),
+            "queued",
+            "the new coordinator must start no job"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    h.ok(&["resume"]);
+    h.until("the job starts again", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+}
+
+/// A person can ask for a lock that a job holds.
+///
+/// # The fault that this test prevents
+///
+/// A command that refused while a job held the lock would be a command that a
+/// person cannot use: the person would try it again and again, and one of the
+/// waiting jobs would take the lock between two tries. The request must be safe
+/// to type at any moment, so qex records it, the job that holds the lock keeps
+/// it, and no other job takes it in the time between.
+#[test]
+fn a_person_gets_a_lock_when_the_job_that_holds_it_stops() {
+    let h = Harness::with_default_config("pauselock");
+
+    let holder = h.submit(&[
+        "submit", "--lock", "gpu0", "--cpu", "1", "--mem", "64MB", "--", "sleep", "6",
+    ]);
+    h.until("the job holds the lock", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    let out = h.ok(&["pause", "lock", "gpu0"]);
+    assert!(
+        out.contains("holds the lock"),
+        "the answer must name the job that holds the lock now: {out}"
+    );
+
+    // This job needs the same lock. It must never take it.
+    let waiter = h.submit(&[
+        "submit", "--lock", "gpu0", "--cpu", "1", "--mem", "64MB", "--", "true",
+    ]);
+
+    h.until("the first job stopped", Duration::from_secs(60), || {
+        h.state_of(&holder) == "completed"
+    });
+
+    // The lock is now the person's, and the job still waits.
+    h.until(
+        "the lock belongs to the person",
+        Duration::from_secs(30),
+        || h.ok(&["pause"]).contains("it is yours now"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert_eq!(
+            h.state_of(&waiter),
+            "queued",
+            "no job may take a lock that a person holds"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    let reason = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("which a person holds"),
+        "the reason must name the person: {reason}"
+    );
+
+    h.ok(&["resume", "lock", "gpu0"]);
+    h.until("the job takes the lock", Duration::from_secs(45), || {
+        h.has_started(&waiter)
+    });
+}
+
+/// A job that waits for a pause must say the pause, and not the capacity.
+///
+/// # The fault that this test prevents
+///
+/// A paused job that said "waits for capacity" sends the reader to look at the
+/// budget, at the memory and at the other users of the machine. None of those
+/// is the cause, and no change to any of them starts the job.
+#[test]
+fn a_job_that_waits_for_a_pause_says_the_pause() {
+    let h = Harness::with_default_config("pausereason");
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    let out = h.qex(&["submit", "--", "true"]);
+    assert!(out.status.success());
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let warning = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        warning.contains("the queue is paused"),
+        "the submission must warn immediately: {warning}"
+    );
+
+    h.until("the job has a reason", Duration::from_secs(30), || {
+        !h.status_json(&id)["blocked_reason"].is_null()
+    });
+    let reason = h.status_json(&id)["blocked_reason"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        reason.contains("the queue is paused"),
+        "the reason must give the pause: {reason}"
+    );
+    assert!(
+        reason.contains("recording a demo"),
+        "the reason must give the text of --reason: {reason}"
+    );
+    assert!(
+        !reason.contains("waits for"),
+        "the pause replaces the capacity reason, and does not stand beside it: {reason}"
+    );
+
+    h.ok(&["resume"]);
+}
+
+/// A pause with `--for` must end by itself.
+///
+/// # The fault that this test prevents
+///
+/// A pause that needed a second command would become a queue that a person
+/// forgets, and an empty queue in the morning.
+#[test]
+fn a_pause_with_a_time_ends_by_itself() {
+    let h = Harness::with_default_config("pausefor");
+
+    h.ok(&["pause", "queue", "--for", "10s"]);
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    assert_eq!(
+        h.state_of(&id),
+        "queued",
+        "the job must wait while the pause lasts"
+    );
+
+    h.until(
+        "the job starts when the pause ends",
+        Duration::from_secs(60),
+        || h.has_started(&id),
+    );
+    assert!(
+        h.ok(&["pause"]).contains("queue: running"),
+        "the pause must go away by itself"
+    );
+}
+
+/// A job whose dependency failed must become `skipped` while the queue is
+/// paused.
+///
+/// # The fault that this test prevents
+///
+/// The dependency pass and the capacity pass are separate. If the pause test
+/// stopped the dependency pass as well, a job whose dependency already failed
+/// would stay in the queue for the whole length of the pause, and `qex wait` on
+/// it would block for ever. Skipping starts no process, so a pause has no
+/// reason to stop it.
+#[test]
+fn a_failed_dependency_is_still_skipped_while_the_queue_is_paused() {
+    let h = Harness::with_default_config("pausedeps");
+
+    let failer = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "false"]);
+    let out = h.qex(&["wait", &failer]);
+    assert_eq!(out.status.code(), Some(1));
+
+    h.ok(&["pause", "queue"]);
+
+    let skipped = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", &failer, "--", "true",
+    ]);
+
+    h.until("the job is skipped", Duration::from_secs(45), || {
+        h.state_of(&skipped) == "skipped"
+    });
+
+    let out = h.qex(&["wait", &skipped, "--timeout", "10s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(126),
+        "`qex wait` must give an answer while the queue is paused"
+    );
+
+    h.ok(&["resume"]);
+}
+
+/// A retry must not start a new attempt while the queue is paused.
+///
+/// # The fault that this test prevents
+///
+/// A retry starts the next attempt inside the supervisor process. That process
+/// never gives the job back to the scheduler, so the pause test of the
+/// scheduler does not see it. Two fresh processes started 4 and 10 seconds
+/// AFTER `qex pause queue` answered "paused". A pause that starts work is the
+/// one thing that this feature must never do.
+#[test]
+fn a_retry_starts_no_new_attempt_while_the_queue_is_paused() {
+    let h = Harness::with_default_config("pauseretry");
+
+    // Each attempt fails after a short time, so the job wants a retry while the
+    // test operates.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--retries",
+        "3",
+        "--",
+        "sh",
+        "-c",
+        "echo attempt; sleep 2; exit 1",
+    ]);
+    h.until(
+        "the first attempt operates",
+        Duration::from_secs(45),
+        || h.state_of(&id) == "running",
+    );
+
+    h.ok(&["pause", "queue"]);
+
+    // Count the attempts that the job wrote. The first attempt can still be
+    // between the pause and its own end, so read the count after that.
+    std::thread::sleep(Duration::from_secs(5));
+    let log = h.job_dir(&id).join("stdout.log");
+    let count = |path: &Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .matches("attempt")
+            .count()
+    };
+    let after_the_pause = count(&log);
+
+    // Measure over a period. One look would pass while an attempt waits for
+    // the one second that the retry gives the machine.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        assert_eq!(
+            count(&log),
+            after_the_pause,
+            "a paused queue must start no attempt of a job with --retries"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    h.ok(&["resume"]);
+    h.until("the next attempt starts", Duration::from_secs(45), || {
+        count(&log) > after_the_pause
+    });
+
+    h.ok(&["kill", &id, "--grace", "1s"]);
+}
+
+/// A retry must not take a lock that a person holds.
+///
+/// # The fault that this test prevents
+///
+/// The attempts of one job share one id and one record, so a retry that took
+/// the lock again gave a truthful message and an untruthful machine: the person
+/// held `gpu0` and a job used it.
+#[test]
+fn a_retry_does_not_take_a_lock_that_a_person_holds() {
+    let h = Harness::with_default_config("pauseretrylock");
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--lock",
+        "gpu0",
+        "--retries",
+        "3",
+        "--",
+        "sh",
+        "-c",
+        "echo attempt; sleep 2; exit 1",
+    ]);
+    h.until(
+        "the first attempt operates",
+        Duration::from_secs(45),
+        || h.state_of(&id) == "running",
+    );
+
+    h.ok(&["pause", "lock", "gpu0"]);
+
+    std::thread::sleep(Duration::from_secs(5));
+    let log = h.job_dir(&id).join("stdout.log");
+    let count = |path: &Path| {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .matches("attempt")
+            .count()
+    };
+    let after_the_pause = count(&log);
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        assert_eq!(
+            count(&log),
+            after_the_pause,
+            "a person holds the lock, so no attempt of that job may start"
+        );
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    h.ok(&["resume", "lock", "gpu0"]);
+    h.until("the next attempt starts", Duration::from_secs(45), || {
+        count(&log) > after_the_pause
+    });
+
+    h.ok(&["kill", &id, "--grace", "1s"]);
+}
+
+/// A pause record that qex cannot read must HOLD the queue, and say why.
+///
+/// # The fault that this test prevents
+///
+/// A parse fault that gave "nothing is paused" would start the work while the
+/// person believes that the machine is quiet, with no line in any log and no
+/// word in any command. The two directions are not equal in cost: a queue that
+/// qex holds by mistake costs latency and one command corrects it, and a queue
+/// that operates by mistake cannot be corrected after the work started.
+#[test]
+fn a_pause_record_that_qex_cannot_read_holds_the_queue() {
+    let h = Harness::with_default_config("pausebroken");
+
+    // Make the runtime directory, then write a record that no version of qex
+    // can read.
+    h.ok(&["pause", "queue"]);
+    let file = h.root.join("state/qex/run/paused.json");
+    assert!(file.exists(), "the pause must be a file");
+    h.ok(&["resume"]);
+
+    // Stop the coordinator, so the next command reads the file from the start.
+    let text = h.ok(&["info", "--no-start", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let pid = v["pid"].as_i64().unwrap() as i32;
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator stopped", Duration::from_secs(30), || {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        !alive
+    });
+
+    std::fs::write(&file, "{\"queue\": {\"paused_at\": ").unwrap();
+
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        assert_eq!(
+            h.state_of(&id),
+            "queued",
+            "a record that qex cannot read must hold the queue"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // The report must say what happened and what to do.
+    let info = h.ok(&["info", "--no-start", "--json"]);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(info["queue_state"], "paused-by-fault");
+
+    let words = h.ok(&["pause"]);
+    assert!(
+        words.contains("could not read"),
+        "the report must say what happened: {words}"
+    );
+    assert!(
+        words.contains("qex resume queue"),
+        "the report must give the remedy: {words}"
+    );
+
+    let reason = h.status_json(&id)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("could not read"),
+        "the job must give the true reason: {reason}"
+    );
+
+    // The remedy must operate.
+    h.ok(&["resume"]);
+    h.until("the job starts again", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+}
+
+/// `--for 0` must be an error.
+///
+/// `parse_duration` reads `0` as "no limit", which is correct for `--timeout`
+/// and is the opposite of what `--for` asks for. A person who writes `--for 0`
+/// wants a short pause, and must not get a pause with no end.
+#[test]
+fn a_pause_for_zero_is_refused() {
+    let h = Harness::with_default_config("pausezero");
+    let out = h.qex(&["pause", "queue", "--for", "0"]);
+    assert!(!out.status.success(), "`--for 0` must not give a pause");
+    let words = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        words.contains("qex resume queue"),
+        "the error must give the remedy: {words}"
+    );
+    assert!(h.ok(&["pause"]).contains("nothing is paused"));
+}
+
+/// A second `qex pause queue` must keep the end that the first one gave.
+#[test]
+fn a_second_pause_keeps_the_end_of_the_first() {
+    let h = Harness::with_default_config("pausetwice");
+
+    h.ok(&["pause", "queue", "--for", "30m", "--reason", "a video call"]);
+    h.ok(&["pause", "queue"]);
+
+    let words = h.ok(&["pause"]);
+    assert!(
+        !words.contains("NO END"),
+        "the second command must not remove the end: {words}"
+    );
+    assert!(
+        words.contains("a video call"),
+        "the second command must not remove the reason: {words}"
+    );
+
+    h.ok(&["resume"]);
+}
+
+/// A pause must NOT expire a job that carries `--max-queue-time`.
+///
+/// # The fault that this test prevents
+///
+/// `--max-queue-time` and the pause are two features that landed apart, and
+/// their meeting is the sharp edge of both. A person pauses the queue to take
+/// the machine for half an hour. Every job with a smaller limit then reaches
+/// that limit while NOBODY can start it: qex writes `expired`, it fires the
+/// stop hook of each one, and the person — who is away, which is the whole
+/// point of a pause — comes back to an empty queue and a set of dead records.
+///
+/// A pause protects the machine. It must not delete the queue. The clock of the
+/// limit therefore stops while the queue is paused, and it runs again at the
+/// resume.
+#[test]
+fn a_pause_does_not_expire_a_job_that_has_a_queue_limit() {
+    let h = Harness::with_default_config("pauseexpire");
+
+    h.ok(&["pause", "queue"]);
+
+    // A limit of 3 seconds, and a pause much longer than that.
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--max-queue-time",
+        "3s",
+        "--",
+        "true",
+    ]);
+
+    // Measure over a period. The scheduler tests the queue every 500ms, so a
+    // job that expires does so inside this window.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        let state = h.state_of(&id);
+        assert_eq!(
+            state, "queued",
+            "a paused queue must not expire a job; the job became `{state}`"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // The record must say that the pause gave the time back. Without this the
+    // test above would also pass on a build that merely DELAYED the expiry to
+    // the resume, which kills the same job one moment later.
+    let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
+    assert_eq!(
+        credited, 0,
+        "the credit belongs to the END of the pause, not to each second of it"
+    );
+
+    h.ok(&["resume", "queue"]);
+
+    let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
+    assert!(
+        credited >= 5,
+        "the resume must give the paused time back; got {credited} seconds"
+    );
+
+    // The job runs. It never expired.
+    h.until(
+        "the job runs after the resume",
+        Duration::from_secs(45),
+        || h.state_of(&id) == "completed",
+    );
+    assert_eq!(
+        h.state_of(&id),
+        "completed",
+        "the job must run, and not expire"
+    );
+}
+
+/// The limit must still expire a job after the pause ends.
+///
+/// # The fault that this test prevents
+///
+/// The rule above stops the clock of `--max-queue-time` while the queue is
+/// paused. A build that stopped that clock and never started it again would
+/// turn one pause into a queue with no limits at all, and `--max-queue-time`
+/// would give an id and wait for ever — which is the fault that
+/// `--max-queue-time` exists to remove.
+#[test]
+fn the_limit_still_expires_a_job_after_the_pause_ends() {
+    let h = Harness::with_default_config("pauseexpire2");
+
+    // Block the job with a DEPENDENCY, and not with the capacity of the
+    // machine. A test that holds every core gives a different answer on a
+    // machine that is busy.
+    let holder = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    h.ok(&["pause", "queue"]);
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--needs",
+        &holder,
+        "--max-queue-time",
+        "4s",
+        "--",
+        "true",
+    ]);
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        h.state_of(&id),
+        "queued",
+        "the pause must hold the clock of the limit"
+    );
+
+    h.ok(&["resume", "queue"]);
+
+    // The clock runs again from the resume. The job still waits for a job that
+    // does not stop, so it reaches its limit and gives up.
+    h.until("the job reaches its limit", Duration::from_secs(45), || {
+        h.state_of(&id) == "expired"
+    });
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+}
+
+/// `qex wait` must say that the queue is paused.
+///
+/// # The fault that this test prevents
+///
+/// Issue #28: `qex wait` gives no word where `qex run` explains itself. A pause
+/// makes that silence unbounded. An agent that runs `qex wait <id>` with no
+/// `--timeout`, behind a pause with no end, waits for ever and reads nothing —
+/// no line, no reason, no remedy. The wait must name the pause and the command
+/// that ends it.
+#[test]
+fn a_wait_behind_a_pause_says_the_pause() {
+    let h = Harness::with_default_config("pausewait");
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    let out = h.qex(&["wait", &id, "--timeout", "3s"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        err.contains("THE QUEUE IS PAUSED"),
+        "the wait must say that the queue is paused: {err}"
+    );
+    assert!(
+        err.contains("recording a demo"),
+        "the wait must give the reason of the pause: {err}"
+    );
+    assert!(
+        err.contains("qex resume queue"),
+        "the wait must give the command that ends the pause: {err}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "the wait still reaches its own limit and gives 124"
+    );
+
+    // The result of a wait stays alone on stdout. An agent reads that stream.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !stdout.contains("PAUSED"),
+        "the pause belongs on stderr: {stdout}"
+    );
+
+    h.ok(&["resume"]);
+}
+
+/// A pause reason and a lock name are user text. No control byte of either may
+/// reach a terminal.
+///
+/// # The fault that this test prevents
+///
+/// `--reason` is a SENTENCE that `qex info`, `qex top`, `qex list` and `qex
+/// pause` each print, and a lock name is a NAME that goes into the
+/// `blocked_reason` of every job that waits for it. An ESC byte in either one
+/// clears the screen of the next reader or moves the cursor over the lines
+/// above, and the reader then trusts a display that the text wrote.
+#[test]
+fn a_pause_shows_no_control_byte_of_a_reason_or_a_lock_name() {
+    let h = Harness::with_default_config("pausebytes");
+
+    h.ok(&["pause", "queue", "--reason", "esc\x1b[2Jbad"]);
+    h.ok(&["pause", "lock", "esc\x1b[2Jlock"]);
+
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--lock",
+        "esc\x1b[2Jlock",
+        "--",
+        "true",
+    ]);
+    h.until(
+        "the job takes the reason of the pause",
+        Duration::from_secs(45),
+        || !h.status_json(&id)["blocked_reason"].is_null(),
+    );
+
+    for args in [
+        vec!["pause"],
+        vec!["info"],
+        vec!["list"],
+        vec!["status", id.as_str()],
+    ] {
+        let out = h.qex(&args);
+        let mut stream = out.stdout.clone();
+        stream.extend_from_slice(&out.stderr);
+        assert!(
+            !stream.windows(4).any(|w| w == b"\x1b[2J"),
+            "`qex {}` wrote the ESC byte of a pause",
+            args.join(" ")
+        );
+    }
+
+    // The sentences must still NAME the reason and the lock, in their safe
+    // form. A test that only looks for the absence of a byte passes when the
+    // text is gone.
+    let shown = h.ok(&["pause"]);
+    assert!(
+        shown.contains("esc [2Jbad"),
+        "`qex pause` must keep the reason, without the control byte: {shown}"
+    );
+    assert!(
+        shown.contains("esc_2Jlock"),
+        "`qex pause` must keep the lock name, in its safe form: {shown}"
+    );
+
+    h.ok(&["resume", "lock", "esc\x1b[2Jlock"]);
+    h.ok(&["resume"]);
+}
+
+/// An oversized job in a paused queue must say the PAUSE, and not the budget.
+///
+/// # The fault that this test prevents
+///
+/// A job that is larger than the budget carries its own reason, and the pause
+/// carries another. A record that kept the budget reason sends the reader to
+/// change the budget, and no budget starts a job while the queue is paused. The
+/// reader then makes a change that cannot help, and reads the same line again.
+///
+/// The pause REPLACES the capacity reason; it never stands beside one.
+#[test]
+fn an_oversized_job_in_a_paused_queue_says_the_pause() {
+    let h = Harness::new(
+        "pauseoversized",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [queue]\noversized = \"run-when-idle\"\nsettle = \"1s\"\n",
+    );
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    // Larger than the budget, so the submission also has the oversized reason.
+    let id = h.submit(&["submit", "--cpu", "4", "--mem", "128MB", "--", "true"]);
+
+    let reason = h.status_json(&id)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        reason.contains("the queue is paused"),
+        "the record must give the pause as the reason: {reason}"
+    );
+    assert!(
+        !reason.contains("the budget is"),
+        "the record must not send the reader to the budget: {reason}"
+    );
+
+    // The warning of the submission still gives BOTH, because the person who
+    // typed the command must learn about the claim as well.
+    let out = h.qex(&["submit", "--cpu", "4", "--mem", "128MB", "--", "true"]);
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("the queue is paused"),
+        "the submission must name the pause: {err}"
+    );
+    assert!(
+        err.contains("the budget is"),
+        "the submission must still name the claim: {err}"
+    );
+
+    h.ok(&["resume"]);
+}
+
+/// Every command that reports a pause must name the SAME pid, and it must be
+/// the pid of the process that paused.
+///
+/// # The fault that this test prevents
+///
+/// `Response::Info` carried the moment, the reason and the end of a pause, and
+/// no pauser pid. The two readers of that answer therefore invented one: `qex
+/// top` gave 0, and `qex info` gave the pid of the COORDINATOR. One paused
+/// queue thus gave three answers to "who paused this".
+///
+/// The `qex info` invention is the dangerous one. Each pause message tells the
+/// reader that a pid can be killed, so a second person reads `qex info`,
+/// believes that the coordinator is the pauser, and runs `kill <pid>` on the
+/// one process that must keep operating.
+///
+/// A unit test on `pause::queue_line` cannot see this: it builds the record
+/// itself, so it measures the formatter and never the caller. This test goes
+/// through the commands.
+#[test]
+fn every_command_names_the_same_pauser_and_not_the_coordinator() {
+    let h = Harness::with_default_config("pausewho");
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    // The pid of the coordinator. No report of the pause may give this number.
+    let coordinator = h.ok(&["info", "--no-start", "--json"]);
+    let coordinator: serde_json::Value = serde_json::from_str(&coordinator).unwrap();
+    let coordinator_pid = coordinator["pid"].as_i64().expect("the coordinator pid");
+
+    let pauser = coordinator["paused_by_pid"]
+        .as_i64()
+        .expect("`qex info --json` must give the pid that asked for the pause");
+    assert_ne!(
+        pauser, coordinator_pid,
+        "the pauser is the CLI process, and never the coordinator"
+    );
+    assert!(pauser > 0, "a pid of 0 is not a process: {pauser}");
+
+    // Every text report must name that same pid, and none of them may name the
+    // coordinator. `qex list` and `qex wait` write the pause to STDERR, so this
+    // loop reads both streams.
+    for args in [
+        vec!["pause"],
+        vec!["info"],
+        vec!["top", "--once"],
+        vec!["list"],
+    ] {
+        let out = h.qex(&args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            text.contains(&format!("pid {pauser}")),
+            "`qex {}` must name the process that paused: {text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.contains(&format!("by pid {coordinator_pid}")),
+            "`qex {}` must not name the coordinator as the pauser: {text}",
+            args.join(" ")
+        );
+        assert!(
+            !text.contains("by an unknown process"),
+            "this coordinator reports the pid, so no report may say unknown: {text}",
+        );
+    }
+
+    h.ok(&["resume"]);
+}
+
+/// A pause that reaches its `--for` while NO coordinator operates must still
+/// give the time back.
+///
+/// # The fault that this test prevents
+///
+/// A pause of the queue ends in three places, and only two of them were
+/// covered. The third is a coordinator that is not there: qex itself tells a
+/// user to run `kill <pid>` on it, a new build replaces it, and a reboot or an
+/// out-of-memory kill removes it. `recover` read the pause and expired it, and
+/// it gave no credit — and it could not, because the job records are read after
+/// that point, so there was nobody to credit yet.
+///
+/// The whole queue-deleting behaviour came back through this door: the job
+/// below reached its `--max-queue-time` on time that the pause took, and its
+/// message blamed the person for the wait.
+#[test]
+fn a_pause_that_ends_while_the_coordinator_is_down_still_gives_the_time_back() {
+    let h = Harness::with_default_config("pausedown");
+
+    // A job that holds the machine, so the job below waits for the queue and
+    // not for a moment of capacity.
+    let holder = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+
+    h.ok(&["pause", "queue", "--for", "8s"]);
+    let id = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--needs",
+        &holder,
+        "--max-queue-time",
+        "4s",
+        "--",
+        "true",
+    ]);
+
+    // Take the pid from the coordinator itself, and never from a process list.
+    let info = h.ok(&["info", "--no-start", "--json"]);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let pid = info["pid"].as_i64().expect("the coordinator pid") as i32;
+
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+
+    // Let the pause reach its end with no coordinator to see it.
+    std::thread::sleep(Duration::from_secs(12));
+
+    // The next command starts a new coordinator, which runs `recover`.
+    let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
+    assert!(
+        credited >= 6,
+        "a pause that ended while no coordinator operated must still give the \
+         time back; got {credited} seconds"
+    );
+
+    // The credit must not exceed the pause. The time between the end of the
+    // pause and the restart was time that the queue was free to run.
+    assert!(
+        credited <= 10,
+        "the credit must be the length of the PAUSE, and not the time until \
+         the restart; got {credited} seconds"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+}
+
+/// A job that ALREADY waited when the pause began must learn the pause too.
+///
+/// # The fault that this test prevents
+///
+/// Two different pieces of code put the pause into the reason of a job.
+/// `handle_submit` covers a job that arrives DURING a pause. `sched::choose`
+/// covers a job that was already in the queue when the pause began, and only
+/// that one — the job keeps whatever it waited for before, "waits for cores: 1
+/// of 1 is in use", for the whole length of the pause.
+///
+/// That is the worse of the two. The reader takes the sentence at its word,
+/// looks at a budget that is not the cause, and can wait for hours before
+/// anything says the true reason. Deleting the loop in `choose` left the whole
+/// suite green.
+#[test]
+fn a_job_that_already_waited_learns_the_pause() {
+    let h = Harness::new(
+        "pausealready",
+        "[budget]
+cpu = \"1\"
+mem = \"1GB\"
+\
+         [peers]
+enabled = false
+\
+         [system]
+reserve_mem = \"0\"
+max_pressure = 100
+",
+    );
+
+    // A job that holds the machine, and a job behind it. The second job waits
+    // for the first, and its reason says so.
+    let holder = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
+    let waiter = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.until(
+        "the second job has a reason",
+        Duration::from_secs(45),
+        || !h.status_json(&waiter)["blocked_reason"].is_null(),
+    );
+
+    // The reason before the pause. Without this the test cannot tell a reason
+    // that CHANGED from a reason that was always the pause.
+    let before = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !before.contains("paused"),
+        "the job must wait for something other than a pause first: {before}"
+    );
+
+    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+
+    h.until("the job learns the pause", Duration::from_secs(30), || {
+        h.status_json(&waiter)["blocked_reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("the queue is paused")
+    });
+
+    let after = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        after.contains("qex resume queue"),
+        "the reason must give the remedy: {after}"
+    );
+
+    h.ok(&["resume"]);
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+}

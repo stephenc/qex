@@ -808,6 +808,7 @@ mod tests {
             config_settling: None,
             config_error: None,
             events: EventLog::with_capacity(RETAINED),
+            paused: crate::pause::Paused::default(),
             stop: false,
         }
     }

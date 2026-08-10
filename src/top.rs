@@ -110,6 +110,12 @@ fn render(
         mem_claimed,
         jobs_running,
         jobs_queued,
+        queue_state,
+        paused_at,
+        paused_by_pid,
+        paused_reason,
+        paused_until,
+        paused_locks,
         ..
     }) = info
     {
@@ -135,6 +141,42 @@ fn render(
             out.push_str(
                 "      the qex program changed; this coordinator stops when no job operates\n",
             );
+        }
+
+        // Say the pause on the page. A person who watches a queue that starts
+        // nothing must read the cause here, and not look for it.
+        let now = sys::now_secs();
+        let fault = queue_state.as_deref() == Some("paused-by-fault");
+        if let (true, Some(at)) = (
+            matches!(
+                queue_state.as_deref(),
+                Some("paused") | Some("paused-by-fault")
+            ),
+            paused_at,
+        ) {
+            let record = crate::pause::PauseRecord {
+                paused_at: *at,
+                // The pid of the PAUSER. This page gave 0 for every pause,
+                // which `pause::who` prints as "an unknown process" — the
+                // honest answer for a coordinator that does not report it, and
+                // the wrong answer for one that does.
+                by_pid: paused_by_pid.unwrap_or(0),
+                reason: paused_reason.clone(),
+                until: *paused_until,
+                fault,
+            };
+            out.push_str(&crate::style::warning(&format!(
+                "      QUEUE PAUSED: qex starts no job. {}",
+                crate::pause::queue_line(&record, now)
+            )));
+            out.push('\n');
+        }
+        for lock in paused_locks.iter().flatten() {
+            out.push_str(&crate::style::warning(&format!(
+                "      {}",
+                crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
+            )));
+            out.push('\n');
         }
     }
 
@@ -421,6 +463,7 @@ mod tests {
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
+            queue_pause_secs: 0,
             blocked_reason: None,
             error: None,
             needs: vec![],
@@ -448,7 +491,73 @@ mod tests {
             mem_budget: 20 << 30,
             cpu_claimed: 2,
             mem_claimed: 4 << 30,
+            queue_state: Some("running".into()),
+            paused_at: None,
+            paused_by_pid: None,
+            paused_reason: None,
+            paused_until: None,
+            paused_locks: Some(vec![]),
         }
+    }
+
+    /// A paused queue must say so on the page.
+    ///
+    /// A person who watches a queue that starts nothing must read the cause
+    /// here. A queue that does nothing and does not say why is the fault that
+    /// this tool exists to remove.
+    #[test]
+    fn a_paused_queue_says_so_on_the_page() {
+        let Response::Info {
+            pid,
+            version,
+            started_at,
+            program_replaced,
+            jobs_running,
+            jobs_queued,
+            cpu_budget,
+            mem_budget,
+            cpu_claimed,
+            mem_claimed,
+            ..
+        } = info()
+        else {
+            panic!("expected an info response")
+        };
+        let paused = Response::Info {
+            pid,
+            version,
+            started_at,
+            program_replaced,
+            jobs_running,
+            jobs_queued,
+            cpu_budget,
+            mem_budget,
+            cpu_claimed,
+            mem_claimed,
+            config_error: None,
+            queue_state: Some("paused".into()),
+            paused_at: Some(crate::sys::now_secs() - 360),
+            paused_by_pid: Some(3704694),
+            paused_reason: Some("recording a demo".into()),
+            paused_until: None,
+            paused_locks: Some(vec![]),
+        };
+
+        let mut previous = HashMap::new();
+        let page = render(&[], Some(&paused), &mut previous);
+        assert!(page.contains("QUEUE PAUSED"), "got: {page}");
+        assert!(
+            page.contains("recording a demo"),
+            "the page must give the reason: {page}"
+        );
+        assert!(
+            page.contains("6m"),
+            "the page must say how long the pause has lasted: {page}"
+        );
+        assert!(
+            page.contains("NO END"),
+            "a pause with no end must be loud: {page}"
+        );
     }
 
     #[test]

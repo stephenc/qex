@@ -377,6 +377,24 @@ pub struct JobStatus {
     /// The reason for a forced start, in text for a person to read.
     #[serde(default)]
     pub forced_reason: Option<String>,
+    /// The seconds of the wait of this job that the QUEUE WAS PAUSED.
+    ///
+    /// `--max-queue-time` says "the work has no value after this much time in
+    /// the queue". That limit measures the contention of the queue. A person
+    /// who pauses the queue is not contention: the person holds the machine on
+    /// purpose, and a job that died while nobody could start it would give the
+    /// person an empty queue and a set of `expired` records on the return.
+    ///
+    /// The scheduler subtracts this value from the wait before it compares the
+    /// wait with the limit, so the clock of the limit stops while the queue is
+    /// paused and it runs again at the resume.
+    ///
+    /// The scheduler adds to this value one time for each pause, at the end of
+    /// that pause. It does NOT count up while the queue is paused: a number
+    /// that changed would write the record of every job in the queue twice a
+    /// second. See `pause::credit_paused_wait`.
+    #[serde(default)]
+    pub queue_pause_secs: u64,
     /// The reason that the job stays in the queue.
     ///
     /// This text tells the reader what the job waits for. The reader does not
@@ -469,6 +487,7 @@ impl JobStatus {
             usage: Usage::default(),
             forced: false,
             forced_reason: None,
+            queue_pause_secs: 0,
             blocked_reason: None,
             error: None,
             needs: spec.needs.clone(),

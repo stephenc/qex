@@ -501,6 +501,13 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
     // From here the records are for a READER. See `for_display`.
     let jobs = all_for_display(jobs);
 
+    // Say the pause before the jobs, and say it every time.
+    //
+    // A queue that does nothing and does not say why is the fault that this
+    // tool exists to remove. The text goes to stderr, so `qex list --json`
+    // still writes JSON alone on stdout.
+    warn_if_paused(&mut client);
+
     if args.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(0);
@@ -995,6 +1002,21 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
             return Ok(EXIT_NO_SUCH_JOB);
         }
     };
+
+    // Say the pause BEFORE the wait begins.
+    //
+    // Issue #28: `qex wait` gives no word where `qex run` explains itself. A
+    // pause makes that silence unbounded — a wait with no `--timeout`, behind a
+    // pause with no end, never returns and never says why. One line on stderr
+    // is the whole remedy, and stdout keeps the result alone.
+    //
+    // `--json` keeps its silence, in the same way as the answers below: a
+    // reader that asked for JSON reads the exit code.
+    if !args.json {
+        if let Ok(mut client) = Client::connect() {
+            warn_if_paused(&mut client);
+        }
+    }
 
     // With `--any`, give control back when the FIRST job stops. An agent that
     // started several jobs can then read a result as soon as it arrives, in
@@ -2232,6 +2254,13 @@ fn for_display(mut s: JobStatus) -> JobStatus {
     // job by its key, so the safe form loses nothing. Without this line, a key
     // that holds an ESC byte moves the cursor of the reader.
     s.dedupe_key = s.dedupe_key.as_deref().map(safe_name);
+    // A lock name is a word from the command line, and `qex status` prints the
+    // list of locks on its own line. `qex pause lock <name>` puts that same
+    // word in front of a person as well. Measured with a lock named
+    // `esc<ESC>[2Jlock`: `qex status` wrote the ESC byte to the terminal. A
+    // lock name is a NAME, so it takes `safe_name`, in the same way as the
+    // name of the job.
+    s.locks = s.locks.iter().map(|l| safe_name(l)).collect();
     // The two SENTENCES take the rule for a sentence, and not `safe_name`.
     //
     // qex wrote these two, but it wrote them AROUND text that the caller chose.
@@ -2569,8 +2598,16 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
         {
             return Err(anyhow::anyhow!("{message}"));
         }
-        crate::capabilities::check_command(&have, &version, pid, "events", "qex events")
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        crate::capabilities::check_command(
+            &have,
+            &version,
+            pid,
+            "events",
+            "qex events",
+            "That coordinator does not know this request, so the command would give you \
+             nothing and no reason.",
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
     // Warn about a number with no stream name.
@@ -2846,12 +2883,25 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             config_error,
             cpu_claimed,
             mem_claimed,
+            queue_state,
+            paused_at,
+            paused_by_pid,
+            paused_reason,
+            paused_until,
+            paused_locks,
         } => {
+            let now = crate::sys::now_secs();
             if args.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "pid": pid,
+                        "queue_state": queue_state,
+                        "paused_at": paused_at,
+                        "paused_by_pid": paused_by_pid,
+                        "paused_reason": paused_reason,
+                        "paused_until": paused_until,
+                        "paused_locks": paused_locks,
                         "version": version,
                         "started_at": started_at,
                         "program_replaced": program_replaced,
@@ -2910,9 +2960,350 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 format_size(mem_claimed),
                 format_size(mem_budget)
             );
+
+            // Say what the queue does. A queue that does nothing and does not
+            // say why is the fault that this tool exists to remove.
+            //
+            // An earlier coordinator gives no value here. Write `unknown`, and
+            // do not write `running`: a guess in this place is a lie, and this
+            // is the one place where the honest answer matters most.
+            let line = match (queue_state.as_deref(), paused_at) {
+                (Some(state @ ("paused" | "paused-by-fault")), Some(at)) => {
+                    let record = crate::pause::PauseRecord {
+                        paused_at: at,
+                        // The pid of the PAUSER, and never the pid of the
+                        // coordinator. `0` says "this coordinator does not
+                        // report it", and `pause::who` prints that as words.
+                        by_pid: paused_by_pid.unwrap_or(0),
+                        reason: paused_reason,
+                        until: paused_until,
+                        fault: state == "paused-by-fault",
+                    };
+                    format!(
+                        "{} · other users are not paused",
+                        crate::pause::queue_line(&record, now)
+                    )
+                }
+                (Some(state), _) => state.to_string(),
+                (None, _) => "unknown; this coordinator does not report it".to_string(),
+            };
+            println!("queue:           {line}");
+            for lock in paused_locks.unwrap_or_default() {
+                println!(
+                    "                 {}",
+                    crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
+                );
+            }
             Ok(0)
         }
         other => report(other),
+    }
+}
+
+/// Writes a loud line when a person paused the queue or a lock.
+///
+/// Every command that lists jobs calls this function. A pause with no end is
+/// the pause that a person forgets, and an empty queue in the morning is the
+/// result, so qex says it every time and not one time.
+fn warn_if_paused(client: &mut Client) {
+    let Ok(Response::PauseState { queue, locks }) = client.call(&Request::PauseState) else {
+        // An earlier coordinator cannot answer this request, and it cannot
+        // pause either, so there is nothing to report.
+        return;
+    };
+    let now = crate::sys::now_secs();
+    if let Some(record) = &queue {
+        eprintln!(
+            "qex: THE QUEUE IS PAUSED, so qex starts no job. {}",
+            crate::pause::queue_line(record, now)
+        );
+    }
+    for lock in &locks {
+        eprintln!(
+            "qex: {}",
+            crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
+        );
+    }
+}
+
+/// Changes `--for 30m` into the moment when the pause ends.
+///
+/// `--for 0` is an error. `parse_duration` gives "no limit" for zero, which is
+/// correct for `--timeout` and is the opposite of what this option asks for: a
+/// person who writes `--for 0` wants a short pause, and would get a pause with
+/// no end.
+fn end_of_pause(duration: Option<&str>) -> Result<Option<u64>> {
+    let Some(text) = duration else {
+        return Ok(None);
+    };
+    match crate::units::parse_duration(text).map_err(|e| anyhow::anyhow!("--for: {e}"))? {
+        Some(d) => Ok(Some(crate::sys::now_secs() + d.as_secs())),
+        None => bail!(
+            "--for: give a time that is longer than zero, such as `30m`.\n\
+             To end a pause now, run `qex resume queue`."
+        ),
+    }
+}
+
+/// Refuses a command that the coordinator cannot obey.
+///
+/// A development build passes the floor test and takes a warning instead, which
+/// `warn_if_version_differs` already wrote. `check_command` below still refuses
+/// a coordinator that does not know this request, by name.
+fn require_command(client: &mut Client, name: &str, command: &str, danger: &str) -> Result<()> {
+    let (have, version, pid) = coordinator_capabilities(client);
+    if let crate::capabilities::Floor::Below(message) =
+        crate::capabilities::check_floor(&version, pid)
+    {
+        return Err(anyhow::anyhow!("{message}"));
+    }
+    crate::capabilities::check_command(&have, &version, pid, name, command, danger)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Why a refused `qex pause` matters.
+const PAUSE_DANGER: &str = "The coordinator would start the jobs of the queue, and you would \
+     believe that the machine is quiet.";
+
+/// Why a refused `qex resume` matters.
+///
+/// The danger of a refused resume is the opposite of the danger of a refused
+/// pause. A message that gave the pause words here would state a reason that is
+/// not true, and a reader who acts on it acts on a fault that does not exist.
+const RESUME_DANGER: &str = "That coordinator does not read the pause record, so it already \
+     starts the jobs of the queue. This command would change nothing.";
+
+/// Writes what is paused now, as text or as JSON.
+fn print_pause_state(
+    queue: Option<&crate::pause::PauseRecord>,
+    locks: &[crate::proto::LockPause],
+    json: bool,
+) -> Result<i32> {
+    let now = crate::sys::now_secs();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "paused": queue.is_some(),
+                "queue": queue,
+                "locks": locks,
+            }))?
+        );
+        return Ok(0);
+    }
+
+    match queue {
+        Some(record) => println!(
+            "queue: {} · other users are not paused",
+            crate::pause::queue_line(record, now)
+        ),
+        None => println!("queue: running"),
+    }
+    for lock in locks {
+        println!(
+            "{}",
+            crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
+        );
+    }
+    if queue.is_none() && locks.is_empty() {
+        println!("nothing is paused");
+    }
+    Ok(0)
+}
+
+/// Stops qex from starting work, or takes a lock for the person.
+pub fn pause(args: cli::PauseArgs) -> Result<i32> {
+    use crate::proto::PauseTarget;
+
+    let Some(target) = args.target else {
+        return pause_report(args.json);
+    };
+
+    match target {
+        cli::PauseTarget::Queue {
+            reason,
+            duration,
+            drain,
+            json,
+        } => {
+            let until = end_of_pause(duration.as_deref())?;
+            let mut client = Client::connect()?;
+            require_command(&mut client, "pause", "qex pause", PAUSE_DANGER)?;
+
+            let response = client.call(&Request::Pause {
+                target: PauseTarget::Queue,
+                reason,
+                until,
+                by_pid: std::process::id() as i32,
+            })?;
+            let Response::PauseState { queue, locks } = response else {
+                return report(response);
+            };
+
+            let code = print_pause_state(queue.as_ref(), &locks, json || args.json)?;
+            if drain {
+                return drain_queue(&mut client);
+            }
+            // Say what a pause does NOT do. A person who asked for a quiet
+            // machine must not believe that the jobs which operate stopped.
+            if !(json || args.json) {
+                let running = jobs_running(&mut client).unwrap_or(0);
+                if running > 0 {
+                    println!(
+                        "{running} job(s) still operate. They continue, because each one already \
+                         holds its capacity. Use `qex pause queue --drain` to wait for them, or \
+                         `qex kill <id>` to stop one."
+                    );
+                }
+            }
+            Ok(code)
+        }
+
+        cli::PauseTarget::Lock {
+            name,
+            reason,
+            duration,
+            json,
+        } => {
+            let until = end_of_pause(duration.as_deref())?;
+            let mut client = Client::connect()?;
+            require_command(&mut client, "pause", "qex pause", PAUSE_DANGER)?;
+
+            let response = client.call(&Request::Pause {
+                target: PauseTarget::Lock { name: name.clone() },
+                reason,
+                until,
+                by_pid: std::process::id() as i32,
+            })?;
+            let Response::PauseState { queue, locks } = response else {
+                return report(response);
+            };
+
+            if json || args.json {
+                return print_pause_state(queue.as_ref(), &locks, true);
+            }
+
+            // A lock name is text that the person typed, and these lines go
+            // to a terminal. Show the safe form of the name. See
+            // `job::safe_name`.
+            let shown = crate::job::safe_name(&name);
+            match locks.iter().find(|l| l.name == name) {
+                Some(lock) => match &lock.held_by {
+                    Some(job) => println!(
+                        "the job {job} holds the lock `{shown}` now. qex gives it to you when \
+                         that job stops, and no other job takes it. Use `qex list` to watch \
+                         that job."
+                    ),
+                    None => println!(
+                        "the lock `{shown}` is yours. Every job that needs it waits until you \
+                         run `qex resume lock {shown}`."
+                    ),
+                },
+                None => println!("the lock `{shown}` is yours"),
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Starts the queue again, or gives a lock back.
+pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
+    use crate::proto::PauseTarget;
+
+    // `qex resume` with no word starts the queue. That is the usual need, and
+    // it is the command that every pause message names.
+    let (target, json) = match args.target {
+        None => (PauseTarget::Queue, args.json),
+        Some(cli::ResumeTarget::Queue { json }) => (PauseTarget::Queue, json || args.json),
+        Some(cli::ResumeTarget::Lock { name, json }) => {
+            (PauseTarget::Lock { name }, json || args.json)
+        }
+    };
+    let words = match &target {
+        PauseTarget::Queue => "the queue operates again".to_string(),
+        PauseTarget::Lock { name } => format!(
+            "the lock `{}` is free. The next job that needs it takes it.",
+            crate::job::safe_name(name)
+        ),
+    };
+
+    let mut client = Client::connect()?;
+    require_command(&mut client, "pause", "qex resume", RESUME_DANGER)?;
+
+    let response = client.call(&Request::Resume { target })?;
+    let Response::PauseState { queue, locks } = response else {
+        return report(response);
+    };
+
+    if json {
+        return print_pause_state(queue.as_ref(), &locks, true);
+    }
+    println!("{words}");
+    Ok(0)
+}
+
+/// Writes what is paused now, with no change.
+///
+/// This command does not start a coordinator. A command that asks a question
+/// must not make the thing that it asks about. When no coordinator operates,
+/// the file on the disk holds the answer.
+fn pause_report(json: bool) -> Result<i32> {
+    if let Some(mut client) = Client::connect_existing() {
+        let response = client.call(&Request::PauseState)?;
+        if let Response::PauseState { queue, locks } = response {
+            return print_pause_state(queue.as_ref(), &locks, json);
+        }
+        // An earlier coordinator cannot answer. It also cannot pause, so the
+        // file is the whole truth.
+    }
+
+    // End a pause that reached the time of `--for`.
+    //
+    // The scheduler does this step, and no scheduler operates now. Without it
+    // this command reports a pause that the next command ends at once — a
+    // report that lies in the dangerous direction, because the reader believes
+    // that the machine stays quiet.
+    let mut paused = crate::pause::Paused::read();
+    paused.expire(crate::sys::now_secs());
+    let jobs = crate::job::read_all_from_disk();
+    let locks: Vec<crate::proto::LockPause> = paused
+        .locks
+        .iter()
+        .map(|(name, record)| crate::proto::LockPause {
+            name: name.clone(),
+            record: record.clone(),
+            held_by: jobs
+                .iter()
+                .find(|j| j.state.is_active() && j.locks.iter().any(|l| l == name))
+                .map(|j| format!("{} ({})", short_id(&j.id), j.name)),
+        })
+        .collect();
+    print_pause_state(paused.queue.as_ref(), &locks, json)
+}
+
+/// Gives the number of jobs that operate now.
+fn jobs_running(client: &mut Client) -> Option<usize> {
+    match client.call(&Request::Info) {
+        Ok(Response::Info { jobs_running, .. }) => Some(jobs_running),
+        _ => None,
+    }
+}
+
+/// Waits until no job of this queue operates.
+///
+/// A person who takes the machine back asks two things: start nothing new, and
+/// tell me when it is quiet. This is the second one.
+fn drain_queue(client: &mut Client) -> Result<i32> {
+    loop {
+        let Some(running) = jobs_running(client) else {
+            bail!("the coordinator did not give the number of jobs that operate");
+        };
+        if running == 0 {
+            println!("the machine is quiet: no job of this queue operates");
+            return Ok(0);
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
 }
 
@@ -4160,6 +4551,7 @@ mod tests {
             forced: false,
             forced_reason: None,
             sequence: 0,
+            queue_pause_secs: 0,
             blocked_reason: None,
             error: None,
             needs: vec![],

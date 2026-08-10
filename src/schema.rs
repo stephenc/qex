@@ -252,6 +252,10 @@ pub const STATUS: &str = r##"{
       "type": ["string", "null"],
       "description": "The reason for a forced start."
     },
+    "queue_pause_secs": {
+      "type": "integer",
+      "description": "The seconds of the wait of this job that the queue was paused. --max-queue-time does not count them, so a pause does not expire a job."
+    },
     "blocked_reason": {
       "type": ["string", "null"],
       "description": "The reason that the job waits in the queue. The value is null for a job that started."

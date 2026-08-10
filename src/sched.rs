@@ -74,6 +74,19 @@ fn lock_conflict(state: &crate::daemon::State, spec: &JobSpec) -> Option<String>
     if spec.locks.is_empty() {
         return None;
     }
+
+    // A person can hold a lock, in the same way as a job holds it.
+    //
+    // This test comes first. When a person asks for a lock that a job holds,
+    // the person is next: the job keeps the lock, and no other job takes it in
+    // the time between. The reason must therefore name the person, whatever job
+    // holds the lock at this moment.
+    for name in &spec.locks {
+        if state.paused.locks.contains_key(name) {
+            return Some(crate::pause::lock_reason(name));
+        }
+    }
+
     for job in state.jobs.values() {
         if !job.status.state.is_active() {
             continue;
@@ -316,6 +329,26 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<(usize, usize)> {
         // process, and this code must not hold the lock during that work.
         let choice = {
             let mut state = coord.state.lock().unwrap();
+
+            // End a pause that reached the time of `--for`.
+            //
+            // The scheduler is the correct place: it is the code that reads the
+            // pause, so a pause can never end in the record and continue in the
+            // decision.
+            let now = sys::now_secs();
+            let queue_pause = state.paused.queue.clone();
+            if state.paused.expire(now) {
+                // A pause of the QUEUE that reached its `--for` ends in exactly
+                // the same way as `qex resume queue`. This call is before
+                // `choose`, so no job can expire on time that the pause took.
+                if let Some(record) = queue_pause {
+                    if state.paused.queue.is_none() {
+                        crate::pause::end_queue_pause(&mut state, &record, now);
+                        log("a pause reached its end; qex starts the queue again");
+                    }
+                }
+                state.save_pause();
+            }
 
             let active = state.count_state(|s| s.is_active());
             if active == 0 && state.idle_since.is_none() {
@@ -593,6 +626,17 @@ fn expire(
 /// stage that must wait for the stages before it therefore takes a limit that
 /// covers the whole pipeline, or no limit.
 fn overdue(state: &crate::daemon::State, chosen: Option<uuid::Uuid>) -> Vec<(uuid::Uuid, u64)> {
+    // A paused queue expires NOTHING.
+    //
+    // qex started no job in this pass because a person holds the machine, so a
+    // job that waits does not wait for the queue. To expire it here would make
+    // a pause of 30 minutes delete every job with a smaller limit, and the
+    // person who paused is away by construction and sees none of it. The wait
+    // that the pause added comes back at the end of the pause, in
+    // `pause::credit_paused_wait`.
+    if state.paused.queue.is_some() {
+        return Vec::new();
+    }
     let now = sys::now_secs();
     state
         .queue
@@ -607,7 +651,10 @@ fn overdue(state: &crate::daemon::State, chosen: Option<uuid::Uuid>) -> Vec<(uui
                 return None;
             }
             let limit = job.spec.max_queue_time?;
-            let waited = now.saturating_sub(job.status.submitted_at);
+            // The time that the queue was paused is not time in the queue.
+            let waited = now
+                .saturating_sub(job.status.submitted_at)
+                .saturating_sub(job.status.queue_pause_secs);
             (waited >= limit).then_some((id, waited))
         })
         .collect()
@@ -642,6 +689,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     let cfg = state.cfg.clone();
     let active = state.count_state(|s| s.is_active());
     let idle_since = state.idle_since;
+    let paused = state.paused.queue.clone();
 
     // Collect the decisions first. The loop cannot change the state while it
     // reads the jobs.
@@ -711,6 +759,27 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     // Pass 2: choose one job from the jobs that have no dependency and no lock
     // left.
     //
+    // A paused queue starts NOTHING, so this pass does not run at all.
+    //
+    // The test is here, and not before pass 1, for two reasons that a later
+    // change must not lose:
+    //
+    //   * Pass 1 must still run. A job whose dependency failed must become
+    //     `skipped` while the queue is paused. Skipping starts no process, and
+    //     a job that stays in the queue makes `qex wait` block for ever.
+    //   * The test comes before the oversized branch below. A paused queue is
+    //     idle by construction, so a pause would otherwise start every job that
+    //     is larger than the budget — the opposite of a quiet machine.
+    if let Some(record) = &paused {
+        let reason = crate::pause::queue_reason(record);
+        for id in ready.iter().copied() {
+            reasons.push((id, Some(reason.clone())));
+        }
+        // Pass 2 now has no job to test, so it chooses nothing and it starts
+        // nothing. The reasons above are already the whole reason.
+        ready.clear();
+    }
+
     // The scheduler starts one job for each call, so a lock that this pass gives
     // away cannot be given again: the next call sees the job as active.
     for id in ready.iter().copied() {
@@ -841,9 +910,15 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
     // Take the job and test it again, with one lock only.
     //
     // The scheduler chose this job and then released the lock. In that moment,
-    // `qex cancel` can change the job, and `qex clean` can delete it. This code
-    // must thus test the job again. Without the test, qex starts a job that the
-    // user cancelled, and the user receives an answer that says the opposite.
+    // `qex cancel` can change the job, `qex clean` can delete it, and
+    // `qex pause` can stop the queue. This code must thus test the job again.
+    // Without the test, qex starts a job that the user cancelled, and the user
+    // receives an answer that says the opposite.
+    //
+    // The pause is in this list for the same reason: `qex pause queue` answers
+    // "paused" and the job starts, and `qex pause lock gpu0` tells the person
+    // that the lock is theirs while a job takes it in the same instant. That
+    // order is the whole claim of the lock half of this feature.
     //
     // This code uses no `expect` on the map. A panic here occurs while this
     // thread holds the lock, which poisons the lock and stops the coordinator.
@@ -856,6 +931,22 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         };
         if job.status.state != JobState::Queued {
             // `qex cancel` or a different thread changed the job.
+            return Ok(());
+        }
+
+        if state.paused.queue.is_some() {
+            log(&format!("job {id} does not start: the queue is paused"));
+            return Ok(());
+        }
+        if let Some(name) = job
+            .spec
+            .locks
+            .iter()
+            .find(|n| state.paused.locks.contains_key(*n))
+        {
+            log(&format!(
+                "job {id} does not start: a person holds the lock `{name}`"
+            ));
             return Ok(());
         }
 
@@ -1122,6 +1213,162 @@ mod tests {
         assert!(reason.contains("reserve"), "got: {reason}");
     }
 
+    /// A paused queue must expire NO job.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// `--max-queue-time` and a pause are two features that landed apart. Their
+    /// meeting is the sharp edge: a person pauses the queue for a call of 30
+    /// minutes, and every job with a limit below 30 minutes dies while nobody
+    /// can start it. The person comes back to an empty queue, a set of
+    /// `expired` records and a stop hook for each one, and the pause — which
+    /// exists to protect the machine — deleted the work instead.
+    #[test]
+    fn a_paused_queue_expires_no_job() {
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        // Without the pause this job expires. That is the control: a test that
+        // did not measure it would pass with the limit removed.
+        assert_eq!(
+            overdue(&state, None).len(),
+            1,
+            "the job must be over its limit before the pause, or this test \
+             measures nothing"
+        );
+
+        state.paused.queue = Some(crate::pause::PauseRecord::new(1, None, None));
+        assert!(
+            overdue(&state, None).is_empty(),
+            "a paused queue must expire no job"
+        );
+    }
+
+    /// The time that the queue was paused must not count against the limit.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// A pause that only DELAYED the expiry would kill the same jobs one moment
+    /// after the resume, and the person would see the same empty queue. The
+    /// clock of the limit must stop, and it must run again at the resume.
+    #[test]
+    fn the_time_of_a_pause_does_not_count_against_the_limit() {
+        // The job waited 61 seconds against a limit of 60, and 40 of those
+        // seconds were a pause. 21 seconds count, so the job stays.
+        let mut state = state_with(JobState::Queued, Some(60), 61);
+        let id = state.queue[0];
+        state.jobs.get_mut(&id).unwrap().status.queue_pause_secs = 40;
+        assert!(
+            overdue(&state, None).is_empty(),
+            "21 seconds of a limit of 60 must not expire the job"
+        );
+
+        // The same job with a shorter pause is over the limit, so the credit
+        // does not simply switch the limit off.
+        state.jobs.get_mut(&id).unwrap().status.queue_pause_secs = 1;
+        assert_eq!(
+            overdue(&state, None).len(),
+            1,
+            "60 seconds of a limit of 60 must still expire the job"
+        );
+    }
+
+    /// The end of a pause must give the time back, once, to the jobs that
+    /// waited through it.
+    #[test]
+    fn the_end_of_a_pause_gives_the_time_back_to_each_job_that_waited() {
+        let now = sys::now_secs();
+        let mut state = state_with(JobState::Queued, Some(60), 100);
+        let waiter = state.queue[0];
+
+        // A second job, submitted 10 seconds AFTER the pause began. It takes
+        // the part of the pause that it lived through, and no more.
+        let late = add_job(&mut state, JobState::Queued, 1, Some(60), 20);
+
+        crate::pause::credit_paused_wait(&mut state, now.saturating_sub(30), now);
+        assert_eq!(
+            state.jobs[&waiter].status.queue_pause_secs, 30,
+            "a job that waited through the whole pause takes the whole pause"
+        );
+        assert_eq!(
+            state.jobs[&late].status.queue_pause_secs, 20,
+            "a job submitted during the pause takes the part after its \
+             submission only"
+        );
+    }
+
+    /// A pause must not give time back to a job that is not in the queue.
+    #[test]
+    fn a_pause_gives_no_time_back_to_a_job_that_operates() {
+        let now = sys::now_secs();
+        let mut state = state_with(JobState::Running, Some(60), 100);
+        let running = state.queue[0];
+        crate::pause::credit_paused_wait(&mut state, now.saturating_sub(30), now);
+        assert_eq!(
+            state.jobs[&running].status.queue_pause_secs, 0,
+            "a job that operates does not wait in the queue"
+        );
+    }
+
+    /// The end of a pause of the queue must start the settle timer again.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// `idle_since` says how long no job has operated. A paused queue is idle
+    /// by construction, so at the end of the pause that timer is ALREADY
+    /// satisfied, and the first job that qex starts would be an OVERSIZED job,
+    /// alone, in front of everything that waited for hours. The deletion of
+    /// this one line left the whole suite green before this test existed.
+    #[test]
+    fn the_end_of_a_pause_starts_the_settle_timer_again() {
+        let now = sys::now_secs();
+        let mut state = state_with(JobState::Queued, Some(60), 100);
+        let record = crate::pause::PauseRecord::new(1, None, None);
+
+        // A queue that has been idle since long ago. That is the state at the
+        // end of a pause, and it is the state that must not survive.
+        state.idle_since = Some(Instant::now() - Duration::from_secs(3600));
+        crate::pause::end_queue_pause(&mut state, &record, now);
+
+        let waited = state.idle_since.expect("the timer must exist").elapsed();
+        assert!(
+            waited < Duration::from_secs(5),
+            "the end of a pause must start the settle timer again; it says {waited:?}"
+        );
+    }
+
+    /// A pause that reaches its `--for` must give the time back, in the same
+    /// way as `qex resume queue`.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// The two ends of a pause were two blocks of code, and the deletion of the
+    /// credit in the `--for` block left the suite green: a pause of 30 minutes
+    /// that ended BY ITSELF still killed every job with a smaller limit, and
+    /// only a pause that a person ended was safe. `pause::end_queue_pause` is
+    /// now the one place, and this test holds both paths to it.
+    #[test]
+    fn a_pause_that_reaches_its_time_gives_the_time_back_too() {
+        let now = sys::now_secs();
+        let mut state = state_with(JobState::Queued, Some(60), 100);
+        let id = state.queue[0];
+
+        // A pause that began 30 seconds ago and ends now.
+        let mut record = crate::pause::PauseRecord::new(1, None, Some(now));
+        record.paused_at = now.saturating_sub(30);
+        state.paused.queue = Some(record.clone());
+
+        assert!(
+            state.paused.expire(now),
+            "a pause with a time in the past must end"
+        );
+        assert!(state.paused.queue.is_none());
+        crate::pause::end_queue_pause(&mut state, &record, now);
+
+        assert_eq!(
+            state.jobs[&id].status.queue_pause_secs, 30,
+            "a pause that ended by itself must give its time back"
+        );
+    }
+
     /// Makes a state with one job in the queue, for the tests of the limit.
     fn state_with(
         job_state: JobState,
@@ -1160,6 +1407,7 @@ mod tests {
             config_error: None,
             dedupe: Default::default(),
             events: crate::events::EventLog::new(),
+            paused: crate::pause::Paused::default(),
             stop: false,
         }
     }

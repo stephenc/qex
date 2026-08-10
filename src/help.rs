@@ -33,6 +33,7 @@ pub const TOPICS: &[&str] = &[
     "exit-codes",
     "pipeline",
     "each-line",
+    "pause",
 ];
 
 /// Gives the text for one topic.
@@ -50,6 +51,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "exit-codes" | "exit" | "exitcodes" => Some(EXIT_CODES),
         "pipeline" | "pipelines" => Some(PIPELINE),
         "each-line" | "eachline" | "fan-out" | "fanout" => Some(EACH_LINE),
+        "pause" | "resume" => Some(PAUSE),
         _ => None,
     }
 }
@@ -780,6 +782,125 @@ shell holds secrets, use `--env-capture minimal`. The command `qex status` hides
 the environment. Add `--show-env` to see it.
 
 A field name with a spelling error gives an error. qex does not ignore it.
+";
+
+pub const PAUSE: &str = "\
+qex pause and qex resume
+========================
+
+Use these commands to take the machine, or one resource of it, back for a
+moment.
+
+    qex pause queue              start no new job
+    qex resume queue             start the queue again
+
+    qex pause lock <name>        take that lock for yourself
+    qex resume lock <name>       give the lock back
+
+    qex pause                    say what is paused now
+
+`qex resume` with no word starts the queue again.
+
+Pause the queue
+---------------
+
+    qex pause queue --reason \"recording a demo\"
+
+qex then starts NO job. There is no exception: every job in qex has a claim, so
+a job that costs nothing does not exist, and `paused` is one fact that you can
+act on.
+
+THE JOBS THAT OPERATE NOW CONTINUE. Each one already holds its capacity, and a
+stop would lose that work. To wait for a quiet machine:
+
+    qex pause queue --drain      # gives control back when no job operates
+
+To stop a job that operates, use `qex kill <id>`.
+
+Give the pause an end
+---------------------
+
+    qex pause queue --for 30m
+
+A pause with no end continues until you run `qex resume`. Every command that
+lists jobs says so, because a pause that a person forgets gives an empty queue
+in the morning.
+
+A second `qex pause queue` KEEPS the end and the reason of the first one. A
+command that replaced them would change a pause of 30 minutes into a pause with
+no end. To replace an end, run `qex resume queue` first.
+
+`--for 0` is an error. To end a pause now, run `qex resume queue`.
+
+A job with `--retries` starts its next attempt inside its own supervisor, and
+that supervisor reads the pause as well. The next attempt waits.
+
+Pause a lock
+------------
+
+A lock names a resource that one job at a time may hold (`qex submit --lock
+gpu0`). You frequently need that same resource by hand.
+
+    qex pause lock gpu0
+
+qex gives the lock TO YOU as soon as no job holds it. Every job that needs it
+waits, and `qex list` gives the reason:
+
+    b0bb2614  queued  train  ...  waits for the lock `gpu0`, which a person holds
+
+The command never fails when a job holds the lock now. qex records the request,
+that job keeps the lock, no other job takes it, and the lock comes to you when
+that job stops. The command is thus safe to type at any moment.
+
+What survives
+-------------
+
+The pause is a file beside the job records, so it survives a coordinator that
+stops. A new coordinator reads it and the queue stays paused.
+
+If qex cannot read that file, it HOLDS the queue and says so. A file that qex
+cannot read can hold a pause, and qex does not know. `qex resume queue` writes
+a new file and starts the queue again.
+
+The pause covers YOUR queue only. It does not pause another user of the
+machine. `qex info` says so.
+
+What a pause does NOT do
+------------------------
+
+A pause does not expire a job. `--max-queue-time` measures the time that a job
+waits for the QUEUE, and a person who holds the machine is not the queue. The
+clock of that limit stops at the pause and runs again at the resume, so a pause
+of 30 minutes does not kill every job with a smaller limit. `qex status` gives
+that time in `queue_pause_secs`.
+
+This holds when the pause ends by itself while no coordinator operates. The next
+coordinator finds it and gives the time back.
+
+A pause of a LOCK does not stop that clock. A job that waits for a lock already
+expires in the same way, whatever holds it. Give such a job a
+`--max-queue-time` that covers the hold, or no limit at all.
+
+A pause refuses no command. `qex submit` gives you a job id and the exit code 0,
+and the job waits with the pause as its reason.
+
+Who may end it
+--------------
+
+Anybody who can reach this queue. A pause is not a lock on the queue: the queue
+belongs to one user of the machine, and everybody who reaches it already shares
+every job in it. Each line below names the pid that asked for the pause, so you
+can find the owner before you start the queue again.
+
+Where to read it
+----------------
+
+    qex pause                    what is paused, for how long, and who asked
+    qex info                     the same line, with the budget and the load
+    qex top                      the same line, on the page
+    qex list                     the same line, before the jobs
+    qex wait <id>                the same line, before the wait begins
+    qex status <id>              the reason that one job waits
 ";
 
 pub const CONFIG: &str = "\
