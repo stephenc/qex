@@ -625,7 +625,7 @@ qex version --check --json   # the same answer for a program
 | --- | --- |
 | Exit code 0 | The answer arrived, whatever it says. A newer release is information, not a fault. |
 | Exit code 1 | qex could not ask. The message says why, and nothing changed. |
-| `--json` | `version`, `newest`, `newer`, `development`, `source`, `error`. |
+| `--json` | The answer of `qex version`, with an `update` object added: `newest`, `newer`, `development`, `source`, `error`. |
 
 **The coordinator asks, and your command never does.** A check must not delay a
 command and must not fail one, so the network stays out of the path of a

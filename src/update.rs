@@ -128,15 +128,24 @@ fn with_the_record_in(dir: &std::path::Path, change: impl FnOnce(&mut Record)) -
     //
     // Nothing is lost by stopping. A command gives no line and gives one
     // later; the coordinator writes nothing and asks again at its next turn.
+    // WAIT FOR THE LOCK, AND NOT FOR EVER. This file is on the path of every
+    // command now, so a lock that a stopped process holds must not hold every
+    // later command with it. Two seconds is far more than a read and a write
+    // of one small file.
+    let give_up = std::time::Instant::now() + Duration::from_secs(2);
     loop {
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             break;
         }
         let e = std::io::Error::last_os_error();
         // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal
         // arrives, and qex catches SIGINT and SIGTERM in every command that
         // waits, so this is an ordinary event and not a fault.
-        if e.kind() == std::io::ErrorKind::Interrupted {
+        let busy = e.kind() == std::io::ErrorKind::WouldBlock;
+        if (busy || e.kind() == std::io::ErrorKind::Interrupted)
+            && std::time::Instant::now() < give_up
+        {
+            std::thread::sleep(Duration::from_millis(20));
             continue;
         }
         bail!("qex could not lock {}: {e}", path.display());
@@ -221,22 +230,32 @@ pub fn is_an_address(url: &str) -> bool {
 
 /// Runs the program that talks to the network.
 ///
-/// qex holds the limit itself, and it does not trust the program to hold one.
-/// `curl --max-time` covers the whole transfer, and the `--timeout` of `wget`
-/// covers ONE operation: a service that sends one byte every two seconds keeps
-/// wget for ever, and a coordinator that stops then leaves it behind. The
-/// deadline below covers both, and a child that passes it takes a signal.
+/// QEX HOLDS THE TIME LIMIT, AND IT TRUSTS NO PROGRAM TO HOLD ONE.
+///
+/// - `curl --max-time` covers a transfer over the network, and it does NOT
+///   cover a read of `file://`: a URL that names a FIFO, a device or a mount
+///   that stopped answering holds curl for ever.
+/// - The `-T` of GNU wget covers ONE operation, and the `wget` of busybox
+///   takes that letter and then stops with a fault of memory. So the wget of
+///   qex carries no time limit of its own at all.
+///
+/// The limit here is thus the only one, and it must cover every way that a
+/// program can stop answering: one that says nothing, one that answers and
+/// then holds the pipe open, and one that fills the stream of its faults while
+/// qex reads the other one.
 fn fetch(url: &str, limit: Duration) -> Result<String> {
     use std::io::Read;
+    use std::os::unix::io::AsRawFd;
 
-    let seconds = limit.as_secs().max(1).to_string();
     let attempts: [(&str, Vec<String>); 2] = [
         (
             "curl",
             vec![
                 "-fsSL".into(),
                 "--max-time".into(),
-                seconds.clone(),
+                // Round UP, and never to zero. A limit of 500ms would give
+                // curl `--max-time 0`, which means NO limit.
+                limit.as_secs_f64().ceil().max(1.0).to_string(),
                 "--max-filesize".into(),
                 MOST_BYTES.to_string(),
                 "-H".into(),
@@ -245,34 +264,44 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
             ],
         ),
         (
-            // THE FLAGS THAT EVERY `wget` TAKES.
+            // THE FLAGS THAT EVERY `wget` TAKES, AND NO MORE.
             //
             // The `wget` of busybox is the one on Alpine and on most small
-            // containers, which are the machines least likely to hold curl.
-            // It does not take `--timeout=` or `--tries=`, and a command with
-            // those gives a usage error that names an option and not the
-            // fault. `-q`, `-O -` and `-T` are in busybox and in GNU wget
-            // alike. The deadline of qex covers the time in either case.
+            // containers, which are the machines least likely to hold curl. It
+            // takes no `--timeout=` and no `--tries=`, and BusyBox v1.30.1
+            // takes `-T` and then stops with a fault of memory:
+            //
+            //     busybox wget -q -O - -T 5 http://example.com
+            //     Segmentation fault (core dumped)
+            //
+            // An option that one build of a program cannot obey is worse than
+            // no option, and qex holds the time limit itself.
             "wget",
-            vec![
-                "-q".into(),
-                "-O".into(),
-                "-".into(),
-                "-T".into(),
-                seconds.clone(),
-                url.into(),
-            ],
+            vec!["-q".into(), "-O".into(), "-".into(), url.into()],
         ),
     ];
 
     let mut missing = Vec::new();
     for (program, args) in attempts {
-        let child = std::process::Command::new(program)
+        let mut command = std::process::Command::new(program);
+        command
             .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
+            .stderr(std::process::Stdio::piped());
+        // GIVE THE PROGRAM ITS OWN GROUP, so that a stop reaches every
+        // process of it. qex does the same for a job, and for the same
+        // reason: a program that starts another program leaves that other one
+        // behind when a signal names one process. Measured with a shell that
+        // starts `sleep`: four processes stayed with pid 1 as their parent.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let child = command.spawn();
         let mut child = match child {
             Ok(child) => child,
             Err(_) => {
@@ -281,52 +310,108 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
             }
         };
 
-        // Read no more than the limit, and stop at the deadline.
+        // READ THE STREAM OF FAULTS ON ITS OWN THREAD.
         //
-        // THE REASON FOR THE STOP COMES FROM THIS LOOP, and never from a test
-        // of the child. A program that ends the moment before this loop ends
-        // is not reaped yet, and `try_wait` then says that it operates: a
-        // fault that arrived in six milliseconds read as a service that never
-        // answered, and every answer that arrived was one race away from the
-        // same message.
-        enum Stop {
-            /// The program closed its output. It is finishing now.
-            Answered,
-            /// The limit of the reader came first.
-            TooSlow,
-            /// The service sent more than an answer.
-            TooMuch,
-        }
+        // Both streams are pipes with a small buffer. A program that fills the
+        // stream of its faults stops there and writes nothing more, and qex
+        // then waits for an answer that cannot arrive while that program waits
+        // for qex. The thread takes a bounded quantity and ends when the
+        // program closes the pipe.
+        // The thread SENDS its text, and this command never waits for the
+        // thread itself. A program can leave a child of its own holding that
+        // pipe — a shell that starts another program does exactly this — and
+        // the end of the stream then never comes. A wait for the thread would
+        // hold this command for ever, which is the fault that this whole
+        // function exists to remove.
+        let mut said = child.stderr.take();
+        let (sender, complaints) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            if let Some(handle) = said.as_mut() {
+                handle.take(8 * 1024).read_to_end(&mut text).ok();
+            }
+            sender
+                .send(String::from_utf8_lossy(&text).trim().to_string())
+                .ok();
+        });
+
         let deadline = std::time::Instant::now() + limit;
         let mut body = Vec::new();
         let mut stop = Stop::Answered;
+
         if let Some(out) = child.stdout.as_mut() {
+            let fd = out.as_raw_fd();
             let mut buffer = [0u8; 8192];
             loop {
-                if std::time::Instant::now() >= deadline {
+                // WAIT FOR THE DATA, AND NOT IN THE READ.
+                //
+                // A test of the time before a BLOCKING read gives no limit at
+                // all: a program that says nothing holds that read for ever,
+                // and the test above it never runs a second time. `poll` holds
+                // the limit, and the read after it takes what is ready.
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
                     stop = Stop::TooSlow;
                     break;
                 }
-                match out.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        body.extend_from_slice(&buffer[..n]);
-                        if body.len() > MOST_BYTES {
-                            stop = Stop::TooMuch;
+                let mut watch = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ms = left.as_millis().min(i32::MAX as u128) as i32;
+                match unsafe { libc::poll(&mut watch, 1, ms) } {
+                    // The time passed with nothing to read.
+                    0 => {
+                        stop = Stop::TooSlow;
+                        break;
+                    }
+                    -1 => {
+                        // A signal ended the wait. That is not a fault, and
+                        // the limit above still holds.
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
+                        stop = Stop::Broken;
+                        break;
+                    }
+                    _ => match out.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            body.extend_from_slice(&buffer[..n]);
+                            if body.len() > MOST_BYTES {
+                                stop = Stop::TooMuch;
+                                break;
+                            }
+                        }
+                        // A read that failed gives no answer. It must not
+                        // read as one: a part of a body would then reach the
+                        // reader as "the service gave an answer that qex
+                        // could not read".
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => {
+                            stop = Stop::Broken;
                             break;
                         }
-                    }
-                    Err(_) => break,
+                    },
                 }
             }
         }
 
-        // A program that qex stopped takes a signal. A program that answered
-        // is closing already, so qex waits for it in the usual way.
+        // The program stops here, whatever it was doing. A program that
+        // answered is closing already, and one that qex stopped takes a
+        // signal: `wait` with no limit would hold this command for ever for a
+        // program that closed its output and stayed.
         if !matches!(stop, Stop::Answered) {
-            child.kill().ok();
+            stop_the_group(&child);
         }
-        let end = child.wait_with_output();
+        let ended = wait_briefly(&mut child, Duration::from_secs(2));
+        // Take the words if they arrived. A program that says nothing, and one
+        // whose child holds the pipe, both give an empty message here.
+        let words = complaints
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap_or_default();
 
         match stop {
             Stop::TooMuch => bail!(
@@ -334,29 +419,30 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
                  is one small object. qex stopped the read."
             ),
             Stop::TooSlow => bail!(
-                "{program} did not answer for {url} in {seconds} seconds, and qex stopped it."
+                "{program} did not answer for {url} in {} seconds, and qex stopped it.",
+                limit.as_secs_f64()
             ),
+            Stop::Broken => bail!("qex could not read the answer of {program} for {url}"),
             Stop::Answered => {}
         }
 
-        let Ok(end) = end else {
-            bail!("qex could not wait for {program}");
+        let Some(end) = ended else {
+            bail!("{program} did not stop for {url}, and qex could not wait for it");
         };
-        if end.status.success() {
+        if end.success() {
             return Ok(String::from_utf8_lossy(&body).to_string());
         }
 
         // The program ran and the request failed. Give the words of the
         // program: they name the proxy, the certificate or the limit, and qex
         // cannot say it better.
-        let said = String::from_utf8_lossy(&end.stderr).trim().to_string();
-        let code = end.status.code().unwrap_or(-1);
+        let code = end.code().unwrap_or(-1);
         bail!(
             "{program} could not reach {url}: exit code {code}{}",
-            if said.is_empty() {
+            if words.is_empty() {
                 String::new()
             } else {
-                format!(": {said}")
+                format!(": {words}")
             }
         );
     }
@@ -366,6 +452,59 @@ fn fetch(url: &str, limit: Duration) -> Result<String> {
          Install one, or set `[update] check = \"never\"` in your config file.",
         missing.join(" and ")
     )
+}
+
+/// Why the read of an answer stopped.
+enum Stop {
+    /// The program closed its output. It is finishing now.
+    Answered,
+    /// The limit of the reader came first.
+    TooSlow,
+    /// The service sent more than an answer.
+    TooMuch,
+    /// The read itself failed. There is no answer, and no part of one.
+    Broken,
+}
+
+/// Stops a program and every process that it started.
+///
+/// The program is the leader of its own group, so one signal to the group
+/// reaches the program and its children. A signal to the program alone leaves
+/// a child of it with pid 1 as its parent, and that child runs for ever.
+fn stop_the_group(child: &std::process::Child) {
+    let pid = child.id() as i32;
+    if pid > 1 {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Waits for a program to stop, and gives up after a short time.
+///
+/// A program that took a signal ends at once. One that ignores a signal must
+/// not hold this command: qex gives it a second signal and stops waiting, so
+/// the caller always returns.
+fn wait_briefly(
+    child: &mut std::process::Child,
+    limit: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(end)) => return Some(end),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if std::time::Instant::now() >= deadline {
+            // The program did not answer a signal. Take the one that no
+            // program can ignore, and take the result if it comes.
+            stop_the_group(child);
+            child.kill().ok();
+            return child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Takes the version from the answer of the service.
@@ -555,10 +694,9 @@ pub fn report(cfg: &Config) -> Report {
 impl Report {
     /// The words for a person.
     pub fn text(&self) -> String {
-        let mine = &self.mine;
         if let Some(error) = &self.error {
             return format!(
-                "qex {mine}\nqex could not ask for the newest release: {error}\n\
+                "qex could not ask for the newest release: {error}\n\
                  The version that you have still operates. Nothing changed."
             );
         }
@@ -570,6 +708,7 @@ impl Report {
         // It carries the hash of a commit and no place in the order of the
         // releases, so a message that picks one of those two is wrong.
         if self.development {
+            let mine = &self.mine;
             return format!(
                 "This is a development build: {mine}.\n\
                  The newest release is {newest}, from {source}.\n\
@@ -579,13 +718,13 @@ impl Report {
         }
         if self.newer {
             return format!(
-                "qex {mine}\nA newer release exists: {newest}, from {source}.\n\
+                "A newer release exists: {newest}, from {source}.\n\
                  Take it from https://github.com/stephenc/qex/releases/latest , or run \
                  `cargo install qex`.\n\
                  qex installs nothing by itself."
             );
         }
-        format!("qex {mine}\nThis is the newest release. The newest is {newest}, from {source}.")
+        format!("This is the newest release. The newest is {newest}, from {source}.")
     }
 
     /// The same answer for a program.
@@ -804,6 +943,37 @@ mod tests {
         // runs in.
         assert!(note_for_a_command_in(&dir, "0.23.0", &Config::default()).is_none());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The lock keeps two writers apart.
+    ///
+    /// `flock` belongs to an OPEN of a file and not to a process, so two
+    /// threads that each open the lock meet each other exactly as two
+    /// processes do. Without the lock, a read and a write of the whole record
+    /// lose one another and the count comes out short.
+    #[test]
+    fn two_writers_at_once_lose_nothing() {
+        let dir = a_directory("race");
+        write_record_in(&dir, &Record::default()).unwrap();
+
+        let writers = 8;
+        let each = 25;
+        std::thread::scope(|scope| {
+            for _ in 0..writers {
+                scope.spawn(|| {
+                    for _ in 0..each {
+                        with_the_record_in(&dir, |r| r.last_checked += 1).unwrap();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            read_record_in(&dir).last_checked,
+            writers * each,
+            "every write must reach the record"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

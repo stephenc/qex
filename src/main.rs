@@ -165,7 +165,10 @@ fn main() {
 #[cfg(unix)]
 fn say_that_a_newer_qex_exists() {
     let word = subcommand_word();
-    if matches!(word.as_str(), "daemon" | "supervise" | "__complete") {
+    // `qex run` forwards the output of the JOB to these streams, so a line of
+    // advice here would arrive inside the output that a caller captured. That
+    // caller reads it again on its next command.
+    if matches!(word.as_str(), "daemon" | "supervise" | "__complete" | "run") {
         return;
     }
     // A config file that qex cannot read is a fault of its own, and the

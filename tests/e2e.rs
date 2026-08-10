@@ -1207,13 +1207,24 @@ fn never_asks_nothing_and_writes_nothing() {
     let id = h.submit(&["submit", "--", "true"]);
     assert_eq!(h.qex(&["wait", &id]).status.code(), Some(0));
 
-    // The coordinator ran, and it wrote no record of a check.
+    // WAIT LONGER THAN THE FIRST LOOK OF THE COORDINATOR.
+    //
+    // That thread waits two seconds before it looks at all, so a test that
+    // ends at once passes whatever `never` does. A test of an absolute promise
+    // must give that promise a chance to break.
     let record = h.root.join("state/qex/update.json");
-    assert!(
-        !record.exists(),
-        "`never` must write no file: {}",
-        record.display()
-    );
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        assert!(
+            !record.exists(),
+            "`never` must write no file: {}",
+            record.display()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // The coordinator was there for the whole of that time.
+    assert!(h.qex(&["info", "--no-start"]).status.success());
 }
 
 /// The first run of a fresh install asks nothing.
