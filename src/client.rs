@@ -108,9 +108,7 @@ impl Client {
     ///
     /// A command that waits for a job must stay awake for two other events: a
     /// signal from the user, and a coordinator that stops. A blocking read sees
-    /// neither. `read_line` continues through a signal, because the system
-    /// restarts the read, so a Ctrl-C during `qex wait` would do nothing until
-    /// the job stopped.
+    /// neither, because the system restarts a read that a signal interrupts.
     ///
     /// This function looks at the socket and reads nothing, so a short limit
     /// costs one system call and it cannot divide an answer in two. A short

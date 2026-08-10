@@ -136,11 +136,13 @@ The state, the exit code, the resources that the job really used, and the last
 lines of BOTH streams. A program frequently writes its result to one stream and
 its failure to the other, so the error alone reads as a complete failure.
 
-`qex wait` gives that result as an exit code, and your script can then make a
-decision: `0` the job succeeded, `1` it failed, `123` it never started and it
-reached its `--max-queue-time`, `124` your wait reached its time limit, `125`
-something stopped the job, `126` a job that it needed failed, `127` there is no
-job with that id.
+Every command that waits gives that result as an exit code, and your script can
+then make a decision. A code from `0` to `96` is the code of the JOB, unchanged.
+A code from `97` to `127` is the answer of qex about the queue or about the
+wait: `122` your wait stopped and the job continues, `123` the job never started
+and it reached its `--max-queue-time`, `124` your wait reached its time limit,
+`125` something stopped the job, `126` a job that it needed failed, `127` there
+is no job with that id. See [the table](agents.md#the-exit-codes).
 
 ## How qex compares
 

@@ -14,11 +14,11 @@ qex submit [--cpu N] [--mem SIZE] [--gpu N] [--vram SIZE] [--claim NAME=N]
            [--lock NAME] [--timeout TIME] [--max-queue-time TIME]
            [--needs ID,ID] [--after ID,ID] [--name NAME] [--job FILE] [--json]
            [--dedupe-key KEY] [--dedupe-window TIME] [--id-file FILE]
-           [--wait] [--wait-timeout TIME] -- COMMAND...
+           [--wait|--follow] [--wait-timeout TIME] [--quiet] -- COMMAND...
 qex submit --each-line FILE [--max-jobs N] -- COMMAND...
-qex wait   <id>... [--timeout TIME] [--any]
+qex wait   <id>... [--timeout TIME] [--next] [--quiet]
 qex list   [--state STATE] [--tag TAG] [--json]
-qex status <id> [--json] [--show-env]
+qex status <id> [--wait|--follow] [--quiet] [--timeout TIME] [--json]
 qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
@@ -66,16 +66,13 @@ Every other command gives 0 for success, 1 for a failure, 2 for a command line
 that qex cannot read, and 127 for a job that does not exist. `qex list` never
 speaks for a job, so those codes are not ambiguous there.
 
-`--passthrough` on `qex wait` is accepted and it is no longer necessary. Every
-wait gives the code of the job.
-
 #### Why a band, and why a sentinel
 
 A job can exit with any code from 0 to 255. Every code that qex gives itself is
 thus a code that a job can give as well, and no single free number escapes that.
 A job that exits 124 of its own accord gives you **97**, and `qex status` holds
-the 124. A wait that reached its time limit gives you **124**. The two are now
-different, and before the band they were one number.
+the 124. A wait that reached its time limit gives you **124**. Each code thus
+has one meaning.
 
 The cost is small and it is real: a job that exits between 97 and 255 loses its
 exact code **at the shell**, and keeps it in the record.
@@ -116,43 +113,62 @@ qex submit --wait --id-file build.id -- make test
 ```
 
 `--wait` holds the command until the job stops, and it gives the exit code of
-the job from the table above. The id still goes to stdout before the wait
-begins.
+the job from the table above. The command ends with the **record** of the job on
+stdout: the state, the exit code, the resources that the job used, and the last
+lines of both streams.
+
+**With `--wait`, the id goes to stderr**, because stdout carries the result. Use
+`--id-file` to keep the id.
 
 | Option | Meaning |
 | ------ | ------- |
-| `--wait` | Wait here until the job stops. The output of the job stays in the log file. |
+| `--wait` | Wait here until the job stops, then write the record. The output of the job stays in the log file. |
+| `--follow` | Wait here, and write the output of the job as it arrives. This is `qex run` in a longer form. |
+| `--quiet` | With `--wait`, write no record. Give the exit code only. |
 | `--wait-timeout TIME` | Stop **your wait** after this time. The job continues, and the code is 124. `--timeout` stops the **job** instead. |
 | `--id-file FILE` | Write the id to this file. qex writes the file, sends the data to the disk and closes it **before** the wait begins. |
 
 **Why one command and not two.** `qex submit` and then `qex wait` is two
 commands, and the second is a thing to remember. An agent that forgets it never
-learns that the job stopped: the job succeeds, and nobody reads the result.
+learns that the job stopped: the job succeeds, and nobody reads the result. One
+command also closes a race: between the two, a short job can stop and a
+`qex clean` in that window deletes the record.
 
-One command also closes a race. Between `qex submit` and `qex wait` a short job
-can stop, and a `qex clean` in that window deletes the record; the wait then
-fails for a job that ran perfectly. One command has no such window.
+`qex run` also waits, and it writes the output of the job to your terminal, so a
+long job fills the context of an agent. `qex submit --wait` keeps that output in
+the log file, so you read the part that you want with `qex logs --grep`.
 
-`qex run` has neither fault, because it also waits. It writes the output of the
-job to your terminal, and a long job thus fills the context of an agent.
-`qex submit --wait` keeps that output in the log file, so you read the part that
-you want with `qex logs --grep`.
-
-The id file survives a crash and not a tidy stop only. qex writes it, sends it
-to the disk and closes it before the wait begins, so
-`qex wait $(cat build.id)` attaches to the job again after any interruption.
+The id file survives a crash. qex writes it, sends it to the disk and closes it
+before the wait begins, so `qex wait $(cat build.id)` attaches to the job again
+after any interruption.
 
 `--each-line` refuses `--wait`, because it makes many jobs and one exit code
 cannot describe them all. Wait for the group instead: `qex wait $GROUP`.
 
-## `qex wait --any` returns one time
+## Attach to a job that already operates
 
 ```sh
-qex wait --any $A $B $C $D    # gives control back when the FIRST job stops
-qex wait --any $B $C $D       # the jobs that stay need another wait
+qex status <id> --follow    # the output of the job, as it arrives
+qex status <id> --wait      # the record, when the job stops
+qex status <id> --quiet     # nothing. The exit code of the job only.
 ```
 
-`--any` gives control back **one time**. The jobs that did not stop then have no
+`--follow` is the way back to a job of `qex run`, from any session. qex writes
+the output of the job on stdout and no text of its own, and it gives the exit
+code of the job. This command did not start the job, so Ctrl-C stops the wait
+and never the job.
+
+`--quiet` with no `--wait` reads the record as it stands now. A job that did not
+stop has no result, so the code is 122.
+
+## `qex wait --next` returns one time
+
+```sh
+qex wait --next $A $B $C $D    # gives control back when the NEXT job stops
+qex wait --next $B $C $D       # the jobs that stay need another wait
+```
+
+`--next` gives control back **one time**. The jobs that did not stop then have no
 watcher, and they finish with nobody to read them. qex names those jobs on
 stderr when it returns, with the command that waits for them again.
 
@@ -567,7 +583,7 @@ this wait only.
 qex: to stop the job itself, run `qex kill 7f3c8a12-...`.
 ```
 
-The exit code of that wait is 124, the code that says "your wait stopped, and
+The exit code of that wait is 122, the code that says "your wait stopped, and
 the job continues". Without this rule, Ctrl-C in one agent would stop a
 four-hour run that a different agent started, and neither agent would know why.
 

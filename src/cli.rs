@@ -307,6 +307,17 @@ pub struct SubmitArgs {
     #[arg(long)]
     pub wait: bool,
 
+    /// Wait here, and write the output of the job as it arrives.
+    ///
+    /// `qex run` is the short form of this option, and the two behave in the
+    /// same way. Ctrl-C stops the job.
+    #[arg(long, conflicts_with = "wait")]
+    pub follow: bool,
+
+    /// Write no record when the job stops. Give the exit code only.
+    #[arg(long, short, requires = "wait")]
+    pub quiet: bool,
+
     /// Stop the wait of --wait after this time. The job continues. Example: 30m.
     ///
     /// This option limits YOUR WAIT. `--timeout` limits the JOB.
@@ -345,10 +356,6 @@ pub struct SubmitArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub submit: SubmitArgs,
-
-    /// Write the id of the job to stderr before the output of the job.
-    #[arg(long)]
-    pub show_id: bool,
 }
 
 #[derive(Debug, Args)]
@@ -424,15 +431,30 @@ pub struct StatusArgs {
     #[arg(long)]
     pub no_logs: bool,
 
-    /// Wait until the job stops, then show the status.
+    /// Wait until the job stops, then show the record.
     ///
-    /// The exit code is the code of `qex wait`. This option gives the result
-    /// and the cause of a failure with one command.
-    #[arg(long)]
+    /// This option gives the result and the cause of a failure with one
+    /// command. The exit code is the code of the job.
+    #[arg(long, conflicts_with = "follow")]
     pub wait: bool,
 
+    /// Wait until the job stops, and write the output of the job as it arrives.
+    ///
+    /// This is the way back to a job of `qex run`, from any session. qex adds
+    /// no text of its own to stdout: the output of the job is the output of
+    /// this command, and the exit code is the code of the job.
+    #[arg(long)]
+    pub follow: bool,
+
+    /// Write nothing. Give the exit code of the job only.
+    ///
+    /// Use this option in a script that tests the result. With --wait, this
+    /// command blocks first.
+    #[arg(long, short, conflicts_with = "follow")]
+    pub quiet: bool,
+
     /// Stop the wait after this time. The job continues. Example: 30m.
-    #[arg(long, value_name = "TIME", requires = "wait")]
+    #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
     #[command(flatten)]
@@ -449,7 +471,7 @@ pub struct WaitArgs {
     #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
-    /// Give control back when the FIRST job stops, and not when all stop.
+    /// Give control back when the NEXT job stops, and not when all stop.
     ///
     /// Use this option to read a result as soon as it arrives, in place of the
     /// order of submission.
@@ -457,11 +479,11 @@ pub struct WaitArgs {
     /// This option gives control back ONE TIME. The jobs that did not stop then
     /// have no watcher, so wait again for them. qex names them when it returns.
     #[arg(long)]
-    pub any: bool,
+    pub next: bool,
 
-    /// Accepted, and no longer necessary. Every wait gives the code of the job.
-    #[arg(long, hide = true)]
-    pub passthrough: bool,
+    /// Write nothing. Give the exit code only.
+    #[arg(long, short)]
+    pub quiet: bool,
 
     /// Write the output as JSON.
     #[arg(long)]
@@ -1073,7 +1095,9 @@ mod tests {
     fn the_help_text_steers_away_from_a_test_job() {
         let agents = crate::help::AGENTS;
         assert!(
-            agents.contains("Do not run a small test job"),
+            agents
+                .to_lowercase()
+                .contains("do not run a small test job"),
             "the topic must tell an agent not to measure a task first"
         );
         assert!(
