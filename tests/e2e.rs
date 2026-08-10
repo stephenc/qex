@@ -496,7 +496,7 @@ fn a_signal_to_the_wait_gives_the_code_of_a_broken_wait() {
         "running",
         "a signal to the wait must not stop the job"
     );
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    h.stop(&id);
 }
 
 /// A SECOND signal stops the command at once.
@@ -535,7 +535,7 @@ fn a_second_signal_stops_the_wait_at_once() {
 
     // The job is the thing that matters, and no signal reached it.
     assert_eq!(h.state_of(&id), "running");
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    h.stop(&id);
 }
 
 /// `--follow` must obey `--timeout`, and the job must continue.
@@ -564,7 +564,7 @@ fn follow_obeys_the_time_limit_of_the_reader() {
         "running",
         "the limit of the reader must not stop the job"
     );
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    h.stop(&id);
 }
 
 /// The help of `qex submit` must say WHERE the id goes.
@@ -768,7 +768,7 @@ fn quiet_gives_the_exit_code_and_no_text() {
         Some(100),
         "a job that did not stop has no result, and this reader set no wait"
     );
-    h.ok(&["kill", &running, "--grace", "1s"]);
+    h.stop(&running);
 }
 
 /// `--quiet` on a PIPELINE must describe every stage.
@@ -847,7 +847,7 @@ fn a_wait_for_many_jobs_says_why_the_later_job_waits() {
         "the wait must say that the second job waits for the holder: {said}"
     );
 
-    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.stop(&holder);
     h.qex(&["cancel", &second]);
 }
 
@@ -911,7 +911,7 @@ fn quiet_keeps_the_faults_of_the_wait() {
         "`--quiet` must say that there is no such job"
     );
 
-    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.stop(&holder);
     h.qex(&["cancel", &waiter]);
 }
 
@@ -982,7 +982,7 @@ fn wait_with_next_says_why_a_job_waits() {
         "`--next` must say why the job waits `{reason}`: {said}"
     );
 
-    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.stop(&holder);
     h.qex(&["cancel", &waiter]);
 }
 
@@ -1110,7 +1110,7 @@ fn a_wait_says_why_the_job_does_not_start() {
         "the wait must give the reason of the record `{reason}`: {said}"
     );
 
-    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.stop(&holder);
     h.qex(&["cancel", &waiter]);
 }
 
@@ -1132,6 +1132,13 @@ fn a_coordinator_that_stops_while_the_wait_opens_gives_no_answer_about_the_job()
 
     for step in 0..8 {
         let id = h.submit(&["submit", "--", "sh", "-c", "sleep 1; exit 0"]);
+        // The job must be RUNNING before the coordinator stops. A job that is
+        // still in the queue has no supervisor, and nothing starts it when the
+        // coordinator goes: the wait then reaches its limit, which is correct
+        // and is not the window that this test measures.
+        h.until("the job starts", Duration::from_secs(45), || {
+            h.state_of(&id) == "running"
+        });
 
         let child = h.spawn(&["wait", &id, "--timeout", "30s"]);
         // Move the moment of the kill through the window of the handshake.
@@ -1205,7 +1212,7 @@ fn wait_with_next_names_the_jobs_that_have_no_watcher() {
         "`--next` must name the job that stays, and the command that waits for it: {said}"
     );
 
-    h.ok(&["kill", &slow, "--grace", "1s"]);
+    h.stop(&slow);
 }
 
 /// A wait that reaches its limit gives the code 124, and the job continues.
