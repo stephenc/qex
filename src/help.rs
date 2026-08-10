@@ -120,9 +120,10 @@ Exit codes
     0 to 96     THE JOB. The exit code of the job, unchanged.
     97 to 127   QEX. The queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job, and qex did not send it. Read the
-                record for the signal.
-      99        the kernel stopped the job for memory. Give a larger --mem.
+      98        a signal stopped the job, and qex did not attribute it to a
+                stop. A kill from anywhere gives 125 instead.
+      99        the kernel stopped the job for memory. It needs `[enforce]`;
+                see `qex help exit-codes`.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -1895,9 +1896,10 @@ One table. Every command that gives you the result of a job obeys it.
     0 to 96     THE JOB. qex gives the exit code of the job, unchanged.
     97 to 127   QEX. The code describes the queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job, and qex did not send it. Read the
-                record for the signal.
-      99        the kernel stopped the job for memory. Give a larger --mem.
+      98        a signal stopped the job, and qex did not attribute it to a
+                stop. A kill from anywhere gives 125 instead.
+      99        the kernel stopped the job for memory. It needs `[enforce]`;
+                see `qex help exit-codes`.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -1908,6 +1910,16 @@ One table. Every command that gives you the result of a job obeys it.
       127       there is no job with that id
     128 and up  QEX ITSELF died from a signal. The job is not described. It can
                 still operate, so attach to it again.
+
+The code 98 says that a signal stopped the job and that qex did not attribute
+that signal to a stop. A kill, a cancel and a time limit give 125, and an
+EXTERNAL `kill -9` gives 125 as well: qex cannot know who sent it. The record
+holds the number of the signal in both cases, so nothing is lost.
+
+The code 99 needs proof that memory stopped the job. qex has that proof when
+`[enforce] mode` applies a limit, and when the kernel names the job that it
+stopped. WITH NO ENFORCEMENT A CLAIM IS A PROMISE AND NOT A LIMIT: a job that
+claims 64MB and uses 1.6GB is not stopped at all, and it never gives 99.
 
 THE CODE ANSWERS `PASS OR FAIL`. THE RECORD ANSWERS `WHY`. An agent that acts
 on the difference between \"the job failed\" and \"my wait stopped\" reads

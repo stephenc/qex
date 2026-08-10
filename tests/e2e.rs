@@ -986,6 +986,72 @@ fn wait_with_next_says_why_a_job_waits() {
     h.qex(&["cancel", &waiter]);
 }
 
+/// qex inside a real sandbox must name the sandbox.
+///
+/// bubblewrap is the sandbox that Codex uses on Linux, and a state directory
+/// that it mounts read-only is the fault that an agent reports. The message
+/// must send the reader to the page, because the remedy belongs to the person
+/// who starts the agent and not to the agent.
+///
+/// The test gives no verdict on a machine with no `bwrap`. It is the tool of
+/// one sandbox, and qex does not need it.
+#[test]
+fn qex_inside_bubblewrap_names_the_sandbox() {
+    if Command::new("bwrap")
+        .arg("--version")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
+
+    let h = Harness::with_default_config("bwrap");
+    let state = h.root.join("state");
+    std::fs::create_dir_all(state.join("qex/run")).unwrap();
+
+    // A sandbox that gives qex a read-only state directory. qex writes its
+    // records, its logs and its socket there, so nothing works.
+    let out = Command::new("bwrap")
+        .args([
+            "--bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--ro-bind",
+            state.to_str().unwrap(),
+            state.to_str().unwrap(),
+            "--setenv",
+            "XDG_STATE_HOME",
+            state.to_str().unwrap(),
+            "--setenv",
+            "XDG_CONFIG_HOME",
+            h.root.join("cfg").to_str().unwrap(),
+            "--",
+            env!("CARGO_BIN_EXE_qex"),
+            "list",
+        ])
+        .output()
+        .expect("bwrap did not start");
+
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains("docs/sandbox.md"),
+        "qex inside a sandbox must give the page for a person: {said}"
+    );
+    // The CAUSE comes first, and the remedy after it. A reader that meets the
+    // remedy first does not know what it corrects.
+    let cause = said.find("Read-only").unwrap_or(usize::MAX);
+    let page = said.find("docs/sandbox.md").unwrap_or(0);
+    assert!(
+        cause < page,
+        "the message must give the fault before the remedy: {said}"
+    );
+}
+
 /// `qex status --wait` ends with the record, so one command gives everything.
 #[test]
 fn status_with_wait_ends_with_the_record_of_the_job() {

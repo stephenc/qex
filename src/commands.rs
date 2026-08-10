@@ -304,7 +304,7 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
         WaitOutcome::TimedOut => {
             if !json {
                 eprintln!("qex: the wait reached its time limit. The job continues.");
-                eprintln!("qex: attach to it again:  qex wait {raw_id}");
+                eprintln!("qex: attach to it again:  qex status {raw_id} --wait");
             }
             Ok(EXIT_TIMEOUT)
         }
@@ -838,12 +838,18 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                     }
                 }
                 WaitOutcome::TimedOut => {
-                    eprintln!("qex: the wait for {id} reached its time limit. The job continues.");
+                    if !args.json {
+                        eprintln!(
+                            "qex: the wait for {id} reached its time limit. The job continues."
+                        );
+                    }
                     wait_code = EXIT_TIMEOUT;
                     break;
                 }
                 WaitOutcome::NoSuchJob => {
-                    eprintln!("qex: there is no job with the id {id}");
+                    if !args.json {
+                        eprintln!("qex: there is no job with the id {id}");
+                    }
                     return Ok(EXIT_NO_SUCH_JOB);
                 }
                 // Give the code of a wait that stopped, and NOT `128 + N`. The
@@ -1472,7 +1478,9 @@ fn wait_for_the_next(
             };
 
             let Some(status) = status else {
-                eprintln!("qex: there is no job with the id {raw}");
+                if !args.json {
+                    eprintln!("qex: there is no job with the id {raw}");
+                }
                 return Ok(EXIT_NO_SUCH_JOB);
             };
 
@@ -1898,10 +1906,10 @@ fn wait_through_coordinator(
             kind: ErrorKind::NoSuchJob,
             ..
         }) => Ok(Some(WaitOutcome::NoSuchJob)),
-        Ok(other) => {
-            report_for_a_job(other)?;
-            bail!("the coordinator gave an answer that qex did not expect")
-        }
+        // One message for one fault. `report_for_a_job` writes the message of
+        // the coordinator, and a second line here would say the same thing
+        // twice in different words.
+        Ok(other) => bail!("the coordinator gave an answer that qex did not expect: {other:?}"),
         // The coordinator closed the connection, or the read failed. Both mean
         // that the coordinator stopped: the deadline above ends a wait that
         // reached its time limit, so a fault here is not a time limit.

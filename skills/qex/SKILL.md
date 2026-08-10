@@ -93,8 +93,8 @@ jobs that did not stop then have no watcher, so wait again for them.
 | 0 to 96 | **The job.** The exit code of the job, unchanged. |
 | 97 to 127 | **qex.** The queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal that qex did not send stopped the job. Read the record for it. A kill, a cancel or a time limit gives 125, and a kill for memory gives 99. |
-| 99 | The kernel stopped the job because the machine ran out of memory. Give a larger `--mem` and run it again. |
+| 98 | A signal stopped the job, and qex did not attribute it to a stop. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. The record holds the number of the signal. |
+| 99 | The kernel stopped the job for memory. Give a larger `--mem` and run it again. **qex needs proof**: `[enforce] mode`, or a kill that the kernel attributed. With no enforcement a claim is a promise and not a limit, so a job that passes its claim is not stopped at all and never gives 99. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and **the job continues.** Attach to it again. |

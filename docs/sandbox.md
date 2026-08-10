@@ -50,12 +50,18 @@ reports that it cannot make a Unix socket, the sandbox is the cause. To test
 the socket alone, with no qex:
 
 ```sh
-python3 -c 'import socket,os,tempfile
-p = os.path.join(tempfile.gettempdir(), "qex-probe")
+python3 -c 'import socket, os
+d = os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")) + "/qex/run"
+os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "probe")
 os.path.exists(p) and os.unlink(p)
 s = socket.socket(socket.AF_UNIX); s.bind(p); s.close(); os.unlink(p)
-print("a Unix socket is allowed here")'
+print("a Unix socket is allowed in", d)'
 ```
+
+Test the directory that **qex** uses, and not `/tmp`: a sandbox frequently gives
+`/tmp` its own rules. `qex info --no-start` names the directory when qex can
+read it.
 
 ## What to change
 
