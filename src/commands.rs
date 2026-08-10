@@ -6111,32 +6111,48 @@ mod tests {
     /// than a millisecond, so no second signal can arrive while the command
     /// still waits. A test that sends two signals in one moment passes with a
     /// trap that a user CANNOT escape, which is the fault that the second
-    /// signal exists to prevent. The rule lives in one flag, so the test reads
-    /// that flag.
+    /// signal exists to prevent.
+    ///
+    /// The test thus sends ONE signal to itself and reads the disposition that
+    /// the system holds after it. A disposition of `SIG_DFL` is the whole of
+    /// the rule: the next signal of that number stops this process.
+    ///
+    /// It reads the DISPOSITION and not the flags. macOS gives `SA_RESETHAND`
+    /// its effect and does not report the flag back, so a test of the flags
+    /// measures the system and not the behaviour of qex.
     #[test]
     fn the_trap_of_a_wait_gives_the_disposition_back_to_the_system() {
+        use std::sync::atomic::Ordering;
+
+        WAIT_INTERRUPTED.store(false, Ordering::SeqCst);
         catch_signals_while_waiting();
 
         for signal in [libc::SIGINT, libc::SIGTERM] {
+            // The FIRST signal reaches the trap, and the trap holds it.
+            WAIT_INTERRUPTED.store(false, Ordering::SeqCst);
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            assert!(
+                wait_was_interrupted(),
+                "the trap must catch the first signal {signal}"
+            );
+
+            // The SECOND signal of that number now meets the system.
             let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
             assert_eq!(
                 unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
                 0
             );
-            assert!(
-                action.sa_flags & libc::SA_RESETHAND != 0,
+            assert_eq!(
+                action.sa_sigaction,
+                libc::SIG_DFL,
                 "the trap of the signal {signal} must give the disposition back at the \
-                 delivery, so a second signal is never caught"
-            );
-            assert!(
-                action.sa_flags & libc::SA_RESTART == 0,
-                "the trap of the signal {signal} must not restart a system call, because the \
-                 wait learns of the signal when its `poll` ends"
+                 delivery, so a second signal stops the command"
             );
         }
 
-        // Leave the process as it was. A test that keeps a handler changes the
-        // tests that come after it.
+        // Leave the process as it was. A test that keeps a flag or a handler
+        // changes the tests that come after it.
+        WAIT_INTERRUPTED.store(false, Ordering::SeqCst);
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
