@@ -36,7 +36,7 @@ find the coordinator, use `qex info` — never search the process list.
 | --- | --- | --- |
 | The output as it arrives | `qex run -- CMD` (= `qex submit --follow`) | `qex status <id> --follow` |
 | The record when it stops | `qex submit --wait -- CMD` | `qex status <id> --wait` |
-| The exit code only | `qex submit --wait -q -- CMD` | `qex status <id> --quiet`, or `qex wait <id>...` for many |
+| The exit code only | `qex submit --wait -q -- CMD` | `qex status <id> --wait -q`, or `qex wait <id>...` for many |
 
 Each gives the exit code of the job. They differ in what they **write**: the
 output of the job, the record of the job, or nothing.
@@ -78,12 +78,14 @@ jobs that did not stop then have no watcher, so wait again for them.
 | 0 to 96 | **The job.** The exit code of the job, unchanged. |
 | 97 to 127 | **qex.** The queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal stopped the job. Read the record for the signal. |
+| 98 | A signal that qex did not send stopped the job. Read the record for it. A kill, a cancel or a time limit gives 125, and a kill for memory gives 99. |
+| 99 | The kernel stopped the job because the machine ran out of memory. Give a larger `--mem` and run it again. |
+| 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and **the job continues.** Attach to it again. |
 | 123 | The job gave up in the queue. It reached its `--max-queue-time`. |
 | 124 | Your wait reached its time limit. **The job continues.** |
-| 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
+| 125 | Something stopped the job: a kill, a cancel or a time limit. |
 | 126 | A job that this job needed did not succeed. |
 | 127 | There is no job with that id. |
 | 128 and up | **qex itself died from a signal.** The job is not described, and it can still operate. |
@@ -179,6 +181,7 @@ and gives you a `gap` line; with a number alone it cannot. **Act on `id` and
 ```sh
 qex list                     what operates, what waits, and WHY it waits
 qex logs <id> --grep ERROR   the lines you want from a large log
+qex logs <id> --tail 50      the last lines of a log
 qex kill <id>                stop a job and each of its children
 qex cancel <id>              take a job out of the queue
 qex top                      watch the queue; press q to leave
@@ -199,6 +202,10 @@ Every command that reads data accepts `--json`.
   is history for a reader; never signal it.
 - **A claim is a promise, not a measurement.** A job that claims 2GB and uses
   20GB still fills the machine.
+- **`--lock NAME` keeps two jobs apart** when they share something a claim
+  cannot express: a build directory, a port, a database.
+- **`status --follow` writes the log from its first line.** For a job that
+  already stopped, use `qex logs --tail` or `qex status --wait` instead.
 - **`qex submit` copies your environment to the disk.** Use
   `--env-capture minimal` when the shell holds a token, and never paste
   `--show-env` output anywhere public.

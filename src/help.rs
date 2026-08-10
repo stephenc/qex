@@ -73,11 +73,15 @@ Which command
     arrives                (= qex submit --follow)
     the record when the    qex submit --wait        qex status <id> --wait
     job stops
-    the exit code only     qex submit --wait -q     qex status <id> --quiet
+    the exit code only     qex submit --wait -q     qex status <id> --wait -q
                                                     qex wait <id>... for many
 
 Each one gives the exit code of the job. They differ in what they WRITE: the
 output of the job, the record of the job, or nothing.
+
+`--follow` writes the log from its FIRST line, so a job that already stopped
+gives you the whole log. Use `qex logs <id> --tail` or `qex status <id> --wait`
+for such a job.
 
 USE `qex submit --wait` FOR YOUR LONG WORK:
 
@@ -111,12 +115,15 @@ Exit codes
     0 to 96     THE JOB. The exit code of the job, unchanged.
     97 to 127   QEX. The queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job. Read the record for the signal.
+      98        a signal stopped the job, and qex did not send it. Read the
+                record for the signal.
+      99        the kernel stopped the job for memory. Give a larger --mem.
+      100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
       123       the job gave up in the queue. It reached `--max-queue-time`.
       124       your wait reached its time limit. The job continues.
-      125       something stopped the job: kill, cancel, timeout, out-of-memory
+      125       something stopped the job: a kill, a cancel or a time limit
       126       a job that this job needed did not succeed
       127       there is no job with that id
     128 and up  QEX ITSELF died from a signal. The job is not described, and it
@@ -1872,12 +1879,15 @@ One table. Every command that gives you the result of a job obeys it.
     0 to 96     THE JOB. qex gives the exit code of the job, unchanged.
     97 to 127   QEX. The code describes the queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job. Read the record for the signal.
+      98        a signal stopped the job, and qex did not send it. Read the
+                record for the signal.
+      99        the kernel stopped the job for memory. Give a larger --mem.
+      100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
       123       the job gave up in the queue. It reached `--max-queue-time`.
       124       your wait reached its time limit. The job continues.
-      125       something stopped the job: kill, cancel, timeout, out-of-memory
+      125       something stopped the job: a kill, a cancel or a time limit
       126       the job did not run, because a job that it needed did not succeed
       127       there is no job with that id
     128 and up  QEX ITSELF died from a signal. The job is not described. It can
@@ -1904,9 +1914,14 @@ and `qex status` holds the 124. A wait that reached its time limit gives you
 124. Each code thus has one meaning.
 
 The cost is small and it is real: a job that exits between 97 and 255 loses its
-exact code AT THE SHELL, and keeps it in the record. Programs that exit in that
-range are rare, and most of them speak the same convention as qex: 126 for a
-program that cannot be executed, 127 for a program that does not exist.
+exact code AT THE SHELL, and keeps it in the record. A wrapper that reads `$?`
+alone thus sees 97 for each of those jobs, and it reads `qex status --json` to
+get the number. Programs that exit in that range are rare, and most of them
+speak the same convention as qex: 126 for a program that cannot be executed,
+127 for a program that does not exist.
+
+The floor of the band is 96 because the codes above it hold the two conventions
+that a shell already uses, 126 and 127, with room for the codes of qex.
 
 Why 128 and above is qex, and not the job
 -----------------------------------------
@@ -1921,6 +1936,9 @@ out-of-memory kill gives 137. That form cannot serve here:
 A dead process writes no exit code. `128 + N` from a qex command can thus only
 mean that the qex command itself died, and the job is then not described at all.
 qex gives 98 for a job that a signal stopped, and the record names the signal.
+A kill, a cancel or a time limit gives 125 in place of 98, and a kill for memory
+gives 99: qex knows the cause of those, and each of them takes a different
+correction from the reader.
 
 qex catches Ctrl-C and SIGTERM during a wait, so the usual case gives 122 with a
 sentence, and not 130 in silence. A SECOND Ctrl-C stops the command immediately,
@@ -1951,5 +1969,8 @@ stops your wait and not the job, and the code is 122.
 ----------------
 
 `--next` gives control back ONE time. The jobs that did not stop then have no
-watcher, so wait again for them. qex names them when it returns.
+watcher, so wait again for them. qex names them on STDERR when it returns, in a
+line that a person reads. That line is not a data format: your program gave
+those ids, so it holds them already, and `--json` writes the record of the job
+that stopped on stdout.
 ";

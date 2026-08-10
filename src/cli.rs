@@ -302,8 +302,9 @@ pub struct SubmitArgs {
     /// The output of the job goes to the log file, so read it with `qex logs`
     /// and take the part that you want.
     ///
-    /// The id still goes to stdout before the wait begins. Use `--id-file` as
-    /// well, and `qex wait $(cat FILE)` attaches to the job again.
+    /// The id goes to STDERR before the wait begins, because stdout carries the
+    /// record of the job. Use `--id-file` as well, and
+    /// `qex status $(cat FILE) --wait` attaches to the job again.
     #[arg(long)]
     pub wait: bool,
 
@@ -315,7 +316,9 @@ pub struct SubmitArgs {
     pub follow: bool,
 
     /// Write no record when the job stops. Give the exit code only.
-    #[arg(long, short, requires = "wait")]
+    ///
+    /// Use it with `--wait`.
+    #[arg(long, short)]
     pub quiet: bool,
 
     /// Stop the wait of --wait after this time. The job continues. Example: 30m.
@@ -454,6 +457,8 @@ pub struct StatusArgs {
     pub quiet: bool,
 
     /// Stop the wait after this time. The job continues. Example: 30m.
+    ///
+    /// This option limits `--wait`, `--follow` and `--quiet --wait`.
     #[arg(long, value_name = "TIME")]
     pub timeout: Option<String>,
 
@@ -1067,6 +1072,32 @@ mod tests {
             text.contains("125"),
             "the topic must say that a job somebody stops still gives an answer"
         );
+    }
+
+    /// `subcommand_word` in main.rs reads the first argument that does not
+    /// start with a dash. That is the subcommand ONLY while `qex` itself takes
+    /// no option with a value: `qex --config FILE submit` would otherwise give
+    /// the word `FILE`, and the exit code for a usage error would then follow
+    /// the wrong rule.
+    #[test]
+    fn qex_takes_no_global_option_with_a_value() {
+        let command = crate::cli::Cli::command();
+        for arg in command.get_arguments() {
+            assert!(
+                matches!(
+                    arg.get_action(),
+                    clap::ArgAction::Help
+                        | clap::ArgAction::HelpShort
+                        | clap::ArgAction::HelpLong
+                        | clap::ArgAction::Version
+                        | clap::ArgAction::SetTrue
+                        | clap::ArgAction::SetFalse
+                ),
+                "the option `{}` takes a value, so the first word that is not an option is no \
+                 longer the subcommand. See `subcommand_word` in main.rs.",
+                arg.get_id()
+            );
+        }
     }
 
     /// The topic must show the pattern that operates inside a harness.

@@ -156,8 +156,48 @@ fn main() {
 /// usage code 2 of the convention.
 #[cfg(unix)]
 fn speaks_for_a_job(name: &str) -> bool {
-    matches!(name, "submit" | "run" | "wait" | "status")
+    // A word that qex does not know takes the band as well. `qex staus $ID
+    // --wait` is a command that an agent writes, and the code 2 there says
+    // "the job exited 2" when no job ran. The words of 121 — qex could not do
+    // what you asked, no job ran — describe a name that qex cannot read
+    // exactly.
+    //
+    // An EMPTY word says that the command line held no subcommand at all, such
+    // as `qex --bogus`. That is a fault of the command line and not of a job,
+    // so it keeps the conventional code 2.
+    !name.is_empty() && !SPEAKS_FOR_ITSELF.contains(&name)
 }
+
+/// The commands that never give the exit code of a job.
+///
+/// `qex list` and the others answer about qex, so a usage error there is the
+/// conventional 2 and nothing can read it as the code of a job.
+#[cfg(unix)]
+const SPEAKS_FOR_ITSELF: &[&str] = &[
+    "list",
+    "logs",
+    "events",
+    "kill",
+    "cancel",
+    "rerun",
+    "clean",
+    "gc",
+    "du",
+    "info",
+    "pause",
+    "resume",
+    "config",
+    "schema",
+    "help",
+    "version",
+    "watchers",
+    "completions",
+    "top",
+    "pipeline",
+    "daemon",
+    "supervise",
+    "__complete",
+];
 
 /// Gives the first word of the command line that is not an option.
 ///

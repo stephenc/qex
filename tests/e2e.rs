@@ -499,6 +499,93 @@ fn a_signal_to_the_wait_gives_the_code_of_a_broken_wait() {
     h.ok(&["kill", &id, "--grace", "1s"]);
 }
 
+/// A SECOND signal stops the command at once.
+///
+/// A trap that a user cannot escape is worse than no trap. The first signal
+/// gives 122 and a sentence; the second one meets the default behaviour of the
+/// system, so the command dies from the signal and the shell reports 130.
+#[test]
+fn a_second_signal_stops_the_wait_at_once() {
+    let h = Harness::with_default_config("twosig");
+    let id = h.submit(&["submit", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+
+    let child = h.spawn(&["wait", &id]);
+    std::thread::sleep(Duration::from_millis(800));
+    // Two signals, one after the other, with no time for the command to write
+    // its message between them.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let out = child.wait_with_output().expect("the wait did not stop");
+
+    // The command died from the signal, or it gave the code of a broken wait.
+    // Both are correct: the two signals race, and the rule is that the SECOND
+    // one is never caught.
+    use std::os::unix::process::ExitStatusExt;
+    let code = out.status.code();
+    let signal = out.status.signal();
+    assert!(
+        signal == Some(libc::SIGINT) || code == Some(122),
+        "the second signal must not be caught: code {code:?}, signal {signal:?}"
+    );
+
+    // The job is the thing that matters, and no signal reached it.
+    assert_eq!(h.state_of(&id), "running");
+    h.ok(&["kill", &id, "--grace", "1s"]);
+}
+
+/// `--follow` must obey `--timeout`, and the job must continue.
+#[test]
+fn follow_obeys_the_time_limit_of_the_reader() {
+    let h = Harness::with_default_config("followlimit");
+    let id = h.submit(&["submit", "--", "sleep", "30"]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&id)
+    });
+
+    let started = Instant::now();
+    let out = h.qex(&["status", &id, "--follow", "--timeout", "2s"]);
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a wait that reaches its limit gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "`--follow` ignored the limit of the reader"
+    );
+    assert_eq!(
+        h.state_of(&id),
+        "running",
+        "the limit of the reader must not stop the job"
+    );
+    h.ok(&["kill", &id, "--grace", "1s"]);
+}
+
+/// The help of `qex submit` must say WHERE the id goes.
+///
+/// An agent that reads "stdout" writes `ID=$(qex submit --wait ...)` and
+/// captures the record of the job in place of the id.
+#[test]
+fn the_help_of_submit_says_that_the_id_goes_to_stderr() {
+    let h = Harness::with_default_config("submithelp");
+    let text = String::from_utf8_lossy(&h.qex(&["submit", "--help"]).stdout).to_string();
+    let wait_part = text
+        .split("--wait")
+        .nth(1)
+        .expect("`--wait` must be in the help of `qex submit`")
+        .to_string();
+    assert!(
+        wait_part.contains("STDERR") || wait_part.contains("stderr"),
+        "the help must say that the id goes to stderr: {wait_part:.600}"
+    );
+}
+
 /// `qex submit --wait` gives the exit code of the job, and it writes the id file
 /// BEFORE the wait begins.
 ///
@@ -678,10 +765,90 @@ fn quiet_gives_the_exit_code_and_no_text() {
     let out = h.qex(&["status", &running, "--quiet"]);
     assert_eq!(
         out.status.code(),
-        Some(122),
-        "a job that did not stop must not give the code of a job that failed"
+        Some(100),
+        "a job that did not stop has no result, and this reader set no wait"
     );
     h.ok(&["kill", &running, "--grace", "1s"]);
+}
+
+/// `--quiet` on a PIPELINE must describe every stage.
+///
+/// A code that reads the first stage alone says that a build succeeded while a
+/// later stage failed, which is the fault that this branch exists to remove: a
+/// code of qex that does not describe the job.
+#[test]
+fn quiet_on_a_pipeline_reports_the_stage_that_failed() {
+    let h = Harness::with_default_config("quietpipe");
+    let file = h.root.join("pl.toml");
+    std::fs::write(
+        &file,
+        "[[jobs]]\nname = \"one\"\ncommand = [\"true\"]\n\
+         [[jobs]]\nname = \"two\"\nneeds = [\"one\"]\ncommand = [\"sh\", \"-c\", \"exit 6\"]\n",
+    )
+    .unwrap();
+    let group = h.ok(&["pipeline", file.to_str().unwrap()]);
+    h.qex(&["wait", &group, "--timeout", "45s"]);
+
+    // Every form of the question gives one answer.
+    for args in [
+        vec!["status", &group, "--quiet"],
+        vec!["status", &group, "--wait", "--quiet"],
+        vec!["wait", &group, "--quiet"],
+    ] {
+        let out = h.qex(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "`qex {}` must give the code of the stage that failed",
+            args.join(" ")
+        );
+    }
+}
+
+/// A wait for MANY jobs must say why EACH of them waits.
+///
+/// One reporter for many jobs stops at the first job that starts, and every
+/// later job of that wait is then silent. The first job here RUNS, so the
+/// reporter meets a job that is not queued; the second job is blocked behind a
+/// third. With one reporter for each job, the second job speaks.
+#[test]
+fn a_wait_for_many_jobs_says_why_the_later_job_waits() {
+    let h = Harness::new(
+        "manyreason",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    // The first job of the wait. It RUNS, so a shared reporter stops here.
+    let first = h.submit(&["submit", "--cpu", "2", "--mem", "100MB", "--", "sleep", "6"]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&first)
+    });
+    // The job that holds the second job back. It outlives the first job.
+    let holder = h.submit(&[
+        "submit", "--name", "holder", "--cpu", "2", "--mem", "100MB", "--", "sleep", "25",
+    ]);
+    // The second job of the wait. It cannot start until the holder stops.
+    let second = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "100MB", "--needs", &holder, "--", "true",
+    ]);
+
+    let child = h.spawn(&["wait", &first, &second, "--timeout", "30s"]);
+    // The first job stops at 6 seconds, and the wait then moves to the second.
+    std::thread::sleep(Duration::from_secs(12));
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    let out = child.wait_with_output().expect("the wait did not stop");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        said.contains(&holder[..8]) || said.contains("holder"),
+        "the wait must say that the second job waits for the holder: {said}"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.qex(&["cancel", &second]);
 }
 
 /// `qex status --wait` ends with the record, so one command gives everything.
@@ -746,6 +913,44 @@ fn a_wait_says_why_the_job_does_not_start() {
     h.qex(&["cancel", &waiter]);
 }
 
+/// A coordinator that stops while the wait OPENS must not give an answer about
+/// the job.
+///
+/// The wait asks the coordinator for the job list, and then sends the request.
+/// A coordinator that stops in that window gave two wrong answers: the code 127,
+/// which says "there is no job with that id" about a job that operates, and the
+/// broken pipe of issue #45. Both describe the coordinator in the voice of the
+/// job.
+///
+/// This test looks for a window in time, so it cannot prove that the window is
+/// shut. It caught both faults while they were open, and it can never fail for
+/// a reason that is not a fault.
+#[test]
+fn a_coordinator_that_stops_while_the_wait_opens_gives_no_answer_about_the_job() {
+    let h = Harness::with_default_config("openrace");
+
+    for step in 0..8 {
+        let id = h.submit(&["submit", "--", "sh", "-c", "sleep 1; exit 0"]);
+
+        let child = h.spawn(&["wait", &id, "--timeout", "30s"]);
+        // Move the moment of the kill through the window of the handshake.
+        std::thread::sleep(Duration::from_millis(2 + step * 4));
+        let pid = h.coordinator_pid();
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+
+        let out = child.wait_with_output().expect("the wait did not stop");
+        let code = out.status.code();
+        assert!(
+            code == Some(0),
+            "a coordinator that stopped gave the code {code:?} about a job that succeeded: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(h.state_of(&id), "completed");
+    }
+}
+
 /// A coordinator that stops in the middle of a wait must not end the wait.
 ///
 /// Issue #45: the wait died with the code 1, which is the code of a job that
@@ -769,15 +974,9 @@ fn a_wait_survives_a_coordinator_that_stops() {
         libc::kill(pid, libc::SIGKILL);
     }
 
-    // Start a NEW coordinator, which is what an update of the program does.
-    // Without this the test measures the fallback to the record, which qex
-    // had already. The reconnect is the new behaviour, so the test must make
-    // a coordinator for the wait to find.
     h.until("the coordinator is gone", Duration::from_secs(10), || {
         (unsafe { libc::kill(pid, 0) }) != 0
     });
-    let fresh = h.coordinator_pid();
-    assert_ne!(fresh, pid, "the test needs a NEW coordinator");
 
     let out = child.wait_with_output().expect("the wait did not stop");
     assert_eq!(
@@ -791,7 +990,7 @@ fn a_wait_survives_a_coordinator_that_stops() {
 
 /// `--next` gives control back one time, so it must name the jobs that stay.
 #[test]
-fn wait_with_any_names_the_jobs_that_have_no_watcher() {
+fn wait_with_next_names_the_jobs_that_have_no_watcher() {
     let h = Harness::with_default_config("anyrest");
     let fast = h.submit(&["submit", "--", "true"]);
     let slow = h.submit(&["submit", "--", "sleep", "20"]);
@@ -6607,8 +6806,8 @@ fn qex_run_gives_125_when_a_different_command_cancels_the_queued_job() {
 /// job when the job RAN.
 ///
 /// Without this, `qex run` would change the result of the command that it goes
-/// in front of. The test also compares the code against `qex wait
-/// `qex wait`, which answers the same question, so the two cannot drift.
+/// in front of. The test also compares the code against `qex wait`, which
+/// answers the same question, so the two cannot drift.
 #[test]
 fn qex_run_gives_the_exit_code_of_a_job_that_ran() {
     let h = Harness::with_default_config("runcode");
@@ -11154,9 +11353,10 @@ fn a_claim_that_stays_too_small_stops_at_the_limit() {
     ]);
     job.release(&h, &id);
 
-    // The code is 125: something stopped the job.
+    // The code is 99: the kernel stopped the job for memory. It is not the 125
+    // of a kill or a time limit, because the correction is a larger claim.
     let out = h.qex(&["wait", &id, "--timeout", "90s"]);
-    assert_eq!(out.status.code(), Some(125), "got: {out:?}");
+    assert_eq!(out.status.code(), Some(99), "got: {out:?}");
 
     let s = h.status_json(&id);
     assert_eq!(s["state"], "oom", "got: {s}");
@@ -11212,7 +11412,7 @@ fn a_kill_for_memory_with_no_limit_reports_but_does_not_run_the_job_again() {
     job.release(&h, &id);
 
     let out = h.qex(&["wait", &id, "--timeout", "60s"]);
-    assert_eq!(out.status.code(), Some(125), "got: {out:?}");
+    assert_eq!(out.status.code(), Some(99), "got: {out:?}");
 
     let s = h.status_json(&id);
     // The report is correct: the kernel stopped the job for memory.

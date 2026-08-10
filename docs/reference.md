@@ -48,12 +48,14 @@ Every command that reads data accepts `--json`.
 | 0 to 96 | **The job.** qex gives the exit code of the job, unchanged. `qex run -- sh -c 'exit 7'` gives 7. |
 | 97 to 127 | **qex.** The code describes the queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal stopped the job. Read the record for the signal. |
+| 98 | A signal that qex did not send stopped the job. Read the record for it. |
+| 99 | The kernel stopped the job because the machine ran out of memory. Give a larger `--mem`. |
+| 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and the job did not. Attach to it again. |
 | 123 | The job gave up in the queue. It reached its `--max-queue-time`. |
 | 124 | Your wait reached its time limit. The job continues. |
-| 125 | Something stopped the job: a kill, a cancel, a timeout, or out of memory. |
+| 125 | Something stopped the job: a kill, a cancel or a time limit. |
 | 126 | The job did not run, because a job that it needed failed. |
 | 127 | There is no job with that id. |
 | 128 and up | **qex itself died from a signal.** The job is not described. It can still operate, so attach to it again. |
@@ -75,7 +77,10 @@ the 124. A wait that reached its time limit gives you **124**. Each code thus
 has one meaning.
 
 The cost is small and it is real: a job that exits between 97 and 255 loses its
-exact code **at the shell**, and keeps it in the record.
+exact code **at the shell**, and keeps it in the record. A wrapper that reads
+`$?` alone sees 97 for each of those jobs and reads `qex status --json` for the
+number. The floor is 96 because the codes above it hold the two conventions that
+a shell already uses, 126 and 127, with room for the codes of qex.
 
 #### Why 128 and above is qex, and not the job
 
@@ -105,6 +110,13 @@ stops your wait and not the job, and the code is 122. Run
 
 A job that reaches the time limit of `--timeout` gives 125, because something
 stopped that job. It never gives 124: 124 says that a limit of the READER came.
+A job that the kernel stopped for memory gives 99, because the correction is a
+larger `--mem` and not more time.
+
+The wait looks for a coordinator that replaced the one that stopped, for ten
+seconds. It watches the record of the job at the same time, so the limit changes
+the speed of an answer and never the answer: after it, the wait reads the record
+alone, which always answers.
 
 ## Wait for the job in the same command
 
@@ -158,8 +170,9 @@ the output of the job on stdout and no text of its own, and it gives the exit
 code of the job. This command did not start the job, so Ctrl-C stops the wait
 and never the job.
 
-`--quiet` with no `--wait` reads the record as it stands now. A job that did not
-stop has no result, so the code is 122.
+`--quiet` with no `--wait` reads the records as they stand now, and a pipeline
+handle gives every stage. A job that did not stop has no result, so the code is
+100.
 
 ## `qex wait --next` returns one time
 
