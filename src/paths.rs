@@ -230,14 +230,15 @@ fn sweep_socket_dirs(dir: &std::path::Path, own: &[PathBuf], limit: std::time::D
 /// directory. Each other answer gives `false`, and the caller keeps the
 /// directory.
 ///
-/// The test of the process comes first, and it is the strong test. A live
-/// process that holds the socket keeps the directory, and the socket then needs
-/// no probe. The answer of a socket is weaker: Linux and macOS give different
+/// The lock on the pid file is the strong test, and it comes first. A process
+/// that holds that lock operates, so the directory stays and the socket needs no
+/// probe. The answer of a socket is weaker: Linux and macOS give different
 /// errors for a socket that a live coordinator holds but does not accept, and
 /// the safety of this code must not depend on that difference.
 fn no_coordinator_uses(dir: &std::path::Path, limit: std::time::Duration) -> bool {
-    if pid_file_shows_a_live_process(dir) {
-        return false;
+    match pid_file_state(dir) {
+        PidFile::Held | PidFile::Unknown => return false,
+        PidFile::Free => {}
     }
     matches!(
         ask_socket(&dir.join("s"), limit),
@@ -258,59 +259,107 @@ pub enum SocketAnswer {
     Unknown,
 }
 
-/// Writes the process id of this coordinator beside its socket.
+/// The state of the pid file of a socket directory.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum PidFile {
+    /// A process holds the lock on the file. That process operates.
+    Held,
+    /// No process holds the lock, and the file thus says nothing about a
+    /// coordinator. A file that is not there gives this state as well.
+    Free,
+    /// qex cannot test the file.
+    Unknown,
+}
+
+/// Holds the pid file of this coordinator, and the lock on it.
 ///
-/// The sweep of a different coordinator reads this file. A live process keeps
-/// the directory, whatever the socket answers.
+/// The coordinator keeps this value for its whole life. The kernel gives the
+/// lock back when the process stops, so the lock is present exactly while the
+/// coordinator operates.
+pub struct PidFileLock {
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+/// Takes the lock on the pid file beside the socket, and writes the number of
+/// this process into it.
 ///
-/// The coordinator calls this function after `bind`. A file that is present
-/// thus always accompanies a socket that a process holds.
-pub fn write_pid_file(socket: &std::path::Path) -> Result<()> {
+/// THE LOCK IS THE EVIDENCE OF LIFE, AND THE NUMBER IS NOT. The kernel gives an
+/// `flock` back when the process stops, whatever stops it: a signal that a
+/// process cannot catch, a kill at an out-of-memory condition, or a loss of
+/// power. A number gives no such promise, because the system gives the number
+/// of a process that stopped to a new process after some time. A test of the
+/// number would then keep a state directory that no coordinator uses, and
+/// nothing could correct it.
+///
+/// The number stays in the file for a reader, and for a message that names the
+/// process. No decision uses it.
+///
+/// The coordinator calls this function after `bind`, so a lock that is present
+/// always accompanies a socket that this process holds.
+pub fn hold_pid_file(socket: &std::path::Path) -> Result<Option<PidFileLock>> {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd;
+
     let Some(dir) = socket.parent() else {
-        return Ok(());
+        return Ok(None);
     };
     let path = dir.join(PID_FILE);
-    std::fs::write(&path, std::process::id().to_string())
-        .with_context(|| format!("writing {}", path.display()))
-}
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
 
-/// Tests if the pid file of a directory names a live process.
-///
-/// A file that is not there, a text that is not a number, and a process that
-/// stopped all give `false`. The caller then asks the socket.
-///
-/// A system gives the number of a process that stopped to a new process after
-/// some time. This function then gives `true` for a directory that it could
-/// delete. That answer keeps a directory that nobody uses, and it never deletes
-/// a directory that a coordinator uses, so it is the safe direction.
-pub fn pid_file_shows_a_live_process(dir: &std::path::Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(dir.join(PID_FILE)) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<libc::pid_t>() else {
-        return false;
-    };
-    if pid <= 1 {
-        return false;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("locking {}", path.display()));
     }
-    process_is_alive(pid)
+
+    file.write_all(std::process::id().to_string().as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.flush().ok();
+
+    Ok(Some(PidFileLock { file }))
 }
 
-/// Tests if a process operates.
+/// Tests if a process holds the pid file of a directory.
 ///
-/// The signal 0 makes no change to the process. It tests the permission and the
-/// existence only.
+/// The test takes the lock, and it gives the lock back at once. A lock that
+/// this function cannot take belongs to a process that operates.
 ///
-/// `EPERM` says that the process operates and belongs to a different user. This
-/// function gives `true` for it. Each other error says that the process is
-/// gone.
-fn process_is_alive(pid: libc::pid_t) -> bool {
-    unsafe {
-        if libc::kill(pid, 0) == 0 {
-            return true;
+/// This test does not read the number in the file. See `hold_pid_file` for the
+/// reason: the lock says that a process operates, and the number does not.
+pub fn pid_file_state(dir: &std::path::Path) -> PidFile {
+    use std::os::unix::io::AsRawFd;
+
+    let path = dir.join(PID_FILE);
+    let file = match std::fs::OpenOptions::new().read(true).open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PidFile::Free,
+        // qex cannot read the file, so it cannot say that the directory is
+        // free. The caller keeps the directory.
+        Err(_) => return PidFile::Unknown,
+    };
+
+    // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal arrives,
+    // and that is an ordinary event and not a fault.
+    for _ in 0..5 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Give the lock back at once. This process must not hold a lock on
+            // the file of a different coordinator, and a deletion comes next.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return PidFile::Free;
         }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::WouldBlock => return PidFile::Held,
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return PidFile::Unknown,
+        }
     }
+    PidFile::Unknown
 }
 
 /// Asks a socket to answer inside `limit`.
@@ -710,19 +759,25 @@ mod tests {
         OpenSockets(open)
     }
 
-    /// Gives the number of a process that stopped.
+    /// Makes a pid file and holds the lock on it, as a coordinator does.
     ///
-    /// The test starts a program, waits for it, and takes its number. The
-    /// system can give that number to a new process later, but not in the time
-    /// of one test.
-    fn a_process_that_stopped() -> u32 {
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .spawn()
-            .expect("the test cannot start a program");
-        let pid = child.id();
-        child.wait().expect("the test cannot wait for the program");
-        pid
+    /// The caller must keep the result. A file that closes gives the lock back,
+    /// and the directory is then free.
+    fn a_held_pid_file(dir: &std::path::Path) -> std::fs::File {
+        use std::io::Write as _;
+        use std::os::unix::io::AsRawFd;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(dir.join(PID_FILE))
+            .unwrap();
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the test cannot lock the pid file");
+        file.write_all(std::process::id().to_string().as_bytes())
+            .unwrap();
+        file.flush().unwrap();
+        file
     }
 
     /// The sweep must keep the directory of a coordinator that operates.
@@ -751,21 +806,13 @@ mod tests {
         // full gives this state for a coordinator that is busy. The test of the
         // process is thus the test that decides, and the socket cannot.
         std::fs::write(refuses_but_live.join("s"), b"").unwrap();
-        std::fs::write(
-            refuses_but_live.join(PID_FILE),
-            std::process::id().to_string(),
-        )
-        .unwrap();
+        let _held_two = a_held_pid_file(&refuses_but_live);
 
         // A live process holds each socket, and neither socket accepts.
         let _busy_one = a_socket_that_never_answers(&busy_with_pid.join("s"));
         let _busy_two = a_socket_that_never_answers(&busy_no_pid.join("s"));
-        // This process operates, so its number names a live coordinator.
-        std::fs::write(
-            busy_with_pid.join(PID_FILE),
-            std::process::id().to_string(),
-        )
-        .unwrap();
+        // This process holds the lock, as a coordinator does.
+        let _held_one = a_held_pid_file(&busy_with_pid);
 
         // Run the sweep on a thread. A sweep that waits for ever then gives a
         // failure, and it does not stop the whole test suite.
@@ -824,8 +871,12 @@ mod tests {
         // A socket file that no process holds. A connect gives a refusal.
         std::fs::write(dead_socket.join("s"), b"").unwrap();
         std::fs::write(dead_pid.join("s"), b"").unwrap();
-        // A number of a process that stopped must not keep a directory.
-        std::fs::write(dead_pid.join(PID_FILE), a_process_that_stopped().to_string()).unwrap();
+        // The number of a process that OPERATES, and no lock on the file.
+        //
+        // This is the case that a test of the number gets wrong. The number
+        // names a live process, so such a test keeps this directory for ever.
+        // Nothing holds the lock, so no coordinator uses the directory.
+        std::fs::write(dead_pid.join(PID_FILE), std::process::id().to_string()).unwrap();
 
         sweep_socket_dirs(base.path(), &[], std::time::Duration::from_secs(3));
 
@@ -839,7 +890,8 @@ mod tests {
         );
         assert!(
             !dead_pid.exists(),
-            "the sweep must delete a directory whose process stopped"
+            "the sweep must delete a directory that holds a number and no lock; a number \
+             is not evidence that a coordinator operates"
         );
     }
 
@@ -933,37 +985,103 @@ mod tests {
         );
     }
 
-    /// The test of the process must know a live process from a process that
-    /// stopped. The sweep uses it before it asks a socket.
+    /// Waits until the pid file reaches a state, and gives the last state it saw.
+    ///
+    /// A test cannot read the state one time. `Command::spawn` in a different
+    /// test makes a copy of every open file descriptor of this process, and a
+    /// lock stays while that copy is open. The copy closes when the new program
+    /// starts, so the state settles in a moment.
+    fn wait_for_pid_file(dir: &std::path::Path, want: PidFile) -> PidFile {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = pid_file_state(dir);
+            if state == want || std::time::Instant::now() >= deadline {
+                return state;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The lock says that a coordinator operates, and the number does not.
+    ///
+    /// A number goes back to the system when a process stops, and the system
+    /// gives it to a new process later. A test of the number thus keeps a state
+    /// directory that no coordinator uses, and nothing can correct it.
     #[test]
-    fn the_pid_file_test_reads_a_live_process_only() {
+    fn a_number_in_the_pid_file_is_not_evidence_of_a_coordinator() {
         let base = TestDir::make("qex-pidtest");
 
-        assert!(
-            !pid_file_shows_a_live_process(base.path()),
-            "a directory with no pid file holds no promise"
+        assert_eq!(
+            pid_file_state(base.path()),
+            PidFile::Free,
+            "a directory with no pid file holds no coordinator"
         );
 
-        std::fs::write(base.path().join(PID_FILE), b"not a number").unwrap();
-        assert!(
-            !pid_file_shows_a_live_process(base.path()),
-            "a pid file that holds no number gives no process"
-        );
-
-        std::fs::write(
-            base.path().join(PID_FILE),
-            a_process_that_stopped().to_string(),
-        )
-        .unwrap();
-        assert!(
-            !pid_file_shows_a_live_process(base.path()),
-            "a process that stopped must not keep a directory"
-        );
-
+        // The number of THIS process, which operates, and no lock on the file.
         std::fs::write(base.path().join(PID_FILE), std::process::id().to_string()).unwrap();
-        assert!(
-            pid_file_shows_a_live_process(base.path()),
-            "this process operates, so the test must find it"
+        assert_eq!(
+            pid_file_state(base.path()),
+            PidFile::Free,
+            "a number in a file is not evidence of a coordinator; only the lock is"
+        );
+
+        let held = a_held_pid_file(base.path());
+        assert_eq!(
+            pid_file_state(base.path()),
+            PidFile::Held,
+            "a process holds the lock, so a coordinator operates"
+        );
+        drop(held);
+    }
+
+    /// A kill that a process cannot catch gives the lock back.
+    ///
+    /// This property is the reason that the lock is the evidence and the number
+    /// is not. The kernel gives an `flock` back when the process stops, whatever
+    /// stops it, so a coordinator that a kill removes cannot leave evidence that
+    /// outlives it.
+    #[test]
+    fn a_kill_of_the_process_gives_the_lock_back() {
+        let base = TestDir::make("qex-killtest");
+        let path = base.path().join(PID_FILE);
+        std::fs::write(&path, b"").unwrap();
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+
+        // The child takes the lock and then waits. It uses the calls of the
+        // system only, which a process may use after a fork.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "the test cannot make a process");
+        if child == 0 {
+            unsafe {
+                let fd = libc::open(name.as_ptr(), libc::O_RDWR);
+                if fd < 0 || libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+                    libc::_exit(1);
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+
+        let held = wait_for_pid_file(base.path(), PidFile::Held);
+        assert_eq!(
+            held,
+            PidFile::Held,
+            "the child holds the lock, so the file must say that a process operates"
+        );
+
+        // SIGKILL. A process cannot catch it, and it cannot clean anything.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(child, &mut status, 0);
+        }
+
+        assert_eq!(
+            wait_for_pid_file(base.path(), PidFile::Free),
+            PidFile::Free,
+            "the kernel must give the lock back when the process stops, and a kill that \
+             the process cannot catch is the test of that promise"
         );
     }
 

@@ -13379,15 +13379,23 @@ fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
     open
 }
 
-/// Starts a program that operates until the test stops it.
+/// Makes a pid file and holds the lock on it, as a coordinator does.
 ///
-/// The test uses the number of this process as the number of a coordinator that
-/// operates.
-fn a_process_that_operates() -> std::process::Child {
-    Command::new("/bin/sh")
-        .args(["-c", "sleep 30"])
-        .spawn()
-        .expect("the test cannot start a program")
+/// The caller must keep the result. A file that closes gives the lock back.
+fn a_held_pid_file(path: &Path) -> std::fs::File {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap();
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test cannot lock the pid file");
+    write!(file, "{}", std::process::id()).unwrap();
+    file.flush().unwrap();
+    file
 }
 
 /// A socket that a live process holds, and never accepts, must not stop qex.
@@ -13426,20 +13434,34 @@ fn a_socket_that_never_answers_does_not_stop_a_command() {
     );
 }
 
-/// The coordinator names its process beside its socket.
+/// The coordinator holds the lock on its pid file for its whole life.
 ///
-/// The sweep of a different coordinator reads that file. Without the file, a
-/// system that refuses a connection when the queue of the socket is full lets
-/// that sweep delete the directory of a coordinator that operates.
+/// The sweep of a different coordinator tries that lock. Without it, a system
+/// that refuses a connection when the queue of the socket is full lets that
+/// sweep delete the directory of a coordinator that operates.
 #[test]
-fn a_coordinator_writes_its_process_number_beside_its_socket() {
+fn a_coordinator_holds_the_lock_on_its_pid_file() {
+    use std::os::unix::io::AsRawFd;
+
     let h = Harness::with_default_config("pidfile");
     let info: serde_json::Value = serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
     let pid = info["pid"].as_i64().expect("info must give the pid");
+    let path = h.root.join("state/qex/run/pid");
 
-    let written = std::fs::read_to_string(h.root.join("state/qex/run/pid"))
-        .expect("the coordinator must write its process number beside its socket");
+    // The lock is the evidence that the coordinator operates.
+    let file = std::fs::File::open(&path)
+        .expect("the coordinator must make a pid file beside its socket");
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken == 0 {
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    }
+    assert_ne!(
+        taken, 0,
+        "the coordinator must hold the lock on its pid file while it operates"
+    );
 
+    // The number is for a reader, and no decision uses it.
+    let written = std::fs::read_to_string(&path).unwrap();
     assert_eq!(
         written.trim().parse::<i64>().unwrap(),
         pid,
@@ -13485,13 +13507,13 @@ fn a_socket_with_no_answer_stops_a_new_coordinator() {
     );
 }
 
-/// A live process named in the pid file must stop a new coordinator.
+/// A lock on the pid file must stop a new coordinator.
 ///
 /// A system that refuses a connection when the queue of the socket is full
-/// gives the same answer as a socket that nobody holds. The pid file is thus
-/// the test that does not change with the system.
+/// gives the same answer as a socket that nobody holds. The lock is thus the
+/// test that does not change with the system.
 #[test]
-fn a_live_pid_file_stops_a_new_coordinator() {
+fn a_locked_pid_file_stops_a_new_coordinator() {
     let mut h = Harness::with_default_config("ownpid");
     // A coordinator that starts here is a failure of this test. Give it a
     // short life, so the test reports that failure and does not wait.
@@ -13502,32 +13524,21 @@ fn a_live_pid_file_stops_a_new_coordinator() {
     let socket = run.join("s");
     // A socket file that no process holds. Alone, it lets a coordinator start.
     std::fs::write(&socket, b"").unwrap();
-    let mut child = a_process_that_operates();
-    std::fs::write(run.join("pid"), child.id().to_string()).unwrap();
+    let held = a_held_pid_file(&run.join("pid"));
 
     let out = h.qex(&["daemon"]);
     let kind = std::fs::symlink_metadata(&socket).map(|m| m.file_type());
 
-    child.kill().ok();
-    child.wait().ok();
+    drop(held);
 
     assert!(
         out.status.success(),
         "the coordinator must stop with no fault: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let kind = kind.expect("the coordinator deleted the socket of a live process");
+    let kind = kind.expect("the coordinator deleted the socket of a process that operates");
     assert!(
         !std::os::unix::fs::FileTypeExt::is_socket(&kind),
-        "the coordinator bound its own socket while a different process operates"
-    );
-
-    // The coordinator writes its log to the standard output. The CLI sends that
-    // output to `daemon.log` when the CLI starts a coordinator.
-    let log = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        log.contains("delete the two files"),
-        "the log must say what the reader does to correct a number that is not a \
-         coordinator, and it says: {log}"
+        "the coordinator bound its own socket while a different process holds the lock"
     );
 }
