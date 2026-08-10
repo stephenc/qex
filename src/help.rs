@@ -714,8 +714,12 @@ qex looks for a newer release of itself, and it says one line when it finds
 one. It never installs anything: the person who installed qex chose how, and a
 package manager can own that file.
 
-`[update] check = \"never\"` stops it completely. qex then opens no connection
-for this, writes no file for it, and says nothing about a version, for ever.
+`[update] check = \"never\"` stops the AUTOMATIC check completely. qex then opens
+no connection of its own, writes no file for it, and says nothing about a
+version, for ever.
+
+`qex version --check` still asks, because a person asked it to. A command that
+refused would leave that person with no way to answer the question at all.
 
 THE COORDINATOR ASKS, AND YOUR COMMAND NEVER DOES. A check must not delay a
 command and must not fail one, so the network stays out of the path of a

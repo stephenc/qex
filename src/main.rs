@@ -900,5 +900,17 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
         ),
         None => println!("stop hook:    none"),
     }
+    // Show the check for a newer qex, for the reason that the hook above is
+    // here: it reaches a web service on its own, and a reader who forgot it
+    // has no other sign of it.
+    match update::interval(cfg) {
+        Ok(Some(gap)) => println!(
+            "update check: every {}, from {}",
+            units::format_duration(gap),
+            cfg.update.url
+        ),
+        Ok(None) => println!("update check: never"),
+        Err(e) => println!("update check: {e}"),
+    }
     Ok(())
 }

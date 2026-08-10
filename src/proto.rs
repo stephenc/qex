@@ -391,6 +391,55 @@ mod tests {
         let request: Request =
             serde_json::from_str(later).expect("an older coordinator must read a newer request");
         assert!(matches!(request, Request::Status { .. }));
+
+        // THE TYPES INSIDE A MESSAGE OBEY THE RULE AS WELL. `JobStatus` and
+        // `JobSpec` cross this socket inside `Response::Status`,
+        // `Response::Jobs` and `Request::Submit`, so a `deny_unknown_fields`
+        // on one of THOSE breaks an older CLI in the same way, and a test of
+        // the outer message alone never meets it.
+        //
+        // The record comes from the code and not from a text of this test. A
+        // field that a later release ADDS to `JobStatus` would otherwise make
+        // this test fail for a reason that is not the rule.
+        let spec = JobSpec {
+            id: uuid::Uuid::new_v4(),
+            name: "t".into(),
+            cwd: "/".into(),
+            command: vec!["true".into()],
+            env: Default::default(),
+            cpu: 1,
+            mem: 1 << 20,
+            timeout: None,
+            max_queue_time: None,
+            tags: vec![],
+            priority: 0,
+            env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
+            locks: vec![],
+            claims: Default::default(),
+            retries: 0,
+            nice: None,
+            needs: vec![],
+            after: vec![],
+            dedupe_key: None,
+            dedupe_window: 0,
+            learn_key: None,
+            submitted_at: 0,
+        };
+        let record = JobStatus::new(&spec);
+        let mut later = serde_json::to_value(&record).unwrap();
+        later["a_field_from_a_later_release"] = serde_json::json!({"anything": 1});
+        let answer: Response = serde_json::from_value(serde_json::json!({
+            "result": "status",
+            "status": later,
+        }))
+        .expect("an older CLI must read a newer record");
+        match answer {
+            Response::Status { status } => assert_eq!(status.name, record.name),
+            other => panic!("the answer became {other:?}"),
+        }
     }
 
     #[test]

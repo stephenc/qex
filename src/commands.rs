@@ -4392,16 +4392,12 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     // qex could not ask. A newer release is information: a code that says
     // otherwise would fail every script that runs this command on the day of a
     // release.
-    if args.check {
+    let check = if args.check {
         let cfg = Config::load()?;
-        let report = crate::update::report(&cfg);
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&report.json())?);
-        } else {
-            println!("{}", report.text());
-        }
-        return Ok(if report.error.is_some() { 1 } else { 0 });
-    }
+        Some(crate::update::report(&cfg))
+    } else {
+        None
+    };
 
     // Do not start a coordinator. A question about a version must not change
     // the machine.
@@ -4416,7 +4412,7 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
     });
 
     if args.json {
-        let value = match &coordinator {
+        let mut value = match &coordinator {
             Some((version, pid, replaced)) => serde_json::json!({
                 "version": mine,
                 "coordinator": {
@@ -4432,8 +4428,18 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
                 "coordinator": { "running": false }
             }),
         };
+        // `--check` ADDS to this answer, and it does not replace it. One
+        // command gives one shape, so a reader that takes `coordinator` keeps
+        // taking it when it asks for the check as well.
+        if let Some(report) = &check {
+            value["update"] = report.json();
+        }
         println!("{}", serde_json::to_string_pretty(&value)?);
-        return Ok(0);
+        return Ok(if check.as_ref().is_some_and(|r| r.error.is_some()) {
+            1
+        } else {
+            0
+        });
     }
 
     println!("qex {mine}");
@@ -4470,6 +4476,13 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
                 println!("the qex program changed after this coordinator started");
             }
         }
+    }
+
+    // The answer of `--check` comes after the versions, because it is about
+    // the RELEASE and the lines above are about this machine.
+    if let Some(report) = &check {
+        println!("{}", report.text());
+        return Ok(if report.error.is_some() { 1 } else { 0 });
     }
     Ok(0)
 }

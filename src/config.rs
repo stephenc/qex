@@ -1007,8 +1007,10 @@ pub struct Config {
 pub struct UpdateConfig {
     /// How often qex looks: a time such as `24h` or `7d`, or `never`.
     ///
-    /// `never` is absolute. qex then opens no connection, writes no file for
-    /// this, and says nothing about a version, for ever.
+    /// `never` stops the AUTOMATIC check absolutely: qex then opens no
+    /// connection of its own, writes no file for this, and says nothing about
+    /// a version, for ever. `qex version --check` still asks, because a person
+    /// asked it to.
     #[serde(deserialize_with = "text_or_number")]
     pub check: String,
     /// The service that answers. Give a mirror here.
@@ -1430,6 +1432,35 @@ impl Config {
     }
 
     /// Tests each `[[pool]]` entry.
+    /// Tests the fields of `[update]`.
+    ///
+    /// Without this, `check = \"banana\"` is silent everywhere: `qex config
+    /// show` says nothing, `qex info` gives no warning, and the check is
+    /// simply off for ever. A field that qex cannot read must be reported one
+    /// time, and not at the moment that qex first uses it.
+    fn update_fields(&self) -> Result<()> {
+        let check = self.update.check.trim();
+        if !check.eq_ignore_ascii_case(crate::update::NEVER) {
+            crate::units::parse_duration(check).map_err(|e| {
+                anyhow::anyhow!(
+                    "config [update] check: {e}. Give a time such as `24h` or `7d`, or \
+                     `never`."
+                )
+            })?;
+        }
+        crate::units::parse_duration(self.update.timeout.trim())
+            .map_err(|e| anyhow::anyhow!("config [update] timeout: {e}"))?;
+        let url = self.update.url.trim();
+        if !url.is_empty() && !crate::update::is_an_address(url) {
+            anyhow::bail!(
+                "config [update] url must start with `https://`, `http://` or `file://`, and \
+                 it holds `{url}`. An address that starts with a dash becomes an OPTION of \
+                 the program that asks."
+            );
+        }
+        Ok(())
+    }
+
     fn validate_pools(&self) -> Result<()> {
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for p in &self.pools {
@@ -1599,6 +1630,7 @@ impl Config {
     /// Call this function at start. qex then reports an incorrect config file
     /// one time, and not at the moment that it first uses the field.
     pub fn validate(&self) -> Result<()> {
+        self.update_fields()?;
         self.budget_cpu()?;
         self.budget_mem()?;
         self.reserve_mem()?;

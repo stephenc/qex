@@ -61,30 +61,32 @@ pub struct Record {
 }
 
 /// The answer of the service.
+#[derive(Debug)]
 pub struct Answer {
     pub newest: String,
     pub source: String,
 }
 
-fn record_path() -> Result<std::path::PathBuf> {
-    Ok(paths::state_dir()?.join("update.json"))
-}
-
 pub fn read_record() -> Record {
-    let Ok(path) = record_path() else {
+    let Ok(dir) = paths::state_dir() else {
         return Record::default();
     };
+    read_record_in(&dir)
+}
+
+/// The same, for one directory. A test gives its own.
+fn read_record_in(dir: &std::path::Path) -> Record {
+    let path = dir.join("update.json");
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-fn write_record(record: &Record) -> Result<()> {
-    let path = record_path()?;
-    paths::ensure_dir(&paths::state_dir()?, 0o700)?;
+fn write_record_in(dir: &std::path::Path, record: &Record) -> Result<()> {
+    paths::ensure_dir(dir, 0o700)?;
     let bytes = serde_json::to_vec_pretty(record)?;
-    crate::job::write_atomic(&path, &bytes, 0o600)
+    crate::job::write_atomic(&dir.join("update.json"), &bytes, 0o600)
 }
 
 /// Reads the record, changes it, and writes it, with nobody else in between.
@@ -100,10 +102,14 @@ fn write_record(record: &Record) -> Result<()> {
 /// back when a process stops, so a process that dies here leaves nothing
 /// locked.
 fn with_the_record(change: impl FnOnce(&mut Record)) -> Result<Record> {
+    with_the_record_in(&paths::state_dir()?, change)
+}
+
+/// The same, for one directory. A test gives its own.
+fn with_the_record_in(dir: &std::path::Path, change: impl FnOnce(&mut Record)) -> Result<Record> {
     use std::os::unix::io::AsRawFd;
 
-    let dir = paths::state_dir()?;
-    paths::ensure_dir(&dir, 0o700)?;
+    paths::ensure_dir(dir, 0o700)?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -112,9 +118,9 @@ fn with_the_record(change: impl FnOnce(&mut Record)) -> Result<Record> {
         .open(dir.join("update.lock"))?;
     let held = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0;
 
-    let mut record = read_record();
+    let mut record = read_record_in(dir);
     change(&mut record);
-    let answer = write_record(&record);
+    let answer = write_record_in(dir, &record);
 
     if held {
         unsafe {
@@ -148,12 +154,18 @@ pub fn ask(cfg: &Config) -> Result<Answer> {
     if url.is_empty() {
         bail!("[update] url is empty, so qex has nothing to ask");
     }
+    if !is_an_address(&url) {
+        bail!(
+            "[update] url must start with `https://`, `http://` or `file://`, and it holds \
+             `{url}`. An address that starts with a dash becomes an OPTION of the program \
+             that asks."
+        );
+    }
     let limit = parse_duration(&cfg.update.timeout)
         .map_err(|e| anyhow::anyhow!("[update] timeout: {e}"))?
         .unwrap_or(Duration::from_secs(5));
-    let seconds = limit.as_secs().max(1).to_string();
 
-    let body = fetch(&url, &seconds)?;
+    let body = fetch(&url, limit)?;
     let newest = tag_of(&body)?;
     Ok(Answer {
         newest,
@@ -161,26 +173,69 @@ pub fn ask(cfg: &Config) -> Result<Answer> {
     })
 }
 
+/// The most that qex reads from the service.
+///
+/// The answer is one small JSON object. A service that sends more than this is
+/// not answering the question, and the coordinator must not hold it: a read
+/// with no limit reached 8.3GB of memory in 5 seconds against a service that
+/// floods, IN THE PROCESS WHOSE PURPOSE IS TO STOP AN OUT-OF-MEMORY KILL.
+const MOST_BYTES: usize = 256 * 1024;
+
+/// The schemes that `[update] url` may hold.
+///
+/// The address goes to `curl` as an argument, and a value that starts with a
+/// dash becomes an OPTION of curl: `-K/path/to/curlrc` makes curl read a
+/// configuration of its own, and that configuration can write a file. A user
+/// pastes this field from the instructions of a mirror, so it takes the
+/// narrow test and not a test for a leading dash.
+const SCHEMES: [&str; 3] = ["https://", "http://", "file://"];
+
+/// True when qex may ask this address.
+pub fn is_an_address(url: &str) -> bool {
+    SCHEMES.iter().any(|scheme| url.starts_with(scheme))
+}
+
 /// Runs the program that talks to the network.
-fn fetch(url: &str, seconds: &str) -> Result<String> {
+///
+/// qex holds the limit itself, and it does not trust the program to hold one.
+/// `curl --max-time` covers the whole transfer, and the `--timeout` of `wget`
+/// covers ONE operation: a service that sends one byte every two seconds keeps
+/// wget for ever, and a coordinator that stops then leaves it behind. The
+/// deadline below covers both, and a child that passes it takes a signal.
+fn fetch(url: &str, limit: Duration) -> Result<String> {
+    use std::io::Read;
+
+    let seconds = limit.as_secs().max(1).to_string();
     let attempts: [(&str, Vec<String>); 2] = [
         (
             "curl",
             vec![
                 "-fsSL".into(),
                 "--max-time".into(),
-                seconds.into(),
+                seconds.clone(),
+                "--max-filesize".into(),
+                MOST_BYTES.to_string(),
                 "-H".into(),
                 "Accept: application/vnd.github+json".into(),
                 url.into(),
             ],
         ),
         (
+            // THE FLAGS THAT EVERY `wget` TAKES.
+            //
+            // The `wget` of busybox is the one on Alpine and on most small
+            // containers, which are the machines least likely to hold curl.
+            // It does not take `--timeout=` or `--tries=`, and a command with
+            // those gives a usage error that names an option and not the
+            // fault. `-q`, `-O -` and `-T` are in busybox and in GNU wget
+            // alike. The deadline of qex covers the time in either case.
             "wget",
             vec![
-                "-qO-".into(),
-                format!("--timeout={seconds}"),
-                "--tries=1".into(),
+                "-q".into(),
+                "-O".into(),
+                "-".into(),
+                "-T".into(),
+                seconds.clone(),
                 url.into(),
             ],
         ),
@@ -188,28 +243,98 @@ fn fetch(url: &str, seconds: &str) -> Result<String> {
 
     let mut missing = Vec::new();
     for (program, args) in attempts {
-        let answer = std::process::Command::new(program).args(&args).output();
-        match answer {
-            Ok(out) if out.status.success() => {
-                return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+        let child = std::process::Command::new(program)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(_) => {
+                missing.push(program);
+                continue;
             }
-            Ok(out) => {
-                // The program ran and the request failed. Give the words of
-                // the program: they name the proxy, the certificate or the
-                // limit, and qex cannot say it better.
-                let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                let code = out.status.code().unwrap_or(-1);
-                bail!(
-                    "{program} could not reach {url}: exit code {code}{}",
-                    if said.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {said}")
-                    }
-                );
-            }
-            Err(_) => missing.push(program),
+        };
+
+        // Read no more than the limit, and stop at the deadline.
+        //
+        // THE REASON FOR THE STOP COMES FROM THIS LOOP, and never from a test
+        // of the child. A program that ends the moment before this loop ends
+        // is not reaped yet, and `try_wait` then says that it operates: a
+        // fault that arrived in six milliseconds read as a service that never
+        // answered, and every answer that arrived was one race away from the
+        // same message.
+        enum Stop {
+            /// The program closed its output. It is finishing now.
+            Answered,
+            /// The limit of the reader came first.
+            TooSlow,
+            /// The service sent more than an answer.
+            TooMuch,
         }
+        let deadline = std::time::Instant::now() + limit;
+        let mut body = Vec::new();
+        let mut stop = Stop::Answered;
+        if let Some(out) = child.stdout.as_mut() {
+            let mut buffer = [0u8; 8192];
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    stop = Stop::TooSlow;
+                    break;
+                }
+                match out.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        body.extend_from_slice(&buffer[..n]);
+                        if body.len() > MOST_BYTES {
+                            stop = Stop::TooMuch;
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // A program that qex stopped takes a signal. A program that answered
+        // is closing already, so qex waits for it in the usual way.
+        if !matches!(stop, Stop::Answered) {
+            child.kill().ok();
+        }
+        let end = child.wait_with_output();
+
+        match stop {
+            Stop::TooMuch => bail!(
+                "the answer of {url} passed {MOST_BYTES} bytes, and the answer of this service \
+                 is one small object. qex stopped the read."
+            ),
+            Stop::TooSlow => bail!(
+                "{program} did not answer for {url} in {seconds} seconds, and qex stopped it."
+            ),
+            Stop::Answered => {}
+        }
+
+        let Ok(end) = end else {
+            bail!("qex could not wait for {program}");
+        };
+        if end.status.success() {
+            return Ok(String::from_utf8_lossy(&body).to_string());
+        }
+
+        // The program ran and the request failed. Give the words of the
+        // program: they name the proxy, the certificate or the limit, and qex
+        // cannot say it better.
+        let said = String::from_utf8_lossy(&end.stderr).trim().to_string();
+        let code = end.status.code().unwrap_or(-1);
+        bail!(
+            "{program} could not reach {url}: exit code {code}{}",
+            if said.is_empty() {
+                String::new()
+            } else {
+                format!(": {said}")
+            }
+        );
     }
 
     bail!(
@@ -313,6 +438,12 @@ pub fn check_if_due(cfg: &Config) {
 /// This function reads a file. It opens no connection, so a command that calls
 /// it cannot wait for a service and cannot fail because of one.
 pub fn note_for_a_command(cfg: &Config) -> Option<String> {
+    let dir = paths::state_dir().ok()?;
+    note_for_a_command_in(&dir, crate::version::VERSION, cfg)
+}
+
+/// The same, for one directory and one version. A test gives both.
+fn note_for_a_command_in(dir: &std::path::Path, mine: &str, cfg: &Config) -> Option<String> {
     interval(cfg).ok().flatten()?;
     // DECIDE WITH NO LOCK AND NO WRITE FIRST.
     //
@@ -320,15 +451,15 @@ pub fn note_for_a_command(cfg: &Config) -> Option<String> {
     // nothing to say. A lock and a write on that path would cost each command
     // a file operation, and it would make the file exist before the
     // coordinator ever asked anything.
-    note(crate::version::VERSION, &read_record())?;
+    note(mine, &read_record_in(dir))?;
 
     // There is a line to give. Decide again on the record as it stands INSIDE
     // the lock, and claim the version in the same operation: the coordinator
     // writes this file as well, and a decision from before its write would
     // give the same line two times.
     let mut line = None;
-    with_the_record(|r| {
-        line = note(crate::version::VERSION, r);
+    with_the_record_in(dir, |r| {
+        line = note(mine, r);
         if line.is_some() {
             // Keep the version that qex named, so the next command is quiet.
             r.told.clone_from(&r.newest);
@@ -523,6 +654,142 @@ mod tests {
         let mut empty = record_of("0.24.0", None);
         empty.newest = None;
         assert!(note("0.23.0", &empty).is_none());
+    }
+
+    fn a_directory(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qx-upd-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The line reaches a command, and the record remembers that it did.
+    ///
+    /// The whole path is under test here: the decision, the lock and the
+    /// write. A test of the decision alone passes when nothing calls it.
+    #[test]
+    fn a_command_gives_the_line_one_time_and_remembers_it() {
+        let dir = a_directory("cmd");
+        let cfg = Config::default();
+        write_record_in(&dir, &record_of("0.24.0", None)).unwrap();
+
+        let first = note_for_a_command_in(&dir, "0.23.0", &cfg);
+        assert!(first.is_some(), "the first command must give the line");
+        assert_eq!(
+            read_record_in(&dir).told.as_deref(),
+            Some("0.24.0"),
+            "the record must remember the version that qex named"
+        );
+
+        // The second command says nothing, and the record keeps its other
+        // fields.
+        assert!(note_for_a_command_in(&dir, "0.23.0", &cfg).is_none());
+        let record = read_record_in(&dir);
+        assert_eq!(record.newest.as_deref(), Some("0.24.0"));
+        assert_eq!(record.source.as_deref(), Some("a service"));
+
+        // `never` stops the line, whatever the record says.
+        let mut quiet = Config::default();
+        quiet.update.check = "never".into();
+        write_record_in(&dir, &record_of("0.25.0", None)).unwrap();
+        assert!(note_for_a_command_in(&dir, "0.23.0", &quiet).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A command that has nothing to say writes NOTHING.
+    ///
+    /// This runs at the end of every command. A write there would cost each
+    /// command a file operation, and it would make the record exist before the
+    /// coordinator ever asked.
+    #[test]
+    fn a_command_with_nothing_to_say_writes_no_file() {
+        let dir = a_directory("quiet");
+        let cfg = Config::default();
+
+        assert!(note_for_a_command_in(&dir, "0.23.0", &cfg).is_none());
+        assert!(
+            !dir.join("update.json").exists(),
+            "a command with nothing to say must write no record"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The record keeps the field of the OTHER writer.
+    ///
+    /// The coordinator writes what a service said, and a command writes the
+    /// version that it named. Each one holds the whole record, so a change of
+    /// one must not undo a change of the other.
+    #[test]
+    fn a_writer_keeps_the_field_of_the_other_writer() {
+        let dir = a_directory("both");
+        write_record_in(&dir, &record_of("0.24.0", Some("0.24.0"))).unwrap();
+
+        // The coordinator learns of a newer release.
+        with_the_record_in(&dir, |r| {
+            r.newest = Some("0.25.0".into());
+            r.last_checked = 99;
+        })
+        .unwrap();
+        let record = read_record_in(&dir);
+        assert_eq!(
+            record.told.as_deref(),
+            Some("0.24.0"),
+            "the coordinator must keep the word of a command"
+        );
+
+        // A command then names the new one.
+        let line = note_for_a_command_in(&dir, "0.23.0", &Config::default());
+        assert!(line.unwrap().contains("0.25.0"));
+        let record = read_record_in(&dir);
+        assert_eq!(record.last_checked, 99, "a command must keep the time");
+        assert_eq!(record.told.as_deref(), Some("0.25.0"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An address that is not an address is refused before anything runs.
+    ///
+    /// `curl` takes a value that starts with a dash as an OPTION, and
+    /// `-K/path` makes it read a configuration that can write a file.
+    #[test]
+    fn only_an_address_reaches_the_program_that_asks() {
+        assert!(is_an_address("https://example.test/x"));
+        assert!(is_an_address("http://example.test/x"));
+        assert!(is_an_address("file:///tmp/x"));
+        assert!(!is_an_address("-K/tmp/curlrc"));
+        assert!(!is_an_address("--config=/tmp/curlrc"));
+        assert!(!is_an_address("example.test/x"));
+        assert!(!is_an_address(""));
+
+        let mut cfg = Config::default();
+        cfg.update.url = "-K/tmp/curlrc".into();
+        let e = format!("{:#}", ask(&cfg).expect_err("qex must refuse this"));
+        assert!(e.contains("must start with"), "got: {e}");
+    }
+
+    /// A service that floods must not fill the memory of the coordinator.
+    ///
+    /// A read with no limit reached 8.3GB in 5 seconds, in the process whose
+    /// purpose is to stop an out-of-memory kill.
+    #[test]
+    fn an_answer_that_never_ends_stops_at_the_limit() {
+        let mut cfg = Config::default();
+        cfg.update.url = "file:///dev/zero".into();
+        cfg.update.timeout = "10s".into();
+
+        let started = std::time::Instant::now();
+        let e = format!("{:#}", ask(&cfg).expect_err("an endless answer is a fault"));
+        assert!(
+            e.contains("passed") || e.contains("could not reach"),
+            "got: {e}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the read must stop at the limit, and it took {:?}",
+            started.elapsed()
+        );
     }
 
     /// `never` is absolute, and `0` says the same thing.

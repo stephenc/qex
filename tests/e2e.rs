@@ -1221,7 +1221,7 @@ fn a_fresh_install_asks_nothing_and_says_nothing() {
     h.write_config(&format!(
         "[peers]\nenabled = false\n\
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
-         [update]\ncheck = \"1s\"\nurl = \"file://{}\"\n",
+         [update]\ncheck = \"300s\"\nurl = \"file://{}\"\n",
         answer.display()
     ));
 

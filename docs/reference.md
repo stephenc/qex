@@ -647,7 +647,9 @@ url     = "https://api.github.com/repos/stephenc/qex/releases/latest"
 timeout = "5s"
 ```
 
-`never` is absolute: no connection, no file, no message, for ever.
+`never` stops the **automatic** check absolutely: no connection of its own, no
+file, no message, for ever. `qex version --check` still asks, because a person
+asked it to.
 
 qex runs `curl`, and then `wget`. An HTTP client inside qex would bring a TLS
 stack to a tool with nine dependencies, and both programs are on Linux and
