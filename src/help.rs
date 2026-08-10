@@ -946,6 +946,7 @@ that qex uses now.
     [queue]
     oversized = \"run-when-idle\"   # run-when-idle, reject or queue
     settle = \"3s\"
+    max_bypass = 2        # jobs that may start before the job at the front
 
     [politeness]
     nice = 10             # -20 to 19; a larger number gives way
@@ -1213,6 +1214,38 @@ attempt: the machine can be full while the claim of this job is correct.
 
 Set `[enforce] mode` to get the correction. Set `on_oom = 0` to stop it.
 
+The order of the queue
+----------------------
+
+The order is a RESERVATION WITH A BOUNDED BYPASS, and it is not strict order.
+
+`[queue] max_bypass` gives the number of jobs that may start before the job at
+the front of the queue. The default is 2. After that number, qex keeps the
+capacity for the job at the front and starts nothing else, so a stream of small
+jobs cannot hold a large job in the queue for ever.
+
+With `max_bypass = 0`, no job passes a job at the front THAT KEEPS CAPACITY.
+The order is then strict for those jobs, and one large job stops the queue while
+it waits. The value changes nothing for the classes below that keep no capacity
+at any value: qex starts the jobs behind those, because it does not control the
+holder and no wait for it would end.
+
+qex keeps capacity only while the jobs of THIS queue hold it, or while a large
+job waits for a quiet machine. qex schedules those releases. If another user or
+a program outside qex holds the capacity, qex starts the jobs behind the job at
+the front and keeps no capacity: an empty machine gives that job nothing,
+because qex does not control the holder. The count of the jobs that passed is
+NOT reset when the holder changes, so the job becomes unpassable in the same
+scheduler cycle in which the other user releases the capacity.
+
+A job that waits for a job that it needs, for a lock, or for a pause never
+keeps capacity. None of the three takes capacity, so there is nothing to keep,
+and a paused queue starts no job at all.
+
+A bypass does not change the queue. The order stays the order of `--priority`
+and then of the submission, and the job at the front starts before every job
+behind it as soon as it can start.
+
 Enforcement
 -----------
 
@@ -1309,6 +1342,39 @@ qex starts a job when all these conditions are true:
      `max_pressure`.
 
 If a job waits, `qex status` gives the reason in the `blocked_reason` field.
+
+Why a job waits, and what holds the queue
+-----------------------------------------
+
+`blocked_reason` names the holder of the capacity. There are four holders, and
+they do not have the same effect on the jobs behind:
+
+  1. The jobs of this queue. qex knows that they stop, so it keeps the capacity
+     for the job at the front after `[queue] max_bypass` jobs passed it.
+  2. Another user. qex does not control that user, so the wait has no known end.
+     qex starts the jobs behind, and it keeps no capacity.
+  3. A program outside qex, or memory pressure. The same rule as 2.
+  4. The size of the job. A job that is larger than the budget waits for a quiet
+     machine, or the config file keeps it in the queue.
+
+Each job that waits gives a reason of ITS OWN. A job behind a job that qex keeps
+capacity for gives that fact and the id of the job at the front.
+
+qex counts the jobs that pass the job at the front in the field `passed_by`, and
+`blocked_since` gives the time when that job reached the front. The count is not
+reset when the holder changes. A job that another user held for an hour keeps its
+count, and it is unpassable in the same cycle in which a job of this queue
+becomes the holder.
+
+Is the queue healthy
+--------------------
+
+    qex info
+
+The last line answers the question. The queue is healthy when a job started
+recently, OR when the line names a cause outside this queue: another user or the
+machine. The queue is stuck when no job started and the cause is a job of this
+queue. `qex top` gives the same line in its header.
 
 A job that is larger than the budget
 ------------------------------------

@@ -100,6 +100,33 @@ pub struct LockPause {
     pub held_by: Option<String>,
 }
 
+/// What the coordinator measured about the health of the queue.
+///
+/// The scheduler makes these values in one pass, so they name the same moment
+/// and the same numbers that the scheduler used for its decision. A reader that
+/// asked the machine again would get a different moment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueHealth {
+    /// The time when a job last started. `None` means that no job started
+    /// since this coordinator started.
+    pub last_start_at: Option<u64>,
+    /// The number of other coordinators that hold capacity.
+    pub peer_count: usize,
+    /// The cores that the other users hold.
+    pub peer_cpu: u64,
+    /// The memory that the other users hold.
+    pub peer_mem: u64,
+    /// The job at the front of the queue that cannot start, as
+    /// `a1b2c3d4 (train)`. `None` means that no job waits.
+    pub head_job: Option<String>,
+    /// Who holds the capacity that the job at the front needs. See
+    /// `sched::Blocker`.
+    pub head_blocker: Option<String>,
+    /// The number of jobs that started after the job at the front reached the
+    /// front. `None` means that no job is at the front.
+    pub head_passed_by: Option<u32>,
+}
+
 /// A message from the coordinator to the CLI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -156,7 +183,12 @@ pub enum Response {
         config_error: Option<String>,
         cpu_claimed: u64,
         mem_claimed: u64,
-        /// What the queue does now: `running` or `paused`.
+        /// The health of the queue, in one word for a program to read.
+        ///
+        /// The words are `running`, `paused`, `paused-by-fault`, `held`,
+        /// `waits-for-peer`, `waits-for-machine`, `waits-for-capacity`,
+        /// `waits-for-idle` and `parked`. A pause comes before every word about
+        /// the front of the queue, because a paused queue starts no job at all.
         ///
         /// # Why this field is an Option, and why it holds a string
         ///
@@ -195,6 +227,21 @@ pub enum Response {
         /// The locks that a person holds.
         #[serde(default)]
         paused_locks: Option<Vec<LockPause>>,
+        /// What the coordinator measured about the health of the queue.
+        ///
+        /// THIS FIELD IS AN OPTION, AND THAT IS DELIBERATE.
+        ///
+        /// A newer CLI can talk to an older coordinator, which does not measure
+        /// any of it. A defaulted `0` in `peer_cpu` would then say "no other
+        /// user holds anything", which is a lie in the place where the true
+        /// answer is the most valuable. `None` says "this coordinator does not
+        /// measure the health", and every command prints `unknown`.
+        ///
+        /// One option holds them all, so a reader tests ONE field. Seven
+        /// parallel options would let a later change fill three of them and
+        /// leave four, and no reader could say what that state means.
+        #[serde(default)]
+        health: Option<Box<QueueHealth>>,
     },
     /// The things that the coordinator can do.
     Capabilities { names: Vec<String> },

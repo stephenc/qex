@@ -86,7 +86,31 @@ pub struct State {
     pub events: crate::events::EventLog,
     /// What a person paused. The file `paused.json` holds the same values.
     pub paused: crate::pause::Paused,
+    /// The time when a job last started, in seconds after the Unix epoch.
+    pub last_start_at: Option<u64>,
+    /// What the last scheduler pass found at the front of the queue.
+    pub head: Option<HeadInfo>,
+    /// The claims of the other users, from the last scheduler pass.
+    ///
+    /// `qex info` reads this copy and does not read the files of the other
+    /// users again. The answer then names the same numbers that the scheduler
+    /// used for its decision.
+    pub peer_claims: crate::peers::Claims,
     pub stop: bool,
+}
+
+/// The job at the front of the queue that cannot start, for `qex info`.
+#[derive(Debug, Clone)]
+pub struct HeadInfo {
+    pub id: uuid::Uuid,
+    /// The SAFE name. See `job::safe_name`.
+    pub name: String,
+    /// The word for the class of the cause. See `sched::Blocker`.
+    pub blocker: String,
+    /// True when qex keeps the capacity for this job and starts nothing else.
+    pub reserved: bool,
+    /// The number of jobs that started after this job reached the front.
+    pub passed_by: u32,
 }
 
 /// How long every look at the configuration file must give the same content
@@ -515,6 +539,9 @@ impl Coordinator {
                 config_error: None,
                 events: crate::events::EventLog::new(),
                 paused: crate::pause::Paused::default(),
+                last_start_at: None,
+                head: None,
+                peer_claims: crate::peers::Claims::default(),
                 stop: false,
             }),
             changed: Condvar::new(),
@@ -1116,6 +1143,26 @@ fn no_such_job(id: uuid::Uuid) -> Response {
 fn handle_info(coord: &Arc<Coordinator>) -> Response {
     let state = coord.state.lock().unwrap();
     let (cpu_claimed, mem_claimed) = state.claimed();
+    // One word that answers "is the queue healthy".
+    //
+    // A PAUSE COMES FIRST. A paused queue starts no job at all, whatever the
+    // front of the queue holds, so a word about the front would name a cause
+    // that is not the cause. `paused-by-fault` is a state of its own, and not a
+    // flag beside `paused`. Two parallel fields drift, and a reader that learns
+    // the pause but not its cause cannot correct the cause.
+    //
+    // `held` then says that qex keeps the capacity for the job at the front and
+    // starts nothing. Each other word names the holder of the capacity, so a
+    // reader learns at once whether the cause is inside this queue or outside.
+    let queue_state = match &state.paused.queue {
+        Some(record) if record.fault => "paused-by-fault".to_string(),
+        Some(_) => "paused".to_string(),
+        None => match &state.head {
+            None => "running".to_string(),
+            Some(h) if h.reserved => "held".to_string(),
+            Some(h) => h.blocker.clone(),
+        },
+    };
     Response::Info {
         pid: std::process::id() as i32,
         version: crate::version::VERSION.to_string(),
@@ -1128,22 +1175,24 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         config_error: state.config_error.clone(),
         cpu_claimed,
         mem_claimed,
-        // `paused-by-fault` is a state of its own, and not a flag beside
-        // `paused`. Two parallel fields drift, and a reader that learns the
-        // pause but not its cause cannot correct the cause.
-        queue_state: Some(
-            match &state.paused.queue {
-                Some(record) if record.fault => "paused-by-fault",
-                Some(_) => "paused",
-                None => "running",
-            }
-            .to_string(),
-        ),
+        queue_state: Some(queue_state),
         paused_at: state.paused.queue.as_ref().map(|p| p.paused_at),
         paused_by_pid: state.paused.queue.as_ref().map(|p| p.by_pid),
         paused_reason: state.paused.queue.as_ref().and_then(|p| p.reason.clone()),
         paused_until: state.paused.queue.as_ref().and_then(|p| p.until),
         paused_locks: Some(state.paused_locks()),
+        health: Some(Box::new(crate::proto::QueueHealth {
+            last_start_at: state.last_start_at,
+            peer_count: state.peer_claims.count,
+            peer_cpu: state.peer_claims.cpu,
+            peer_mem: state.peer_claims.mem,
+            head_job: state
+                .head
+                .as_ref()
+                .map(|h| format!("{} ({})", &h.id.to_string()[..8], h.name)),
+            head_blocker: state.head.as_ref().map(|h| h.blocker.clone()),
+            head_passed_by: state.head.as_ref().map(|h| h.passed_by),
+        })),
     }
 }
 
@@ -1567,6 +1616,9 @@ mod tests {
             next_sequence: 1,
             started_at: 0,
             paused: crate::pause::Paused::default(),
+            last_start_at: None,
+            head: None,
+            peer_claims: Default::default(),
             stop: false,
             config_seen: 0,
             config_settling: None,

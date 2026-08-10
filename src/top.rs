@@ -178,6 +178,16 @@ fn render(
             )));
             out.push('\n');
         }
+
+        // The health of the queue, in the same words as `qex info`. A reader of
+        // a screen that does not change must be able to see WHY it does not
+        // change, and the reason of each job is not on this screen.
+        if let Some(info) = info {
+            let line = crate::commands::queue_line(info);
+            if !line.is_empty() {
+                out.push_str(&format!("      {line}\n"));
+            }
+        }
     }
 
     if info.is_none() {
@@ -467,6 +477,8 @@ mod tests {
             forced_reason: None,
             queue_pause_secs: 0,
             blocked_reason: None,
+            blocked_since: None,
+            passed_by: 0,
             error: None,
             needs: vec![],
             after: vec![],
@@ -500,6 +512,15 @@ mod tests {
             paused_reason: None,
             paused_until: None,
             paused_locks: Some(vec![]),
+            health: Some(Box::new(crate::proto::QueueHealth {
+                last_start_at: Some(crate::sys::now_secs()),
+                peer_count: 0,
+                peer_cpu: 0,
+                peer_mem: 0,
+                head_job: None,
+                head_blocker: None,
+                head_passed_by: None,
+            })),
         }
     }
 
@@ -544,6 +565,15 @@ mod tests {
             paused_reason: Some("recording a demo".into()),
             paused_until: None,
             paused_locks: Some(vec![]),
+            health: Some(Box::new(crate::proto::QueueHealth {
+                last_start_at: None,
+                peer_count: 0,
+                peer_cpu: 0,
+                peer_mem: 0,
+                head_job: None,
+                head_blocker: None,
+                head_passed_by: None,
+            })),
         };
 
         let mut previous = HashMap::new();
