@@ -1190,40 +1190,46 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let base = TestDir::make("qex-reaptest");
 
-        let busy_with_pid = base.path().join(format!("qex-{uid}-busypid"));
-        let busy_no_pid = base.path().join(format!("qex-{uid}-busy"));
+        // THE DIRECTORIES THAT THE LOCK KEEPS. These run on every system, and
+        // nothing below makes them conditional. The lock is the mechanism that
+        // carries this property on a system where a socket cannot give "no
+        // answer".
         let refuses_but_live = base.path().join(format!("qex-{uid}-livepid"));
         let own = base.path().join(format!("qex-{uid}-own"));
-        for dir in [&busy_with_pid, &busy_no_pid, &refuses_but_live, &own] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
+        std::fs::create_dir_all(&refuses_but_live).unwrap();
+        std::fs::create_dir_all(&own).unwrap();
 
-        // A socket that refuses a connection, and a process that operates.
-        //
-        // A system that refuses a connection when the queue of the socket is
-        // full gives this state for a coordinator that is busy. The test of the
+        // A socket that refuses a connection, and a process that operates. A
+        // system that refuses a connection when the queue of the socket is full
+        // gives this state for a coordinator that is busy. The test of the
         // process is thus the test that decides, and the socket cannot.
-        std::fs::write(refuses_but_live.join("s"), b"").unwrap();
-        let _held_two = a_held_pid_file(&refuses_but_live);
+        a_socket_file_with_no_owner(&refuses_but_live.join("s"));
+        let _held_live = a_held_pid_file(&refuses_but_live);
 
-        // A live process holds each socket, and neither socket accepts.
-        // A system that refuses a connection when the queue of the socket is
-        // full gives no way to hold a connect open. The two directories that
-        // need one then do not take part, and the directory that the LOCK keeps
-        // still holds the property on every system.
-        let _busy_one = a_socket_that_never_answers(&busy_with_pid.join("s"));
-        let _busy_two = a_socket_that_never_answers(&busy_no_pid.join("s"));
-        let socket_can_wait = _busy_one.is_some() && _busy_two.is_some();
-        if !socket_can_wait {
+        // THE DIRECTORIES THAT NEED A SOCKET WHICH GIVES NO ANSWER.
+        //
+        // The making of each directory, its socket and its lock live together
+        // in this one block. A system that cannot hold a connect open thus
+        // leaves NO half-made directory, and no step after this block depends
+        // on the directories or on the result.
+        let busy_with_pid = base.path().join(format!("qex-{uid}-busypid"));
+        let busy_no_pid = base.path().join(format!("qex-{uid}-busy"));
+        let busy = (|| {
+            std::fs::create_dir_all(&busy_with_pid).unwrap();
+            std::fs::create_dir_all(&busy_no_pid).unwrap();
+            let one = a_socket_that_never_answers(&busy_with_pid.join("s"))?;
+            let two = a_socket_that_never_answers(&busy_no_pid.join("s"))?;
+            let held = a_held_pid_file(&busy_with_pid);
+            Some((one, two, held))
+        })();
+        if busy.is_none() {
             eprintln!(
                 "this system refuses a connection when the queue of a socket is full, so \
                  the two directories with a socket that gives no answer do not take part"
             );
-            std::fs::remove_dir_all(&busy_with_pid).unwrap();
-            std::fs::remove_dir_all(&busy_no_pid).unwrap();
+            std::fs::remove_dir_all(&busy_with_pid).ok();
+            std::fs::remove_dir_all(&busy_no_pid).ok();
         }
-        // This process holds the lock, as a coordinator does.
-        let _held_one = a_held_pid_file(&busy_with_pid);
 
         // Run the sweep on a thread. A sweep that waits for ever then gives a
         // failure, and it does not stop the whole test suite.
@@ -1242,7 +1248,7 @@ mod tests {
             finished,
             "the sweep waits for a socket that never answers; every qex command then waits"
         );
-        if socket_can_wait {
+        if busy.is_some() {
             assert!(
                 busy_with_pid.exists(),
                 "the sweep deleted the socket directory of a coordinator that operates \
@@ -1411,12 +1417,14 @@ mod tests {
     /// socket.
     #[test]
     fn a_connect_that_finishes_later_gives_the_true_answer() {
-        // A port with no listener. The bind gives a free port, and the close
-        // leaves it free.
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        // A PORT THAT THIS SYSTEM NEVER GIVES TO A PROGRAM THAT ASKS FOR ONE.
+        //
+        // The port 1 needs a privilege, so no test can take it, and it is
+        // outside the range that the system gives for a connection that a
+        // program makes. A test that binds a port and closes it does not give
+        // this promise: the system gives that number to the next program that
+        // asks, and the connect of this test then reaches that program.
+        let port: u16 = 1;
 
         let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
         address.sin_family = libc::AF_INET as libc::sa_family_t;
@@ -1449,6 +1457,15 @@ mod tests {
             );
             libc::close(fd);
 
+            if answer == Some(SocketAnswer::Answers) {
+                // A program listens at this port. The test cannot measure a
+                // refusal, and it must not report a fault of qex.
+                eprintln!(
+                    "this test did not run: a program listens at the port {port}, so this \
+                     test cannot measure a refusal"
+                );
+                return;
+            }
             assert_eq!(
                 answer,
                 Some(SocketAnswer::NobodyListens),
