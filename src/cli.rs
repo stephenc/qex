@@ -458,7 +458,7 @@ pub struct StatusArgs {
     /// qex still reports a FAULT of the wait: a job that does not exist, a wait
     /// that reached its limit, and a wait that a signal stopped. Those lines
     /// give the id that attaches to the job again.
-    #[arg(long, short, conflicts_with = "follow")]
+    #[arg(long, short, conflicts_with_all = ["follow", "json"])]
     pub quiet: bool,
 
     /// Stop the wait after this time. The job continues. Example: 30m.
@@ -495,7 +495,7 @@ pub struct WaitArgs {
     ///
     /// qex still reports a FAULT of the wait, and those lines give the id that
     /// attaches to the job again.
-    #[arg(long, short)]
+    #[arg(long, short, conflicts_with = "json")]
     pub quiet: bool,
 
     /// Write the output as JSON.

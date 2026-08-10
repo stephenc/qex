@@ -79,10 +79,11 @@ Which command
 Each one gives the exit code of the job. They differ in what they WRITE: the
 output of the job, the record of the job, or nothing.
 
-`--quiet` silences the RECORD and the reason that a job waits. It never
-silences a fault of the wait — a job that does not exist, a wait that reached
-its limit, a wait that a signal stopped — because those lines give the id that
-attaches to the job again.
+`--quiet` silences the RECORD and the reason that a job waits, and `--json`
+puts the record on stdout as JSON. NEITHER silences a fault of the wait — a job
+that does not exist, a wait that reached its limit, a wait that a signal stopped
+— because those lines give the id that attaches to the job again, and they go to
+stderr where they cannot mix with JSON.
 
 `--follow` writes the log from its FIRST line, so a job that already stopped
 gives you the whole log. Use `qex logs <id> --tail` or `qex status <id> --wait`
@@ -122,8 +123,8 @@ Exit codes
       97        the job gave a code from 97 to 255. Read the record for it.
       98        a signal stopped the job, and qex did not attribute it to a
                 stop. A kill from anywhere gives 125 instead.
-      99        the kernel stopped the job for memory. It needs `[enforce]`;
-                see `qex help exit-codes`.
+      99        the kernel stopped the job for memory. See the note below:
+                qex must be able to prove it.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -1898,8 +1899,8 @@ One table. Every command that gives you the result of a job obeys it.
       97        the job gave a code from 97 to 255. Read the record for it.
       98        a signal stopped the job, and qex did not attribute it to a
                 stop. A kill from anywhere gives 125 instead.
-      99        the kernel stopped the job for memory. It needs `[enforce]`;
-                see `qex help exit-codes`.
+      99        the kernel stopped the job for memory. See the note below:
+                qex must be able to prove it.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -1925,11 +1926,13 @@ THE CODE ANSWERS `PASS OR FAIL`. THE RECORD ANSWERS `WHY`. An agent that acts
 on the difference between \"the job failed\" and \"my wait stopped\" reads
 `qex status`. An agent that needs pass or fail reads the code.
 
-The commands that obey this table are `qex run`, `qex submit --wait`,
-`qex wait` and `qex status --wait`. Every other command gives 0 for success, 1
-for a failure, 2 for a command line that qex cannot read, and 127 for a job that
-does not exist. `qex list` never speaks for a job, so those codes are not
-ambiguous there.
+Every command that gives you the result of a job obeys it: `qex run`,
+`qex submit --wait`, `qex submit --follow`, `qex wait`, `qex status --wait`,
+`qex status --follow` and `qex status --quiet`.
+
+Every other command gives 0 for success, 1 for a failure, 2 for a command line
+that qex cannot read, and 127 for a job that does not exist. `qex list` never
+speaks for a job, so those codes are not ambiguous there.
 
 Why a band, and why a sentinel
 ------------------------------
@@ -1948,8 +1951,9 @@ get the number. Programs that exit in that range are rare, and most of them
 speak the same convention as qex: 126 for a program that cannot be executed,
 127 for a program that does not exist.
 
-The floor of the band is 96 because the codes above it hold the two conventions
-that a shell already uses, 126 and 127, with room for the codes of qex.
+The band starts at 97, and the job keeps 0 to 96. It starts there because the
+codes above it hold the two conventions that a shell already uses, 126 and 127,
+with room for the codes of qex between them.
 
 Why 128 and above is qex, and not the job
 -----------------------------------------

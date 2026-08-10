@@ -196,21 +196,15 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             if let Some(text) = warning {
                 eprintln!("qex: {text}");
             }
-            // Write the id file BEFORE the wait, and close it.
-            //
-            // `write_id_file` writes the data to the disk and closes the file,
-            // so the id is on the disk before this command waits. The file is
-            // thus a handle after a crash, and not after a tidy stop only. An
-            // id that stays in the memory of a command dies with it.
-            if let Some(path) = &args.id_file {
-                write_id_file(path, &format!("{id}\n"))?;
-            }
             // With `--wait`, stdout carries the RESULT of the job, so the id
             // goes to stderr. Two answers on one stream would give
             // `ID=$(qex submit --wait ...)` the whole record. Use `--id-file`
             // to keep the id, which also survives an interruption.
+            //
+            // The file reaches the disk BEFORE the wait, and it is closed, so
+            // it is a handle after a crash and not after a tidy stop only.
             if args.wait {
-                eprintln!("qex: job {id}");
+                say_the_id_and_write_the_file(id, args.id_file.as_ref());
                 return wait_after_submit(
                     &id.to_string(),
                     args.wait_timeout.as_deref(),
@@ -230,9 +224,40 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
             } else {
                 println!("{id}");
             }
+            // The id is on stdout already, so a file that fails takes nothing
+            // from the caller. Say the fault, and give the code of the fault:
+            // the caller asked for that file, and a later command reads it.
+            if let Some(path) = &args.id_file {
+                write_id_file(path, &format!("{id}\n"))?;
+            }
             Ok(0)
         }
         other => report_for_a_job(other),
+    }
+}
+
+/// Says the id, and then writes the id file.
+///
+/// THE ID GOES FIRST, AND A FILE THAT FAILS DOES NOT TAKE IT.
+///
+/// The job exists at this moment: the coordinator answered, and it waits or it
+/// operates. A write that fails cannot undo that, so a command that stops here
+/// leaves a job that runs with nobody who knows its id — which is the fault
+/// that `--id-file` exists to remove. A full disk and a read-only directory are
+/// exactly the conditions in which a caller needs the handle most.
+///
+/// The failure is still loud, because the caller asked for that file and a
+/// later command will read it.
+fn say_the_id_and_write_the_file(id: uuid::Uuid, path: Option<&std::path::PathBuf>) {
+    eprintln!("qex: job {id}");
+    if let Some(path) = path {
+        if let Err(e) = write_id_file(path, &format!("{id}\n")) {
+            eprintln!(
+                "qex: the id file did not reach the disk: {e:#}\n\
+                 qex: the job {id} still operates. Keep the id from the line above, or read \
+                 `qex list --cwd .`"
+            );
+        }
     }
 }
 
@@ -301,20 +326,19 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
             }
             Ok(code)
         }
+        // A FAULT of the wait always reaches stderr. stdout keeps its JSON,
+        // and `--quiet` keeps the record away; neither hides the line that
+        // carries the id.
         WaitOutcome::TimedOut => {
-            if !json {
-                eprintln!("qex: the wait reached its time limit. The job continues.");
-                eprintln!("qex: attach to it again:  qex status {raw_id} --wait");
-            }
+            eprintln!("qex: the wait reached its time limit. The job continues.");
+            eprintln!("qex: attach to it again:  qex status {raw_id} --wait");
             Ok(EXIT_TIMEOUT)
         }
         WaitOutcome::NoSuchJob => {
-            if !json {
-                eprintln!("qex: there is no job with the id {raw_id}");
-            }
+            eprintln!("qex: there is no job with the id {raw_id}");
             Ok(EXIT_NO_SUCH_JOB)
         }
-        WaitOutcome::Interrupted => Ok(report_broken_wait(&ids, json)),
+        WaitOutcome::Interrupted => Ok(report_broken_wait(&ids, false)),
     }
 }
 
@@ -837,19 +861,15 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                         wait_code = code;
                     }
                 }
+                // A FAULT of the wait always reaches stderr. See
+                // `wait_after_submit`.
                 WaitOutcome::TimedOut => {
-                    if !args.json {
-                        eprintln!(
-                            "qex: the wait for {id} reached its time limit. The job continues."
-                        );
-                    }
+                    eprintln!("qex: the wait for {id} reached its time limit. The job continues.");
                     wait_code = EXIT_TIMEOUT;
                     break;
                 }
                 WaitOutcome::NoSuchJob => {
-                    if !args.json {
-                        eprintln!("qex: there is no job with the id {id}");
-                    }
+                    eprintln!("qex: there is no job with the id {id}");
                     return Ok(EXIT_NO_SUCH_JOB);
                 }
                 // Give the code of a wait that stopped, and NOT `128 + N`. The
@@ -857,7 +877,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                 WaitOutcome::Interrupted => {
                     let names: Vec<String> =
                         ids.iter().skip(waited).map(|i| i.to_string()).collect();
-                    return Ok(report_broken_wait(&names, args.json));
+                    return Ok(report_broken_wait(&names, false));
                 }
             }
         }
@@ -1330,9 +1350,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         Err(e) => {
             // A fault, and not a report. `--quiet` keeps it: the reader has no
             // result and no id, so silence would leave it with a number only.
-            if !args.json {
-                eprintln!("qex: {e}");
-            }
+            eprintln!("qex: {e}");
             return Ok(EXIT_NO_SUCH_JOB);
         }
     };
@@ -1372,21 +1390,15 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         let status = match wait_one(raw_id, deadline, &mut reporter)? {
             WaitOutcome::Finished(s) => s,
             WaitOutcome::TimedOut => {
-                if !args.json {
-                    eprintln!(
-                        "qex: the wait for {raw_id} reached its time limit. The job continues."
-                    );
-                }
+                eprintln!("qex: the wait for {raw_id} reached its time limit. The job continues.");
                 return Ok(EXIT_TIMEOUT);
             }
             WaitOutcome::NoSuchJob => {
-                if !args.json {
-                    eprintln!(
-                        "qex: there is no job with the id {raw_id}. A `qex clean` deletes the \
-                         record of a job that stopped, so a job that succeeded a moment ago \
-                         can give this answer."
-                    );
-                }
+                eprintln!(
+                    "qex: there is no job with the id {raw_id}. A `qex clean` deletes the \
+                     record of a job that stopped, so a job that succeeded a moment ago can \
+                     give this answer."
+                );
                 return Ok(EXIT_NO_SUCH_JOB);
             }
             // A signal stopped this wait. Name every job that this command
@@ -1397,7 +1409,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
                     .skip(results.len())
                     .map(|i| i.to_string())
                     .collect();
-                return Ok(report_broken_wait(&rest, args.json));
+                return Ok(report_broken_wait(&rest, false));
             }
         };
 
@@ -1452,7 +1464,7 @@ fn wait_for_the_next(
 
     loop {
         if wait_was_interrupted() {
-            return Ok(report_broken_wait(ids, args.json));
+            return Ok(report_broken_wait(ids, false));
         }
         for (n, raw) in ids.iter().enumerate() {
             // Ask the coordinator, and read the record when the coordinator
@@ -1478,9 +1490,7 @@ fn wait_for_the_next(
             };
 
             let Some(status) = status else {
-                if !args.json {
-                    eprintln!("qex: there is no job with the id {raw}");
-                }
+                eprintln!("qex: there is no job with the id {raw}");
                 return Ok(EXIT_NO_SUCH_JOB);
             };
 
@@ -1508,9 +1518,7 @@ fn wait_for_the_next(
 
         if let Some(d) = deadline {
             if Instant::now() >= d {
-                if !args.json {
-                    eprintln!("qex: no job stopped before the time limit. They continue.");
-                }
+                eprintln!("qex: no job stopped before the time limit. They continue.");
                 return Ok(EXIT_TIMEOUT);
             }
         }
@@ -1772,7 +1780,14 @@ fn wait_one(
                 }
                 match reconnect(raw_id, deadline) {
                     // A new coordinator answers. Ask it the same question.
-                    Reconnect::Ready => continue,
+                    //
+                    // Sleep first. A coordinator that accepts a connection and
+                    // then fails every request would otherwise make this loop
+                    // spin, and the message above would repeat with it.
+                    Reconnect::Ready => {
+                        std::thread::sleep(WAIT_SLICE);
+                        continue;
+                    }
                     Reconnect::Finished(status) => return Ok(WaitOutcome::Finished(status)),
                     Reconnect::TimedOut => return Ok(WaitOutcome::TimedOut),
                     Reconnect::Interrupted => return Ok(WaitOutcome::Interrupted),
@@ -2905,9 +2920,13 @@ fn exit_code_for(status: &JobStatus) -> i32 {
         // "my job failed" from "a job before mine failed", and it does not read
         // the JSON output.
         JobState::Skipped => EXIT_SKIPPED,
-        // A state that is not the end of a job. qex has no result to give, and
-        // 1 would say that the job ran and failed. The rule of the band holds
-        // by construction here, and not by the states that reach this function.
+        // A state that is not the end of a job, or a job that ended with
+        // neither an exit code nor a signal. qex has no result to give, and 1
+        // would say that the job ran and gave 1. No code in the table fits
+        // exactly: 121 says "qex could not do what you asked", and the part
+        // that qex could not do is the RESULT. The record holds the state, and
+        // the rule of the band holds here by construction, and not by the
+        // states that happen to reach this function.
         _ => EXIT_QEX_FAILED,
     }
 }
@@ -4657,13 +4676,22 @@ fn catch_run_signals() {
 /// stop the job. It continues, and `qex list` finds it. Use `qex submit` for
 /// work that must live longer than the command that starts it.
 pub fn run(args: cli::RunArgs) -> Result<i32> {
-    // `qex run` takes the options of `qex submit`, and `--each-line` is the one
-    // option that it cannot obey: `qex run` waits for ONE job and gives the
-    // output and the exit code of that job. To accept the option here and use
-    // one line only would give the user a result that is not the file.
+    // Name the command that the READER typed. `qex submit --follow` is this
+    // same command in a longer form, and a message about `qex run` names a
+    // command that such a reader never used.
+    let name = if args.submit.follow {
+        "qex submit --follow"
+    } else {
+        "qex run"
+    };
+
+    // This command takes the options of `qex submit`, and `--each-line` is the
+    // one option that it cannot obey: it waits for ONE job and gives the output
+    // and the exit code of that job. To accept the option here and use one line
+    // only would give the user a result that is not the file.
     if args.submit.each_line.is_some() {
         bail!(
-            "`qex run` does not accept `--each-line`, because it waits for one job and \
+            "`{name}` does not accept `--each-line`, because it waits for one job and \
              gives the output and the exit code of that job.\n\n\
              Use `qex submit --each-line`, then wait for the group:\n\
              \x20   GROUP=$(qex submit --each-line inputs.txt -- ./process {{}})"
@@ -4678,7 +4706,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     // expects a difference.
     if args.submit.quiet {
         bail!(
-            "`qex run` does not accept `--quiet`, because it writes the output of the job to \
+            "`{name}` does not accept `--quiet`, because it writes the output of the job to \
              your terminal.\n\n\
              Use `qex submit --wait --quiet` for the exit code with no output."
         );
@@ -4686,7 +4714,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
 
     if args.submit.wait {
         bail!(
-            "`qex run` does not accept `--wait`, because it always waits for the job.\n\n\
+            "`{name}` does not accept `--wait`, because it always waits for the job.\n\n\
              `qex run` writes the output of the job to your terminal. Use \
              `qex submit --wait` to keep the output in the log file."
         );
@@ -4696,7 +4724,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     // would mix with that output, and neither part could be read.
     if args.submit.json {
         bail!(
-            "`qex run` does not accept --json.\n\n\
+            "`{name}` does not accept --json.\n\n\
              This command writes the output of the job to stdout, so a JSON object there \
              would mix with that output.\n\n\
              Use two commands:\n\
@@ -4762,16 +4790,11 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         other => return report_for_a_job(other),
     };
 
-    // Write the id file, and then say the id.
-    //
-    // ALWAYS SAY IT. This command writes the output of the job on stdout, so
-    // the id has no other place to go, and a caller that loses this command
-    // has no handle for a job that continues. One line on stderr costs
-    // nothing and it cannot mix with the output of the job.
-    if let Some(path) = &args.submit.id_file {
-        write_id_file(path, &format!("{id}\n"))?;
-    }
-    eprintln!("qex: job {id}");
+    // ALWAYS SAY THE ID. This command writes the output of the job on stdout,
+    // so the id has no other place to go, and a caller that loses this command
+    // has no handle for a job that continues. One line on stderr costs nothing
+    // and it cannot mix with the output of the job.
+    say_the_id_and_write_the_file(id, args.submit.id_file.as_ref());
 
     // Catch Ctrl-C, and stop the job with it.
     //
@@ -5074,11 +5097,14 @@ fn report_run_stop(status: &JobStatus, stopped_here: bool) {
             "the job {id} reached its time limit, and qex stopped it. Give a longer `--timeout` \
              when the work needs more time."
         ),
+        // Say what the RECORD says. `describe_result` holds the full story of
+        // a kill for memory — the claim that qex tried, and whether it raised
+        // it — and two commands must not explain one state two ways. The words
+        // "the machine ran out of memory" also sent readers to the machine
+        // when the fault was in the claim.
         JobState::Oom => format!(
-            "the machine ran out of memory, and the job {id} stopped. The job claimed {} and \
-             used {}. Give a larger `--mem`, or make the work smaller.",
-            format_size(status.mem),
-            format_size(status.usage.max_rss)
+            "the job {id} stopped: {}. Give a larger `--mem`, or make the work smaller.",
+            describe_result(status)
         ),
         JobState::Skipped => describe_result(status),
         other => format!("the job {id} is {other}"),
@@ -6074,6 +6100,46 @@ mod tests {
                     "the state {state} with the code {code:?} gives {answer}"
                 );
             }
+        }
+    }
+
+    /// The trap of a wait gives the disposition back to the system, so a
+    /// SECOND signal always stops the command.
+    ///
+    /// This is a unit test, and not an end-to-end test, because the property
+    /// cannot be seen from outside: the first signal ends the wait in less
+    /// than a millisecond, so no second signal can arrive while the command
+    /// still waits. A test that sends two signals in one moment passes with a
+    /// trap that a user CANNOT escape, which is the fault that the second
+    /// signal exists to prevent. The rule lives in one flag, so the test reads
+    /// that flag.
+    #[test]
+    fn the_trap_of_a_wait_gives_the_disposition_back_to_the_system() {
+        catch_signals_while_waiting();
+
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(signal, std::ptr::null(), &mut action) },
+                0
+            );
+            assert!(
+                action.sa_flags & libc::SA_RESETHAND != 0,
+                "the trap of the signal {signal} must give the disposition back at the \
+                 delivery, so a second signal is never caught"
+            );
+            assert!(
+                action.sa_flags & libc::SA_RESTART == 0,
+                "the trap of the signal {signal} must not restart a system call, because the \
+                 wait learns of the signal when its `poll` ends"
+            );
+        }
+
+        // Leave the process as it was. A test that keeps a handler changes the
+        // tests that come after it.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
         }
     }
 

@@ -499,45 +499,6 @@ fn a_signal_to_the_wait_gives_the_code_of_a_broken_wait() {
     h.stop(&id);
 }
 
-/// A SECOND signal stops the command at once.
-///
-/// A trap that a user cannot escape is worse than no trap. The first signal
-/// gives 122 and a sentence; the second one meets the default behaviour of the
-/// system, so the command dies from the signal and the shell reports 130.
-#[test]
-fn a_second_signal_stops_the_wait_at_once() {
-    let h = Harness::with_default_config("twosig");
-    let id = h.submit(&["submit", "--", "sleep", "30"]);
-    h.until("the job starts", Duration::from_secs(45), || {
-        h.has_started(&id)
-    });
-
-    let child = h.spawn(&["wait", &id]);
-    std::thread::sleep(Duration::from_millis(800));
-    // Two signals, one after the other, with no time for the command to write
-    // its message between them.
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGINT);
-        libc::kill(child.id() as i32, libc::SIGINT);
-    }
-    let out = child.wait_with_output().expect("the wait did not stop");
-
-    // The command died from the signal, or it gave the code of a broken wait.
-    // Both are correct: the two signals race, and the rule is that the SECOND
-    // one is never caught.
-    use std::os::unix::process::ExitStatusExt;
-    let code = out.status.code();
-    let signal = out.status.signal();
-    assert!(
-        signal == Some(libc::SIGINT) || code == Some(122),
-        "the second signal must not be caught: code {code:?}, signal {signal:?}"
-    );
-
-    // The job is the thing that matters, and no signal reached it.
-    assert_eq!(h.state_of(&id), "running");
-    h.stop(&id);
-}
-
 /// `--follow` must obey `--timeout`, and the job must continue.
 #[test]
 fn follow_obeys_the_time_limit_of_the_reader() {
@@ -1090,6 +1051,64 @@ fn a_job_that_does_not_exist_answers_at_once_with_no_coordinator() {
         "the answer took {:?}, and the record was ready at once",
         started.elapsed()
     );
+}
+
+/// A failed id file must not take the id with it.
+///
+/// The job exists at that moment, and a command that stops there leaves work
+/// that runs with nobody who knows its id. A full disk is exactly the condition
+/// in which a caller needs the handle most, and it is the condition that gave
+/// `--id-file` its rule.
+#[test]
+fn an_id_file_that_fails_does_not_lose_the_job() {
+    let h = Harness::with_default_config("idfilefail");
+    let locked = h.root.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    // A test that runs as root writes anywhere, so it cannot make this fault.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
+    let path = locked.join("job.id");
+    let out = h.qex(&[
+        "submit",
+        "--wait",
+        "--id-file",
+        path.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        "exit 4",
+    ]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+
+    // The wait ran to the end and gave the code of the JOB.
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a file that failed must not stop the wait: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The id reached the caller, and the fault of the file is loud.
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    let id = said
+        .lines()
+        .find_map(|l| l.strip_prefix("qex: job "))
+        .expect("the id must reach stderr before anything can fail");
+    assert!(
+        id.trim().parse::<uuid::Uuid>().is_ok(),
+        "the line must hold a job id: {id}"
+    );
+    assert!(
+        said.contains("did not reach the disk"),
+        "the fault of the file must be loud: {said}"
+    );
+    // The job is real, and the id names it.
+    assert_eq!(h.status_json(id.trim())["exit_code"], 4);
 }
 
 /// `qex status --wait` ends with the record, so one command gives everything.

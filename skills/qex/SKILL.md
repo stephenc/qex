@@ -51,10 +51,11 @@ find the coordinator, use `qex info` — never search the process list.
 Each gives the exit code of the job. They differ in what they **write**: the
 output of the job, the record of the job, or nothing.
 
-`--quiet` silences the record and the reason that a job waits. It never
-silences a **fault** of the wait — no such job, a wait that reached its limit,
-a wait that a signal stopped — because those lines give the id that attaches to
-the job again.
+`--quiet` silences the record and the reason that a job waits, and `--json`
+puts the record on stdout as JSON. **Neither silences a fault of the wait** —
+no such job, a wait that reached its limit, a wait that a signal stopped —
+because those lines give the id that attaches to the job again. They go to
+stderr, so they never mix with JSON.
 
 **Use `qex submit --wait` for your long work:**
 
@@ -87,6 +88,10 @@ that closes, never stop a job; `qex list` finds it and `qex kill <id>` stops it.
 jobs that did not stop then have no watcher, so wait again for them.
 
 ## The exit codes
+
+**One table.** Every command that gives you the result of a job obeys it:
+`qex run`, `qex submit --wait`, `qex submit --follow`, `qex wait`,
+`qex status --wait`, `qex status --follow` and `qex status --quiet`.
 
 | Code | Meaning |
 | --- | --- |

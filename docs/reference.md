@@ -16,9 +16,10 @@ qex submit [--cpu N] [--mem SIZE] [--gpu N] [--vram SIZE] [--claim NAME=N]
            [--dedupe-key KEY] [--dedupe-window TIME] [--id-file FILE]
            [--wait|--follow] [--wait-timeout TIME] [--quiet] -- COMMAND...
 qex submit --each-line FILE [--max-jobs N] -- COMMAND...
-qex wait   <id>... [--timeout TIME] [--next] [--quiet]
+qex wait   <id>... [--timeout TIME] [--next] [--quiet] [--json]
 qex list   [--state STATE] [--tag TAG] [--json]
 qex status <id> [--wait|--follow] [--quiet] [--timeout TIME] [--json]
+           [--show-env] [--no-logs]
 qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
@@ -41,7 +42,8 @@ Every command that reads data accepts `--json`.
 ### Exit codes
 
 **One table.** Every command that gives you the result of a job obeys it:
-`qex run`, `qex submit --wait`, `qex wait` and `qex status --wait`.
+`qex run`, `qex submit --wait`, `qex submit --follow`, `qex wait`,
+`qex status --wait`, `qex status --follow` and `qex status --quiet`.
 
 | Code | Meaning |
 | ---- | ------- |
@@ -79,8 +81,9 @@ has one meaning.
 The cost is small and it is real: a job that exits between 97 and 255 loses its
 exact code **at the shell**, and keeps it in the record. A wrapper that reads
 `$?` alone sees 97 for each of those jobs and reads `qex status --json` for the
-number. The floor is 96 because the codes above it hold the two conventions that
-a shell already uses, 126 and 127, with room for the codes of qex.
+number. The band starts at 97, and the job keeps 0 to 96. It starts there because the
+codes above it hold the two conventions that a shell already uses, 126 and 127,
+with room for the codes of qex between them.
 
 #### Why 128 and above is qex, and not the job
 

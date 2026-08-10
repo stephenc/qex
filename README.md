@@ -88,9 +88,15 @@ the background coordinator for you, and you do not configure a service.
 
 ```sh
 qex submit --wait --cpu guess --mem guess --id-file t.id -- make test
+```
+
+That command blocks until the job stops, and it ends with the record. From
+another shell, while it runs:
+
+```sh
 ID=$(cat t.id)
-qex list                    # what operates now
-qex logs $ID --tail 50      # the output
+qex list                    # what operates now, and why anything waits
+qex logs $ID --follow       # the output as it arrives
 qex kill $ID                # stop it
 qex status $ID --wait       # attach again, from any session
 ```
