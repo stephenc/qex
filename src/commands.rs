@@ -286,7 +286,11 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
     };
 
     catch_signals_while_waiting();
-    let mut reporter = ReasonReporter::new(json);
+    // `--quiet` silences the REPORT and the narration of the queue. It does not
+    // silence a fault of the wait: those lines name the fault and give the id
+    // that attaches to the job again, and a caller that loses them holds
+    // nothing. See `qex help exit-codes`.
+    let mut reporter = ReasonReporter::new(json || quiet);
     let ids = [raw_id.to_string()];
 
     match wait_one(raw_id, deadline, &mut reporter)? {
@@ -813,7 +817,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
             // so a reporter that many jobs share goes silent for all of them
             // at the first job that is not queued. In a pipeline the LAST
             // stage is the one that waits, and it is the one that must speak.
-            let mut reporter = ReasonReporter::new(args.json);
+            let mut reporter = ReasonReporter::new(args.json || args.quiet);
             match wait_one(&id.to_string(), deadline, &mut reporter)? {
                 WaitOutcome::Finished(s) => {
                     waited += 1;
@@ -1309,9 +1313,9 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     let ids = match expand_ids(&args.ids) {
         Ok(ids) => ids,
         Err(e) => {
-            // Keep the silence of `--json`, in the same way as the two answers
-            // below. A reader that asked for JSON reads the exit code.
-            if !args.json && !args.quiet {
+            // A fault, and not a report. `--quiet` keeps it: the reader has no
+            // result and no id, so silence would leave it with a number only.
+            if !args.json {
                 eprintln!("qex: {e}");
             }
             return Ok(EXIT_NO_SUCH_JOB);
@@ -1353,7 +1357,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         let status = match wait_one(raw_id, deadline, &mut reporter)? {
             WaitOutcome::Finished(s) => s,
             WaitOutcome::TimedOut => {
-                if !args.json && !args.quiet {
+                if !args.json {
                     eprintln!(
                         "qex: the wait for {raw_id} reached its time limit. The job continues."
                     );
@@ -1361,7 +1365,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
                 return Ok(EXIT_TIMEOUT);
             }
             WaitOutcome::NoSuchJob => {
-                if !args.json && !args.quiet {
+                if !args.json {
                     eprintln!(
                         "qex: there is no job with the id {raw_id}. A `qex clean` deletes the \
                          record of a job that stopped, so a job that succeeded a moment ago \
@@ -1378,7 +1382,7 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
                     .skip(results.len())
                     .map(|i| i.to_string())
                     .collect();
-                return Ok(report_broken_wait(&rest, args.json || args.quiet));
+                return Ok(report_broken_wait(&rest, args.json));
             }
         };
 
@@ -1427,7 +1431,7 @@ fn wait_for_the_next(
 
     loop {
         if wait_was_interrupted() {
-            return Ok(report_broken_wait(ids, args.json || args.quiet));
+            return Ok(report_broken_wait(ids, args.json));
         }
         for raw in ids {
             // Ask the coordinator, and read the record when the coordinator
@@ -1479,7 +1483,7 @@ fn wait_for_the_next(
 
         if let Some(d) = deadline {
             if Instant::now() >= d {
-                if !args.json && !args.quiet {
+                if !args.json {
                     eprintln!("qex: no job stopped before the time limit. They continue.");
                 }
                 return Ok(EXIT_TIMEOUT);

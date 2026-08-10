@@ -79,6 +79,11 @@ Which command
 Each one gives the exit code of the job. They differ in what they WRITE: the
 output of the job, the record of the job, or nothing.
 
+`--quiet` silences the RECORD and the reason that a job waits. It never
+silences a fault of the wait — a job that does not exist, a wait that reached
+its limit, a wait that a signal stopped — because those lines give the id that
+attaches to the job again.
+
 `--follow` writes the log from its FIRST line, so a job that already stopped
 gives you the whole log. Use `qex logs <id> --tail` or `qex status <id> --wait`
 for such a job.

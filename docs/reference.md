@@ -136,7 +136,7 @@ lines of both streams.
 | ------ | ------- |
 | `--wait` | Wait here until the job stops, then write the record. The output of the job stays in the log file. |
 | `--follow` | Wait here, and write the output of the job as it arrives. This is `qex run` in a longer form. |
-| `--quiet` | With `--wait`, write no record. Give the exit code only. |
+| `--quiet` | With `--wait`, write no record and no queue reason. Give the exit code of the job. qex still reports a fault of the wait, because those lines give the id. |
 | `--wait-timeout TIME` | Stop **your wait** after this time. The job continues, and the code is 124. `--timeout` stops the **job** instead. |
 | `--id-file FILE` | Write the id to this file. qex writes the file, sends the data to the disk and closes it **before** the wait begins. |
 

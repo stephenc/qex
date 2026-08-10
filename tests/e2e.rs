@@ -851,6 +851,70 @@ fn a_wait_for_many_jobs_says_why_the_later_job_waits() {
     h.qex(&["cancel", &second]);
 }
 
+/// `--quiet` silences the REPORT, and never a fault of the wait.
+///
+/// A quiet wait that stops with no message leaves an agent with a number and no
+/// id. The lines that name a fault carry the handle, so they stay.
+#[test]
+fn quiet_keeps_the_faults_of_the_wait() {
+    let h = Harness::new(
+        "quietfault",
+        "[budget]\ncpu = \"2\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+
+    // A job that waits in the queue. The REASON is narration, and `--quiet`
+    // silences it; the time limit is a fault, and `--quiet` keeps it.
+    let holder = h.submit(&[
+        "submit", "--cpu", "2", "--mem", "100MB", "--", "sleep", "20",
+    ]);
+    h.until("the first job starts", Duration::from_secs(45), || {
+        h.has_started(&holder)
+    });
+    let waiter = h.submit(&["submit", "--cpu", "2", "--mem", "100MB", "--", "true"]);
+    h.until("the second job waits", Duration::from_secs(30), || {
+        !h.status_json(&waiter)["blocked_reason"].is_null()
+    });
+    let reason = h.status_json(&waiter)["blocked_reason"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    for args in [
+        vec!["wait", &waiter, "--quiet", "--timeout", "3s"],
+        vec!["status", &waiter, "--wait", "--quiet", "--timeout", "3s"],
+    ] {
+        let out = h.qex(&args);
+        assert_eq!(out.status.code(), Some(124), "`qex {}`", args.join(" "));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "",
+            "`--quiet` must write nothing on stdout"
+        );
+        let said = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            !said.contains(&reason),
+            "`--quiet` must not narrate the queue: {said}"
+        );
+        assert!(
+            said.contains("time limit"),
+            "`--quiet` must keep the fault of the wait: {said}"
+        );
+    }
+
+    // A job that does not exist is a fault as well.
+    let out = h.qex(&["wait", "0f0f0f0f", "--quiet"]);
+    assert_eq!(out.status.code(), Some(127));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "`--quiet` must say that there is no such job"
+    );
+
+    h.ok(&["kill", &holder, "--grace", "1s"]);
+    h.qex(&["cancel", &waiter]);
+}
+
 /// `qex status --wait` ends with the record, so one command gives everything.
 #[test]
 fn status_with_wait_ends_with_the_record_of_the_job() {

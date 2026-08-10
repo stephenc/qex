@@ -315,9 +315,10 @@ pub struct SubmitArgs {
     #[arg(long, conflicts_with = "wait")]
     pub follow: bool,
 
-    /// Write no record when the job stops. Give the exit code only.
+    /// Write no record when the job stops. Give the exit code of the job.
     ///
-    /// Use it with `--wait`.
+    /// Use it with `--wait`. qex still reports a FAULT of the wait, and those
+    /// lines give the id that attaches to the job again.
     #[arg(long, short)]
     pub quiet: bool,
 
@@ -449,10 +450,14 @@ pub struct StatusArgs {
     #[arg(long)]
     pub follow: bool,
 
-    /// Write nothing. Give the exit code of the job only.
+    /// Write no record. Give the exit code of the job.
     ///
     /// Use this option in a script that tests the result. With --wait, this
     /// command blocks first.
+    ///
+    /// qex still reports a FAULT of the wait: a job that does not exist, a wait
+    /// that reached its limit, and a wait that a signal stopped. Those lines
+    /// give the id that attaches to the job again.
     #[arg(long, short, conflicts_with = "follow")]
     pub quiet: bool,
 
@@ -486,7 +491,10 @@ pub struct WaitArgs {
     #[arg(long)]
     pub next: bool,
 
-    /// Write nothing. Give the exit code only.
+    /// Write no result for each job. Give the exit code only.
+    ///
+    /// qex still reports a FAULT of the wait, and those lines give the id that
+    /// attaches to the job again.
     #[arg(long, short)]
     pub quiet: bool,
 
