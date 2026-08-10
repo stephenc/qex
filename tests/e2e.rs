@@ -1140,12 +1140,6 @@ fn version_check_asks_the_service_and_says_what_it_found() {
         said.contains(&answer.display().to_string()),
         "the service that answered must be named: {said}"
     );
-    // A test build is a development build, and that is neither new nor old.
-    assert!(
-        said.contains("development build"),
-        "a development build must be named as one: {said}"
-    );
-
     // `--check` ADDS to the answer of `qex version`, so the version and the
     // coordinator stay where a reader of that command expects them.
     let value: serde_json::Value =
@@ -1154,12 +1148,31 @@ fn version_check_asks_the_service_and_says_what_it_found() {
     assert!(value["coordinator"].is_object(), "got: {value}");
     let update = &value["update"];
     assert_eq!(update["newest"], "9.9.9");
-    assert_eq!(update["development"], true);
-    assert_eq!(
-        update["newer"], false,
-        "a development build is never behind"
-    );
     assert!(update["error"].is_null());
+
+    // TEST BOTH SHAPES OF A BUILD.
+    //
+    // The tests usually run on a development build, and the RELEASE workflow
+    // runs them on a release: it sets the number in `Cargo.toml`, so the same
+    // command then takes the other path. A test that requires the words of a
+    // development build stopped the release of 0.24.0 after the tag existed.
+    let development = update["development"].as_bool().unwrap_or(false);
+    if development {
+        assert!(
+            said.contains("development build"),
+            "a development build must be named as one: {said}"
+        );
+        assert_eq!(
+            update["newer"], false,
+            "a development build takes no place in the order"
+        );
+    } else {
+        assert!(
+            said.contains("A newer release exists"),
+            "a release below 9.9.9 must be told about it: {said}"
+        );
+        assert_eq!(update["newer"], true, "9.9.9 is above every release of qex");
+    }
 }
 
 /// A service that does not answer gives 1, and it changes nothing.
