@@ -27,6 +27,18 @@ const IDLE_EXIT: Duration = Duration::from_secs(3600);
 /// The name of the variable that changes the idle time. The tests use it.
 const IDLE_EXIT_VAR: &str = "QEX_IDLE_EXIT_SECS";
 
+/// The time that this process waits for a socket file that is already present.
+///
+/// A live coordinator accepts a connection in less than one millisecond, so
+/// this limit is generous. The limit must exist: a connect without a limit
+/// waits for ever for a socket that a stuck process holds, and this test comes
+/// before the socket of this coordinator exists. Every qex command then waits.
+///
+/// The limit is longer than the limit of the sweep, because the decision is
+/// more serious here. This process deletes the socket file after the limit, and
+/// it must give a busy coordinator time to answer first.
+const OWN_SOCKET_ANSWER_LIMIT: Duration = Duration::from_secs(1);
+
 /// One job, as the coordinator holds it.
 pub struct Job {
     pub spec: JobSpec,
@@ -722,10 +734,6 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Delete the short socket directories of the coordinators that stopped.
-    // Without this step, each unusual state directory leaves one in /tmp.
-    paths::reap_stale_socket_dirs();
-
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
@@ -734,7 +742,7 @@ pub fn run() -> Result<()> {
     // A socket file can stay after a failure. Test it, then delete it. The CLI
     // holds the spawn lock now, so no other coordinator can start here.
     if socket_path.exists() {
-        if UnixStream::connect(&socket_path).is_ok() {
+        if paths::socket_answers(&socket_path, OWN_SOCKET_ANSWER_LIMIT) {
             log("a different coordinator operates; this process stops");
             return Ok(());
         }
@@ -769,6 +777,18 @@ pub fn run() -> Result<()> {
         })?
     };
     restrict_socket(&socket_path)?;
+
+    // Delete the short socket directories of the coordinators that stopped.
+    // Without this step, each unusual state directory leaves one in /tmp.
+    //
+    // THIS STEP COMES AFTER `bind`, AND IT RUNS ON ITS OWN THREAD. The sweep
+    // asks each socket in the temporary directory to answer, and a socket that
+    // a stuck process holds is slow. Before the socket of this coordinator
+    // exists, every qex command on the machine waits for that sweep, and each
+    // command then reports that the coordinator did not start. The sweep
+    // touches the directories of other coordinators only, so the start
+    // sequence needs no result from it.
+    std::thread::spawn(paths::reap_stale_socket_dirs);
 
     // Warn now if the config asks for a limit that this system cannot apply. A
     // silent failure is dangerous: the user reads the config file and believes

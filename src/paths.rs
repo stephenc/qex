@@ -120,6 +120,21 @@ fn short_socket_dir(preferred: &std::path::Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The time that qex waits for one socket to answer.
+///
+/// A socket on this machine answers in less than one millisecond. A longer wait
+/// gives no more information. Without this limit, a connect to a socket that a
+/// live process holds, but never accepts, waits for ever.
+const SOCKET_ANSWER_LIMIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The time that one sweep of the temporary directory can take.
+///
+/// The sweep stops at this limit and leaves the rest of the directories. The
+/// next coordinator continues the work. The limit is a time and not a count of
+/// directories: a count leaves the same directories at each start, and they
+/// then stay for ever.
+const SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Deletes the short socket directories that no coordinator uses.
 ///
 /// Each test run and each unusual state directory can make one of these
@@ -127,19 +142,54 @@ fn short_socket_dir(preferred: &std::path::Path) -> Result<PathBuf> {
 ///
 /// This function deletes a directory of this user only, and only when it holds
 /// no socket that answers.
+///
+/// The coordinator calls this function on a thread, and after it opens its own
+/// socket. The sweep touches the directories of other coordinators only, so no
+/// command waits for it.
 pub fn reap_stale_socket_dirs() {
+    // Keep the directories of this process. The socket of this coordinator
+    // answers, so the sweep keeps them anyway, but the rule must not depend on
+    // that: a sweep must never delete the socket that it needs to operate.
+    let mut own: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = runtime_dir() {
+        own.push(dir);
+    }
+    if let Ok(socket) = socket_path() {
+        if let Some(dir) = socket.parent() {
+            own.push(dir.to_path_buf());
+        }
+    }
+    sweep_socket_dirs(&std::env::temp_dir(), &own, SWEEP_LIMIT);
+}
+
+/// Sweeps one directory for the socket directories that no coordinator uses.
+///
+/// `own` holds the directories of this process, which the sweep keeps. `limit`
+/// is the time that the whole sweep can take.
+///
+/// This function takes the directory as a parameter, and thus a test can give
+/// it a directory of its own. `$TMPDIR` belongs to the whole process, and a
+/// test that changes it changes the other tests at the same time.
+fn sweep_socket_dirs(dir: &std::path::Path, own: &[PathBuf], limit: std::time::Duration) {
     use std::os::unix::fs::MetadataExt;
+    let start = std::time::Instant::now();
     let uid = unsafe { libc::getuid() };
     let prefix = format!("qex-{uid}-");
 
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
 
     for entry in entries.flatten() {
+        if start.elapsed() >= limit {
+            return;
+        }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with(&prefix) {
+            continue;
+        }
+        if own.iter().any(|p| *p == entry.path()) {
             continue;
         }
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
@@ -150,11 +200,84 @@ pub fn reap_stale_socket_dirs() {
         }
 
         // Keep a directory with a socket that answers. A coordinator uses it.
-        let socket = entry.path().join("s");
-        if socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        if socket_answers(&entry.path().join("s"), SOCKET_ANSWER_LIMIT) {
             continue;
         }
         std::fs::remove_dir_all(entry.path()).ok();
+    }
+}
+
+/// Tests if a socket answers inside `limit`.
+///
+/// The standard library gives no connect with a time limit for a Unix socket.
+/// This function thus uses a socket that does not block, and it tries again
+/// until the limit.
+///
+/// The limit is necessary. A process that holds the socket, but never accepts a
+/// connection, makes a connect without a limit wait for ever. A socket that
+/// does not answer inside the limit is a socket that no coordinator uses.
+pub fn socket_answers(socket: &std::path::Path, limit: std::time::Duration) -> bool {
+    let Some(address) = unix_address(socket) else {
+        return false;
+    };
+
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(answer) = connect_once(&address) {
+            return answer;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Gives the address of a Unix socket at `path`.
+///
+/// The result is `None` when the path is too long for `sun_path`.
+fn unix_address(path: &std::path::Path) -> Option<libc::sockaddr_un> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return None;
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    Some(address)
+}
+
+/// Makes one attempt to connect, and never blocks.
+///
+/// The result is `Some(true)` when the socket accepts the connection, and
+/// `Some(false)` when it refuses. The result is `None` when the socket is full
+/// at this moment: the caller can try again, or stop at its own limit.
+fn connect_once(address: &libc::sockaddr_un) -> Option<bool> {
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Some(false);
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let result = libc::connect(
+            fd,
+            address as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        );
+        let error = std::io::Error::last_os_error().raw_os_error();
+        libc::close(fd);
+        if result == 0 {
+            return Some(true);
+        }
+        match error {
+            Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => None,
+            _ => Some(false),
+        }
     }
 }
 
@@ -362,6 +485,148 @@ mod tests {
         assert_ne!(p, socket_path().unwrap());
 
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    /// Opens a socket that accepts no connection, and fills its backlog.
+    ///
+    /// A connect to this socket blocks. The standard `UnixListener` asks for a
+    /// backlog of 128, so this test uses `libc` and asks for a backlog of one.
+    ///
+    /// The result holds the listener and the connections. The caller must keep
+    /// them, because a closed socket answers at once with a refusal.
+    fn a_socket_that_never_answers(path: &std::path::Path) -> Vec<libc::c_int> {
+        let address = unix_address(path).expect("the path of the test socket is short");
+        let size = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let mut open = Vec::new();
+
+        unsafe {
+            let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(listener >= 0, "the test cannot open a socket");
+            open.push(listener);
+            let bound = libc::bind(
+                listener,
+                &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                size,
+            );
+            assert_eq!(bound, 0, "the test cannot bind {}", path.display());
+            assert_eq!(libc::listen(listener, 1), 0, "the test cannot listen");
+
+            // Fill the backlog. The listener accepts nothing, so each
+            // connection stays in the queue.
+            for _ in 0..256 {
+                let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                assert!(client >= 0, "the test cannot open a socket");
+                let flags = libc::fcntl(client, libc::F_GETFL);
+                libc::fcntl(client, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let result = libc::connect(
+                    client,
+                    &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                    size,
+                );
+                if result != 0 {
+                    libc::close(client);
+                    break;
+                }
+                open.push(client);
+            }
+        }
+
+        assert!(
+            connect_once(&address).is_none(),
+            "the test needs a socket with a full backlog"
+        );
+        open
+    }
+
+    /// The sweep must give a result, and a socket cannot stop it.
+    ///
+    /// A live process can hold a socket and accept no connection. A connect to
+    /// that socket without a time limit waits for ever, and the coordinator
+    /// then never opens its own socket. Every qex command on the machine then
+    /// fails with "the coordinator did not start".
+    #[test]
+    fn a_socket_that_never_answers_does_not_stop_the_sweep() {
+        let uid = unsafe { libc::getuid() };
+        // The name of this directory does not start with `qex-<uid>-`, so a
+        // coordinator on this machine does not delete it.
+        let base = std::env::temp_dir().join(format!("qex-reaptest-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+
+        let stale = base.join(format!("qex-{uid}-stale"));
+        let dead = base.join(format!("qex-{uid}-dead"));
+        let own = base.join(format!("qex-{uid}-own"));
+        let stuck = base.join(format!("qex-{uid}-stuck"));
+        for dir in [&stale, &dead, &own, &stuck] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // A socket file that no process holds. A connect gives a refusal.
+        std::fs::write(dead.join("s"), b"").unwrap();
+        let open = a_socket_that_never_answers(&stuck.join("s"));
+
+        // Run the sweep on a thread. A sweep that waits for ever then gives a
+        // failure, and it does not stop the whole test suite.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let directory = base.clone();
+        let keep = own.clone();
+        std::thread::spawn(move || {
+            sweep_socket_dirs(&directory, &[keep], std::time::Duration::from_secs(3));
+            sender.send(()).ok();
+        });
+        let finished = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
+
+        let results = [stale.exists(), dead.exists(), own.exists(), stuck.exists()];
+
+        for fd in open {
+            unsafe { libc::close(fd) };
+        }
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(
+            finished,
+            "the sweep waits for a socket that never answers; every qex command then waits"
+        );
+        assert!(
+            !results[0],
+            "the sweep must delete a directory with no socket"
+        );
+        assert!(
+            !results[1],
+            "the sweep must delete a directory with a dead socket"
+        );
+        assert!(
+            results[2],
+            "the sweep must keep the directory of this process"
+        );
+        assert!(
+            !results[3],
+            "a socket that does not answer inside the limit is stale"
+        );
+    }
+
+    /// The sweep stops at its time limit and leaves the rest for the next
+    /// coordinator. A limit on the count of directories keeps the same
+    /// directories for ever, so the limit is a time.
+    #[test]
+    fn the_sweep_stops_at_its_time_limit() {
+        let uid = unsafe { libc::getuid() };
+        let base = std::env::temp_dir().join(format!("qex-limittest-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        for n in 0..20 {
+            std::fs::create_dir_all(base.join(format!("qex-{uid}-{n}"))).unwrap();
+        }
+
+        let start = std::time::Instant::now();
+        sweep_socket_dirs(&base, &[], std::time::Duration::ZERO);
+        let elapsed = start.elapsed();
+        let left = std::fs::read_dir(&base).unwrap().count();
+        std::fs::remove_dir_all(&base).ok();
+
+        assert!(elapsed < std::time::Duration::from_secs(1));
+        assert_eq!(left, 20, "a sweep with no time must delete no directory");
     }
 
     #[test]

@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 /// One isolated qex installation.
 struct Harness {
     root: PathBuf,
+    /// Variables that each command of this test gets in addition.
+    extra_env: Vec<(String, String)>,
 }
 
 impl Harness {
@@ -45,7 +47,10 @@ impl Harness {
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::create_dir_all(root.join("run")).unwrap();
         std::fs::write(root.join("cfg/qex.toml"), config).unwrap();
-        Self { root }
+        Self {
+            root,
+            extra_env: Vec::new(),
+        }
     }
 
     fn with_default_config(name: &str) -> Self {
@@ -66,6 +71,7 @@ impl Harness {
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             // Keep the coordinator for the length of the test only.
             .env("QEX_IDLE_EXIT_SECS", "120")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .expect("qex did not start")
     }
@@ -13310,4 +13316,93 @@ fn info_reports_the_pools_and_their_devices() {
 
     let human = h.ok(&["info"]);
     assert!(human.contains("pool gpu"), "got: {human}");
+}
+
+/// Opens a socket that accepts no connection, and fills its backlog.
+///
+/// A connect to this socket blocks. The standard `UnixListener` asks for a
+/// backlog of 128, so this test uses `libc` and asks for a backlog of one.
+///
+/// The result holds the listener and the connections. The caller must keep
+/// them, because a closed socket answers at once with a refusal.
+fn a_socket_that_never_answers(path: &Path) -> Vec<libc::c_int> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    assert!(
+        bytes.len() < address.sun_path.len(),
+        "the path of the test socket is too long"
+    );
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let size = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    let target = &address as *const libc::sockaddr_un as *const libc::sockaddr;
+    let mut open = Vec::new();
+
+    unsafe {
+        let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        assert!(listener >= 0, "the test cannot open a socket");
+        open.push(listener);
+        assert_eq!(
+            libc::bind(listener, target, size),
+            0,
+            "the test cannot bind {}",
+            path.display()
+        );
+        assert_eq!(libc::listen(listener, 1), 0, "the test cannot listen");
+
+        // Fill the backlog. The listener accepts nothing, so each connection
+        // stays in the queue. A further connect then blocks.
+        let mut full = false;
+        for _ in 0..256 {
+            let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(client >= 0, "the test cannot open a socket");
+            let flags = libc::fcntl(client, libc::F_GETFL);
+            libc::fcntl(client, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if libc::connect(client, target, size) != 0 {
+                let error = std::io::Error::last_os_error().raw_os_error();
+                libc::close(client);
+                full = error == Some(libc::EAGAIN);
+                break;
+            }
+            open.push(client);
+        }
+        assert!(full, "the test needs a socket with a full backlog");
+    }
+
+    open
+}
+
+/// A socket that a live process holds, and never accepts, must not stop qex.
+///
+/// The coordinator deletes the short socket directories of the coordinators
+/// that stopped. It asks each socket to answer. Without a time limit, and
+/// before it opens its own socket, one such socket makes every qex command on
+/// the machine report that the coordinator did not start.
+#[test]
+fn a_socket_that_never_answers_does_not_stop_a_command() {
+    let mut h = Harness::with_default_config("stucksock");
+    let tmp = h.root.join("t");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let uid = unsafe { libc::getuid() };
+    let stuck = tmp.join(format!("qex-{uid}-stuck"));
+    std::fs::create_dir_all(&stuck).unwrap();
+    let open = a_socket_that_never_answers(&stuck.join("s"));
+    h.extra_env
+        .push(("TMPDIR".into(), tmp.display().to_string()));
+
+    let out = h.qex(&["info", "--json"]);
+
+    for fd in open {
+        unsafe { libc::close(fd) };
+    }
+
+    assert!(
+        out.status.success(),
+        "the command failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
