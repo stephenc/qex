@@ -589,6 +589,67 @@ A pause of the queue changes the reason of every job that waits, so a reader of
 `qex events` sees one `job` line with `change: "reason"` for each of those jobs,
 and the same at the resume. The pause itself is not a job, so it has no event of
 its own; a reader that must know the pause reads `qex pause --json`.
+## The order of the queue
+
+qex starts the jobs in the order of the queue. The first job that cannot start
+is the job at the front. The rule for the jobs behind it depends on **who holds
+the capacity**:
+
+| The holder | The jobs behind |
+| ---------- | --------------- |
+| The jobs of this queue | Two jobs pass, then qex keeps the capacity and starts nothing. |
+| Another user | Every job starts. qex keeps no capacity. |
+| A program outside qex | Every job starts. qex keeps no capacity. |
+| The size of the job, with `oversized = "run-when-idle"` | Two jobs pass, then qex keeps the capacity and the queue becomes empty. |
+| The size of the job, with `oversized = "queue"` | Every job starts. That job never runs. |
+
+qex controls the release of the capacity that its own jobs hold. It controls
+nothing else. To keep the machine empty for a job that waits for another user
+gives that job nothing, and it stops every other job — a queue that never moves
+with no cause.
+
+`[queue] max_bypass` gives the number of jobs that may pass. The default is 2.
+Set `max_bypass = 0` for a strict order, in which no job passes the job at the
+front. **That value applies to the two rows above that keep capacity only.** The
+three rows that keep no capacity keep none at any value of `max_bypass`: qex
+does not control those holders, so no value of this option can make the wait
+end.
+
+qex counts the jobs that pass in the status field `passed_by`, and
+`blocked_since` gives the time when the job reached the front. **The count is
+not reset when the holder changes.** A job that another user held for an hour
+keeps its count. In the same scheduler cycle in which the holder becomes a job
+of this queue, that count is already at the limit, and the job at the front is
+unpassable. A wait behind another user thus costs one cycle, and not the life of
+the other user's job.
+
+Each job that waits gives a reason of its own in `blocked_reason`. A job behind
+a job that qex keeps capacity for reads that fact and the id of the job at the
+front.
+
+### Is the queue healthy
+
+```sh
+qex info
+```
+
+The last line answers the question:
+
+```
+queue: running · last start 8s ago · 2 running, 5 queued
+queue: waits for another user · no job started for 42m · 1 other user holds 6 cores and 16GB · the job at the front is a1b2c3d4 (train)
+queue: held for the job a1b2c3d4 (train) · 2 job(s) started before it · no job started for 12s · 0 running, 3 queued
+```
+
+The queue is healthy when a job started recently, **or** when the line names a
+cause outside this queue: another user or the machine. The queue is stuck when
+no job started and the cause is a job of this queue.
+
+`qex top` gives the same line in its header. `qex info --json` gives the fields
+`queue_state`, `last_start_at`, `peer_count`, `peer_cpu`, `peer_mem`,
+`head_job`, `head_blocker` and `head_passed_by`. A `null` in one of those fields
+means **unknown**, because the coordinator is too old to measure it. It does not
+mean zero.
 
 ## A pipeline of stages
 
@@ -1007,6 +1068,7 @@ max_pressure = 20     # maximum PSI memory pressure (Linux only)
 
 [queue]
 oversized = "run-when-idle"   # run-when-idle, reject or queue
+max_bypass = 2                # jobs that may start before the job at the front
 
 [logs]
 max_bytes = "32MB"    # the output that qex keeps for each stream of each job

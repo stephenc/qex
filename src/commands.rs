@@ -2867,6 +2867,103 @@ fn event_text(event: &crate::events::Event) -> String {
     }
 }
 
+/// Gives the one line that says if the queue is healthy.
+///
+/// A reader answers one question with this line: does the queue move, and if it
+/// does not, what holds it? Without the line, a reader must open the reason of
+/// each job and calculate the answer.
+///
+/// The queue is healthy when a job started recently, OR when the line names a
+/// cause outside this queue: another user or the machine. The queue is stuck
+/// when no job started and the cause is a job of this queue.
+///
+/// `qex info` and `qex top` both use this function. Two texts for one fact
+/// would say two different things after the first change to one of them.
+pub fn queue_line(info: &Response) -> String {
+    let Response::Info {
+        jobs_running,
+        jobs_queued,
+        queue_state,
+        health,
+        ..
+    } = info
+    else {
+        return String::new();
+    };
+
+    // `queue_state` and `health` are the marks of a coordinator that reports
+    // the health. An older coordinator sends neither, and `unknown` is the true
+    // answer. A defaulted value would say "the queue is running", which is a
+    // statement that qex did not measure.
+    let (Some(state), Some(health)) = (queue_state, health) else {
+        return "queue: unknown · this coordinator is too old to report the health of the queue"
+            .to_string();
+    };
+    let last_start_at = &health.last_start_at;
+    let head_job = &health.head_job;
+    let head_passed_by = &health.head_passed_by;
+
+    // A PAUSE HAS ITS OWN LINE, and this function gives none.
+    //
+    // `qex info` and `qex top` each write the pause with `pause::queue_line`,
+    // which names the person, the reason and the end of the pause. A second
+    // line here would say the same fact with fewer of those values, and the
+    // reader would then have to decide which of the two to trust.
+    if state == "paused" || state == "paused-by-fault" {
+        return String::new();
+    }
+
+    let now = crate::sys::now_secs();
+    let age = last_start_at.map(|t| format_duration(Duration::from_secs(now.saturating_sub(t))));
+    let started = match (&age, state.as_str()) {
+        (Some(a), "running") => format!("last start {a} ago"),
+        (Some(a), _) => format!("no job started for {a}"),
+        (None, _) => "no job started yet".to_string(),
+    };
+    let front = match head_job {
+        Some(j) => format!(" · the job at the front is {j}"),
+        None => String::new(),
+    };
+    let counts = format!("{jobs_running} running, {jobs_queued} queued");
+
+    match state.as_str() {
+        "running" => format!("queue: running · {started} · {counts}"),
+        "held" => format!(
+            "queue: held for the job {} · {} job(s) started before it · {started} · {counts}",
+            head_job.clone().unwrap_or_else(|| "unknown".into()),
+            head_passed_by
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+        "waits-for-peer" => format!(
+            "queue: waits for another user · {started} · {} {} cores and {}{front}",
+            if health.peer_count == 1 {
+                "1 other user holds".to_string()
+            } else {
+                format!("{} other users hold", health.peer_count)
+            },
+            health.peer_cpu,
+            format_size(health.peer_mem),
+        ),
+        "waits-for-machine" => format!(
+            "queue: waits for the machine · {started}{front} · the memory belongs to a program \
+             outside this queue"
+        ),
+        "waits-for-capacity" => {
+            format!("queue: waits for the capacity of this queue · {started} · {counts}{front}")
+        }
+        "waits-for-idle" => format!(
+            "queue: waits for a quiet machine · {started}{front} · that job is larger than the \
+             budget"
+        ),
+        "parked" => format!(
+            "queue: the job at the front is larger than the budget and the config keeps it in the \
+             queue · {started}{front} · qex starts the jobs behind it"
+        ),
+        other => format!("queue: {other} · {started} · {counts}{front}"),
+    }
+}
+
 /// Writes the state of the coordinator.
 ///
 /// The process id here comes from the coordinator itself. Use this command to
@@ -2888,7 +2985,9 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
     } else {
         Client::connect()?
     };
-    match client.call(&Request::Info)? {
+    let response = client.call(&Request::Info)?;
+    let line = queue_line(&response);
+    match response {
         Response::Info {
             pid,
             version,
@@ -2907,6 +3006,7 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             paused_reason,
             paused_until,
             paused_locks,
+            health,
         } => {
             let now = crate::sys::now_secs();
             if args.json {
@@ -2931,6 +3031,17 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         "cpu_claimed": cpu_claimed,
                         "mem_claimed": mem_claimed,
                         "config_error": config_error,
+                        // Each value below is null when the coordinator is too
+                        // old to measure it. A null says "unknown". It does not
+                        // say "zero", and a reader must not read it as zero.
+                        "queue_line": line,
+                        "last_start_at": health.as_ref().and_then(|h| h.last_start_at),
+                        "peer_count": health.as_ref().map(|h| h.peer_count),
+                        "peer_cpu": health.as_ref().map(|h| h.peer_cpu),
+                        "peer_mem": health.as_ref().map(|h| h.peer_mem),
+                        "head_job": health.as_ref().and_then(|h| h.head_job.clone()),
+                        "head_blocker": health.as_ref().and_then(|h| h.head_blocker.clone()),
+                        "head_passed_by": health.as_ref().and_then(|h| h.head_passed_by),
                     }))?
                 );
                 return Ok(0);
@@ -2979,13 +3090,27 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                 format_size(mem_budget)
             );
 
+            // Say what the other users hold. The measurement is the one that
+            // the scheduler used, so this answer and the reason of a job that
+            // waits name the same numbers.
+            match &health {
+                Some(h) if h.peer_cpu > 0 || h.peer_mem > 0 => println!(
+                    "other users:     {} coordinator(s) with {} cores and {}",
+                    h.peer_count,
+                    h.peer_cpu,
+                    format_size(h.peer_mem)
+                ),
+                Some(_) => println!("other users:     none"),
+                None => println!("other users:     unknown"),
+            }
+
             // Say what the queue does. A queue that does nothing and does not
             // say why is the fault that this tool exists to remove.
             //
             // An earlier coordinator gives no value here. Write `unknown`, and
             // do not write `running`: a guess in this place is a lie, and this
             // is the one place where the honest answer matters most.
-            let line = match (queue_state.as_deref(), paused_at) {
+            let state_line = match (queue_state.as_deref(), paused_at) {
                 (Some(state @ ("paused" | "paused-by-fault")), Some(at)) => {
                     let record = crate::pause::PauseRecord {
                         paused_at: at,
@@ -3002,10 +3127,16 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
                         crate::pause::queue_line(&record, now)
                     )
                 }
-                (Some(state), _) => state.to_string(),
+                // Not a pause. `queue_line` gives the full sentence: what holds
+                // the queue, and when a job last started. It writes its own
+                // `queue: ` prefix, so this arm removes it.
+                (Some(state), _) => line
+                    .strip_prefix("queue: ")
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| state.to_string()),
                 (None, _) => "unknown; this coordinator does not report it".to_string(),
             };
-            println!("queue:           {line}");
+            println!("queue:           {state_line}");
             for lock in paused_locks.unwrap_or_default() {
                 println!(
                     "                 {}",
@@ -4586,6 +4717,8 @@ mod tests {
             sequence: 0,
             queue_pause_secs: 0,
             blocked_reason: None,
+            blocked_since: None,
+            passed_by: 0,
             error: None,
             needs: vec![],
             after: vec![],

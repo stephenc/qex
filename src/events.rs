@@ -809,6 +809,9 @@ mod tests {
             config_error: None,
             events: EventLog::with_capacity(RETAINED),
             paused: crate::pause::Paused::default(),
+            last_start_at: None,
+            head: None,
+            peer_claims: Default::default(),
             stop: false,
         }
     }

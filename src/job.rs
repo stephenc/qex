@@ -416,6 +416,25 @@ pub struct JobStatus {
     /// calculate the budget. The value is `None` for a job that started.
     #[serde(default)]
     pub blocked_reason: Option<String>,
+    /// The time when this job first failed the capacity test at the front of
+    /// the queue, in seconds after the Unix epoch.
+    ///
+    /// A reader uses it to see how long the front of the queue has not moved.
+    #[serde(default)]
+    pub blocked_since: Option<u64>,
+    /// The number of jobs that qex started after this job reached the front of
+    /// the queue.
+    ///
+    /// This count is in a field of its own, and it is NOT in `blocked_reason`.
+    /// A number in the reason text changes at each start, and each change
+    /// rewrites the record of the job with two operations to the disk. The
+    /// sentence therefore stays the same while the count changes.
+    ///
+    /// The count is not reset when the cause of the wait changes. A job that
+    /// another user held for an hour thus becomes unpassable in the same
+    /// scheduler cycle in which that user releases the capacity.
+    #[serde(default)]
+    pub passed_by: u32,
     /// The reason that a job failed, when qex itself gives the reason.
     ///
     /// A command that does not exist is the usual cause. This field is separate
@@ -513,6 +532,8 @@ impl JobStatus {
             forced_reason: None,
             queue_pause_secs: 0,
             blocked_reason: None,
+            blocked_since: None,
+            passed_by: 0,
             error: None,
             needs: spec.needs.clone(),
             after: spec.after.clone(),
