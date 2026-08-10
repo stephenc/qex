@@ -1156,7 +1156,13 @@ fn version_check_asks_the_service_and_says_what_it_found() {
     // runs them on a release: it sets the number in `Cargo.toml`, so the same
     // command then takes the other path. A test that requires the words of a
     // development build stopped the release of 0.24.0 after the tag existed.
-    let development = update["development"].as_bool().unwrap_or(false);
+    // REQUIRE the field. `unwrap_or(false)` would take the branch for a
+    // release when the field went away, and on a release build that branch
+    // passes: a schema that lost `development` would then reach a user with
+    // every test green.
+    let development = update["development"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("`update.development` must be a boolean: {update}"));
     if development {
         assert!(
             said.contains("development build"),
