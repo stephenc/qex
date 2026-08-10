@@ -573,8 +573,12 @@ pub fn hold_pid_file(socket: &std::path::Path, patience: std::time::Duration) ->
 pub fn pid_file_state(dir: &std::path::Path) -> PidFile {
     use std::os::unix::io::AsRawFd;
 
+    // OPEN THE FILE FOR WRITING AS WELL AS FOR READING. An exclusive lock needs
+    // a descriptor that can write on some systems and on some file systems, and
+    // this test takes an exclusive lock.
     let file = match std::fs::OpenOptions::new()
         .read(true)
+        .write(true)
         .open(dir.join(PID_FILE))
     {
         Ok(file) => file,
@@ -625,7 +629,7 @@ pub fn ask_socket(socket: &std::path::Path, limit: std::time::Duration) -> Socke
 
     let deadline = std::time::Instant::now() + limit;
     loop {
-        match connect_once(&address) {
+        match connect_once(&address, deadline) {
             Some(answer) => return answer,
             None => {
                 if std::time::Instant::now() >= deadline {
@@ -655,17 +659,96 @@ fn unix_address(path: &std::path::Path) -> Option<libc::sockaddr_un> {
     Some(address)
 }
 
+/// Reads the answer of a connect, or of `SO_ERROR`, as one of three states.
+///
+/// These are the errors of `connect(2)` that prove that NOBODY LISTENS at the
+/// path. Each one is a statement about the path, and not about this process:
+///
+/// * `ECONNREFUSED` — a socket with no process that accepts. A system that
+///   refuses when the queue of the socket is full gives this error as well, so
+///   this answer alone cannot say that a coordinator stopped. The lock on the
+///   pid file makes that decision.
+/// * `ENOENT` — no file at the path.
+/// * `ENOTSOCK` — a file that is not a socket. Nothing can listen at such a
+///   path. One system gives `ECONNREFUSED` for it and another gives this error,
+///   and the two must give one answer to qex.
+///
+/// Every other error gives `Unknown`, and a caller then keeps the socket.
+fn answer_of(error: Option<i32>) -> SocketAnswer {
+    match error {
+        Some(libc::ECONNREFUSED) | Some(libc::ENOENT) | Some(libc::ENOTSOCK) => {
+            SocketAnswer::NobodyListens
+        }
+        _ => SocketAnswer::Unknown,
+    }
+}
+
+/// Waits for a connect that the system did not finish at once.
+///
+/// A non-blocking connect can give `EINPROGRESS`. The system then finishes the
+/// connect later, and the caller reads the result from `SO_ERROR` after the
+/// socket is ready to write. A caller that reads the answer of `connect` alone
+/// never sees that result.
+///
+/// The result is `None` when the caller can try again.
+fn finish_connect(fd: libc::c_int, deadline: std::time::Instant) -> Option<SocketAnswer> {
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    let mut waiting = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let ready = unsafe {
+        libc::poll(
+            &mut waiting,
+            1,
+            left.as_millis().min(i32::MAX as u128) as i32,
+        )
+    };
+    if ready == 0 {
+        // The connect did not finish inside the limit. A coordinator can hold
+        // this socket, so the answer is not known.
+        return Some(SocketAnswer::Unknown);
+    }
+    if ready < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => None,
+            other => Some(answer_of(other)),
+        };
+    }
+
+    let mut error: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let read = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut error as *mut libc::c_int as *mut libc::c_void,
+            &mut size,
+        )
+    };
+    if read != 0 {
+        return Some(SocketAnswer::Unknown);
+    }
+    if error == 0 {
+        return Some(SocketAnswer::Answers);
+    }
+    if error == libc::EAGAIN || error == libc::EINTR {
+        return None;
+    }
+    Some(answer_of(Some(error)))
+}
+
 /// Makes one attempt to connect, and never blocks.
 ///
 /// The result is `Some(answer)` when the system gives an answer. The result is
 /// `None` when the caller can try again: the socket is full at this moment, or
 /// a signal stopped the call.
 ///
-/// `ECONNREFUSED` and `ENOENT` are the two errors that prove that nobody
-/// listens. Each other error gives `Unknown`, because a fault in this process —
-/// a limit on the count of open files, or a failure of `fcntl` — says nothing
-/// about the process at the other end of the socket.
-fn connect_once(address: &libc::sockaddr_un) -> Option<SocketAnswer> {
+/// `deadline` bounds the wait for a connect that the system did not finish at
+/// once. It does not make the caller wait for anything else.
+fn connect_once(address: &libc::sockaddr_un, deadline: std::time::Instant) -> Option<SocketAnswer> {
     unsafe {
         let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
         if fd < 0 {
@@ -685,16 +768,22 @@ fn connect_once(address: &libc::sockaddr_un) -> Option<SocketAnswer> {
             address as *const libc::sockaddr_un as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
         );
-        let error = std::io::Error::last_os_error().raw_os_error();
-        libc::close(fd);
         if result == 0 {
+            libc::close(fd);
             return Some(SocketAnswer::Answers);
         }
-        match error {
-            Some(libc::ECONNREFUSED) | Some(libc::ENOENT) => Some(SocketAnswer::NobodyListens),
-            Some(libc::EAGAIN) | Some(libc::EINPROGRESS) | Some(libc::EINTR) => None,
-            _ => Some(SocketAnswer::Unknown),
-        }
+        let error = std::io::Error::last_os_error().raw_os_error();
+        let answer = match error {
+            // The system finishes this connect later. Wait for it, and read the
+            // result that it gives.
+            Some(libc::EINPROGRESS) => finish_connect(fd, deadline),
+            // The queue of the socket is full at this moment. A process holds
+            // the socket, so the caller tries again.
+            Some(libc::EAGAIN) | Some(libc::EINTR) => None,
+            other => Some(answer_of(other)),
+        };
+        libc::close(fd);
+        answer
     }
 }
 
@@ -975,12 +1064,18 @@ mod tests {
     ///
     /// The result holds the listener and the connections. The caller must keep
     /// it, because a closed socket answers at once with a refusal.
-    fn a_socket_that_never_answers(path: &std::path::Path) -> OpenSockets {
+    ///
+    /// THE RESULT IS `None` ON A SYSTEM THAT REFUSES A CONNECTION WHEN THE
+    /// QUEUE OF THE SOCKET IS FULL. Such a system gives no way to hold a
+    /// connect open, so a test that needs one cannot run there. The lock on the
+    /// pid file, and not the answer of the socket, keeps the directory of a
+    /// coordinator on such a system.
+    fn a_socket_that_never_answers(path: &std::path::Path) -> Option<OpenSockets> {
         let address = unix_address(path).expect("the path of the test socket is short");
         let size = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
         let mut open = Vec::new();
 
-        unsafe {
+        let can_wait = unsafe {
             let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
             assert!(listener >= 0, "the test cannot open a socket");
             open.push(listener);
@@ -1013,15 +1108,53 @@ mod tests {
                 if result != 0 {
                     let error = std::io::Error::last_os_error().raw_os_error();
                     libc::close(client);
-                    full = error == Some(libc::EAGAIN);
+                    // A queue that is full gives one of these two answers. The
+                    // first says that the connect can finish later, and the
+                    // test can then hold it open. The second is a refusal, and
+                    // this system gives no way to hold a connect open.
+                    full = matches!(error, Some(libc::EAGAIN) | Some(libc::EINPROGRESS));
                     break;
                 }
                 open.push(client);
             }
-            assert!(full, "the test needs a socket with a full backlog");
-        }
+            full
+        };
 
-        OpenSockets(open)
+        // Make the guard before the test of `full`, so that a system that
+        // cannot hold a connect open still closes every socket of this test.
+        let sockets = OpenSockets(open);
+        if !can_wait {
+            return None;
+        }
+        Some(sockets)
+    }
+
+    /// Makes a REAL socket file whose process is gone.
+    ///
+    /// This is the file that a coordinator leaves when a kill stops it. A bind
+    /// makes the file, and the close of the socket leaves the file with no
+    /// process behind it.
+    ///
+    /// A test must use this file, and not an ordinary file: one system refuses
+    /// a connection to an ordinary file and another gives "that path is not a
+    /// socket", and only a real socket file measures the state that a
+    /// coordinator leaves.
+    fn a_socket_file_with_no_owner(path: &std::path::Path) {
+        let address = unix_address(path).expect("the path of the test socket is short");
+        let size = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "the test cannot open a socket");
+            let bound = libc::bind(
+                fd,
+                &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                size,
+            );
+            assert_eq!(bound, 0, "the test cannot bind {}", path.display());
+            assert_eq!(libc::listen(fd, 1), 0, "the test cannot listen");
+            libc::close(fd);
+        }
+        assert!(path.exists(), "the bind must leave the socket file");
     }
 
     /// Makes a pid file and holds the lock on it, as a coordinator does.
@@ -1074,8 +1207,21 @@ mod tests {
         let _held_two = a_held_pid_file(&refuses_but_live);
 
         // A live process holds each socket, and neither socket accepts.
+        // A system that refuses a connection when the queue of the socket is
+        // full gives no way to hold a connect open. The two directories that
+        // need one then do not take part, and the directory that the LOCK keeps
+        // still holds the property on every system.
         let _busy_one = a_socket_that_never_answers(&busy_with_pid.join("s"));
         let _busy_two = a_socket_that_never_answers(&busy_no_pid.join("s"));
+        let socket_can_wait = _busy_one.is_some() && _busy_two.is_some();
+        if !socket_can_wait {
+            eprintln!(
+                "this system refuses a connection when the queue of a socket is full, so \
+                 the two directories with a socket that gives no answer do not take part"
+            );
+            std::fs::remove_dir_all(&busy_with_pid).unwrap();
+            std::fs::remove_dir_all(&busy_no_pid).unwrap();
+        }
         // This process holds the lock, as a coordinator does.
         let _held_one = a_held_pid_file(&busy_with_pid);
 
@@ -1096,16 +1242,18 @@ mod tests {
             finished,
             "the sweep waits for a socket that never answers; every qex command then waits"
         );
-        assert!(
-            busy_with_pid.exists(),
-            "the sweep deleted the socket directory of a coordinator that operates and \
-             that names its process"
-        );
-        assert!(
-            busy_no_pid.exists(),
-            "the sweep deleted the socket directory of a coordinator that operates; a \
-             socket that gives no answer is not a socket that nobody holds"
-        );
+        if socket_can_wait {
+            assert!(
+                busy_with_pid.exists(),
+                "the sweep deleted the socket directory of a coordinator that operates \
+                 and that holds the lock on its pid file"
+            );
+            assert!(
+                busy_no_pid.exists(),
+                "the sweep deleted the socket directory of a coordinator that operates; \
+                 a socket that gives no answer is not a socket that nobody holds"
+            );
+        }
         assert!(
             refuses_but_live.exists(),
             "the sweep deleted the directory of a process that operates; the answer of a \
@@ -1133,9 +1281,11 @@ mod tests {
         for dir in [&no_socket, &dead_socket, &dead_pid] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        // A socket file that no process holds. A connect gives a refusal.
-        std::fs::write(dead_socket.join("s"), b"").unwrap();
-        std::fs::write(dead_pid.join("s"), b"").unwrap();
+        // A REAL socket file that no process holds. This is the file that a
+        // coordinator leaves when a kill stops it, and a connect to it gives a
+        // refusal on every system.
+        a_socket_file_with_no_owner(&dead_socket.join("s"));
+        a_socket_file_with_no_owner(&dead_pid.join("s"));
         // The number of a process that OPERATES, and no lock on the file.
         //
         // This is the case that a test of the number gets wrong. The number
@@ -1217,7 +1367,16 @@ mod tests {
     fn a_socket_that_never_answers_gives_the_unknown_answer() {
         let base = TestDir::make("qex-answertest");
         let stuck = base.path().join("s");
-        let _sockets = a_socket_that_never_answers(&stuck);
+        let Some(_sockets) = a_socket_that_never_answers(&stuck) else {
+            // This system refuses a connection when the queue of a socket is
+            // full, so no socket here can give "no answer". The state that this
+            // test measures does not exist on it.
+            eprintln!(
+                "this test did not run: this system gives a refusal, and not a wait, for \
+                 a socket with a full queue"
+            );
+            return;
+        };
 
         // Ask on a thread. A question that gives no answer is then a failure of
         // this test, and it does not stop the whole test suite.
@@ -1238,6 +1397,67 @@ mod tests {
         );
     }
 
+    /// A connect that the system finishes later must give the true answer.
+    ///
+    /// One system finishes a connect at once and another gives `EINPROGRESS`
+    /// and finishes it later. The second answer arrives in `SO_ERROR`, and a
+    /// caller that reads the answer of `connect` alone never sees it. Such a
+    /// caller reads "not known" for a socket that nobody holds, and a
+    /// coordinator that reads "not known" for its own socket stops for ever.
+    ///
+    /// THIS TEST USES A SOCKET OF THE NETWORK, because a Unix socket on this
+    /// system finishes every connect at once. The code under test reads the
+    /// result of the system, and it does not depend on the family of the
+    /// socket.
+    #[test]
+    fn a_connect_that_finishes_later_gives_the_true_answer() {
+        // A port with no listener. The bind gives a free port, and the close
+        // leaves it free.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+
+        let mut address: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_port = port.to_be();
+        address.sin_addr.s_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "the test cannot open a socket");
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let result = libc::connect(
+                fd,
+                &address as *const libc::sockaddr_in as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            let error = std::io::Error::last_os_error().raw_os_error();
+            if result == 0 || error != Some(libc::EINPROGRESS) {
+                libc::close(fd);
+                eprintln!(
+                    "this test did not run: this system finished the connect at once, so \
+                     it makes no `EINPROGRESS` to measure"
+                );
+                return;
+            }
+
+            let answer = finish_connect(
+                fd,
+                std::time::Instant::now() + std::time::Duration::from_secs(10),
+            );
+            libc::close(fd);
+
+            assert_eq!(
+                answer,
+                Some(SocketAnswer::NobodyListens),
+                "the answer of a connect that the system finishes later arrives in \
+                 `SO_ERROR`, and nobody listens at this port"
+            );
+        }
+    }
+
     /// A socket that no process holds must say that nobody listens.
     #[test]
     fn a_socket_with_no_process_says_that_nobody_listens() {
@@ -1249,11 +1469,25 @@ mod tests {
             "a socket file that is not there holds no coordinator"
         );
 
-        std::fs::write(&missing, b"").unwrap();
+        // A REAL socket file whose process is gone. This is the state that a
+        // coordinator leaves behind, and the answer decides whether a new
+        // coordinator can start at all.
+        a_socket_file_with_no_owner(&missing);
         assert_eq!(
             ask_socket(&missing, std::time::Duration::from_millis(50)),
             SocketAnswer::NobodyListens,
             "a socket file that no process holds refuses a connection"
+        );
+
+        // A file that is not a socket. One system refuses a connection to it
+        // and another says that the path is not a socket. Nothing can listen at
+        // such a path, so qex must give one answer for both.
+        let plain = base.path().join("plain");
+        std::fs::write(&plain, b"").unwrap();
+        assert_eq!(
+            ask_socket(&plain, std::time::Duration::from_millis(50)),
+            SocketAnswer::NobodyListens,
+            "a path that is not a socket holds no coordinator"
         );
     }
 

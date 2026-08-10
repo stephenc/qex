@@ -824,10 +824,11 @@ pub fn run() -> Result<()> {
                  https://github.com/stephenc/qex/blob/main/docs/sandbox.md"
                     .to_string()
             } else if e.kind() == std::io::ErrorKind::AddrInUse {
-                // A directory, or a file that qex could not test, holds this
-                // path. qex tested the path for a socket that answers, so no
-                // coordinator uses it. Name the path: without a remedy, qex
-                // cannot start on this machine again.
+                // Something that is not a socket of this coordinator holds
+                // this path: a directory, or an entry that arrived after the
+                // test above, or an entry that qex could not test. Name the
+                // path, and do not say what holds it: without a remedy, qex
+                // cannot start on this machine again, and a reader must look.
                 format!(
                     "\nSomething that is not a socket of qex holds that path. Look at it, \
                      and remove it if no coordinator uses it: {}",

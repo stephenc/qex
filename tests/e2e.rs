@@ -13470,8 +13470,13 @@ fn a_coordinator_holds_the_lock_on_its_pid_file() {
     let path = h.root.join("state/qex/run/pid");
 
     // The lock is the evidence that the coordinator operates.
-    let file =
-        std::fs::File::open(&path).expect("the coordinator must make a pid file beside its socket");
+    // Open for writing as well: an exclusive lock needs a descriptor that can
+    // write on some systems and on some file systems.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("the coordinator must make a pid file beside its socket");
     let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if taken == 0 {
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
