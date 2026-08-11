@@ -85,6 +85,20 @@ pub const EXIT_SKIPPED: i32 = 126;
 /// The exit code when there is no job with the given id.
 pub const EXIT_NO_SUCH_JOB: i32 = 127;
 
+/// Gives the code for an error that a resolver of ids reported.
+///
+/// A TIMEOUT IS NEVER "NO SUCH JOB". The code 127 says that qex holds no job
+/// with that id, and a coordinator that did not answer proves nothing of the
+/// kind. To answer 127 for a job that OPERATES tells the caller that its work
+/// does not exist, and the caller then stops watching a job that continues.
+fn code_for_a_resolver_error(error: &anyhow::Error) -> i32 {
+    if crate::client::is_a_coordinator_timeout(error) {
+        EXIT_TIMEOUT
+    } else {
+        EXIT_NO_SUCH_JOB
+    }
+}
+
 /// The age of a record that `qex clean --auto` deletes.
 ///
 /// A job that stopped in the last hour is frequently the job that a user reads
@@ -306,7 +320,14 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
     let deadline = match timeout {
         Some(t) => parse_duration(t)
             .map_err(|e| anyhow::anyhow!("--wait-timeout: {e}"))?
-            .map(|d| Instant::now() + d),
+            .map(|d| {
+                // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
+                // who says five seconds must not wait longer while qex reaches
+                // the coordinator: the connect, the lock and the read share
+                // this limit with the wait for the job.
+                crate::client::take_the_limit_of_the_reader(d);
+                Instant::now() + d
+            }),
         None => None,
     };
 
@@ -778,7 +799,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         Ok(found) => found,
         Err(e) => {
             eprintln!("qex: {e}");
-            return Ok(EXIT_NO_SUCH_JOB);
+            return Ok(code_for_a_resolver_error(&e));
         }
     };
     let is_pipeline = found.group.is_some();
@@ -797,7 +818,14 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
     let deadline = match &args.timeout {
         Some(t) => parse_duration(t)
             .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
-            .map(|d| Instant::now() + d),
+            .map(|d| {
+                // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
+                // who says five seconds must not wait longer while qex reaches
+                // the coordinator: the connect, the lock and the read share
+                // this limit with the wait for the job.
+                crate::client::take_the_limit_of_the_reader(d);
+                Instant::now() + d
+            }),
         None => None,
     };
 
@@ -1333,7 +1361,14 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     let deadline = match &args.timeout {
         Some(t) => parse_duration(t)
             .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
-            .map(|d| Instant::now() + d),
+            .map(|d| {
+                // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
+                // who says five seconds must not wait longer while qex reaches
+                // the coordinator: the connect, the lock and the read share
+                // this limit with the wait for the job.
+                crate::client::take_the_limit_of_the_reader(d);
+                Instant::now() + d
+            }),
         None => None,
     };
 
@@ -2212,7 +2247,7 @@ pub fn logs(args: cli::LogsArgs) -> Result<i32> {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("qex: {e}");
-                return Ok(EXIT_NO_SUCH_JOB);
+                return Ok(code_for_a_resolver_error(&e));
             }
         },
         None => match find_id_on_disk(&args.id)? {
@@ -2574,7 +2609,7 @@ pub fn kill(args: cli::KillArgs) -> Result<i32> {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("qex: {e}");
-                worst = EXIT_NO_SUCH_JOB;
+                worst = code_for_a_resolver_error(&e);
                 continue;
             }
         };
@@ -2668,7 +2703,7 @@ pub fn cancel(args: cli::CancelArgs) -> Result<i32> {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("qex: {e}");
-                worst = EXIT_NO_SUCH_JOB;
+                worst = code_for_a_resolver_error(&e);
                 continue;
             }
         };
@@ -3411,7 +3446,14 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
     let deadline = match &args.timeout {
         Some(t) => parse_duration(t)
             .map_err(|e| anyhow::anyhow!("--timeout: {e}"))?
-            .map(|d| Instant::now() + d),
+            .map(|d| {
+                // THE NUMBER OF THE READER BOUNDS THE WHOLE COMMAND. A reader
+                // who says five seconds must not wait longer while qex reaches
+                // the coordinator: the connect, the lock and the read share
+                // this limit with the wait for the job.
+                crate::client::take_the_limit_of_the_reader(d);
+                Instant::now() + d
+            }),
         None => None,
     };
 
@@ -3424,7 +3466,7 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
     // end is not possible. This test gives the words that name the remedy, in
     // place of the words of a parser.
     {
-        let (have, version, pid) = coordinator_capabilities(&mut client);
+        let (have, version, pid) = coordinator_capabilities(&mut client)?;
         // A development build passes here and takes a warning instead, which
         // `warn_if_version_differs` already wrote. `check_command` below still
         // refuses a coordinator that does not know this request, by name.
@@ -4062,7 +4104,7 @@ fn end_of_pause(duration: Option<&str>) -> Result<Option<u64>> {
 /// `warn_if_version_differs` already wrote. `check_command` below still refuses
 /// a coordinator that does not know this request, by name.
 fn require_command(client: &mut Client, name: &str, command: &str, danger: &str) -> Result<()> {
-    let (have, version, pid) = coordinator_capabilities(client);
+    let (have, version, pid) = coordinator_capabilities(client)?;
     if let crate::capabilities::Floor::Below(message) =
         crate::capabilities::check_floor(&version, pid)
     {
@@ -4521,7 +4563,7 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
             // Say what the coordinator can do, and name anything that this
             // build can do and the coordinator cannot.
             if let Some(mut c) = Client::connect_existing() {
-                let (have, _, _) = coordinator_capabilities(&mut c);
+                let (have, _, _) = coordinator_capabilities(&mut c)?;
                 let missing: Vec<&&str> = crate::capabilities::ALL
                     .iter()
                     .filter(|name| !have.iter().any(|h| h == *name))
@@ -4881,7 +4923,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     //
     // This message names no id, because the job has none yet. It gives the way
     // to find one instead.
-    let owns_jobs = coordinator_owns_jobs(&mut client);
+    let owns_jobs = coordinator_owns_jobs(&mut client)?;
     if !owns_jobs {
         eprintln!(
             "qex: this coordinator keeps a job that waits, when this command stops without \
@@ -5031,9 +5073,9 @@ fn ownership_message(id: uuid::Uuid, answer: &OwnershipAnswer) -> Option<String>
 /// typed `qex run` and asked for a job, so a refusal would take the work away
 /// to protect the cleanup of the work. Ctrl-C and SIGTERM still stop the job,
 /// and only a stop that this command cannot catch loses the rule.
-fn coordinator_owns_jobs(client: &mut Client) -> bool {
-    let (have, _, _) = coordinator_capabilities(client);
-    have.iter().any(|n| n == "own-job")
+fn coordinator_owns_jobs(client: &mut Client) -> Result<bool> {
+    let (have, _, _) = coordinator_capabilities(client)?;
+    Ok(have.iter().any(|n| n == "own-job"))
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
@@ -5254,7 +5296,9 @@ fn status_without_the_coordinator(
         // the answer of the coordinator that stopped says nothing about it: a
         // new one can take the ownership that an earlier one refused.
         if started_here {
-            if coordinator_owns_jobs(client) {
+            // A coordinator that did not answer is not a coordinator that
+            // refuses. Keep the job in that case, which is the safe direction.
+            if coordinator_owns_jobs(client).unwrap_or(false) {
                 own_the_job(client, id);
             } else {
                 eprintln!(
@@ -5361,7 +5405,7 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
         Ok(id) => id,
         Err(e) => {
             eprintln!("qex: {e}");
-            return Ok(EXIT_NO_SUCH_JOB);
+            return Ok(code_for_a_resolver_error(&e));
         }
     };
 
@@ -5445,18 +5489,27 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
 /// earlier coordinator gives an error for a request that it cannot read. This
 /// function thus reads the version first, because every version answers `Info`,
 /// and it uses a table for an earlier coordinator.
-fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
+fn coordinator_capabilities(client: &mut Client) -> Result<(Vec<String>, String, i32)> {
     let (version, pid) = match client.call(&Request::Info) {
         Ok(Response::Info { version, pid, .. }) => (version, pid),
-        _ => return (Vec::new(), String::from("unknown"), 0),
+        // A COORDINATOR THAT DID NOT ANSWER IS NOT A COORDINATOR OF AN UNKNOWN
+        // VERSION. The words `unknown` and the number 0 below describe a
+        // coordinator that ANSWERED with a form that this version cannot read.
+        // A limit that ended the wait proves nothing about the version, and a
+        // message built from those values names a version that nobody has and
+        // a remedy that reads `kill 0` — a signal to the process group of the
+        // reader.
+        Err(e) if crate::client::is_a_coordinator_timeout(&e) => return Err(e),
+        _ => return Ok((Vec::new(), String::from("unknown"), 0)),
     };
 
     // Every version that qex supports answers this request. A coordinator that
     // does not answer it is below the capability floor, and it gets an empty list;
     // the floor test then refuses it with the correct words.
     match client.call(&Request::Capabilities) {
-        Ok(Response::Capabilities { names }) => (names, version, pid),
-        _ => (Vec::new(), version, pid),
+        Ok(Response::Capabilities { names }) => Ok((names, version, pid)),
+        Err(e) if crate::client::is_a_coordinator_timeout(&e) => Err(e),
+        _ => Ok((Vec::new(), version, pid)),
     }
 }
 
@@ -5539,7 +5592,7 @@ struct PipelineNeeds {
 /// Every pipeline makes a group, so every file asks for the groups. It asks for
 /// the dependencies only when a stage waits for another stage.
 fn require_pipeline_capabilities(client: &mut Client, needs: &PipelineNeeds) -> Result<()> {
-    let (have, version, pid) = coordinator_capabilities(client);
+    let (have, version, pid) = coordinator_capabilities(client)?;
 
     if let crate::capabilities::Floor::Below(message) =
         crate::capabilities::check_floor(&version, pid)
@@ -5566,7 +5619,7 @@ fn require_pipeline_capabilities(client: &mut Client, needs: &PipelineNeeds) -> 
 /// ignored in silence. A user would then receive a job id for a job that runs
 /// without the rule that the user asked for.
 fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
-    let (have, version, pid) = coordinator_capabilities(client);
+    let (have, version, pid) = coordinator_capabilities(client)?;
 
     // The floor first. A coordinator below it comes from a build that no
     // release holds, so no promise covers it, whatever the job asks for.

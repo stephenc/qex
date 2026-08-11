@@ -14798,7 +14798,12 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
 ///
 /// The tests below bound themselves ABOVE this number, so a command that keeps
 /// its limit passes and a command with no limit fails.
-const COORDINATOR_LIMIT_SECS: u64 = 10;
+const COORDINATOR_LIMIT_SECS: u64 = 3;
+
+/// Names the variable that gives the ceiling for a coordinator a short value.
+fn qex_ceiling_variable() -> String {
+    "QEX_COORDINATOR_CEILING_SECS".to_string()
+}
 
 /// A command must end when a socket gives no answer.
 ///
@@ -14807,7 +14812,11 @@ const COORDINATOR_LIMIT_SECS: u64 = 10;
 /// so this is not a rare state on a machine that many agents share.
 #[test]
 fn a_socket_that_gives_no_answer_does_not_stop_a_command() {
-    let h = Harness::with_default_config("nocoordans");
+    let mut h = Harness::with_default_config("nocoordans");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
@@ -14845,7 +14854,11 @@ fn a_socket_that_gives_no_answer_does_not_stop_a_command() {
 fn a_spawn_lock_that_nobody_gives_back_does_not_stop_a_command() {
     use std::os::unix::io::AsRawFd;
 
-    let h = Harness::with_default_config("nocoordlock");
+    let mut h = Harness::with_default_config("nocoordlock");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let path = run.join("spawn.lock");
@@ -14881,7 +14894,11 @@ fn a_spawn_lock_that_nobody_gives_back_does_not_stop_a_command() {
 /// can never authorise a second coordinator.
 #[test]
 fn a_socket_that_gives_no_answer_starts_no_second_coordinator() {
-    let h = Harness::with_default_config("nosecond");
+    let mut h = Harness::with_default_config("nosecond");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let socket = run.join("s");
@@ -14968,7 +14985,11 @@ fn a_wait_does_not_take_the_spawn_lock_for_a_notice() {
 /// Both forms write the SAME page. Only the code differs.
 #[test]
 fn a_page_that_qex_could_not_fill_gives_124_for_a_query() {
-    let h = Harness::with_default_config("topquery");
+    let mut h = Harness::with_default_config("topquery");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
@@ -15022,4 +15043,84 @@ fn a_page_with_no_coordinator_gives_zero_for_a_query() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("budget"));
+}
+
+/// Answers the connect and NEVER answers a request.
+///
+/// The helper that fills a backlog exercises the CONNECT. This one exercises
+/// the READ: qex reaches the coordinator, sends its request, and the answer
+/// never arrives. The two faults are different, and a test of one says nothing
+/// about the other.
+///
+/// The result holds the listener. A caller that drops it ends the test socket.
+struct ASocketThatAcceptsAndSaysNothing {
+    _listener: std::os::unix::net::UnixListener,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ASocketThatAcceptsAndSaysNothing {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn a_socket_that_accepts_and_says_nothing(path: &Path) -> ASocketThatAcceptsAndSaysNothing {
+    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let copy = listener.try_clone().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let thread = std::thread::spawn(move || {
+        // Hold every connection open and answer nothing. A connection that
+        // closes would give the reader an end of file, which is a different
+        // answer from silence.
+        let mut held = Vec::new();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match copy.accept() {
+                Ok((stream, _)) => held.push(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    });
+    ASocketThatAcceptsAndSaysNothing {
+        _listener: listener,
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// A coordinator that takes a request and answers nothing must not hold a
+/// command for ever.
+///
+/// This test drives the READ, and no other test does: the connect succeeds, so
+/// a limit on the connect alone leaves this fault open.
+///
+/// The reader gives `--timeout`, because the ceiling for a coordinator is long
+/// on purpose — a loaded machine answers late and a short ceiling gives a false
+/// failure. The number of the reader bounds the whole command.
+#[test]
+fn a_coordinator_that_answers_nothing_does_not_stop_a_command() {
+    let h = Harness::with_default_config("readstall");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+
+    let start = Instant::now();
+    let out = h.qex_within(&["wait", "--timeout", "3s", "abc"], Duration::from_secs(60));
+    let took = start.elapsed();
+
+    assert!(
+        took < Duration::from_secs(30),
+        "the read must end: it took {took:?}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(127),
+        "a coordinator that did not answer is NOT `no such job`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

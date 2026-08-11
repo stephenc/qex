@@ -84,9 +84,9 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             // The CPU column is the change in the CPU time between two
             // measurements, so one page needs two of them. Take the first
             // measurement, wait a short time, then write the page.
-            render(&jobs, info.as_ref(), &mut previous);
+            render(&jobs, info.as_ref(), &mut previous, !reached);
             std::thread::sleep(Duration::from_millis(400));
-            print!("{}", render(&jobs, info.as_ref(), &mut previous));
+            print!("{}", render(&jobs, info.as_ref(), &mut previous, !reached));
             // THE TWO FORMS MAKE TWO PROMISES, AND THE PAGE IS THE SAME.
             //
             // The form that a person watches is a DISPLAY: its promise is to
@@ -103,7 +103,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             });
         }
 
-        let page = render(&jobs, info.as_ref(), &mut previous);
+        let page = render(&jobs, info.as_ref(), &mut previous, !reached);
 
         print!("{CLEAR}{page}");
         use std::io::Write;
@@ -126,6 +126,7 @@ fn render(
     jobs: &[JobStatus],
     info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
+    unreachable: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -234,10 +235,18 @@ fn render(
             format_size(cfg.budget_mem().unwrap_or(0)),
             active.len(),
         ));
-        out.push_str(
+        out.push_str(if unreachable {
+            // A coordinator that did not answer is NOT a coordinator that is
+            // absent, and this page must not say that nothing operates. The
+            // screen clears at each refresh, so the cause on stderr is gone by
+            // the next page and only this line carries it.
+            "      qex could not reach the coordinator. These records come from the state \
+             directory,\n\
+             \x20     and a coordinator can hold jobs that this page does not name.\n"
+        } else {
             "      no coordinator operates. These records come from the state directory.\n\
-             \x20     qex starts a coordinator when you submit a job.\n",
-        );
+             \x20     qex starts a coordinator when you submit a job.\n"
+        });
     }
 
     out.push_str(&format!(
@@ -627,7 +636,7 @@ mod tests {
         };
 
         let mut previous = HashMap::new();
-        let page = render(&[], Some(&paused), &mut previous);
+        let page = render(&[], Some(&paused), &mut previous, false);
         assert!(page.contains("QUEUE PAUSED"), "got: {page}");
         assert!(
             page.contains("recording a demo"),
@@ -647,7 +656,7 @@ mod tests {
     fn the_page_holds_the_budget_and_the_jobs() {
         let jobs = vec![job(JobState::Running, 2, 4 << 30)];
         let mut previous = HashMap::new();
-        let page = render(&jobs, Some(&info()), &mut previous);
+        let page = render(&jobs, Some(&info()), &mut previous, false);
 
         assert!(page.contains("2/12 cores"), "the budget is missing: {page}");
         assert!(page.contains("example"), "the job name is missing");
@@ -684,11 +693,11 @@ mod tests {
         let jobs = vec![job(JobState::Running, 1, 1 << 30)];
         let mut previous = HashMap::new();
 
-        let first = render(&jobs, Some(&info()), &mut previous);
+        let first = render(&jobs, Some(&info()), &mut previous, false);
         assert!(first.contains("..."), "the first page has no earlier value");
 
         std::thread::sleep(Duration::from_millis(50));
-        let second = render(&jobs, Some(&info()), &mut previous);
+        let second = render(&jobs, Some(&info()), &mut previous, false);
         assert!(
             !second.contains("..."),
             "the second page must give a number: {second}"
@@ -703,7 +712,7 @@ mod tests {
         j.finished_at = Some(10);
 
         let mut previous = HashMap::new();
-        let page = render(&[j], Some(&info()), &mut previous);
+        let page = render(&[j], Some(&info()), &mut previous, false);
         assert!(page.contains("500MB"), "the measurement is missing: {page}");
         assert!(page.contains("ok"), "the result is missing");
     }
@@ -719,7 +728,7 @@ mod tests {
         j.finished_at = Some(5);
 
         let mut previous = HashMap::new();
-        let page = render(&[j], None, &mut previous);
+        let page = render(&[j], None, &mut previous, false);
 
         assert!(page.contains("example"), "the job is missing: {page}");
         assert!(
@@ -812,7 +821,7 @@ mod tests {
     #[test]
     fn the_page_gives_the_time() {
         let mut previous = HashMap::new();
-        let page = render(&[], Some(&info()), &mut previous);
+        let page = render(&[], Some(&info()), &mut previous, false);
         let clock = crate::sys::clock_text(crate::sys::now_secs());
         assert!(page.contains(&clock[..5]), "the time is missing: {page}");
     }
@@ -820,7 +829,7 @@ mod tests {
     #[test]
     fn an_empty_queue_says_so() {
         let mut previous = HashMap::new();
-        let page = render(&[], Some(&info()), &mut previous);
+        let page = render(&[], Some(&info()), &mut previous, false);
         assert!(page.contains("no jobs"));
     }
 
@@ -832,7 +841,7 @@ mod tests {
         j.started_at = None;
 
         let mut previous = HashMap::new();
-        let page = render(&[j], Some(&info()), &mut previous);
+        let page = render(&[j], Some(&info()), &mut previous, false);
         assert!(page.contains("waits for cores"), "got: {page}");
     }
 }

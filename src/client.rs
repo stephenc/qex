@@ -36,14 +36,123 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 /// answer, so it takes this limit; `send` with `recv_opt` or `wait_readable`
 /// leaves the limit to the caller that waits for a job.
 ///
-/// The value is the limit for a coordinator that starts, so a reader who
-/// learns one number learns them all.
-const COORDINATOR_LIMIT: Duration = SPAWN_TIMEOUT;
+/// The value is NOT the limit for a coordinator that starts. Those are two
+/// questions: a coordinator that has not bound its socket after ten seconds did
+/// not start, and a coordinator that answers a busy machine slowly is working.
+///
+/// # The fault is "for ever", and not "slow"
+///
+/// A short ceiling gives a FALSE failure, and a false failure costs more than a
+/// wait. Measured against a healthy coordinator: 400 commands at once on a
+/// machine with every core busy took up to 27 seconds to answer, and every one
+/// of them answered. A ceiling of ten seconds refused 200 of them.
+///
+/// This ceiling is therefore large. It ends a wait that would never end, and a
+/// machine that is merely loaded never reaches it. A reader who needs a fast
+/// failure gives `--timeout`, and that number bounds the WHOLE command.
+///
+/// One command holds ONE budget. The connect, the lock and the read share it,
+/// so the ceiling is the ceiling of the command and not of each phase.
+const COORDINATOR_CEILING: Duration = Duration::from_secs(300);
+
+/// The time after which qex says that it still waits.
+///
+/// A reader must not sit in front of a silent command. This line converts a
+/// silent wait into a visible one, and it does NOT end the wait: the work can
+/// be fine, and only the reader knows whether to keep waiting.
+const SAY_STILL_WAITING_AFTER: Duration = Duration::from_secs(10);
+
+/// The moment at which this command stops waiting for the coordinator.
+///
+/// One command, one budget. The connect, the spawn lock and the read of an
+/// answer share it, so a reader can predict the ceiling of a command: it is the
+/// ceiling itself, and not the sum of the phases.
+static DEADLINE: std::sync::OnceLock<std::sync::Mutex<Instant>> = std::sync::OnceLock::new();
+
+/// Names the variable that gives the ceiling a different value.
+///
+/// A command with no `--timeout` takes the ceiling, and the ceiling is long
+/// because a loaded machine answers late. A reader who wants a short answer
+/// from such a command sets this variable, in seconds.
+///
+/// The tests of qex use it as well: a test cannot wait five minutes to prove
+/// that a wait ends.
+pub const CEILING_VARIABLE: &str = "QEX_COORDINATOR_CEILING_SECS";
+
+fn ceiling() -> Duration {
+    match std::env::var(CEILING_VARIABLE)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        Some(seconds) if seconds > 0 => Duration::from_secs(seconds),
+        _ => COORDINATOR_CEILING,
+    }
+}
+
+fn budget() -> &'static std::sync::Mutex<Instant> {
+    DEADLINE.get_or_init(|| std::sync::Mutex::new(Instant::now() + ceiling()))
+}
+
+/// Gives the moment at which this command stops waiting for the coordinator.
+pub fn deadline() -> Instant {
+    *budget().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes the limit of the READER for the whole command.
+///
+/// `--timeout` is the number of the reader, so it bounds every wait of the
+/// command and not the wait for a job alone. A reader who says five seconds
+/// must not wait for twenty.
+///
+/// A limit that is longer than the ceiling does not raise the ceiling: the
+/// ceiling ends a wait that would never end, and the reader's limit ends a wait
+/// that the reader does not want.
+pub fn take_the_limit_of_the_reader(limit: Duration) {
+    let asked = Instant::now() + limit;
+    let mut held = budget().lock().unwrap_or_else(|e| e.into_inner());
+    if asked < *held {
+        *held = asked;
+    }
+}
+
+/// Says one time that qex still waits, and keeps waiting.
+///
+/// A wait that says nothing looks the same as a wait that will never end. This
+/// line is the difference, and it does not end the wait: a coordinator on a
+/// loaded machine answers a slow question correctly, and a command that gives
+/// up on it turns a healthy machine into a failure.
+fn say_that_qex_still_waits(said: &mut bool, since: Instant, what: &str) {
+    if *said || since.elapsed() < SAY_STILL_WAITING_AFTER {
+        return;
+    }
+    *said = true;
+    eprintln!(
+        "qex: still waiting for the coordinator: {what}. \
+         qex waits until {} seconds, and `--timeout` gives it a shorter limit.",
+        ceiling().as_secs()
+    );
+}
 
 /// A connection to the coordinator.
 pub struct Client {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    /// The connection lost its place in the answers, so nothing may read it.
+    ///
+    /// A request that reached its limit is STILL IN FLIGHT. The coordinator
+    /// answers it later, and that answer waits in the socket. A second request
+    /// on the same connection then reads the FIRST answer as its own, and two
+    /// requests with one kind of answer swap in silence.
+    ///
+    /// The worst form of that: a `Submit` reads the answer of an earlier
+    /// question, so qex reports a failure for a job that the coordinator
+    /// ACCEPTED AND QUEUED, and the id of that job never reaches the reader.
+    /// The reader submits again, and the machine then holds two jobs and a
+    /// watcher for neither.
+    ///
+    /// A connection that reached a limit is therefore dead. It answers every
+    /// later request with the same fault, and it never reads the socket again.
+    lost_its_place: bool,
 }
 
 impl Client {
@@ -114,7 +223,11 @@ impl Client {
 
     fn with_stream(stream: UnixStream) -> Result<Self> {
         let reader = BufReader::new(stream.try_clone().context("copying the socket handle")?);
-        Ok(Self { stream, reader })
+        Ok(Self {
+            stream,
+            reader,
+            lost_its_place: false,
+        })
     }
 
     /// Sends one request and reads one answer, inside the limit for a
@@ -125,18 +238,61 @@ impl Client {
     /// use this function — it sends the request and holds its own limit, so
     /// this limit never shortens a wait that a reader asked for.
     pub fn call(&mut self, request: &Request) -> Result<Response> {
+        if self.lost_its_place {
+            return Err(timed_out(
+                "this connection to the coordinator lost its place in the answers, \
+                 so qex asked nothing more on it.\n\
+                 An earlier request reached its time limit, and the answer to it \
+                 can still arrive. A later request would read that answer as its \
+                 own.\n\
+                 Run the command again."
+                    .to_string(),
+            ));
+        }
         self.send(request)?;
+
         let previous = self.stream.read_timeout().ok().flatten();
         // A caller that set its own limit keeps it. `qex logs --follow` and the
         // reporter of a wait each hold a limit that belongs to their own work.
-        if previous.is_none() {
-            self.set_read_timeout(Some(COORDINATOR_LIMIT)).ok();
-        }
-        let answer = self.recv();
-        if previous.is_none() {
+        let ours = previous.is_none();
+
+        let started = Instant::now();
+        let mut said = false;
+        let answer = loop {
+            let left = deadline().saturating_duration_since(Instant::now());
+            if ours {
+                if left.is_zero() {
+                    break Err(timed_out(a_silent_coordinator()));
+                }
+                // Look in short steps, so the line below can say that qex still
+                // waits. A single long read cannot say anything while it waits.
+                self.set_read_timeout(Some(left.min(SAY_STILL_WAITING_AFTER)))
+                    .ok();
+            }
+            match self.recv() {
+                Ok(response) => break Ok(response),
+                Err(e) => {
+                    if !ours || !a_read_that_reached_its_limit(&e) {
+                        break Err(e);
+                    }
+                    // The answer did not arrive YET. The coordinator can be
+                    // busy, and a command that gives up here turns a healthy
+                    // machine into a failure.
+                    say_that_qex_still_waits(&mut said, started, "an answer to a request");
+                }
+            }
+        };
+
+        if ours {
             self.set_read_timeout(None).ok();
         }
-        answer.map_err(|e| name_a_silent_coordinator(e, previous.is_none()))
+        if answer.is_err() {
+            // THE REQUEST IS STILL IN FLIGHT. Nothing may read this connection
+            // again: the answer arrives later, and the next request would take
+            // it as its own.
+            self.lost_its_place = true;
+        }
+        answer
     }
 
     pub fn send(&mut self, request: &Request) -> Result<()> {
@@ -255,17 +411,9 @@ pub fn is_a_coordinator_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CoordinatorTimeout>().is_some()
 }
 
-/// Names the cause when a coordinator accepted and then said nothing.
-///
-/// The message says what qex TRIED and what did not happen. It does not say
-/// that the coordinator is wedged, because qex cannot know that: a coordinator
-/// that is busy and a coordinator that will never answer look the same from
-/// here.
-fn name_a_silent_coordinator(error: anyhow::Error, ours: bool) -> anyhow::Error {
-    if !ours {
-        return error;
-    }
-    let expired = error
+/// Says whether a read ended because it reached its own limit.
+fn a_read_that_reached_its_limit(error: &anyhow::Error) -> bool {
+    error
         .downcast_ref::<std::io::Error>()
         .map(|e| {
             matches!(
@@ -273,19 +421,24 @@ fn name_a_silent_coordinator(error: anyhow::Error, ours: bool) -> anyhow::Error 
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
             )
         })
-        .unwrap_or(false);
-    if !expired {
-        return error;
-    }
-    timed_out(format!(
+        .unwrap_or(false)
+}
+
+/// Names the cause when a coordinator took a request and gave no answer.
+///
+/// The message says what qex TRIED and what did not happen. It does not say
+/// that the coordinator is wedged, because qex cannot know that: a coordinator
+/// that is busy and a coordinator that will never answer look the same here.
+fn a_silent_coordinator() -> String {
+    format!(
         "the coordinator took the request and gave no answer in {} seconds.\n\
          Run `qex info --no-start` to see whether it answers now, and read {} \
          for what it did.",
-        COORDINATOR_LIMIT.as_secs(),
+        ceiling().as_secs(),
         paths::daemon_log_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "the log of the coordinator".to_string())
-    ))
+    )
 }
 
 /// Tries to connect inside the limit for a coordinator.
@@ -296,21 +449,34 @@ fn name_a_silent_coordinator(error: anyhow::Error, ours: bool) -> anyhow::Error 
 /// each hold the whole budget, and the machine then gets the kill for memory
 /// that qex exists to prevent.
 fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
-    match paths::connect_within(socket, COORDINATOR_LIMIT) {
-        paths::Connected::Open(stream) => Ok(Some(stream)),
-        paths::Connected::NobodyListens => Ok(None),
-        paths::Connected::NoAnswer => Err(timed_out(format!(
-            "the coordinator did not accept a connection in {} seconds.\n\
+    let started = Instant::now();
+    let mut said = false;
+    loop {
+        let left = deadline().saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match paths::connect_within(socket, left.min(SAY_STILL_WAITING_AFTER)) {
+            paths::Connected::Open(stream) => return Ok(Some(stream)),
+            paths::Connected::NobodyListens => return Ok(None),
+            // The socket is there and it did not answer YET. A busy coordinator
+            // answers late, so keep asking until the budget of the command ends.
+            paths::Connected::NoAnswer => {
+                say_that_qex_still_waits(&mut said, started, "a connection to the socket");
+            }
+        }
+    }
+    Err(timed_out(format!(
+        "the coordinator did not accept a connection in {} seconds.\n\
              The socket {} is there, so a process holds it.\n\
              Run `qex info --no-start` to see whether a coordinator answers, \
              and read {} for what it did.",
-            COORDINATOR_LIMIT.as_secs(),
-            socket.display(),
-            paths::daemon_log_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| "the log of the coordinator".to_string())
-        ))),
-    }
+        ceiling().as_secs(),
+        socket.display(),
+        paths::daemon_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "the log of the coordinator".to_string())
+    )))
 }
 
 /// Waits until the new coordinator opens its socket.
@@ -631,7 +797,8 @@ impl SpawnLock {
         //
         // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal
         // arrives, and the caller tries again.
-        let deadline = Instant::now() + COORDINATOR_LIMIT;
+        let started = Instant::now();
+        let mut said = false;
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 return Ok(Self { file });
@@ -643,14 +810,17 @@ impl SpawnLock {
                     return Err(error).with_context(|| format!("locking {}", path.display()));
                 }
             }
-            if Instant::now() >= deadline {
+            say_that_qex_still_waits(&mut said, started, "the lock that guards a start");
+            if Instant::now() >= deadline() {
                 return Err(timed_out(format!(
                     "a different qex command held the lock {} for {} seconds.\n\
-                     That lock covers the start of a coordinator, so a command \
-                     that stopped while it held the lock keeps this one waiting.\n\
+                     That lock covers the start of a coordinator, so this \
+                     command waited for a start that did not finish.\n\
+                     The kernel gives the lock back when the process that holds \
+                     it stops, so the holder still operates.\n\
                      Run `qex info --no-start` to see whether a coordinator answers.",
                     path.display(),
-                    COORDINATOR_LIMIT.as_secs()
+                    ceiling().as_secs()
                 )));
             }
             std::thread::sleep(Duration::from_millis(20));
