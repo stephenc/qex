@@ -1092,19 +1092,19 @@ const KEYS_THAT_WENT: &[(&str, &str)] = &[
 /// answer for it names `retry` and tells the reader to delete a key that the
 /// file does not hold.
 ///
-/// TWO FORMS CARRY THE NAME, because the shape of the file decides which one
-/// serde writes. A key in its section gives ``unknown field `X` ``. The same
-/// key in an array of tables, `[[enforce]]`, gives ``unknown variant `X` ``,
-/// because that shape makes qex read the name as the VALUE of `mode`. The
-/// reader who wrote the key needs the same answer either way.
+/// ONLY THE FIELD FORM ANSWERS HERE. serde writes ``unknown variant `X` `` for
+/// a VALUE that a key does not accept, and the message of a value is the same
+/// message as the one for a key in an array of tables. `[enforce] mode =
+/// "retry"` is thus indistinguishable here from a `retry` KEY, and an answer
+/// for the value tells the reader to delete a key that the file does not hold.
+/// A file that gives a value qex does not take falls through to the answer for
+/// `[enforce] mode`, which names a section that the file DOES hold and lists
+/// the values that qex accepts. That answer is less exact, and it is true.
 fn key_that_went(error: &toml::de::Error) -> Option<(&'static str, &'static str)> {
     let message = error.message();
     KEYS_THAT_WENT
         .iter()
-        .find(|(key, _)| {
-            message.contains(&format!("unknown field `{key}`"))
-                || message.contains(&format!("unknown variant `{key}`"))
-        })
+        .find(|(key, _)| message.contains(&format!("unknown field `{key}`")))
         .map(|(key, what)| (*key, *what))
 }
 

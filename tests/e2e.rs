@@ -12472,7 +12472,13 @@ fn a_job_that_a_user_killed_is_not_retried_and_teaches_the_learner_nothing() {
     let s = h.status_json(&id);
     assert_eq!(s["state"], "killed", "a command stopped this job: {s}");
     assert_eq!(s["attempts"], 1, "qex must not start the job again: {s}");
-    assert_eq!(s["oom_raises"], 0, "qex must not raise the claim: {s}");
+    // The record carries NO count of raises. qex raises no claim, so a field
+    // that counts the raises names a behaviour that went, and every agent that
+    // reads `qex status --json` gets it.
+    assert!(
+        s.get("oom_raises").is_none(),
+        "the record must hold no count of raises: {s}"
+    );
     assert_eq!(
         s["mem"].as_u64().unwrap(),
         128 * 1024 * 1024,
@@ -12506,22 +12512,29 @@ fn a_job_that_a_user_killed_is_not_retried_and_teaches_the_learner_nothing() {
 /// is a FAILURE and not a page to pass over: a gate that reads nothing refuses
 /// nothing, and it reports success.
 ///
-/// # Why this gate reads four files of `src/` and not all of them
+/// # Why this gate reads five files of `src/` and not all of them
 ///
-/// It reads the files that hold text FOR A READER. It must not read the rest,
-/// because a word that names a key that went HAS TO appear in the code that
-/// refuses that key: `src/config.rs` holds `mem_overcommit`, `use_systemd` and
-/// `[retry]` so that a file which sets one of them gets an answer, and
-/// `src/usage.rs` holds `lower-bound` so that qex can read the file of an
-/// earlier version. A gate over every file needs a list of exceptions, and such
-/// a list grows until it hides the thing that the gate looks for.
+/// It reads the files that hold text FOR A READER, and A FIELD NAME IS SUCH
+/// TEXT: `src/job.rs` declares the record, and serde gives every field of it to
+/// `qex status --json`. A field that counts the raises after a kill for memory
+/// thus reached every agent, while a comment beside it said that no command
+/// prints it. The name of a field is shipped text.
 ///
-/// EACH REFUSED WORD MUST NOT MATCH INNOCENT TEXT. A gate that stops a correct
-/// change gets deleted, and then it guards nothing. Two words here carry more
-/// than the name of the feature for that reason: the section name holds the end
-/// of its line, because `[retry]` alone matches a link in markdown, and the
-/// words of the raise hold the word that follows them, because "the new claim"
-/// alone matches an honest sentence about `qex rerun --mem 2GB`.
+/// The gate must not read the rest, because a word that names a key that went
+/// HAS TO appear in the code that refuses that key: `src/config.rs` holds
+/// `mem_overcommit`, `use_systemd` and `[retry]` so that a file which sets one
+/// of them gets an answer, and `src/usage.rs` holds `lower-bound` so that qex
+/// can read the file of an earlier version. A gate over every file needs a list
+/// of exceptions, and such a list grows until it hides the thing that the gate
+/// looks for.
+///
+/// EACH REFUSED WORD STAYS BROAD. A narrow word looks safer, and it is not: a
+/// gate that misses says nothing, and a gate that fires is a question that an
+/// author answers in a minute. `[retry]` and "the new claim" are broad for that
+/// reason. Both carried real text of the feature that went, and that text was
+/// INLINE — a table row wrote `` `[retry] growth` `` with no line end, and a
+/// help topic wrote "the new claim." with a full stop. A form that asks for the
+/// end of the line, or for the word that follows, reads past both of them.
 #[test]
 fn no_shipped_word_promises_the_limit_that_went() {
     // Each word, and why it may not come back.
@@ -12540,15 +12553,13 @@ fn no_shipped_word_promises_the_limit_that_went() {
         ("cgroup of the job", "a cgroup that qex no longer makes"),
         ("raises the claim", "a correction that qex no longer makes"),
         ("raise the claim", "the same"),
-        // The section name holds the end of its line. A section in TOML is
-        // alone on its line, and `[retry]` with no line end also matches the
-        // link `[retry](docs/reference.md)`, which is innocent.
-        ("[retry]\n", "a section that went"),
+        // The section name, with nothing after it. A page named the keys of
+        // this section in a table, in the middle of a line.
+        ("[retry]", "a section that went"),
         // The words of the raise, in the form that carries no verb. A gate
-        // that names the verbs only passes over a description of the record.
-        // The word `and` comes with them, because a sentence about `qex rerun`
-        // says "the new claim" and says nothing about an attempt of qex.
-        ("the new claim and", "a claim that qex no longer makes"),
+        // that names the verbs only passes over a description of the record,
+        // and over a help topic that ended the sentence here with a full stop.
+        ("the new claim", "a claim that qex no longer makes"),
         ("claim that failed", "the same, in the words of a record"),
     ];
 
@@ -12563,6 +12574,8 @@ fn no_shipped_word_promises_the_limit_that_went() {
         root.join("src/help.rs"),
         root.join("src/cli.rs"),
         root.join("src/schema.rs"),
+        // The record itself. Every field name goes to `qex status --json`.
+        root.join("src/job.rs"),
     ];
     // Every page of `docs/` ships. Read the directory, so that a new page gets
     // this gate on the day that somebody writes it.
@@ -12611,24 +12624,38 @@ fn no_shipped_word_promises_the_limit_that_went() {
 /// and those words hold the name of whatever the file wrote. This test thus
 /// asks for the STEP that the reader must take, which only the right answer
 /// holds.
+///
+/// THE ANSWER FOR A VALUE MUST NAME NO KEY. serde writes ``unknown variant `X`
+/// `` both for a VALUE that a key refuses and for a key in an array of tables,
+/// and the two messages are the same. A rule that reads that form as the name
+/// of a key thus answers `[enforce] mode = "retry"`, a file that is well
+/// formed, with the step "Delete `retry`". That file holds no `retry` key. The
+/// last row holds that rule out.
 #[test]
 fn a_config_that_names_a_key_that_went_says_what_to_do() {
-    for (section, text, must_say) in [
+    for (section, text, must_say, must_not_say) in [
         (
             "[enforce]",
             "mem_overcommit = 1.5",
             "Delete `mem_overcommit`",
+            None,
         ),
-        ("[enforce]", "use_systemd = true", "Delete `use_systemd`"),
-        ("[retry]", "on_oom = 2", "Delete `retry`"),
-        ("[enforce]", "mode = \"hard\"", "Use `cooperative`"),
-        // An array of tables makes serde read the name as the VALUE of `mode`,
-        // so the message carries `unknown variant` and not `unknown field`. The
-        // reader wrote the same key and needs the same answer.
         (
-            "[[enforce]]",
-            "mem_overcommit = 1.5",
-            "Delete `mem_overcommit`",
+            "[enforce]",
+            "use_systemd = true",
+            "Delete `use_systemd`",
+            None,
+        ),
+        ("[retry]", "on_oom = 2", "Delete `retry`", None),
+        ("[enforce]", "mode = \"hard\"", "Use `cooperative`", None),
+        // A VALUE, and not a key. The file is well formed and it holds no key
+        // that went, so qex names `[enforce] mode`, which the file DOES hold,
+        // and it asks the reader to delete nothing.
+        (
+            "[enforce]",
+            "mode = \"retry\"",
+            "Use `cooperative`",
+            Some("Delete `retry`"),
         ),
     ] {
         let h = Harness::new("wentkey", &format!("{section}\n{text}\n"));
@@ -12647,6 +12674,13 @@ fn a_config_that_names_a_key_that_went_says_what_to_do() {
             said.contains(must_say),
             "the answer must give the step `{must_say}`, for `{section} {text}`: {said}"
         );
+        if let Some(forbidden) = must_not_say {
+            assert!(
+                !said.contains(forbidden),
+                "the answer must not say `{forbidden}`, because the file holds no such \
+                 key, for `{section} {text}`: {said}"
+            );
+        }
     }
 }
 

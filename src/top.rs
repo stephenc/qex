@@ -548,7 +548,6 @@ mod tests {
             assigned: Default::default(),
             attempts: 1,
             retries_left: 0,
-            oom_raises: 0,
             caused_by: None,
             logs_dropped: None,
             tags: vec![],

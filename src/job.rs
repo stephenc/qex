@@ -490,13 +490,6 @@ pub struct JobStatus {
     /// The number of times that qex may still start this job again.
     #[serde(default)]
     pub retries_left: u32,
-    /// The number of times that an EARLIER qex raised the memory claim.
-    ///
-    /// qex raises no claim. This field stays so that a record which an earlier
-    /// qex wrote still loads, and it is zero in every record that this version
-    /// writes. Nothing reads it, and `qex status` does not print it.
-    #[serde(default)]
-    pub oom_raises: u32,
     /// The job that caused this job to stop, for a job in the state `skipped`.
     ///
     /// This value names the first job that failed, and not the job before this
@@ -558,7 +551,6 @@ impl JobStatus {
             assigned: Default::default(),
             attempts: 0,
             retries_left: spec.retries,
-            oom_raises: 0,
             caused_by: None,
             logs_dropped: None,
             tags: spec.tags.clone(),
