@@ -3742,8 +3742,31 @@ fn clean_accepts_a_state_name() {
 /// until the test makes that file, however slow the machine is.
 ///
 /// Use `release` to end every job that waits for the same file.
+///
+/// THE JOB MUST ALSO END BY ITSELF. A test that fails, or one that stops
+/// before it releases the job, leaves a job that waits for a file which
+/// nobody will make. A job that sleeps ends by itself; a job that waits does
+/// not, so this command gives it two more ways to stop:
+///
+/// * the directory of the test goes. The harness deletes it when the test
+///   ends, so the job stops with it, and the machine keeps no process that
+///   waits for a file in a directory that is not there.
+/// * a count of the attempts. It is the last guard, for a state that neither
+///   the gate nor the directory covers.
+///
+/// The gate is what the TEST uses. The other two are what the MACHINE needs.
 fn waits_for_the_test(gate: &std::path::Path) -> String {
-    format!("while [ ! -f {} ]; do sleep 0.05; done", gate.display())
+    let root = gate
+        .parent()
+        .expect("the gate file is in the directory of the test");
+    format!(
+        "i=0; while [ ! -f {gate} ]; do \
+         [ -d {root} ] || exit 0; \
+         i=$((i+1)); [ $i -gt 2400 ] && exit 0; \
+         sleep 0.05; done",
+        gate = gate.display(),
+        root = root.display()
+    )
 }
 
 /// Ends every job that waits for this file.
