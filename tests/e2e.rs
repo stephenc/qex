@@ -14818,10 +14818,7 @@ fn a_socket_that_gives_no_answer_does_not_stop_a_command() {
         return;
     };
 
-    let out = h.qex_within(
-        &["list"],
-        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
-    );
+    let out = h.qex_within(&["list"], Duration::from_secs(COORDINATOR_LIMIT_SECS + 20));
 
     assert_eq!(
         out.status.code(),
@@ -14861,10 +14858,7 @@ fn a_spawn_lock_that_nobody_gives_back_does_not_stop_a_command() {
     let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     assert_eq!(rc, 0, "the test cannot hold the spawn lock");
 
-    let out = h.qex_within(
-        &["list"],
-        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
-    );
+    let out = h.qex_within(&["list"], Duration::from_secs(COORDINATOR_LIMIT_SECS + 20));
 
     assert_eq!(
         out.status.code(),

@@ -55,9 +55,8 @@ impl Client {
     fn connect_or_explain() -> Result<Self> {
         let socket = paths::socket_path()?;
 
-        match try_connect(&socket)? {
-            Some(stream) => return Client::with_stream(stream),
-            None => {}
+        if let Some(stream) = try_connect(&socket)? {
+            return Client::with_stream(stream);
         }
 
         // Take the lock before the start. Two CLI processes can arrive here at
@@ -66,9 +65,8 @@ impl Client {
 
         // Test the socket again. A different process can start the coordinator
         // while this process waits for the lock.
-        match try_connect(&socket)? {
-            Some(stream) => return Client::with_stream(stream),
-            None => {}
+        if let Some(stream) = try_connect(&socket)? {
+            return Client::with_stream(stream);
         }
 
         spawn_daemon()?;
@@ -238,7 +236,10 @@ pub struct CoordinatorTimeout;
 
 impl std::fmt::Display for CoordinatorTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the limit for an answer of the coordinator ended this wait")
+        write!(
+            f,
+            "the limit for an answer of the coordinator ended this wait"
+        )
     }
 }
 
