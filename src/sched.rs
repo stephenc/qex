@@ -3126,14 +3126,14 @@ mod tests {
         }
     }
 
-    /// The queue must test the claim IN FORCE, and not the claim of the
-    /// submission.
+    /// The queue tests the claim that the RECORD holds.
     ///
-    /// qex raises the claim in the record after the kernel stops a job for
-    /// memory, and it gives the job back to the queue. A test against the first
-    /// claim would admit a job of 1GB into the space that qex kept for 600MB,
-    /// and the sum of the claims would go above the budget. Stopping that is
-    /// the work of this module.
+    /// The record is the one authority for a claim: the scheduler adds the
+    /// claim of each job that operates from the record, and it must test a new
+    /// job against that same number. A test against a different number would
+    /// admit a job of 1GB into the space that qex keeps for 600MB, and the sum
+    /// of the claims would go above the budget. Stopping that is the work of
+    /// this module.
     #[test]
     fn the_queue_tests_the_claim_that_the_job_holds_now() {
         let cfg = cfg_with("4", "1GB");
@@ -3363,12 +3363,13 @@ mod tests {
         assert!(!held.contains("time(s)"), "got: {held}");
     }
 
-    /// The claim IN FORCE decides the class, and not the claim of the spec.
+    /// The SIZE of the claim decides the class of a wait.
     ///
-    /// #21 raises the claim of a job that the kernel stopped for memory. A
-    /// scheduler that read the spec here would give the raised job the class of
-    /// its FIRST claim, and a job that no longer fits the budget would keep
-    /// capacity as a `Sibling` in place of waiting for a quiet machine.
+    /// A job whose claim fits the budget waits for its siblings. A job whose
+    /// claim is above the budget waits for a quiet machine, because no set of
+    /// siblings can release sufficient capacity for it. A scheduler that gave
+    /// the second job the class of the first would let it hold capacity as a
+    /// `Sibling` and wait for a moment that does not come.
     #[test]
     fn the_class_of_a_wait_uses_the_claim_in_force() {
         let cfg = cfg_with("4", "256MB");

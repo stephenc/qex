@@ -12422,13 +12422,19 @@ fn a_job_that_a_user_killed_is_not_retried_and_teaches_the_learner_nothing() {
 
 /// NO SHIPPED WORD MAY PROMISE THE MEMORY LIMIT THAT WENT.
 ///
-/// qex limits no job. Six pages once described a limit, a retry and a learned
-/// bound that no configuration ever produced, and correcting them was the work
-/// that showed how much of the feature did not exist.
+/// qex limits no job, it raises no claim, and it starts no attempt of its own
+/// after a kill for memory. A reader who finds one of these words believes a
+/// promise that no code holds.
 ///
-/// This test reads the text that SHIPS — the help topics, the documentation and
-/// the skill file — and refuses the words of that feature. A later change that
-/// writes one of them meets this test and not a reader.
+/// This test reads the text that SHIPS — the documentation, the skill file, the
+/// help topics and the JSON schema — and refuses the words of that feature. A
+/// later change that writes one of them meets this test and not a reader.
+///
+/// THE PAGES COME FROM THE DIRECTORY, and not from a list. A list covers the
+/// pages that exist on the day that somebody writes it, and a page that joins
+/// the product after that day gets no gate. A file that this test cannot read
+/// is a FAILURE and not a page to pass over: a gate that reads nothing refuses
+/// nothing, and it reports success.
 #[test]
 fn no_shipped_word_promises_the_limit_that_went() {
     // Each word, and why it may not come back.
@@ -12448,26 +12454,42 @@ fn no_shipped_word_promises_the_limit_that_went() {
         ("raises the claim", "a correction that qex no longer makes"),
         ("raise the claim", "the same"),
         ("[retry]", "a section that went"),
+        // The words of the raise, in the form that carries no verb. A gate
+        // that names the verbs only passes over a description of the record.
+        ("the new claim", "a claim that qex no longer makes"),
+        ("claim that failed", "the same, in the words of a record"),
     ];
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut pages: Vec<std::path::PathBuf> = vec![
         root.join("README.md"),
         root.join("skills/qex/SKILL.md"),
-        root.join("docs/agents.md"),
-        root.join("docs/reference.md"),
-        root.join("docs/design.md"),
-        root.join("docs/security.md"),
-        root.join("docs/index.md"),
+        // The help topics and the JSON schema ship INSIDE the program, so read
+        // them from the source of the program.
+        root.join("src/help.rs"),
+        root.join("src/schema.rs"),
     ];
-    // The help topics ship inside the program, so read them from the program.
-    let help = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/help.rs");
-    pages.push(help);
+    // Every page of `docs/` ships. Read the directory, so that a new page gets
+    // this gate on the day that somebody writes it.
+    let mut docs: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("docs"))
+        .expect("the docs directory must be readable")
+        .map(|e| {
+            e.expect("each entry of the docs directory must be readable")
+                .path()
+        })
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .collect();
+    docs.sort();
+    assert!(
+        docs.len() >= 6,
+        "the gate must read every page of docs/, and it found {}: {docs:?}",
+        docs.len()
+    );
+    pages.append(&mut docs);
 
     for page in pages {
-        let Ok(text) = std::fs::read_to_string(&page) else {
-            continue;
-        };
+        let text = std::fs::read_to_string(&page)
+            .unwrap_or_else(|e| panic!("the gate must read {}: {e}", page.display()));
         for (word, what) in refused {
             assert!(
                 !text.contains(word),
@@ -12503,6 +12525,71 @@ fn a_config_that_names_a_key_that_went_says_what_to_do() {
         assert!(
             said.contains("does not limit a job"),
             "the answer must say what qex does now, for `{text}`: {said}"
+        );
+    }
+}
+
+/// `qex config show` gives the values IN FORCE, in both of its forms.
+///
+/// `[enforce] mode` decides the budget, the reserve and the search for peers
+/// when the config file names none of them. The struct then holds an empty
+/// sentinel for each one. A reader of either form must never see that sentinel:
+/// an agent that reads `""` for the budget cannot size a claim, and it cannot
+/// recover the number that qex uses.
+///
+/// The pure function that fills the sentinels has its own test. THIS test reads
+/// the two forms that a reader gets, because a correct function that no command
+/// calls answers nobody.
+#[test]
+fn config_show_gives_the_values_in_force_in_both_forms() {
+    for (name, mode, budget, reserve, peers, label) in [
+        (
+            "forcecoop",
+            "cooperative",
+            "75%",
+            "2GB",
+            true,
+            "mode:         cooperative",
+        ),
+        (
+            "forcealone",
+            "single-user",
+            "90%",
+            "512MB",
+            false,
+            "mode:         single-user",
+        ),
+    ] {
+        let h = Harness::new(name, &format!("[enforce]\nmode = \"{mode}\"\n"));
+
+        // THE JSON FORM. An agent reads this one.
+        let out = h.ok(&["config", "show", "--json"]);
+        let cfg: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("{name}: {e}: {out}"));
+        assert_eq!(
+            cfg["budget"]["cpu"], budget,
+            "{mode}: the JSON form must give the budget in force: {out}"
+        );
+        assert_eq!(
+            cfg["budget"]["mem"], budget,
+            "{mode}: the JSON form must give the budget in force: {out}"
+        );
+        assert_eq!(
+            cfg["system"]["reserve_mem"], reserve,
+            "{mode}: the JSON form must give the reserve in force: {out}"
+        );
+        assert_eq!(
+            cfg["peers"]["enabled"], peers,
+            "{mode}: the JSON form must say if qex looks for peers: {out}"
+        );
+
+        // THE TEXT FORM. A person reads this one, and the line must name the
+        // MODE. A line that named the machine told the reader nothing that
+        // this reader can change.
+        let text = h.ok(&["config", "show"]);
+        assert!(
+            text.contains(label),
+            "{mode}: the text form must name the mode as `{label}`: {text}"
         );
     }
 }

@@ -3057,12 +3057,13 @@ fn describe_result(s: &JobStatus) -> String {
             .error
             .clone()
             .unwrap_or_else(|| "the job waited more time than its queue limit".to_string()),
-        // Say that the CLAIM was too small, and not that the machine was full.
+        // Point the reader at the CLAIM, and not at the machine.
         //
-        // The words "the machine ran out of memory" sent the reader to the
-        // machine, and the fault was in the claim. qex holds the full story in
-        // the error field, with the claim that it tried, so give that text when
-        // qex wrote it.
+        // The words "the machine ran out of memory" send the reader to the
+        // machine, and the step that the reader can take is to give the job a
+        // claim that fits its work. Use the text of the `error` field when qex
+        // wrote one, because that text names the cause more exactly than a
+        // sentence that this function builds from two numbers.
         JobState::Oom => s.error.clone().unwrap_or_else(|| {
             format!(
                 "the kernel stopped the job for memory. The claim of {} was too small, and the \
@@ -5436,20 +5437,12 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     let mut spec = crate::job::read_spec(&dir)
         .with_context(|| format!("reading the specification of the job {id}"))?;
 
-    // Use the claim IN FORCE, and not the claim of the submission.
+    // The specification gives the claim of the new job.
     //
-    // The record holds the claim that the job had at the end. That value is the
-    // value of the specification, except after a kill for memory: qex then
-    // raised the claim, and the job succeeded at the larger value. A rerun from
-    // the specification would repeat the claim that the kernel already stopped,
-    // and the correction that cost a whole run would go away.
-    if let Ok(status) = crate::job::read_status(&dir) {
-        if status.mem > spec.mem {
-            spec.mem = status.mem;
-            spec.cpu = status.cpu.max(spec.cpu);
-            spec.claim_source = status.claim_source.clone();
-        }
-    }
+    // qex writes the claim of the record from the specification when the job
+    // starts, and it changes that value for no job: nothing raises a claim. The
+    // record and the specification thus agree, and a rerun gets the claim that
+    // the first submission gave.
 
     // A new job needs a new id, and it must not keep the dependencies of the
     // first job: those jobs have stopped, and a dependency on a job that
@@ -6677,18 +6670,18 @@ mod tests {
         // The text must give the claim and the true use. An agent then corrects
         // its claim from this line.
         assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
-        // It must also name the CLAIM as the fault. The words "the machine ran
-        // out of memory" sent the reader to the machine, and the fault was in
-        // the claim.
+        // It must also point the reader at the CLAIM. The words "the machine
+        // ran out of memory" send the reader to the machine, and the step that
+        // the reader can take is to give the job a claim that fits its work.
         assert!(text.contains("too small"), "got: {text}");
 
-        // qex writes the full story in the error field: the claim that failed,
-        // the new claim, and the attempt. That text must win, because it says
-        // more than the line above.
-        s.error = Some("qex raised the claim to 2GB and starts the job again".into());
+        // The `error` field wins when qex wrote one. That text comes from the
+        // supervisor, which saw the event, so it names the cause more exactly
+        // than a sentence that this function builds from two numbers.
+        s.error = Some("the kernel stopped this job for memory, and its claim was 1GB".into());
         assert!(
-            describe_result(&s).contains("raised the claim"),
-            "the record of qex must win"
+            describe_result(&s).contains("and its claim was 1GB"),
+            "the text of the record must win"
         );
 
         // A job that never started has no log file, so this line is the only

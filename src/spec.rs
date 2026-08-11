@@ -563,11 +563,10 @@ impl JobSpec {
         // A learned claim never goes above the budget.
         //
         // qex makes this number itself, and it must not make a number that it
-        // then refuses. A job that the kernel stopped for memory at the budget
-        // leaves a lower bound AT the budget, and the margin above that bound
-        // gave a claim of 1.5 budgets. `[queue] oversized = "reject"` then
-        // refused the submission with "Decrease the claim", and the user had
-        // given no claim to decrease.
+        // then refuses. A job that uses the full budget leaves a peak AT the
+        // budget, and the margin above that peak gives a claim of 1.5 budgets.
+        // `[queue] oversized = "reject"` then refuses the submission with
+        // "Decrease the claim", and the user gave no claim to decrease.
         //
         // The claim stops at the budget instead. The job then starts, and if it
         // still needs more memory, the record says that qex has no larger claim

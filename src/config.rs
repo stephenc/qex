@@ -1067,22 +1067,19 @@ enum Detail {
 ///
 /// EVERY NAME HERE IS UNIQUE TO THE THING THAT WENT. `growth` and `on_oom` are
 /// NOT in this list, and they must not be: `growth` also names a field of
-/// `[learn]`, and a test of that word answered a key of another section with a
-/// reason that qex invented for it. The whole `[retry]` section went, so the
+/// `[learn]`, and an answer for that word gives a key of a different section a
+/// reason that qex invents for it. The whole `[retry]` section went, so the
 /// section name answers for both of its fields.
-const KEYS_THAT_WENT: &[(&str, &str, &str)] = &[
+const KEYS_THAT_WENT: &[(&str, &str)] = &[
     (
-        "retry",
         "retry",
         "qex raised the claim and started the job again after a kill for memory.",
     ),
     (
-        "enforce",
         "mem_overcommit",
         "qex applied a second memory limit with this multiplier.",
     ),
     (
-        "enforce",
         "use_systemd",
         "qex started the coordinator again under systemd, to get a cgroup that it owned.",
     ),
@@ -1090,15 +1087,17 @@ const KEYS_THAT_WENT: &[(&str, &str, &str)] = &[
 
 /// Names a key that this qex no longer accepts, if the message holds one.
 ///
-/// The serde message names the SECTION in its `keys` list and the field in its
-/// text, so this function tests both. A test of the field alone answers a key
-/// of another section with a reason that belongs to this one.
+/// THE NAME MUST MATCH IN FULL. serde writes ``unknown field `X` ``, and this
+/// function tests for that complete form. A test for the name alone also
+/// answers a key that only STARTS with the name: `[system] retry_mem` is such a
+/// key, and the answer for it names `retry` and tells the reader to delete a
+/// key that the file does not hold.
 fn key_that_went(error: &toml::de::Error) -> Option<(&'static str, &'static str)> {
     let message = error.message();
     KEYS_THAT_WENT
         .iter()
-        .find(|(_, key, _)| message.contains(*key))
-        .map(|(_, key, what)| (*key, *what))
+        .find(|(key, _)| message.contains(&format!("unknown field `{key}`")))
+        .map(|(key, what)| (*key, *what))
 }
 
 fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) -> anyhow::Error {
@@ -2029,6 +2028,32 @@ mod tests {
             !message.contains("at each raise"),
             "a key of another section must not take the reason of a key that went: {message}"
         );
+    }
+
+    /// A key that only STARTS with a key that went gets no answer for that key.
+    ///
+    /// The remedy of an answer for a key that went is "delete this key". A key
+    /// that the file does not hold thus sends the reader to a line that is not
+    /// there. `[system] retry_mem` and `[system] retry` are two different keys,
+    /// and the reader wrote the first one.
+    #[test]
+    fn a_key_that_holds_the_name_of_a_key_that_went_gets_the_answer_for_an_unknown_field() {
+        for text in [
+            "[system]\nretry_mem = \"1GB\"\n",
+            "[enforce]\nuse_systemd_scope = true\n",
+        ] {
+            let e = toml::from_str::<Config>(text).unwrap_err();
+            let message =
+                config_error(std::path::Path::new("/x/qex.toml"), e, Detail::Full).to_string();
+            assert!(
+                !message.contains("and qex does not accept it"),
+                "a key that only starts with a key that went must not take its answer: {message}"
+            );
+            assert!(
+                message.contains("unknown field"),
+                "the reader must still learn that qex does not know the field: {message}"
+            );
+        }
     }
 
     /// A mode that qex removed must name the values that it takes.

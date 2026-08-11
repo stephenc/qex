@@ -150,17 +150,18 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
             }
             // The supervisor gave the job back to the queue.
             //
-            // It does this after the kernel stopped the job for memory: the
-            // claim is now larger, and the queue never admitted that claim. The
-            // coordinator must test the new claim against the budget, in the
-            // same way as a new job. Without this branch the job would go to
-            // the state `failed` with "the supervisor stopped without a
-            // result", and the work would stop.
+            // It does this for an attempt that failed while `--retries` gives
+            // the job one more. The capacity of the first attempt went back to
+            // the machine when that attempt stopped, so the coordinator must
+            // test the claim against the budget again, in the same way as for a
+            // new job. Without this branch the job would go to the state
+            // `failed` with "the supervisor stopped without a result", and the
+            // work would stop.
             Ok(status) if status.state == JobState::Queued => {
                 job.status = status;
                 job.status.supervisor_pid = None;
                 let claim = job.status.mem;
-                // Use the rule of the submission, so a job that qex corrects
+                // Use the rule of the submission, so a job that starts again
                 // does not go in front of the jobs that waited for it.
                 state.enqueue(id);
                 log(&format!(
@@ -1258,10 +1259,10 @@ fn classify(
 
     // A kill from a command wins against every other test.
     //
-    // `qex kill` writes a mark before it sends the signal. qex answers an
-    // out-of-memory kill with a larger claim and a NEW ATTEMPT, so a job that a
-    // person stopped must never look like one: qex would repeat work that
-    // somebody stopped on purpose, at a larger size.
+    // `qex kill` writes a mark before it sends the signal. The state `oom`
+    // names the memory of the machine as the cause, so a job that a person
+    // stopped must never take that state: qex would give the reader a cause
+    // that the reader knows is false.
     if signal.is_some() && crate::enforce::was_user_killed(dir) {
         return JobState::Killed;
     }
@@ -1329,9 +1330,8 @@ fn unexplained_kill_note(
     Some(
         "the signal KILL stopped this job, and no qex command sent it. This machine keeps no \
          count of the kills for memory, so qex cannot say if the kernel stopped the job for \
-         memory or if a different program stopped it. qex gave the state `killed` and did not \
-         raise the claim. Compare the `usage` field with the claim, and give a larger `--mem` \
-         value if the two are near."
+         memory or if a different program stopped it. qex gave the state `killed`. Compare the \
+         `usage` field with the claim, and give a larger `--mem` value if the two are near."
             .to_string(),
     )
 }
@@ -1760,10 +1760,10 @@ mod tests {
 
     /// A job that a USER stopped must never look like a kill for memory.
     ///
-    /// This test protects the feature from doing harm. qex answers a kill for
-    /// memory with a larger claim and a NEW ATTEMPT. A job that somebody
-    /// stopped on purpose must not run again, and it must not teach the learner
-    /// that the command needs more memory.
+    /// The state `oom` names the memory of the machine as the cause. A job that
+    /// somebody stopped on purpose must not take that state, because the reader
+    /// who sent the kill knows the true cause and must not receive a different
+    /// one from qex.
     ///
     /// The two marks can both exist: the out-of-memory count of a session also
     /// counts a kill in a different program of the same user. The mark from the

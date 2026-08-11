@@ -287,8 +287,8 @@ pub const STATUS: &str = r##"{
     "mem": { "type": "integer", "description": "The memory in bytes that the job claims." },
     "claim_source": {
       "type": "string",
-      "enum": ["explicit", "learned", "default"],
-      "description": "Where the claim came from."
+      "enum": ["explicit", "learned", "default", "fan-out"],
+      "description": "Where the claim came from. `learned` is a claim from the earlier jobs of THIS command. `fan-out` is a claim from the earlier jobs of the fan-out, which qex measures against the template and not against the command of one line."
     },
     "attempts": { "type": "integer", "description": "The number of times that qex started this job." },
     "retries_left": { "type": "integer", "description": "The number of times that qex may still start this job again after a failure. See --retries." },
@@ -358,7 +358,7 @@ pub const STATUS: &str = r##"{
     },
     "error": {
       "type": ["string", "null"],
-      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause. A job that the kernel stopped for memory holds here the claim that failed, the new claim and the attempt, and that text stays in the record when a later attempt succeeds."
+      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause. qex also writes here for a job that it could not start, a job that reached the limit of its wait in the queue, a job that it skipped because a job that it needed did not succeed, and an attempt that failed while qex has an attempt to give. This field gives the REASON; read `state` for what became of the job."
     },
     "needs": {
       "type": "array",

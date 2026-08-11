@@ -599,10 +599,10 @@ impl State {
     /// Puts a job in the queue, after each job of the same priority or a higher
     /// priority. The queue is thus stable.
     ///
-    /// A job enters the queue two times in its life: at the submission, and
-    /// again after the kernel stopped it for memory and qex raised its claim.
-    /// The second case must use the same rule as the first, or a job that qex
-    /// corrects would go in front of the jobs that waited for it.
+    /// A job can enter the queue more than one time: at the submission, and
+    /// again for each attempt that `--retries` gives it after a failure. Each
+    /// entry must use the same rule as the first, or a job that starts again
+    /// would go in front of the jobs that waited for it.
     pub fn enqueue(&mut self, id: uuid::Uuid) {
         if self.queue.contains(&id) {
             return;

@@ -406,9 +406,14 @@ The learned claim never goes above `[budget] mem`: qex makes that number itself,
 and it must not make a number that it then refuses.
 
 A file that an EARLIER qex wrote can hold a sample of a kind that this version
-does not use. qex still reads such a file and keeps every peak in it, and it
-gives no claim from a sample that is not a peak. A command whose only history is
-such a sample gets the default claim, and the record says so.
+does not use, and a file that a LATER qex wrote can hold a kind or a field that
+this version has never seen. qex reads such a file and keeps every peak in it.
+It gives no claim from a sample that is not a peak, so a command whose only
+history is such a sample gets the default claim, and the record says so.
+
+A file that qex cannot read AT ALL is a different case. An incomplete file gives
+an empty store, and qex learns each command again from the jobs that follow.
+Each claim is the default until the measurements come back.
 
 Turn it off with `[learn] enabled = false`.
 

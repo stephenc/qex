@@ -107,8 +107,10 @@ pub enum Measurement {
 /// of every command, with no message, and would learn of the loss when a later
 /// claim came back too small.
 ///
-/// A sample with a missing number reads as zero, and `add` writes no sample of
-/// zero bytes, so such a sample gives no claim.
+/// A missing number reads as ZERO, and a peak of zero bytes is not a
+/// measurement: no job uses no memory. `suggest` thus passes over a peak of
+/// zero, in the same way that it passes over a kind that it cannot use. The
+/// sample stays in the file, and it gives no claim.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Sample {
@@ -285,28 +287,27 @@ pub fn suggest(
     //
     // A claim that is too small stops the job, and a claim that is a little too
     // large costs some capacity only. The two faults are not equal.
-    // A PEAK is the only measurement that gives a claim, so an entry with no
-    // peak gives NO answer.
     //
-    // An entry can hold samples and no peak: a file of an earlier qex holds a
-    // `lower-bound` for a command whose jobs never completed. Without this
-    // test, such a command took the smallest claim that qex permits and the
-    // record said `learned`, so a reader was told that 64MB came from the
-    // earlier jobs of a command that an earlier qex knew needed more than 8GB.
-    // NO answer is the correct answer: the reader then gets the default, which
-    // no measurement contradicts.
+    // A PEAK OF MORE THAN ZERO BYTES is the only measurement that gives a
+    // claim, and an entry that holds no such sample gives NO answer. Two
+    // shapes get past the reader and reach this point:
+    //
+    // - a `lower-bound`, which a file of an earlier qex holds for a command
+    //   whose jobs never completed. It says that a job stopped, and it names no
+    //   memory that the job used;
+    // - a peak of ZERO bytes, which is what a sample with no number reads as.
+    //   No job uses no memory, so the value measures nothing.
+    //
+    // Each one gives the smallest claim that qex permits, with `learned` in the
+    // record: the reader is told that 64MB came from the earlier jobs of a
+    // command that possibly needs 8GB. NO answer is the correct answer, because
+    // the reader then gets the default, which no measurement contradicts.
     let peak_mem = entry
         .samples
         .iter()
-        .filter(|s| s.kind == Measurement::Peak)
+        .filter(|s| s.kind == Measurement::Peak && s.max_rss > 0)
         .map(|s| s.max_rss)
         .max()?;
-    // A PEAK is the only measurement that gives a claim.
-    //
-    // A file of an earlier qex can hold a sample of the kind `lower-bound`.
-    // That value is not a measurement: it says that a job stopped, and it names
-    // no memory that the job used. A claim that came from one would sit above a
-    // number that no job ever reached, for every later run of that command.
     let mem = ((peak_mem as f64 * margin) as u64).max(MIN_MEMORY);
 
     // Calculate the cores from the CPU time and the time that the job operated.
@@ -633,6 +634,52 @@ mod tests {
         assert!(
             suggest(&store, &dir(), &cmd, 1.5).is_none(),
             "a bound is not a measurement, so it must give no claim at all"
+        );
+    }
+
+    /// A PEAK OF ZERO BYTES gives no claim.
+    ///
+    /// No job uses no memory, so a peak of zero measures nothing. A sample that
+    /// is missing its number reads as a peak of zero, because every field of a
+    /// sample takes a default: that is what keeps the peaks of a file that this
+    /// version cannot read in full. A claim from such a sample would be the
+    /// smallest that qex permits, and the record would say `learned`, so the
+    /// reader would get a number that no job supports.
+    #[test]
+    fn a_peak_of_zero_bytes_gives_no_claim() {
+        let cmd: Vec<String> = vec!["train".into()];
+        for (what, text) in [
+            (
+                "a sample with a kind and no number",
+                r#"{"commands":{"KEY":{"name":"t","samples":[{"kind":"peak"}]}}}"#,
+            ),
+            (
+                "a sample with no field at all",
+                r#"{"commands":{"KEY":{"name":"t","samples":[{}]}}}"#,
+            ),
+        ] {
+            let text = text.replace("KEY", &key(&dir(), &cmd));
+            let store: Store = serde_json::from_str(&text).unwrap();
+            assert!(
+                suggest(&store, &dir(), &cmd, 1.5).is_none(),
+                "{what} measures nothing, so it must give no claim at all"
+            );
+        }
+    }
+
+    /// A peak of zero bytes takes no peak of the same command with it.
+    #[test]
+    fn a_peak_of_zero_bytes_leaves_the_claim_of_the_true_peaks() {
+        let cmd: Vec<String> = vec!["train".into()];
+        let store = store_with(
+            &["train"],
+            vec![sample(0, 1.0, 10), sample(1 << 30, 1.0, 10)],
+        );
+        let s = suggest(&store, &dir(), &cmd, 1.5).expect("the peak must give a claim");
+        assert_eq!(
+            s.mem,
+            (1 << 30) * 3 / 2,
+            "the claim must come from the peak that measures memory"
         );
     }
 

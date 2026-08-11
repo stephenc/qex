@@ -208,9 +208,12 @@ pub fn clear_oom(job_dir: &Path) {
 /// The kernel and `qex kill` both use `SIGKILL`, and the cgroup counter is not
 /// exact when qex applies no limit: qex then reads the counter of the session,
 /// which also counts a kill in a different program of the same user. A job that
-/// a person stopped must NEVER look like an out-of-memory kill, because qex
-/// answers an out-of-memory kill with a larger claim and a new attempt. It must
-/// not repeat work that somebody stopped on purpose.
+/// a person stopped must NEVER look like an out-of-memory kill, because the two
+/// states give the reader two different causes. `oom` sends the reader to the
+/// memory of the machine and to the claim of the job, and the person who sent
+/// the kill knows that neither one is the cause. A wrong cause costs that
+/// reader the time to disprove it, and qex must give no cause that it cannot
+/// support.
 ///
 /// This mark is thus the first evidence, and it wins against the counter.
 pub fn mark_user_kill(job_dir: &Path) {
