@@ -841,6 +841,50 @@ impl Drop for SpawnLock {
 mod tests {
     use super::*;
 
+    /// A connection that reached a limit must never be read again.
+    ///
+    /// The request is STILL IN FLIGHT when the limit ends the wait. Its answer
+    /// arrives later and waits in the socket, so a second request on the same
+    /// connection reads the FIRST answer as its own. Two requests with one kind
+    /// of answer swap in silence, and a `Submit` that reads an earlier answer
+    /// loses the id of a job that the coordinator ACCEPTED AND QUEUED.
+    ///
+    /// This test makes that exact sequence: a limit, then a late answer, then a
+    /// second request.
+    #[test]
+    fn a_connection_that_reached_a_limit_reads_no_later_answer() {
+        use std::io::Write as _;
+
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        // A short ceiling. This test must not wait for the real one.
+        take_the_limit_of_the_reader(Duration::from_millis(200));
+        let mut client = Client::with_stream(ours).unwrap();
+
+        // The coordinator says nothing, so the first call reaches the limit.
+        let first = client.call(&Request::Info);
+        assert!(first.is_err(), "the first call must reach the limit");
+
+        // NOW the answer arrives, exactly as a busy coordinator would send it.
+        let late = serde_json::to_string(&Response::Capabilities {
+            names: vec!["late-answer".to_string()],
+        })
+        .unwrap();
+        let mut writer = theirs;
+        writeln!(writer, "{late}").unwrap();
+        writer.flush().unwrap();
+
+        // A second call must NOT read that answer. It belongs to the first
+        // question, and this connection has lost its place.
+        let second = client.call(&Request::Info);
+        let Err(e) = second else {
+            panic!("the second call read an answer that belongs to an earlier request");
+        };
+        assert!(
+            format!("{e:#}").contains("lost its place"),
+            "the fault must say that the connection lost its place: {e:#}"
+        );
+    }
+
     fn refused(kind: std::io::ErrorKind) -> impl Fn(&Path) -> std::io::Result<()> {
         move |_| Err(std::io::Error::new(kind, "refused"))
     }
