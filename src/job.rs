@@ -40,10 +40,10 @@ pub enum JobState {
     Expired,
     /// The out-of-memory killer or the cgroup limit stopped the job.
     ///
-    /// This state is different from `failed`. The correction is also different:
-    /// the memory claim is too small, or the machine is too small. qex makes
-    /// the first correction itself: it raises the claim and starts the job
-    /// again. See `oom_raises`.
+    /// This state is different from `failed`, and so is the correction: the
+    /// claim can be too small, or the machine can be too small. qex REPORTS
+    /// this state and acts on it in no way, because the count that it reads
+    /// covers every program of this user and cannot name the victim.
     Oom,
     /// qex removed the job from the queue before the job started.
     Cancelled,
@@ -497,13 +497,11 @@ pub struct JobStatus {
     /// The number of times that qex may still start this job again.
     #[serde(default)]
     pub retries_left: u32,
-    /// The number of times that qex raised the memory claim of this job.
+    /// The number of times that an EARLIER qex raised the memory claim.
     ///
-    /// The kernel stops a job that uses more memory than its claim. That kill
-    /// says that the claim was too small, so qex multiplies the claim and
-    /// starts the job again. This count is separate from `retries_left`,
-    /// because the user gave that number for a different kind of fault. See
-    /// `[retry] on_oom` in the config file.
+    /// qex raises no claim. This field stays so that a record which an earlier
+    /// qex wrote still loads, and it is zero in every record that this version
+    /// writes. Nothing reads it, and `qex status` does not print it.
     #[serde(default)]
     pub oom_raises: u32,
     /// The job that caused this job to stop, for a job in the state `skipped`.

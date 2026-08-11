@@ -121,8 +121,14 @@ fn peer_dir(cfg: &Config) -> Option<PathBuf> {
 /// directory fails a test would tell the user that a feature operates when it
 /// does not.
 pub fn describe(cfg: &Config) -> String {
-    if !cfg.peers.enabled {
-        return "off; the config file sets [peers] enabled = false".to_string();
+    if !cfg.peers_enabled() {
+        // Say WHICH decision turned it off. Two do: the key, and the mode.
+        return match cfg.peers.enabled {
+            Some(false) => "off; the config file sets [peers] enabled = false".to_string(),
+            _ => "off; the config file sets [enforce] mode = \"single-user\", so qex \
+                  expects no other coordinator"
+                .to_string(),
+        };
     }
     match peer_dir(cfg) {
         Some(dir) => {
@@ -173,7 +179,7 @@ pub fn publish(
     pools: std::collections::BTreeMap<String, u64>,
     devices: std::collections::BTreeMap<String, Vec<u32>>,
 ) {
-    if !cfg.peers.enabled {
+    if !cfg.peers_enabled() {
         return;
     }
     let Some(dir) = peer_dir(cfg) else { return };
@@ -220,7 +226,7 @@ pub fn withdraw(cfg: &Config) {
 /// damaged file must not stop the queue.
 pub fn claims(cfg: &Config) -> Claims {
     let mut total = Claims::default();
-    if !cfg.peers.enabled {
+    if !cfg.peers_enabled() {
         return total;
     }
 
@@ -567,7 +573,7 @@ mod tests {
         let dir = tmpdir("disabled");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let mut cfg = cfg_for(&dir);
-        cfg.peers.enabled = false;
+        cfg.peers.enabled = Some(false);
         assert_eq!(claims(&cfg), Claims::default());
         std::fs::remove_dir_all(&dir).ok();
     }

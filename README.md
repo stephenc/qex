@@ -239,12 +239,16 @@ the job:
 
 ```
 QEX_CPU=2  GOMAXPROCS=2  OMP_NUM_THREADS=2  QEX_MEM=4294967296
-GOMEMLIMIT=4294967296  NODE_OPTIONS=--max-old-space-size=3072
 ```
 
-A runtime then sizes its thread pool and its heap to the claim, and not to the
-machine. This is the one place where qex changes how your program runs, and it
-can decide whether a job succeeds.
+A runtime then sizes its THREAD POOL to the claim, and not to the machine. This
+is the one place where qex changes how your program runs.
+
+**No value carries memory.** qex does not limit the memory of a job, so it does
+not tell a runtime to limit its own. A hint that named a memory value would hold
+a Go job and a node job to the claim and leave every other program free, and it
+would decide whether a job succeeds. `QEX_MEM` NAMES the claim for a script that
+reads it, and no runtime acts on it.
 
 **The value is the claim, and not a measurement.** qex writes the number that
 you asked for.
@@ -266,11 +270,10 @@ false` turns it off for every job.
 and qex trusts it. qex measures a job while the job runs, and it uses that
 measurement as the claim for the next job of the same command.
 
-**qex applies no limit by default**, so nothing stops a job that goes above its
+**qex applies no limit**, so nothing stops a job that goes above its
 claim. A job that claims 2GB and uses 20GB can still fill the machine. qex tests
 the free memory before each start, which limits the damage, but an accurate
-claim is better. Linux can apply a real limit with cgroup v2; set `[enforce]
-mode`. qex never reports a limit that it did not apply.
+claim is better.
 
 **qex does not limit the CPU of a job.** The `cpu` controller of cgroup v2 is
 not available to a user on a usual Linux system, and macOS has no equivalent.
@@ -292,35 +295,25 @@ trusts what the other coordinator writes.
 
 ## When the kernel stops a job for memory
 
-A training run that the kernel stops at hour four gets the state `oom`.
+A training run that the kernel stops at hour four gets the state `oom` and the
+exit code 99.
 
-**qex reports it, and it starts no new attempt.** The record says what you can
-do. Give a larger `--mem` value and submit the work again:
+**qex reports it, and it acts on it in no way.** No new attempt starts, no claim
+changes, and the learner keeps nothing. The record says what you can do:
 
 ```sh
 qex submit --wait --mem 16GB --id-file train.id -- uv run train.py
 ```
 
-qex cannot do more than report while it applies no limit, which is the default.
-A claim is then a promise, and the count that the kernel keeps also rises when
-the kernel stops a different program of the same user. The machine can be full
-while your claim is correct, and a larger claim is then the wrong answer.
+**qex cannot say that your job was the victim.** It reads a count of
+out-of-memory kills that Linux keeps for the cgroup of its own process, and
+every program of your user raises that count. A machine that is short of memory
+is also the machine on which a person uses `kill -9`, so the two arrive
+together. Your claim can be correct, and a larger claim is then the wrong
+answer: read the `usage` field of the record and compare it with the claim.
 
-`[enforce] mode` puts each job in a cgroup of its own and applies the claim as a
-real limit. The kernel counts a kill at that limit separately, and that count is
-proof that the claim was too small. With that proof, qex is designed to multiply
-the claim, start the job again with the same id, and keep the lesson for the
-next job of the same command.
-
-**That correction does not run in this build.** The supervisor joins the cgroup
-of the job and then stops every process in it, so it stops itself before it
-reaches the code that raises the claim. Issue
-[#88](https://github.com/stephenc/qex/issues/88) holds the fault. While it is
-open, `[enforce] mode` gives you a real memory limit and the state `oom`, and no
-job runs a second time.
-
-See [the reference](docs/reference.md#a-job-that-the-kernel-stops-for-memory)
-for the rules of the correction.
+**macOS keeps no such count**, so a kill for memory there gives the state
+`killed` and the code 125. Do not wait for 99 on a Mac.
 
 ## The documentation
 

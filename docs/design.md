@@ -74,14 +74,9 @@ not available to a user on a usual Linux system, and macOS has no equivalent.
 The queue controls the number of cores instead: qex does not start more work
 than the budget permits.
 
-**qex does not limit the memory of a job by default.** A claim controls the
-queue only. This behaviour is the same on Linux and on macOS.
-
-Linux can apply a memory limit with cgroup v2. Set `[enforce] mode` to `soft` or
-`hard` to use it. The coordinator needs a cgroup that it owns, and a coordinator
-that starts from a login shell does not have one. `qex config show` reports
-`NOT ACTIVE` with the reason when this occurs. qex never reports a limit that it
-did not apply.
+**qex does not limit the memory of a job.** A claim controls the queue only, and
+the behaviour is the same on Linux and on macOS. Nothing holds a job to its
+claim after the job starts.
 
 **A claim is a promise, and not a measurement.** A job that claims 2GB and uses
 20GB can still fill the machine. qex tests the free memory of the machine before

@@ -724,16 +724,6 @@ pub fn run() -> Result<()> {
     let cfg = Config::load()?;
     cfg.validate()?;
 
-    // If the config asks for a memory limit, this process can need a cgroup
-    // that it owns, and systemd gives one.
-    //
-    // Do this step before the socket exists. The new process opens the socket,
-    // and two processes must never try to open it together.
-    if crate::enforce::restart_with_systemd(&cfg) {
-        log("the coordinator starts again in a systemd unit, to get a cgroup that it owns");
-        return Ok(());
-    }
-
     let runtime = paths::runtime_dir()?;
     paths::ensure_dir(&runtime, 0o700)?;
     paths::ensure_dir(&paths::jobs_dir()?, 0o700)?;
@@ -853,13 +843,6 @@ pub fn run() -> Result<()> {
     // touches the directories of other coordinators only, so the start
     // sequence needs no result from it.
     std::thread::spawn(paths::reap_stale_socket_dirs);
-
-    // Warn now if the config asks for a limit that this system cannot apply. A
-    // silent failure is dangerous: the user reads the config file and believes
-    // that a limit is active.
-    if let Some(warning) = crate::enforce::startup_warning(&cfg) {
-        log(&format!("warning: {warning}"));
-    }
 
     // Delete the old lines of the job history. See `[history] keep`.
     crate::history::prune(&cfg);
@@ -1500,7 +1483,7 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
     // coordinator gives no value, and the reader must see `unknown`. A
     // defaulted `0` would read as "no other user holds anything", which is a
     // lie in the place where the honest answer matters most.
-    let peers = if state.cfg.peers.enabled {
+    let peers = if state.cfg.peers_enabled() {
         crate::peers::claims(&state.cfg)
     } else {
         crate::peers::Claims::default()

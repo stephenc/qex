@@ -120,17 +120,16 @@ Turn the method off with `[peers] enabled = false`.
 
 ## The limits on a job
 
-qex applies no memory limit by default. A claim controls the queue only.
+**qex applies no limit to a job.** A claim controls the queue only: it decides
+what STARTS and when. A job that claims 2GB and uses 20GB still fills the
+machine, and qex says so.
 
-Linux can apply a real limit with cgroup v2. Set `[enforce] mode` to `soft` or
-`hard`. The coordinator needs a cgroup that it owns, and a coordinator that
-starts from a login shell frequently does not have one.
+qex does test the free memory of the machine before it starts a job, and it
+refuses to start one that the machine cannot hold. That test limits the damage,
+and it is not a limit on a job that already runs.
 
-**qex never reports a limit that it did not apply.** `qex config show` says `NOT
-ACTIVE` with the reason, and a job whose limit qex could not apply records that
-fact in its own status, where `qex status` shows it. A configuration file that
-qex cannot read gives the same treatment: the job continues with the default
-values, and the record says that no limit operates.
+A configuration file that qex cannot read gives the job the default values, and
+the record of that job says so, where `qex status` shows it.
 
 ## The coordinator and the version
 

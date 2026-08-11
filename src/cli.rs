@@ -14,7 +14,7 @@ use std::path::PathBuf;
     // Not the number in Cargo.toml: `main` holds `0.0.0-dev` for ever, and
     // `build.rs` calculates the number of this build. See `src/version.rs`.
     version = crate::version::VERSION,
-    about = "Queued EXecutor. A job queue for long tasks on this machine.",
+    about = "Queued EXecutor. Shared admission control for independent agents on this machine.",
     long_about = None,
     disable_help_subcommand = true,
     subcommand_required = false,
@@ -271,9 +271,9 @@ pub struct SubmitArgs {
     /// Do not tell the job how large its claim is.
     ///
     /// With both --cpu and --mem, qex writes the claim into the environment of
-    /// the job (GOMAXPROCS, OMP_NUM_THREADS, GOMEMLIMIT and more), so a runtime
-    /// sizes its thread pool to the claim and not to the machine. Use this
-    /// option for a job that must see the machine as it is.
+    /// the job (GOMAXPROCS, OMP_NUM_THREADS and more), so a runtime sizes its
+    /// thread pool to the claim and not to the machine. Use this option for a
+    /// job that must see the machine as it is, such as a measurement.
     #[arg(long)]
     pub no_limit_env_hints: bool,
     /// Start no second job when a job with this key already exists.

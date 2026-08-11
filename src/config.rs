@@ -59,26 +59,37 @@ pub enum OversizedPolicy {
     Queue,
 }
 
-/// Selects if qex applies the claimed limits to the job.
+/// What qex may ASSUME about the machine that it runs on.
+///
+/// # This key does not enforce anything
+///
+/// qex does not limit a job in either mode. A claim decides what STARTS and
+/// when, and a job that claims two gigabytes and uses twenty still fills the
+/// machine. The name of the section is `[enforce]` because a way to hold a job
+/// to its claim would attach to `single-user`, and a config file that already
+/// names the mode would then need no new key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum EnforceMode {
-    /// Use the claims for the queue only. Do not set a limit on the job.
+    /// Other users, other agents and people share this machine.
     ///
-    /// This is the default mode. It is the only mode on macOS.
+    /// qex finds the coordinators of the other users and counts their claims
+    /// against the budget, and it leaves room for work that it does not
+    /// control.
     #[default]
-    Off,
-    /// Set `memory.high` to the claim. The kernel then slows the job and
-    /// reclaims memory. Set `memory.max` to `claim * mem_overcommit` as a
-    /// second limit.
-    Soft,
-    /// Set `memory.max` to the claim. The kernel stops a job that goes above it.
-    Hard,
+    Cooperative,
+    /// qex may assume that it decides what runs on this machine.
+    ///
+    /// qex then uses more of the machine, because the room that `cooperative`
+    /// leaves is room for work that does not exist here. It also looks for no
+    /// other coordinator.
+    SingleUser,
 }
 
 impl EnforceMode {
-    pub fn is_on(self) -> bool {
-        self != Self::Off
+    /// True when qex may assume that it decides what runs here.
+    pub fn is_single_user(self) -> bool {
+        self == Self::SingleUser
     }
 }
 
@@ -286,7 +297,7 @@ where
 /// Reads a decimal number that a person can write inside quotation marks.
 ///
 /// The mirror of [`text_or_number`] for `[system] max_pressure`,
-/// `[enforce] mem_overcommit` and `[learn] margin`. `margin = "1.5"` refused the
+/// `[learn] margin`. `margin = "1.5"` refused the
 /// file with `invalid type: string "1.5", expected f64`. See
 /// [`whole_number_opt`] for why the tolerance goes both ways.
 ///
@@ -361,7 +372,13 @@ where
     d.deserialize_any(DecimalNumber)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// The share of the machine that qex uses.
+///
+/// AN EMPTY VALUE means "choose from `[enforce] mode`": a machine that qex
+/// shares needs room for work that qex does not control, and a machine that qex
+/// decides for does not. `budget_cpu` and `budget_mem` resolve it, and a value
+/// that the reader wrote always wins.
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BudgetConfig {
     /// The number of cores that qex can use.
@@ -376,12 +393,15 @@ pub struct BudgetConfig {
     pub mem: String,
 }
 
-impl Default for BudgetConfig {
-    fn default() -> Self {
-        Self {
-            cpu: "75%".into(),
-            mem: "75%".into(),
-        }
+/// The share of the machine that qex uses when the config names no budget.
+///
+/// `cooperative` leaves a quarter of the machine for the work of other users,
+/// of other agents and of a person. `single-user` says that no such work
+/// exists here, so qex uses more.
+fn default_budget(mode: EnforceMode) -> &'static str {
+    match mode {
+        EnforceMode::Cooperative => "75%",
+        EnforceMode::SingleUser => "90%",
     }
 }
 
@@ -406,43 +426,25 @@ pub struct SystemConfig {
 impl Default for SystemConfig {
     fn default() -> Self {
         Self {
-            reserve_mem: "2GB".into(),
+            // EMPTY means "choose from `[enforce] mode`". See `reserve_mem`.
+            reserve_mem: String::new(),
             max_pressure: 20.0,
         }
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnforceConfig {
+    /// What qex may assume about this machine. See [`EnforceMode`].
     pub mode: EnforceMode,
-    /// The multiplier for the second memory limit in the soft mode.
-    ///
-    /// qex sets `memory.max` to the claim multiplied by this value.
-    #[serde(deserialize_with = "decimal_number")]
-    pub mem_overcommit: f64,
-    /// Permits qex to start the coordinator in a temporary systemd unit.
-    ///
-    /// qex uses the command `systemd-run --user`. The coordinator then controls
-    /// its own cgroup, and it can set a memory limit on each job. systemd holds
-    /// a temporary unit in memory and writes no file to the disk.
-    pub use_systemd: bool,
-}
-
-impl Default for EnforceConfig {
-    fn default() -> Self {
-        Self {
-            mode: EnforceMode::Off,
-            mem_overcommit: 1.5,
-            use_systemd: true,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PeersConfig {
-    pub enabled: bool,
+    /// `None` means "choose from `[enforce] mode`". See `Config::peers_enabled`.
+    pub enabled: Option<bool>,
     pub dir: String,
     #[serde(deserialize_with = "text_or_number")]
     pub stale_after: String,
@@ -451,7 +453,7 @@ pub struct PeersConfig {
 impl Default for PeersConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: None,
             dir: "/tmp/qex".into(),
             stale_after: "30s".into(),
         }
@@ -937,39 +939,6 @@ impl HooksConfig {
     }
 }
 
-/// Controls what qex does when the kernel stops a job for memory.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RetryConfig {
-    /// The number of times that qex raises the claim and starts the job again.
-    ///
-    /// This count is SEPARATE from `--retries`, and the reason is important.
-    /// `--retries` is for a fault outside the task, such as a network that is
-    /// not ready, and the user chose that number for that fault. A kill for
-    /// memory is a fault of the CLAIM, and qex made the claim in the usual
-    /// case: `--mem guess` and the learned claim both come from qex. qex must
-    /// therefore correct its own fault, and it must not spend a budget that the
-    /// user gave for a different purpose. A job with no `--retries` value thus
-    /// still gets this correction.
-    ///
-    /// The count has a limit, and 2 raises give 4 times the first claim. Each
-    /// attempt costs the full time of the job: the job in the README runs for
-    /// four hours before the kernel stops it. A ladder with no limit can thus
-    /// use a day of the machine and give no result.
-    pub on_oom: u32,
-    /// The multiplier for the claim at each raise.
-    pub growth: f64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            on_oom: 2,
-            growth: 2.0,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -983,7 +952,6 @@ pub struct Config {
     pub claims: ClaimsConfig,
     pub defaults: DefaultsConfig,
     pub learn: LearnConfig,
-    pub retry: RetryConfig,
     pub history: HistoryConfig,
     pub gc: GcConfig,
     pub logs: LogsConfig,
@@ -1092,8 +1060,74 @@ enum Detail {
 /// error, the coordinator keeps `State.cfg`, and `qex info` reports the fault.
 /// The new option thus has no effect until a NEW coordinator reads it, which is
 /// the fault that this message must stop.
+/// The keys that qex accepted before it became admission control only.
+///
+/// A reader whose file holds one of these must learn what qex does NOW, and not
+/// read "unknown field", which names no remedy.
+const KEYS_THAT_WENT: &[(&str, &str)] = &[
+    (
+        "retry",
+        "qex raised the claim and started the job again after a kill for memory.",
+    ),
+    (
+        "mem_overcommit",
+        "qex applied a second memory limit with this multiplier.",
+    ),
+    (
+        "use_systemd",
+        "qex started the coordinator again under systemd, to get a cgroup that it owned.",
+    ),
+    (
+        "on_oom",
+        "qex raised the claim and started the job again after a kill for memory.",
+    ),
+    (
+        "growth",
+        "qex multiplied the claim by this value at each raise.",
+    ),
+];
+
+/// Names a key that this qex no longer accepts, if the message holds one.
+fn key_that_went(message: &str) -> Option<(&'static str, &'static str)> {
+    KEYS_THAT_WENT
+        .iter()
+        .find(|(key, _)| message.contains(*key))
+        .copied()
+}
+
 fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) -> anyhow::Error {
     let short = anyhow::anyhow!("parsing config file {}: {error}", path.display());
+
+    // A key that qex REMOVED needs its own answer. "unknown field" is true and
+    // it names no remedy, and the reader wrote that key because an earlier qex
+    // asked for it.
+    if let Some((key, what_it_did)) = key_that_went(error.message()) {
+        return anyhow::anyhow!(
+            "the configuration file {} sets `{key}`, and qex does not accept it.\n\n\
+             {what_it_did} qex does not limit a job now: a claim decides what STARTS and \
+             when, and a job that claims two gigabytes and uses twenty still fills the \
+             machine.\n\n\
+             Delete `{key}` from {}. To hold a job to a number, give a claim that fits the \
+             work.",
+            path.display(),
+            path.display()
+        );
+    }
+
+    // A value that qex no longer accepts for a key that stays.
+    if error.message().contains("unknown variant") && error.message().contains("cooperative") {
+        return anyhow::anyhow!(
+            "the configuration file {} gives a value for `[enforce] mode` that qex does not \
+             accept: {error}\n\n\
+             `off`, `soft` and `hard` went with the memory limit. qex does not limit a job \
+             now.\n\n\
+             Use `cooperative` when other users, other agents or people share this machine. \
+             Use `single-user` when qex decides what runs here: qex then uses more of the \
+             machine and looks for no other coordinator. Neither value limits a job.",
+            path.display()
+        );
+    }
+
     if detail == Detail::Short || !error.message().contains("unknown field") {
         return short;
     }
@@ -1304,7 +1338,12 @@ impl Config {
     /// Gives the budget in cores for this machine.
     pub fn budget_cpu(&self) -> Result<u64> {
         let total = sys::cpu_count();
-        let n = units::parse_budget(&self.budget.cpu, total, false)
+        let text = if self.budget.cpu.is_empty() {
+            default_budget(self.enforce.mode)
+        } else {
+            &self.budget.cpu
+        };
+        let n = units::parse_budget(text, total, false)
             .map_err(|e| anyhow::anyhow!("config [budget] cpu: {e}"))?;
         // A budget of zero keeps all the jobs in the queue for ever. A small
         // percentage that rounds down to zero does not have that intention.
@@ -1314,7 +1353,12 @@ impl Config {
     /// Gives the budget in bytes for this machine.
     pub fn budget_mem(&self) -> Result<u64> {
         let total = sys::total_memory();
-        let n = units::parse_budget(&self.budget.mem, total, true)
+        let text = if self.budget.mem.is_empty() {
+            default_budget(self.enforce.mode)
+        } else {
+            &self.budget.mem
+        };
+        let n = units::parse_budget(text, total, true)
             .map_err(|e| anyhow::anyhow!("config [budget] mem: {e}"))?;
         // A budget of zero makes every job too large for the budget. Each job
         // then runs alone with a warning. A memory probe that gives zero, in an
@@ -1322,7 +1366,32 @@ impl Config {
         Ok(n.max(64 << 20))
     }
 
+    /// Says whether qex looks for the coordinators of other users.
+    ///
+    /// With no value in the config file, the answer comes from `[enforce]
+    /// mode`. A machine that qex shares has other coordinators, and their
+    /// claims count against the budget. A machine that qex decides for has
+    /// none, so the search reads a shared directory for nothing.
+    ///
+    /// A value that the reader wrote always wins.
+    pub fn peers_enabled(&self) -> bool {
+        self.peers
+            .enabled
+            .unwrap_or(!self.enforce.mode.is_single_user())
+    }
+
+    /// Gives the memory that qex keeps free for work outside the queue.
+    ///
+    /// With no value in the config file, the answer comes from `[enforce]
+    /// mode`: a machine that qex shares keeps memory for the work of others,
+    /// and a machine that qex decides for keeps less.
     pub fn reserve_mem(&self) -> Result<u64> {
+        if self.system.reserve_mem.is_empty() {
+            return Ok(match self.enforce.mode {
+                EnforceMode::Cooperative => 2 << 30,
+                EnforceMode::SingleUser => 512 << 20,
+            });
+        }
         units::parse_size(&self.system.reserve_mem)
             .map_err(|e| anyhow::anyhow!("config [system] reserve_mem: {e}"))
     }
@@ -1687,21 +1756,6 @@ impl Config {
             );
         }
         self.politeness_values()?;
-        if self.retry.on_oom > 0 && self.retry.growth <= 1.0 {
-            anyhow::bail!(
-                "config [retry] growth is {}. Use a value above 1.0. A smaller value gives the \
-                 claim that the kernel already stopped, and the job would stop again.",
-                self.retry.growth
-            );
-        }
-        if self.enforce.mem_overcommit < 1.0 {
-            anyhow::bail!(
-                "config [enforce] mem_overcommit is {}. Use a value of 1.0 or more. \
-                 A smaller value sets memory.max below memory.high. The kernel then \
-                 stops every job that reaches its claim.",
-                self.enforce.mem_overcommit
-            );
-        }
         Ok(())
     }
 }
@@ -1796,29 +1850,51 @@ mod tests {
         ok.validate().unwrap();
     }
 
-    /// A growth of 1.0 or below gives the claim that already failed.
+    /// A key that qex removed must give an answer that a reader can act on.
     ///
-    /// The file would otherwise be accepted, and each attempt of the ladder
-    /// would run with the same claim and stop in the same place. The user would
-    /// see three attempts, three kills and no correction, and nothing would say
-    /// that the number in the file was the cause.
+    /// A reader wrote that key because an earlier qex asked for it. "unknown
+    /// field" is true and it names no remedy.
     #[test]
-    fn validate_refuses_a_growth_that_raises_no_claim() {
-        let c: Config = toml::from_str("[retry]\ngrowth = 1.0\n").unwrap();
-        let e = c.validate().unwrap_err().to_string();
+    fn a_key_that_went_names_itself_and_the_remedy() {
+        for (text, key) in [
+            ("[enforce]\nmem_overcommit = 1.5\n", "mem_overcommit"),
+            ("[enforce]\nuse_systemd = true\n", "use_systemd"),
+            // The whole section went, so the answer names the section.
+            ("[retry]\non_oom = 2\n", "retry"),
+            ("[retry]\ngrowth = 2.0\n", "retry"),
+        ] {
+            let e = toml::from_str::<Config>(text).unwrap_err();
+            let message =
+                config_error(std::path::Path::new("/x/qex.toml"), e, Detail::Full).to_string();
+            assert!(
+                message.contains(key),
+                "the answer must name the key `{key}`: {message}"
+            );
+            assert!(
+                message.contains("Delete"),
+                "the answer must give the remedy: {message}"
+            );
+            assert!(
+                message.contains("does not limit a job"),
+                "the answer must say what qex does now: {message}"
+            );
+        }
+    }
+
+    /// A mode that qex removed must name the values that it takes.
+    #[test]
+    fn a_mode_that_went_names_the_values_that_qex_takes() {
+        let e = toml::from_str::<Config>("[enforce]\nmode = \"hard\"\n").unwrap_err();
+        let message =
+            config_error(std::path::Path::new("/x/qex.toml"), e, Detail::Full).to_string();
         assert!(
-            e.contains("[retry] growth"),
-            "the error must name the field: {e}"
+            message.contains("cooperative") && message.contains("single-user"),
+            "the answer must name the values that qex takes: {message}"
         );
-
-        // A file that turns the correction off puts no number in force, so it
-        // must pass whatever the growth says.
-        let off: Config = toml::from_str("[retry]\non_oom = 0\ngrowth = 1.0\n").unwrap();
-        off.validate().unwrap();
-
-        // The default values must pass.
-        let ok: Config = toml::from_str("[retry]\non_oom = 2\ngrowth = 2.0\n").unwrap();
-        ok.validate().unwrap();
+        assert!(
+            message.contains("does not limit a job"),
+            "the answer must say that neither value limits a job: {message}"
+        );
     }
 
     /// A value that means nothing must still give an error that names the
@@ -1877,8 +1953,7 @@ mod tests {
         let quoted: Config = toml::from_str(
             "[defaults]\ncpu = \"3\"\n\
              [system]\nmax_pressure = \"30\"\n\
-             [learn]\nmargin = \"2.5\"\n\
-             [enforce]\nmem_overcommit = \"2.0\"\n",
+             [learn]\nmargin = \"2.5\"\n",
         )
         .unwrap();
         quoted.validate().unwrap();
@@ -1886,8 +1961,7 @@ mod tests {
         let bare: Config = toml::from_str(
             "[defaults]\ncpu = 3\n\
              [system]\nmax_pressure = 30\n\
-             [learn]\nmargin = 2.5\n\
-             [enforce]\nmem_overcommit = 2.0\n",
+             [learn]\nmargin = 2.5\n",
         )
         .unwrap();
         bare.validate().unwrap();
@@ -1898,8 +1972,6 @@ mod tests {
         assert_eq!(quoted.system.max_pressure, 30.0);
         assert_eq!(quoted.learn.margin, bare.learn.margin);
         assert_eq!(quoted.learn.margin, 2.5);
-        assert_eq!(quoted.enforce.mem_overcommit, bare.enforce.mem_overcommit);
-        assert_eq!(quoted.enforce.mem_overcommit, 2.0);
 
         // A whole number in a decimal field is the same value again.
         let c: Config = toml::from_str("[learn]\nmargin = 2\n").unwrap();
@@ -1967,8 +2039,6 @@ mod tests {
             "[learn]\nmargin = nan\n",
             "[learn]\nmargin = inf\n",
             "[learn]\nmargin = \"inf\"\n",
-            "[enforce]\nmem_overcommit = nan\n",
-            "[enforce]\nmem_overcommit = inf\n",
         ] {
             let e = toml::from_str::<Config>(text)
                 .err()
@@ -2208,7 +2278,7 @@ mod tests {
         c.validate().unwrap();
         assert_eq!(c.submit.env_capture, EnvCapture::All);
         assert_eq!(c.queue.oversized, OversizedPolicy::RunWhenIdle);
-        assert_eq!(c.enforce.mode, EnforceMode::Off);
+        assert_eq!(c.enforce.mode, EnforceMode::Cooperative);
         assert!(c.budget_cpu().unwrap() >= 1);
         assert_eq!(c.default_cpu(), 1);
         assert_eq!(c.default_timeout().unwrap(), None);
@@ -2262,9 +2332,7 @@ reserve_mem = "2GB"
 max_pressure = 20
 
 [enforce]
-mode = "soft"
-mem_overcommit = 1.5
-use_systemd = true
+mode = "single-user"
 
 [peers]
 enabled = true
@@ -2274,10 +2342,6 @@ stale_after = "30s"
 [queue]
 oversized = "run-when-idle"
 settle = "3s"
-
-[retry]
-on_oom = 2
-growth = 2.0
 
 [submit]
 env_capture = "minimal"
@@ -2309,8 +2373,7 @@ count = 4
 "#;
         let c: Config = toml::from_str(text).unwrap();
         c.validate().unwrap();
-        assert_eq!(c.enforce.mode, EnforceMode::Soft);
-        assert_eq!(c.retry.on_oom, 2);
+        assert_eq!(c.enforce.mode, EnforceMode::SingleUser);
         assert_eq!(c.submit.env_capture, EnvCapture::Minimal);
         assert_eq!(c.budget_mem().unwrap(), 20 << 30);
         assert_eq!(c.default_timeout().unwrap(), None);
@@ -2481,36 +2544,6 @@ count = 4
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("count = 0"), "got: {err}");
         assert!(err.contains("can ever start"), "got: {err}");
-    }
-
-    /// A pool with no size declares nothing. qex must say so, and must not
-    /// give the pool a size that no person chose.
-    #[test]
-    fn a_pool_with_no_count_and_no_devices_is_refused() {
-        let c: Config = toml::from_str("[[pool]]\nname = \"gpu\"\n").unwrap();
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("does not know its size"), "got: {err}");
-    }
-
-    #[test]
-    fn typos_in_config_keys_are_rejected_not_ignored() {
-        // If qex ignores a key with a spelling error, the user believes that a
-        // limit is active. The limit is not active.
-        let err = toml::from_str::<Config>("[budget]\ncpuu = 4\n").unwrap_err();
-        assert!(err.to_string().contains("cpuu"), "got: {err}");
-    }
-
-    #[test]
-    fn bad_values_are_reported_with_the_offending_section() {
-        let c: Config = toml::from_str("[budget]\nmem = \"lots\"\n").unwrap();
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("[budget] mem"), "got: {err}");
-    }
-
-    #[test]
-    fn overcommit_below_one_is_rejected() {
-        let c: Config = toml::from_str("[enforce]\nmem_overcommit = 0.5\n").unwrap();
-        assert!(c.validate().is_err());
     }
 
     /// With no `[hooks]` section there is no hook, and no job starts a program

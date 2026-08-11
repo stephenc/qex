@@ -287,15 +287,11 @@ pub const STATUS: &str = r##"{
     "mem": { "type": "integer", "description": "The memory in bytes that the job claims NOW. The value starts as the claim in the submission, and qex raises it when the kernel stops the job for memory." },
     "claim_source": {
       "type": "string",
-      "enum": ["explicit", "learned", "default", "raised"],
-      "description": "Where the claim came from. `raised` means that the kernel stopped an earlier attempt for memory and qex made the claim larger."
+      "enum": ["explicit", "learned", "default"],
+      "description": "Where the claim came from."
     },
     "attempts": { "type": "integer", "description": "The number of times that qex started this job." },
     "retries_left": { "type": "integer", "description": "The number of times that qex may still start this job again after a failure. See --retries." },
-    "oom_raises": {
-      "type": "integer",
-      "description": "The number of times that qex raised the memory claim of this job, because the kernel stopped an attempt at the memory limit that qex applied. This count is separate from retries_left. qex raises the claim only when it applied the limit itself, with [enforce] mode; with no limit it reports the state oom and starts no new attempt. See [retry] on_oom in the config file."
-    },
     "locks": {
       "type": "array",
       "items": { "type": "string" },

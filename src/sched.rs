@@ -1902,7 +1902,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         // one-writer rule.
         let pools = state.cfg.pools().unwrap_or_default();
         let held = state.claimed();
-        let peers = if state.cfg.peers.enabled {
+        let peers = if state.cfg.peers_enabled() {
             crate::peers::claims(&state.cfg)
         } else {
             crate::peers::Claims::default()
