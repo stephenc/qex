@@ -1850,6 +1850,54 @@ mod tests {
         ok.validate().unwrap();
     }
 
+    /// `single-user` must CHANGE something, or it is a promise qex does not keep.
+    ///
+    /// A reader who sets it and gets nothing has met the fault that the removal
+    /// of the memory limit exists to remove. Each value below follows from one
+    /// assumption: qex decides what runs here, so it needs no room for work
+    /// that it does not control.
+    #[test]
+    fn single_user_uses_more_of_the_machine_than_cooperative() {
+        let shared: Config = toml::from_str("[enforce]\nmode = \"cooperative\"\n").unwrap();
+        let alone: Config = toml::from_str("[enforce]\nmode = \"single-user\"\n").unwrap();
+
+        assert!(
+            alone.budget_mem().unwrap() > shared.budget_mem().unwrap(),
+            "single-user must use more memory of the machine: {} against {}",
+            alone.budget_mem().unwrap(),
+            shared.budget_mem().unwrap()
+        );
+        assert!(
+            alone.reserve_mem().unwrap() < shared.reserve_mem().unwrap(),
+            "single-user must keep less memory for work that does not exist"
+        );
+        assert!(
+            shared.peers_enabled() && !alone.peers_enabled(),
+            "single-user must look for no other coordinator"
+        );
+    }
+
+    /// A value that the reader wrote wins in EITHER mode.
+    ///
+    /// The mode chooses a DEFAULT. It must never take a decision away from the
+    /// reader who wrote one.
+    #[test]
+    fn a_value_that_the_reader_wrote_wins_over_the_mode() {
+        let c: Config = toml::from_str(
+            "[enforce]\nmode = \"single-user\"\n\
+             [budget]\nmem = \"1GB\"\n\
+             [system]\nreserve_mem = \"4GB\"\n\
+             [peers]\nenabled = true\n",
+        )
+        .unwrap();
+        assert_eq!(c.budget_mem().unwrap(), 1 << 30);
+        assert_eq!(c.reserve_mem().unwrap(), 4u64 << 30);
+        assert!(
+            c.peers_enabled(),
+            "a reader who asks for the peers must get them in either mode"
+        );
+    }
+
     /// A key that qex removed must give an answer that a reader can act on.
     ///
     /// A reader wrote that key because an earlier qex asked for it. "unknown
