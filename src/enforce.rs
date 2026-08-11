@@ -249,9 +249,11 @@ pub fn read_oom_counts(cgroup: &Path) -> Option<OomCounts> {
 /// - `oom` counts the times that this cgroup reached ITS OWN limit and the
 ///   kernel could not free memory. The limit of this cgroup alone raises it.
 ///
-/// A kill with a rise in `oom` is thus a kill at the limit that qex made from
-/// the claim: the claim was too small, and qex can act on that. A kill with no
-/// rise in `oom` came from outside this cgroup, so the claim can be correct.
+/// A NEW kill with a NEW rise in `oom` is thus a kill at the limit that qex
+/// made from the claim: the claim was too small, and qex can act on that. A new
+/// kill with NO new rise in `oom` came from outside this cgroup, so the claim
+/// can be correct. Each answer is about a RISE, and never about the value that
+/// a count holds: a count holds the events of every earlier attempt as well.
 ///
 /// The limit of a PARENT cgroup gives the second answer as well. The parent
 /// counts the event and this cgroup counts the kill. That answer is correct for
@@ -293,22 +295,6 @@ pub fn classify_oom(cgroup: &Path, qex_made_cgroup: bool, before: OomCounts) -> 
         Some(OomScope::Job)
     } else {
         Some(OomScope::Machine)
-    }
-}
-
-/// Records what the counters say about THIS attempt.
-///
-/// Both places where the supervisor tests a cgroup call this function, so the
-/// rule lives in one place and a test drives the same code that the supervisor
-/// drives.
-pub fn record_oom_evidence(
-    job_dir: &Path,
-    cgroup: &Path,
-    qex_made_cgroup: bool,
-    before: OomCounts,
-) {
-    if let Some(scope) = classify_oom(cgroup, qex_made_cgroup, before) {
-        mark_oom(job_dir, scope);
     }
 }
 
@@ -362,6 +348,64 @@ pub fn own_cgroup() -> Option<PathBuf> {
     None
 }
 
+/// Watches the out-of-memory counts of ONE attempt of a job.
+///
+/// The supervisor makes this value BEFORE it starts the program of the attempt,
+/// and it asks for the answer after that program stops. The counts from the
+/// start live in here, so no caller passes them and no caller can pass the
+/// wrong ones.
+///
+/// That matters because NEITHER count starts at zero. The counter of the login
+/// session holds the kills of every program of this user, and qex names the
+/// cgroup of a job after the id of the job, so every attempt of one job uses
+/// the same cgroup and the counts of an earlier attempt stay in it.
+pub struct OomWatch {
+    /// The cgroup that qex reads for this attempt.
+    cgroup: Option<PathBuf>,
+    /// True when qex made that cgroup for THIS attempt.
+    ///
+    /// This value comes from the cgroup that this attempt made, and never from
+    /// a path that an earlier attempt recorded. A cgroup of an earlier attempt
+    /// survives, so a recorded path can name a cgroup that this attempt did not
+    /// make, and the counts in it belong to that earlier attempt.
+    qex_made_cgroup: bool,
+    /// The counts at the start of this attempt.
+    before: OomCounts,
+}
+
+impl OomWatch {
+    /// Reads the counts before the program of the attempt starts.
+    ///
+    /// `job_cgroup` is the cgroup that THIS attempt made, and `None` when qex
+    /// made none. With no cgroup of its own, qex reads the cgroup of the login
+    /// session: it then still finds a kill, and it cannot name the victim.
+    pub fn start(job_cgroup: Option<&Path>) -> Self {
+        let cgroup = job_cgroup.map(|p| p.to_path_buf()).or_else(own_cgroup);
+        let before = cgroup
+            .as_deref()
+            .and_then(read_oom_counts)
+            .unwrap_or_default();
+        Self {
+            cgroup,
+            qex_made_cgroup: job_cgroup.is_some(),
+            before,
+        }
+    }
+
+    /// Records what the counts say about this attempt.
+    ///
+    /// The supervisor calls this function more than one time, and `mark_oom`
+    /// keeps the strongest answer, so a second call adds no fault.
+    pub fn record(&self, job_dir: &Path) {
+        let Some(cgroup) = self.cgroup.as_deref() else {
+            return;
+        };
+        if let Some(scope) = classify_oom(cgroup, self.qex_made_cgroup, self.before) {
+            mark_oom(job_dir, scope);
+        }
+    }
+}
+
 /// Tests if the out-of-memory killer stopped a job.
 ///
 /// The kernel stops a process with `SIGKILL` for an out-of-memory event. That
@@ -380,13 +424,13 @@ pub enum OomScope {
     /// The kernel stopped the job at the limit that qex made from the claim.
     ///
     /// qex made the cgroup of this job, so the counts belong to this job and to
-    /// no other program, and the cgroup counted an event at its own limit. The
+    /// no other program, and the cgroup counted a NEW event at its own limit. The
     /// claim was therefore too small, and qex can act on that.
     Job,
     /// The kernel stopped the job, and NOT at the limit of this job.
     ///
     /// qex made the cgroup of this job, so the kill belongs to this job. The
-    /// cgroup counted no event at its own limit, so the memory of the machine,
+    /// cgroup counted no NEW event at its own limit, so the memory of the machine,
     /// or a limit of a parent cgroup, stopped this job. The claim can be
     /// correct.
     ///
@@ -908,20 +952,27 @@ mod tests {
 
     /// The supervisor must WRITE the answer that it found.
     ///
-    /// This test drives the same function that the supervisor drives, with a
-    /// cgroup that the test made. Without it, the classification is correct and
-    /// nothing records the result.
+    /// This test drives the same value that the supervisor drives, and it makes
+    /// it at the same moment: before the counts of the attempt rise. Without
+    /// that, a test can pass while the answer stays in the cgroup and nothing
+    /// records it.
     #[test]
     fn the_answer_of_an_attempt_reaches_the_record() {
         let job = std::env::temp_dir().join(format!("qex-record-{}", std::process::id()));
         std::fs::remove_dir_all(&job).ok();
         std::fs::create_dir_all(&job).unwrap();
-        let cgroup = a_cgroup_with_events("record", "oom 0\noom_kill 1\n");
+        let cgroup = a_cgroup_with_events("record", "oom 0\noom_kill 0\n");
         // The supervisor records this path, so the job dir names the cgroup
         // exactly as it does in a real run.
         record_cgroup_path(&job, &cgroup);
 
-        record_oom_evidence(&job, &cgroup, true, OomCounts::default());
+        // The supervisor makes the watch BEFORE the program of the attempt runs.
+        let watch = OomWatch::start(Some(&cgroup));
+
+        // The machine stops the job during the attempt.
+        std::fs::write(cgroup.join("memory.events"), b"oom 0\noom_kill 1\n").unwrap();
+        watch.record(&job);
+
         // The FILE must exist. A test of `oom_evidence` alone can pass while
         // nothing is written, if that function reads the cgroup as well.
         assert!(
@@ -934,10 +985,39 @@ mod tests {
             "the answer must reach the record of the job"
         );
 
-        // The stronger answer of the second test must replace the first one.
+        // The limit of the job then stops it, and the stronger answer must win.
         std::fs::write(cgroup.join("memory.events"), b"oom 1\noom_kill 2\n").unwrap();
-        record_oom_evidence(&job, &cgroup, true, OomCounts::default());
+        watch.record(&job);
         assert_eq!(oom_evidence(&job), Some(OomScope::Job));
+
+        std::fs::remove_dir_all(&job).ok();
+        std::fs::remove_dir_all(&cgroup).ok();
+    }
+
+    /// The watch reads the counts of the START of the attempt.
+    ///
+    /// The supervisor makes the watch before the program runs, so a count that
+    /// an earlier attempt left is a fact from before this attempt. Without
+    /// that, attempt 2 of a job reads the rise of attempt 1 and names the claim.
+    #[test]
+    fn the_watch_holds_the_counts_of_the_start_of_the_attempt() {
+        let job = std::env::temp_dir().join(format!("qex-watch2-{}", std::process::id()));
+        std::fs::remove_dir_all(&job).ok();
+        std::fs::create_dir_all(&job).unwrap();
+        // Attempt 1 raised both counts and qex acted on that.
+        let cgroup = a_cgroup_with_events("watch2", "oom 1\noom_kill 1\n");
+
+        // Attempt 2 makes its own watch against the same cgroup.
+        let watch = OomWatch::start(Some(&cgroup));
+
+        // The machine stops attempt 2: `oom_kill` rises and `oom` does not.
+        std::fs::write(cgroup.join("memory.events"), b"oom 1\noom_kill 2\n").unwrap();
+        watch.record(&job);
+        assert_eq!(
+            oom_evidence(&job),
+            Some(OomScope::Machine),
+            "a rise of an earlier attempt must not name the claim of this attempt"
+        );
 
         std::fs::remove_dir_all(&job).ok();
         std::fs::remove_dir_all(&cgroup).ok();

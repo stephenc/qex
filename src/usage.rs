@@ -178,7 +178,8 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
 /// # The caller must hold the evidence of THIS JOB
 ///
 /// Call this function only when qex made the cgroup of the job AND that cgroup
-/// counted an event at its own limit. The kernel then stopped the job at the
+/// counted a NEW event at its own limit during that attempt. The kernel then
+/// stopped the job at the
 /// limit that qex made from the claim, so the claim was too small and the need
 /// is above it.
 ///
@@ -188,7 +189,8 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
 /// same user, and the machine can be full while the claim of this job is
 /// correct.
 ///
-/// A kill in the cgroup of the job, with NO event at the limit of that cgroup,
+/// A kill in the cgroup of the job, with no NEW event at the limit of that
+/// cgroup,
 /// says that the memory of the machine stopped this job, or that a limit of a
 /// parent cgroup did. The claim can be correct there as well.
 ///
