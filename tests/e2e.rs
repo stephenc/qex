@@ -14837,7 +14837,7 @@ fn a_socket_that_gives_no_answer_does_not_stop_a_command() {
     );
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
-        said.contains("did not accept a connection"),
+        said.contains("gave no answer"),
         "the message must name what qex tried: {said}"
     );
     assert!(
@@ -15019,7 +15019,7 @@ fn a_page_that_qex_could_not_fill_gives_124_for_a_query() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("did not accept a connection"),
+        String::from_utf8_lossy(&out.stderr).contains("gave no answer"),
         "the cause must reach the reader: {}",
         String::from_utf8_lossy(&out.stderr)
     );

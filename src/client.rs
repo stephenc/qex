@@ -151,11 +151,6 @@ fn deadline_for_one_wait() -> Instant {
     }
 }
 
-/// Gives the limit that this wait obeys, for a message that names a number.
-fn limit_of_one_wait() -> Duration {
-    deadline_for_one_wait().saturating_duration_since(Instant::now())
-}
-
 /// Takes the limit of the READER for the whole command.
 ///
 /// `--timeout` is the number of the reader, so it bounds every wait of the
@@ -298,13 +293,23 @@ impl Client {
     /// use this function — it sends the request and holds its own limit, so
     /// this limit never shortens a wait that a reader asked for.
     pub fn call(&mut self, request: &Request) -> Result<Response> {
+        self.call_within(request, deadline_for_one_wait())
+    }
+
+    /// Sends one request and reads one answer, inside a deadline that the
+    /// caller gives.
+    ///
+    /// `call` computes the deadline for one wait. This form takes it, so a test
+    /// can drive the limit without writing a value that every other test in the
+    /// same program would then read.
+    fn call_within(&mut self, request: &Request, deadline: Instant) -> Result<Response> {
         if self.lost_its_place {
             return Err(timed_out(
-                "this connection to the coordinator lost its place in the answers, \
-                 so qex asked nothing more on it.\n\
+                "qex asked the coordinator nothing more on this connection.\n\
                  An earlier request reached its time limit, and the answer to it \
-                 can still arrive. A later request would read that answer as its \
-                 own.\n\
+                 can still arrive. A later question on the same connection would \
+                 read that answer as its own, and qex would give you the answer \
+                 to a question that you did not ask.\n\
                  Run the command again."
                     .to_string(),
             ));
@@ -322,7 +327,6 @@ impl Client {
         // waited too long for THIS answer — so nothing that the command did
         // earlier shortens it.
         let started = Instant::now();
-        let deadline = deadline_for_one_wait();
 
         let answer = loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -470,19 +474,6 @@ fn timed_out(message: String) -> anyhow::Error {
 /// Says whether the limit for a coordinator ended this error.
 pub fn is_a_coordinator_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CoordinatorTimeout>().is_some()
-}
-
-/// Says whether a read ended because it reached its own limit.
-fn a_read_that_reached_its_limit(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .map(|e| {
-            matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            )
-        })
-        .unwrap_or(false)
 }
 
 /// Names the cause when a coordinator took a request and gave no answer.
@@ -924,12 +915,14 @@ mod tests {
         use std::io::Write as _;
 
         let (ours, theirs) = UnixStream::pair().unwrap();
-        // A short ceiling. This test must not wait for the real one.
-        take_the_limit_of_the_reader(Duration::from_millis(200));
         let mut client = Client::with_stream(ours).unwrap();
+        // A SHORT DEADLINE THAT BELONGS TO THIS TEST. A test that wrote the
+        // limit of the reader would write it for every other test in this
+        // program, and the order of the tests would then decide the result.
+        let soon = Instant::now() + Duration::from_millis(200);
 
         // The coordinator says nothing, so the first call reaches the limit.
-        let first = client.call(&Request::Info);
+        let first = client.call_within(&Request::Info, soon);
         assert!(first.is_err(), "the first call must reach the limit");
 
         // NOW the answer arrives, exactly as a busy coordinator would send it.
@@ -943,13 +936,18 @@ mod tests {
 
         // A second call must NOT read that answer. It belongs to the first
         // question, and this connection has lost its place.
-        let second = client.call(&Request::Info);
+        let second = client.call_within(&Request::Info, soon);
         let Err(e) = second else {
             panic!("the second call read an answer that belongs to an earlier request");
         };
+        let said = format!("{e:#}");
         assert!(
-            format!("{e:#}").contains("lost its place"),
-            "the fault must say that the connection lost its place: {e:#}"
+            said.contains("asked the coordinator nothing more"),
+            "the fault must say what qex did: {said}"
+        );
+        assert!(
+            said.contains("question that you did not ask"),
+            "the fault must say what it prevented: {said}"
         );
     }
 
