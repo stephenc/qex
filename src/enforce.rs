@@ -917,8 +917,17 @@ mod tests {
         std::fs::remove_dir_all(&job).ok();
         std::fs::create_dir_all(&job).unwrap();
         let cgroup = a_cgroup_with_events("record", "oom 0\noom_kill 1\n");
+        // The supervisor records this path, so the job dir names the cgroup
+        // exactly as it does in a real run.
+        record_cgroup_path(&job, &cgroup);
 
         record_oom_evidence(&job, &cgroup, true, OomCounts::default());
+        // The FILE must exist. A test of `oom_evidence` alone can pass while
+        // nothing is written, if that function reads the cgroup as well.
+        assert!(
+            job.join("oom").exists(),
+            "the supervisor must write the record, and not leave the answer in the cgroup"
+        );
         assert_eq!(
             oom_evidence(&job),
             Some(OomScope::Machine),
