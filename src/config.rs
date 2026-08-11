@@ -1064,35 +1064,41 @@ enum Detail {
 ///
 /// A reader whose file holds one of these must learn what qex does NOW, and not
 /// read "unknown field", which names no remedy.
-const KEYS_THAT_WENT: &[(&str, &str)] = &[
+///
+/// EVERY NAME HERE IS UNIQUE TO THE THING THAT WENT. `growth` and `on_oom` are
+/// NOT in this list, and they must not be: `growth` also names a field of
+/// `[learn]`, and a test of that word answered a key of another section with a
+/// reason that qex invented for it. The whole `[retry]` section went, so the
+/// section name answers for both of its fields.
+const KEYS_THAT_WENT: &[(&str, &str, &str)] = &[
     (
+        "retry",
         "retry",
         "qex raised the claim and started the job again after a kill for memory.",
     ),
     (
+        "enforce",
         "mem_overcommit",
         "qex applied a second memory limit with this multiplier.",
     ),
     (
+        "enforce",
         "use_systemd",
         "qex started the coordinator again under systemd, to get a cgroup that it owned.",
-    ),
-    (
-        "on_oom",
-        "qex raised the claim and started the job again after a kill for memory.",
-    ),
-    (
-        "growth",
-        "qex multiplied the claim by this value at each raise.",
     ),
 ];
 
 /// Names a key that this qex no longer accepts, if the message holds one.
-fn key_that_went(message: &str) -> Option<(&'static str, &'static str)> {
+///
+/// The serde message names the SECTION in its `keys` list and the field in its
+/// text, so this function tests both. A test of the field alone answers a key
+/// of another section with a reason that belongs to this one.
+fn key_that_went(error: &toml::de::Error) -> Option<(&'static str, &'static str)> {
+    let message = error.message();
     KEYS_THAT_WENT
         .iter()
-        .find(|(key, _)| message.contains(*key))
-        .copied()
+        .find(|(_, key, _)| message.contains(*key))
+        .map(|(_, key, what)| (*key, *what))
 }
 
 fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) -> anyhow::Error {
@@ -1101,7 +1107,7 @@ fn config_error(path: &std::path::Path, error: toml::de::Error, detail: Detail) 
     // A key that qex REMOVED needs its own answer. "unknown field" is true and
     // it names no remedy, and the reader wrote that key because an earlier qex
     // asked for it.
-    if let Some((key, what_it_did)) = key_that_went(error.message()) {
+    if let Some((key, what_it_did)) = key_that_went(&error) {
         return anyhow::anyhow!(
             "the configuration file {} sets `{key}`, and qex does not accept it.\n\n\
              {what_it_did} qex does not limit a job now: a claim decides what STARTS and \
@@ -1364,6 +1370,30 @@ impl Config {
         // then runs alone with a warning. A memory probe that gives zero, in an
         // unusual container, would cause that result.
         Ok(n.max(64 << 20))
+    }
+
+    /// Gives a copy in which every value that the MODE chose is written down.
+    ///
+    /// `[budget] cpu`, `[budget] mem`, `[system] reserve_mem` and
+    /// `[peers] enabled` take their value from `[enforce] mode` when the config
+    /// file names none. The struct then holds the empty sentinel, and a reader
+    /// of `qex config show --json` would see a value that is NOT the value in
+    /// force, with no way to recover it.
+    ///
+    /// An agent reads the JSON form, so the JSON form must answer.
+    pub fn resolved(&self) -> Self {
+        let mut c = self.clone();
+        if c.budget.cpu.is_empty() {
+            c.budget.cpu = default_budget(self.enforce.mode).to_string();
+        }
+        if c.budget.mem.is_empty() {
+            c.budget.mem = default_budget(self.enforce.mode).to_string();
+        }
+        if c.system.reserve_mem.is_empty() {
+            c.system.reserve_mem = crate::units::format_size(self.reserve_mem().unwrap_or(0));
+        }
+        c.peers.enabled = Some(self.peers_enabled());
+        c
     }
 
     /// Says whether qex looks for the coordinators of other users.
@@ -1898,6 +1928,62 @@ mod tests {
         );
     }
 
+    /// The JSON form must give the value in FORCE, and never a sentinel.
+    ///
+    /// An agent reads `qex config show --json`. A value that the mode chose
+    /// lives as an empty string in the struct, and an agent that read that
+    /// would see no budget at all and could not recover the number.
+    #[test]
+    fn the_json_form_gives_the_values_that_are_in_force() {
+        for mode in ["cooperative", "single-user"] {
+            let c: Config = toml::from_str(&format!("[enforce]\nmode = \"{mode}\"\n")).unwrap();
+            let r = c.resolved();
+            assert!(
+                !r.budget.cpu.is_empty() && !r.budget.mem.is_empty(),
+                "the budget of `{mode}` must be written down: {r:?}"
+            );
+            assert!(
+                !r.system.reserve_mem.is_empty(),
+                "the reserve of `{mode}` must be written down: {r:?}"
+            );
+            assert_eq!(
+                r.peers.enabled,
+                Some(c.peers_enabled()),
+                "the peer answer of `{mode}` must be written down"
+            );
+            // And the written value must be the value that qex uses.
+            let mut from_json: Config = toml::from_str("").unwrap();
+            from_json.budget = r.budget.clone();
+            from_json.system.reserve_mem = r.system.reserve_mem.clone();
+            assert_eq!(from_json.budget_mem().unwrap(), c.budget_mem().unwrap());
+            assert_eq!(from_json.reserve_mem().unwrap(), c.reserve_mem().unwrap());
+        }
+    }
+
+    /// A pool with no size declares nothing. qex must say so, and must not
+    /// give the pool a size that no person chose.
+    #[test]
+    fn a_pool_with_no_count_and_no_devices_is_refused() {
+        let c: Config = toml::from_str("[[pool]]\nname = \"gpu\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("does not know its size"), "got: {err}");
+    }
+
+    #[test]
+    fn typos_in_config_keys_are_rejected_not_ignored() {
+        // If qex ignores a key with a spelling error, the user believes that a
+        // limit is active. The limit is not active.
+        let err = toml::from_str::<Config>("[budget]\ncpuu = 4\n").unwrap_err();
+        assert!(err.to_string().contains("cpuu"), "got: {err}");
+    }
+
+    #[test]
+    fn bad_values_are_reported_with_the_offending_section() {
+        let c: Config = toml::from_str("[budget]\nmem = \"lots\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[budget] mem"), "got: {err}");
+    }
+
     /// A key that qex removed must give an answer that a reader can act on.
     ///
     /// A reader wrote that key because an earlier qex asked for it. "unknown
@@ -1927,6 +2013,22 @@ mod tests {
                 "the answer must say what qex does now: {message}"
             );
         }
+    }
+
+    /// A key of a DIFFERENT section must not take the answer of a key that went.
+    ///
+    /// `[learn] growth` never existed, and a test of the field alone answered
+    /// it with an explanation about multiplying a claim at each raise: the
+    /// remedy was right and the reason was invented.
+    #[test]
+    fn a_key_of_another_section_gets_no_answer_that_belongs_to_this_change() {
+        let e = toml::from_str::<Config>("[learn]\ngrowth = 1.0\n").unwrap_err();
+        let message =
+            config_error(std::path::Path::new("/x/qex.toml"), e, Detail::Full).to_string();
+        assert!(
+            !message.contains("at each raise"),
+            "a key of another section must not take the reason of a key that went: {message}"
+        );
     }
 
     /// A mode that qex removed must name the values that it takes.

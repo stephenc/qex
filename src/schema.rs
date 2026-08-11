@@ -284,7 +284,7 @@ pub const STATUS: &str = r##"{
     "started_at": { "type": ["integer", "null"], "description": "The start time, in seconds after the Unix epoch." },
     "finished_at": { "type": ["integer", "null"], "description": "The stop time, in seconds after the Unix epoch." },
     "cpu": { "type": "integer", "description": "The number of cores that the job claimed." },
-    "mem": { "type": "integer", "description": "The memory in bytes that the job claims NOW. The value starts as the claim in the submission, and qex raises it when the kernel stops the job for memory." },
+    "mem": { "type": "integer", "description": "The memory in bytes that the job claims." },
     "claim_source": {
       "type": "string",
       "enum": ["explicit", "learned", "default"],

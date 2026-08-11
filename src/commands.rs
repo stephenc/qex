@@ -1200,9 +1200,6 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
             // command`: the command of this job can have no measurement at all.
             "fan-out" => "  (from the earlier jobs of this fan-out)",
             "default" => "  (the default; give --cpu and --mem to change it)",
-            // A claim that qex raised must say so. Without this text, a reader
-            // sees a number that no agent gave and no measurement produced.
-            "raised" => "  (qex raised it, because the earlier claim was too small)",
             _ => "",
         }
     );

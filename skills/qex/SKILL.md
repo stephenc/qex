@@ -140,6 +140,11 @@ Give `--cpu` and `--mem`. qex compares the claims against the budget, which is
 when you do not know the size: `half`/`guess` take one half of the budget, and
 `full`/`max` take all of it.
 
+**qex limits no job.** A claim decides what STARTS and when, and a job that
+claims 2GB and uses 20GB still fills the machine. `[enforce] mode` says who else
+uses this machine — `cooperative` by default, or `single-user`, where qex uses
+90% of it and looks for no other coordinator — and neither value limits a job.
+
 **Do not run a small test job to measure a task.** It costs time and measures
 different work. Give `guess` and start the real task:
 

@@ -379,19 +379,12 @@ pub struct JobStatus {
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub cpu: u64,
-    /// The memory claim in force, in bytes.
-    ///
-    /// This value starts as the claim in `spec.json`, and it can become larger:
-    /// qex raises it after the kernel stops the job for memory. The
-    /// specification keeps the value that the user asked for, and this field
-    /// gives the value that the queue and the memory limit use now.
+    /// The memory claim of the job, in bytes.
     pub mem: u64,
-    /// Where the claim came from: `explicit`, `learned`, `default` or `raised`.
+    /// Where the claim came from: `explicit`, `learned` or `default`.
     ///
-    /// A reader can then see that a claim came from a measurement, and it does
-    /// not look like a value that the agent chose. The value `raised` says that
-    /// the kernel stopped an earlier attempt for memory, and that qex made the
-    /// claim larger.
+    /// A reader can then see that a claim came from a measurement, and that it
+    /// is not a value that the agent chose.
     #[serde(default)]
     pub claim_source: String,
     /// The pipeline that this job belongs to.

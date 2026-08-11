@@ -189,14 +189,27 @@ read and the submission, and both agents start a job in that gap.
 A claim is a number of cores and a quantity of memory. qex starts a job when the
 claims of the jobs that operate, plus this claim, stay inside the budget.
 
-**The budget is 75% of the cores and 75% of the memory of the machine.** Set
-another value in `~/.config/qex.toml`, as a percentage or as an exact size:
+**The budget is 75% of the cores and 75% of the memory of the machine.** The
+missing quarter is room for work that qex does not control. Set another value in
+`~/.config/qex.toml`, as a percentage or as an exact size:
 
 ```toml
 [budget]
 cpu = "50%"
 mem = "20GB"
 ```
+
+**Tell qex if it has the machine to itself.** `[enforce] mode` says who else
+uses it, and neither value limits a job:
+
+```toml
+[enforce]
+mode = "single-user"   # or "cooperative", the default
+```
+
+`single-user` says that qex decides what runs here. qex then uses 90% of the
+machine instead of 75%, keeps 512MB free instead of 2GB, and looks for no other
+coordinator. A value that you write always wins in either mode.
 
 `qex info` gives the budget and what the jobs hold now:
 

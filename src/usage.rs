@@ -32,25 +32,24 @@
 //!
 //! # Which jobs qex records
 //!
-//! A job that completed, and a job that the kernel stopped for memory. Each of
-//! the two gives a different kind of evidence, and this module keeps them
-//! apart:
+//! A job that COMPLETED, and nothing else. The job did all its work, so its
+//! peak is the memory that the job needs.
 //!
-//! - A job that COMPLETED gives a peak. The job did all its work, so the peak
-//!   is the memory that the job needs.
-//! - A job that the kernel STOPPED FOR MEMORY gives a lower bound. The job did
-//!   not finish, so the true need is ABOVE this value. This is the most
-//!   valuable sample that qex holds: it costs a whole run to obtain, and it is
-//!   the answer to the question that the next claim asks.
+//! A job that did NOT complete gives the memory that it REACHED, which is the
+//! size at which something stopped it, and that number says nothing about the
+//! memory that the job needs. A sample from such a job would make the next
+//! claim too small, and the next job would stop in the same way. That covers a
+//! job that somebody stopped, a job that reached its time limit, and a job that
+//! the kernel stopped for memory.
 //!
-//! qex records nothing else. A job that somebody stopped, or that reached its
-//! time limit, gives a measurement that is too small and no bound: something
-//! outside the memory stopped it, and the memory that it reached says nothing
-//! about the memory that it needs. A sample from such a job would make the next
-//! claim too small, and the next job would stop in the same way.
+//! # A file of an earlier qex
 //!
-//! A lower bound is never averaged with a peak. `suggest` takes the largest
-//! peak AND the largest lower bound, and the claim is above both.
+//! An earlier qex wrote a second kind of sample, a `lower-bound`, after a kill
+//! for memory. This version writes none and uses none, and it still READS one,
+//! because the store loads as ONE value: a word that this version could not
+//! read would give an empty store and take every peak of every command with it.
+//! `suggest` passes over such a sample, and a command whose only history is one
+//! gives no claim at all.
 
 use crate::job::JobStatus;
 use crate::paths;
@@ -88,12 +87,32 @@ pub enum Measurement {
     /// `suggest` passes over these samples. The value is not a measurement of
     /// the memory that a job used, so a claim must not come from it.
     LowerBound,
+    /// A kind that this version does not know.
+    ///
+    /// A LATER qex can write a kind that this one has never seen, and the store
+    /// loads as ONE value: without this arm, that one word would give an empty
+    /// store and the reader would lose every peak of every command with no
+    /// message. `suggest` passes over these samples, because qex cannot say
+    /// what they measure.
+    #[serde(other)]
+    Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One measurement of one job.
+///
+/// EVERY FIELD TAKES A DEFAULT, and the reason is the same as the reason for
+/// `Measurement::Unknown`: the store loads as one value, so a sample that is
+/// missing a field, or that a later qex wrote with a field that this one does
+/// not know, would give an EMPTY store. The reader would then lose every peak
+/// of every command, with no message, and would learn of the loss when a later
+/// claim came back too small.
+///
+/// A sample with a missing number reads as zero, and `add` writes no sample of
+/// zero bytes, so such a sample gives no claim.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sample {
     /// What this measurement says. See [`Measurement`].
-    #[serde(default)]
     pub kind: Measurement,
     /// The peak memory of the job, in bytes.
     pub max_rss: u64,
@@ -266,13 +285,22 @@ pub fn suggest(
     //
     // A claim that is too small stops the job, and a claim that is a little too
     // large costs some capacity only. The two faults are not equal.
+    // A PEAK is the only measurement that gives a claim, so an entry with no
+    // peak gives NO answer.
+    //
+    // An entry can hold samples and no peak: a file of an earlier qex holds a
+    // `lower-bound` for a command whose jobs never completed. Without this
+    // test, such a command took the smallest claim that qex permits and the
+    // record said `learned`, so a reader was told that 64MB came from the
+    // earlier jobs of a command that an earlier qex knew needed more than 8GB.
+    // NO answer is the correct answer: the reader then gets the default, which
+    // no measurement contradicts.
     let peak_mem = entry
         .samples
         .iter()
         .filter(|s| s.kind == Measurement::Peak)
         .map(|s| s.max_rss)
-        .max()
-        .unwrap_or(0);
+        .max()?;
     // A PEAK is the only measurement that gives a claim.
     //
     // A file of an earlier qex can hold a sample of the kind `lower-bound`.
@@ -286,9 +314,10 @@ pub fn suggest(
     // The CPU time of a job that used two cores for 10 seconds is 20 seconds.
     // The division thus gives the number of cores that the job used together.
     //
-    // Each sample counts here, and a lower bound also. The memory of a job that
-    // the kernel stopped is not the memory that the job needs, but the cores
-    // that it used in the time that it ran are a true measurement.
+    // EVERY sample counts here, and a sample of a kind that this version does
+    // not use as well. The memory of a job that did not finish says nothing
+    // about the memory that it needs, and the cores that it used in the time
+    // that it ran are a true measurement either way.
     let cores = entry
         .samples
         .iter()
@@ -487,7 +516,7 @@ mod tests {
         assert_eq!(s.mem, (400 << 20) * 3 / 2);
     }
 
-    /// A peak that is larger than a lower bound must win. The bound says "more
+    /// A peak that is larger than an old bound must win. The bound says "more
     /// than 2GB", and a run that completed with 6GB says "6GB is sufficient".
     #[test]
     fn the_largest_evidence_wins_whatever_its_kind() {
@@ -503,7 +532,7 @@ mod tests {
     /// A file that qex wrote before this feature holds no `kind` field. Each of
     /// those samples is a peak, so an old file must give the claim that it gave
     /// before. Without this rule, every earlier measurement would become a
-    /// lower bound, and every claim would go up.
+    /// bound of an earlier qex, and every claim would go up.
     #[test]
     fn an_earlier_file_keeps_its_meaning() {
         let text = r#"{"commands":{"x":{"name":"t","samples":[
@@ -543,6 +572,68 @@ mod tests {
             .map(|s| s.max_rss)
             .collect();
         assert_eq!(peaks, vec![1 << 30], "the peak of the old file must stay");
+    }
+
+    /// A file that this version cannot read in full must not lose the rest.
+    ///
+    /// The store loads as ONE value, so one word or one missing field that this
+    /// version does not know would give an EMPTY store: every peak of every
+    /// command, gone with no message, and the reader learns of it when a later
+    /// claim comes back too small.
+    ///
+    /// A later qex can write a kind and a field that this one has never seen,
+    /// so this test drives shapes that do not exist yet.
+    #[test]
+    fn a_file_that_this_version_cannot_read_in_full_keeps_its_peaks() {
+        let peak =
+            r#"{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}"#;
+        for (what, sample) in [
+            (
+                "a kind of a later qex",
+                r#"{"kind":"ceiling","max_rss":8589934592,"cpu_secs":1.0,"elapsed_secs":10,"at":1}"#,
+            ),
+            (
+                "a sample with no kind",
+                r#"{"max_rss":2,"cpu_secs":1.0,"elapsed_secs":10,"at":1}"#,
+            ),
+            (
+                "a sample that is missing a field",
+                r#"{"kind":"peak","max_rss":2}"#,
+            ),
+            ("a sample with no field at all", r#"{}"#),
+        ] {
+            let text =
+                format!(r#"{{"commands":{{"x":{{"name":"t","samples":[{peak},{sample}]}}}}}}"#);
+            let store: Store = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{what} must not empty the store: {e}"));
+            let peaks: Vec<u64> = store.commands["x"]
+                .samples
+                .iter()
+                .filter(|s| s.kind == Measurement::Peak)
+                .map(|s| s.max_rss)
+                .collect();
+            assert!(
+                peaks.contains(&(1 << 30)),
+                "{what} must leave the peak of the file: {peaks:?}"
+            );
+        }
+    }
+
+    /// A command whose only history is a BOUND gives NO claim.
+    ///
+    /// An entry can hold samples and no peak: an earlier qex wrote a bound for
+    /// a command whose jobs never completed. A claim from such an entry would
+    /// be the smallest that qex permits, and the record would say `learned`, so
+    /// a reader would be told that 64MB came from the earlier jobs of a command
+    /// that needed more than 8GB. The reader must get the default instead.
+    #[test]
+    fn a_command_with_a_bound_and_no_peak_gives_no_claim() {
+        let cmd: Vec<String> = vec!["train".into()];
+        let store = store_with(&["train"], vec![lower_bound(8 << 30)]);
+        assert!(
+            suggest(&store, &dir(), &cmd, 1.5).is_none(),
+            "a bound is not a measurement, so it must give no claim at all"
+        );
     }
 
     /// The claim of an old file comes from its PEAKS, and never from its bound.

@@ -640,12 +640,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // Ask the watch again. A kill during this attempt, with a SIGKILL that no
     // qex command sent, is the out-of-memory killer.
     //
-    // The answer says WHICH limit stopped the job. With a cgroup of its own,
-    // the counts are about this job, and a rise in `oom` separates the limit of
-    // this job from the memory of the whole machine. Without a cgroup, qex
-    // reads the cgroup of its own process: that counter counts the kills in each
-    // cgroup below it, so a kill in a different program of this user raises the
-    // same number and qex cannot name the victim.
+    // qex reads the cgroup of its OWN PROCESS, and that counter counts the
+    // kills in each cgroup below it. So a kill in a different program of this
+    // user raises the same number, and qex cannot name the victim: it reports
+    // the state and says what it cannot prove.
     oom_watch.record(&dir);
 
     // Release the process id. Each signal above is complete.

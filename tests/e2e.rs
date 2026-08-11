@@ -12440,6 +12440,14 @@ fn no_shipped_word_promises_the_limit_that_went() {
         ("max-old-space-size", "a heap limit for node"),
         ("mode = \"soft\"", "a mode that went"),
         ("mode = \"hard\"", "a mode that went"),
+        // The words of the learner that went with the limit. A gate that names
+        // the config keys only passed over two whole sections of prose.
+        ("lower bound", "a measurement that qex no longer writes"),
+        ("lower-bound", "the same, in the words of the file"),
+        ("cgroup of the job", "a cgroup that qex no longer makes"),
+        ("raises the claim", "a correction that qex no longer makes"),
+        ("raise the claim", "the same"),
+        ("[retry]", "a section that went"),
     ];
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

@@ -349,6 +349,28 @@ because an empty stream and a stream with no events look the same.
 Give `--cpu` and `--mem`. qex uses these claims to decide how many jobs operate
 together.
 
+**qex limits no job.** A claim decides what STARTS and when. Nothing holds a job
+to its claim after the job starts, so a job that claims 2GB and uses 20GB still
+fills the machine.
+
+### What qex may assume about the machine
+
+`[enforce] mode` says who else uses this machine. NEITHER VALUE LIMITS A JOB.
+
+| Value | qex assumes | The budget | The reserve | The peers |
+| ----- | ----------- | ---------- | ----------- | --------- |
+| `cooperative` (default) | others share this machine | 75% | 2GB | qex looks for them |
+| `single-user` | qex decides what runs here | 90% | 512MB | qex looks for none |
+
+Each value that `single-user` changes follows from the same assumption: the room
+that `cooperative` leaves is room for work that qex does not control, and there
+is no such work here. **A value that you write always wins**, in either mode, so
+`[budget] mem` or `[system] reserve_mem` in the file takes the number you gave.
+
+The section is named `[enforce]` because a way to hold a job to its claim would
+attach to `single-user`, and a file that already names the mode would then need
+no new key. qex holds a job to nothing today.
+
 If you do not know the size of a task, use a word in place of a number:
 
 | Word | Meaning |
@@ -374,28 +396,19 @@ the name, because `cargo build` and `cargo test` need different sizes. qex uses
 the **largest** measurement it holds plus a margin, because a claim that is too
 small stops the job while a claim that is a little large costs only capacity.
 
-qex records two kinds of measurement, and it keeps them apart:
+qex records ONE kind of measurement: the memory that a job which COMPLETED
+used. A job that something stopped shows the memory that it reached, and not the
+memory that it needs, so it teaches the learner nothing. That covers a job that
+you stopped, a job that reached its time limit, and a job that the kernel
+stopped for memory.
 
-| The job | What the sample says |
-| ------- | -------------------- |
-| completed | The memory that the job needs. |
-| the kernel stopped it at its own limit | A **lower bound**. The need is above this value. |
+The learned claim never goes above `[budget] mem`: qex makes that number itself,
+and it must not make a number that it then refuses.
 
-qex keeps one lower bound for a command, because a ladder of attempts makes one
-at each step and they would fill the store. The learned claim also never goes
-above `[budget] mem`: qex makes that number itself, and it must not make a
-number that it then refuses.
-
-A lower bound costs a whole run to obtain, so qex never averages it away. The
-next claim is above it, and a smaller run that succeeds later does not remove
-it. A job that you stopped, or that reached its time limit, is never recorded:
-it shows the memory it reached, not the memory it needs.
-
-**qex records no lower bound in this build.** The code that writes one runs
-after the same gate as the correction below, and issue
-[#88](https://github.com/stephenc/qex/issues/88) stops both. A job that the
-kernel stops for memory thus teaches the learner nothing, and you give the next
-claim yourself.
+A file that an EARLIER qex wrote can hold a sample of a kind that this version
+does not use. qex still reads such a file and keeps every peak in it, and it
+gives no claim from a sample that is not a peak. A command whose only history is
+such a sample gets the default claim, and the record says so.
 
 Turn it off with `[learn] enabled = false`.
 
@@ -1303,12 +1316,15 @@ The config file is `~/.config/qex.toml`. Every field is optional. Run
 
 ```toml
 [budget]
-cpu = "75%"           # cores that qex can use
-mem = "75%"           # memory that qex can use
+cpu = "75%"           # cores that qex can use; 90% under single-user
+mem = "75%"           # memory that qex can use; 90% under single-user
 
 [system]
-reserve_mem  = "2GB"  # memory to keep free for other programs
+reserve_mem  = "2GB"  # memory to keep free; 512MB under single-user
 max_pressure = 20     # maximum PSI memory pressure (Linux only)
+
+[enforce]
+mode = "cooperative"  # cooperative, or single-user
 
 [queue]
 oversized = "run-when-idle"   # run-when-idle, reject or queue
