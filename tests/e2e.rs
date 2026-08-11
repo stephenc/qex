@@ -14045,14 +14045,20 @@ fn a_message_names_what_a_command_wrote() {
 fn a_kill_of_qex_run_cancels_a_job_that_never_started() {
     let h = Harness::new("runkill", "[budget]\ncpu = \"1\"\n");
 
-    // One core, and a job that holds it. The job under test thus stays in the
-    // queue for the whole test, and it never starts.
-    let blocker = h.submit(&["submit", "--cpu", "1", "--", "sleep", "30"]);
+    // The BUDGET holds the queue, and not the memory of the machine.
+    //
+    // This test sets a budget of one core, and the blocker takes that core, so
+    // the job under test waits on every machine. Each job gives a small memory
+    // claim for the same reason: admission for memory asks the MACHINE how much
+    // is free, so a job with the default claim waits on a small machine and
+    // starts on a large one, and the result of the test would follow the
+    // machine and not the code.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "30"]);
     h.until("the blocker operates", Duration::from_secs(30), || {
         h.state_of(&blocker) == "running"
     });
 
-    let (mut child, id) = h.run_bg(&["--cpu", "1", "--", "sleep", "5"]);
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--mem", "64MB", "--", "sleep", "5"]);
     h.until("the job of qex run waits", Duration::from_secs(30), || {
         h.state_of(&id) == "queued"
     });
@@ -14091,7 +14097,8 @@ fn a_kill_of_qex_run_cancels_a_job_that_never_started() {
 fn a_kill_of_qex_run_leaves_a_job_that_operates() {
     let h = Harness::new("runkillrun", "");
 
-    let (mut child, id) = h.run_bg(&["--cpu", "1", "--", "sleep", "12"]);
+    // A small memory claim, so this job starts on a machine of any size.
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--mem", "64MB", "--", "sleep", "12"]);
     h.until("the job operates", Duration::from_secs(30), || {
         h.state_of(&id) == "running"
     });
@@ -14123,7 +14130,9 @@ fn a_kill_of_qex_run_leaves_a_job_that_operates() {
 fn a_kill_of_submit_with_a_wait_leaves_the_job_in_the_queue() {
     let h = Harness::new("subwaitkill", "[budget]\ncpu = \"1\"\n");
 
-    let blocker = h.submit(&["submit", "--cpu", "1", "--", "sleep", "30"]);
+    // The budget holds the queue. Each job gives a small memory claim, so the
+    // memory of the machine never decides what this test measures.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "30"]);
     h.until("the blocker operates", Duration::from_secs(30), || {
         h.state_of(&blocker) == "running"
     });
@@ -14137,6 +14146,8 @@ fn a_kill_of_submit_with_a_wait_leaves_the_job_in_the_queue() {
         &id_path,
         "--cpu",
         "1",
+        "--mem",
+        "64MB",
         "--",
         "sleep",
         "5",
@@ -14182,12 +14193,14 @@ fn a_kill_of_submit_with_a_wait_leaves_the_job_in_the_queue() {
 fn the_ownership_of_a_job_survives_a_new_coordinator() {
     let h = Harness::new("ownagain", "[budget]\ncpu = \"1\"\n");
 
-    let blocker = h.submit(&["submit", "--cpu", "1", "--", "sleep", "60"]);
+    // The budget holds the queue. Each job gives a small memory claim, so the
+    // memory of the machine never decides what this test measures.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "60"]);
     h.until("the blocker operates", Duration::from_secs(30), || {
         h.state_of(&blocker) == "running"
     });
 
-    let (mut child, id) = h.run_bg(&["--cpu", "1", "--", "sleep", "5"]);
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--mem", "64MB", "--", "sleep", "5"]);
     h.until("the job of qex run waits", Duration::from_secs(30), || {
         h.state_of(&id) == "queued"
     });
