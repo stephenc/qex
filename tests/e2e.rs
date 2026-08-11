@@ -15705,7 +15705,18 @@ fn a_command_that_asks_about_a_coordinator_does_not_report_absence_for_silence()
     h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
     let run = h.root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
-    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+    // A SOCKET THAT DOES NOT ACCEPT, so the CONNECT reaches the limit.
+    //
+    // The other instrument accepts and then says nothing, which reaches the
+    // limit of the READ. The two are different arms of the same rule, and a
+    // test of one says nothing about the other.
+    let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
 
     for form in [vec!["version"], vec!["version", "--json"], vec!["pause"]] {
         let out = h.qex_within(&form, Duration::from_secs(60));
