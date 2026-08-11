@@ -31,6 +31,9 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
     }
     let interval = Duration::from_secs_f64(args.interval.max(0.2));
     let mut previous: HashMap<uuid::Uuid, Previous> = HashMap::new();
+    // Say the cause ONE TIME. The page refreshes every second, and a line for
+    // each refresh would push the page off the screen of the reader.
+    let mut said_the_cause = false;
 
     // Read the keys, so `q` stops the command. This step also puts the terminal
     // back when a signal stops the process.
@@ -54,15 +57,27 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
         // when no coordinator operates: the supervisor of each job writes its
         // own record, so those records hold the truth at every moment, and a
         // job that operates can still be measured by its process group.
-        let (jobs, info) = match Client::connect_existing() {
-            Some(mut client) => {
-                let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
-                    bail!("the coordinator did not give the job list");
-                };
-                jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
-                (jobs, Some(client.call(&Request::Info)?))
+        // NO COORDINATOR IS AN ANSWER. A coordinator that does not answer is
+        // not. The first is the true state of a machine with an empty queue,
+        // and the records on the disk describe it. The second means that qex
+        // could not read the state at all, and the page then shows the disk
+        // alone while a coordinator holds jobs that the page does not name.
+        let mut reached = true;
+        let (jobs, info) = match Client::connect_existing_result() {
+            Ok(Some(mut client)) => match read_the_queue(&mut client) {
+                Ok(answer) => answer,
+                Err(e) => {
+                    say_once(&mut said_the_cause, &e);
+                    reached = false;
+                    (crate::job::read_all_from_disk(), None)
+                }
+            },
+            Ok(None) => (crate::job::read_all_from_disk(), None),
+            Err(e) => {
+                say_once(&mut said_the_cause, &e);
+                reached = false;
+                (crate::job::read_all_from_disk(), None)
             }
-            None => (crate::job::read_all_from_disk(), None),
         };
 
         if args.once {
@@ -72,7 +87,20 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             render(&jobs, info.as_ref(), &mut previous);
             std::thread::sleep(Duration::from_millis(400));
             print!("{}", render(&jobs, info.as_ref(), &mut previous));
-            return Ok(0);
+            // THE TWO FORMS MAKE TWO PROMISES, AND THE PAGE IS THE SAME.
+            //
+            // The form that a person watches is a DISPLAY: its promise is to
+            // keep drawing in every state, and a display that drew succeeded.
+            // `--once` is a QUERY, and an agent scripts it. The code 0 from a
+            // query says that qex answered the question, so a page that qex
+            // could not fill must not carry it: an agent then reads an empty
+            // page as the state of the machine and acts on it, and a false
+            // success is worse than a wait, because nobody sees it.
+            return Ok(if reached {
+                0
+            } else {
+                crate::commands::EXIT_TIMEOUT
+            });
         }
 
         let page = render(&jobs, info.as_ref(), &mut previous);
@@ -443,6 +471,24 @@ fn note_for(job: &JobStatus) -> String {
         // top` sees the state and the note together, and a note that is empty
         // makes the reader open a second command to learn the cause.
         _ => String::new(),
+    }
+}
+
+/// Reads the queue and the state of the machine from a coordinator.
+fn read_the_queue(client: &mut Client) -> Result<(Vec<crate::job::JobStatus>, Option<Response>)> {
+    let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+    let info = client.call(&Request::Info)?;
+    Ok((jobs, Some(info)))
+}
+
+/// Writes the cause one time, whatever the number of refreshes.
+fn say_once(said: &mut bool, error: &anyhow::Error) {
+    if !*said {
+        *said = true;
+        eprintln!("qex: {error:#}");
     }
 }
 

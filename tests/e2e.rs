@@ -14957,3 +14957,69 @@ fn a_wait_does_not_take_the_spawn_lock_for_a_notice() {
         "the wait must not take the spawn lock: it took {took:?}"
     );
 }
+
+/// `qex top --once` is a QUERY, and a query that qex could not answer gives 124.
+///
+/// The page that a person watches keeps drawing and gives 0, because a display
+/// that drew did its work. An agent scripts `--once`, and 0 from a query says
+/// that qex answered the question. A page that qex could not fill must not
+/// carry that code: the agent reads an empty page as the state of the machine.
+///
+/// Both forms write the SAME page. Only the code differs.
+#[test]
+fn a_page_that_qex_could_not_fill_gives_124_for_a_query() {
+    let h = Harness::with_default_config("topquery");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    let out = h.qex_within(
+        &["top", "--once"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a query that qex could not answer gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The page is still there. The two forms write one page, and a reader who
+    // compares them must see the same text.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("budget"),
+        "the page must still be written: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("did not accept a connection"),
+        "the cause must reach the reader: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// NO COORDINATOR IS AN ANSWER, and it gives 0.
+///
+/// The records on the disk describe a machine with no coordinator, so the page
+/// is true and the query succeeded. Only a coordinator that qex could not reach
+/// gives 124.
+#[test]
+fn a_page_with_no_coordinator_gives_zero_for_a_query() {
+    let h = Harness::with_default_config("topnocoord");
+
+    let out = h.qex_within(&["top", "--once"], Duration::from_secs(30));
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no coordinator is an answer, so the query succeeded: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("budget"));
+}

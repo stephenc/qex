@@ -148,7 +148,10 @@ Exit codes
       124       qex stopped waiting, because it reached a time limit.
                 Your wait reached `--timeout`, and the job continues. EVERY
                 command gives this code when the COORDINATOR did not answer
-                inside its limit, `qex list` and `qex top` included.
+                inside its limit, `qex list` and `qex top --once` included.
+                The page of `qex top` that a person watches keeps drawing and
+                gives 0: a display that drew did its work, and `--once` is a
+                query that an agent reads.
       125       something stopped the job: a kill, a cancel or a time limit
       126       a job that this job needed did not succeed
       127       there is no job with that id
@@ -1989,7 +1992,10 @@ One table. Every command that gives you the result of a job obeys it.
       124       qex stopped waiting, because it reached a time limit.
                 Your wait reached `--timeout`, and the job continues. EVERY
                 command gives this code when the COORDINATOR did not answer
-                inside its limit, `qex list` and `qex top` included.
+                inside its limit, `qex list` and `qex top --once` included.
+                The page of `qex top` that a person watches keeps drawing and
+                gives 0: a display that drew did its work, and `--once` is a
+                query that an agent reads.
       125       something stopped the job: a kill, a cancel or a time limit
       126       the job did not run, because a job that it needed did not succeed
       127       there is no job with that id
