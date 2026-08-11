@@ -2888,6 +2888,75 @@ fn the_schemas_are_valid_json() {
     }
 }
 
+/// THE SCHEMA MUST ACCEPT EVERY RECORD THAT QEX WRITES.
+///
+/// An agent reads the shipped schema to know what a field can hold, and some
+/// agents refuse a record that the schema does not permit. A value that qex
+/// writes and the schema refuses thus makes qex look broken to the reader that
+/// this schema exists for.
+///
+/// `claim_source` is the field that carries this risk: qex writes `fan-out` for
+/// a job of a fan-out, because such a job learns against its template and not
+/// against the command of its own line.
+///
+/// The test reads the value from a REAL job and the list from the SHIPPED
+/// schema. A test that named the four values itself would agree with itself.
+#[test]
+fn the_schema_accepts_every_claim_source_that_qex_writes() {
+    let h = Harness::with_default_config("claimsource");
+
+    let schema: serde_json::Value = serde_json::from_str(&h.ok(&["schema", "status"])).unwrap();
+    let permitted: Vec<String> = schema["properties"]["claim_source"]["enum"]
+        .as_array()
+        .expect("the schema must give the values of `claim_source`")
+        .iter()
+        .map(|v| v.as_str().expect("each value is a string").to_string())
+        .collect();
+
+    // Run the same fan-out two times. The first run measures the template, and
+    // the second run gets its claim from those measurements, which is the case
+    // that gives `fan-out`.
+    let input = h.root.join("lines.txt");
+    std::fs::write(&input, "alpha\nbeta\n").unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let group = h.ok(&[
+            "submit",
+            "--each-line",
+            input.to_str().unwrap(),
+            "--",
+            "echo",
+            "{}",
+        ]);
+        let text = h.ok(&["list", "--group", group.trim(), "--json"]);
+        let jobs: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        for job in &jobs {
+            let id = job["id"].as_str().unwrap().to_string();
+            h.ok(&["wait", &id, "--timeout", "60s"]);
+            let source = h.status_json(&id)["claim_source"]
+                .as_str()
+                .expect("every record names where its claim came from")
+                .to_string();
+            if !seen.contains(&source) {
+                seen.push(source);
+            }
+        }
+    }
+
+    assert!(
+        seen.contains(&"fan-out".to_string()),
+        "the second run of a fan-out must give the claim source `fan-out`, and it gave {seen:?}"
+    );
+    for source in &seen {
+        assert!(
+            permitted.contains(source),
+            "qex writes the claim source `{source}`, and the shipped schema permits {permitted:?} \
+             only. An agent that tests a record against this schema refuses a record that is \
+             correct."
+        );
+    }
+}
+
 /// A job file must give the same result as the options on the command line.
 #[test]
 fn a_job_file_describes_a_job() {
