@@ -14769,6 +14769,11 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
     unsafe { libc::kill(pid, libc::SIGKILL) };
 
     // `qex run` meets the loss, finds the new coordinator, and asks it again.
+    //
+    // Measure how long the new coordinator takes to answer. A reconnect that
+    // ends before it binds loses the ownership in silence, so the number
+    // belongs in the failure.
+    let killed_at = Instant::now();
     h.until("a new coordinator answers", Duration::from_secs(40), || {
         h.state_of(&id) == "queued" && {
             let fresh: serde_json::Value =
@@ -14777,19 +14782,951 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
         }
     });
 
+    let new_coordinator_took = killed_at.elapsed();
+
     // `qex run` must MEET the loss and ask the new coordinator before this test
     // takes the command away. The command reads the state every 80ms, so this
     // wait is far longer than it needs.
     std::thread::sleep(Duration::from_secs(3));
 
     unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    let said = {
+        use std::io::Read as _;
+        let mut text = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_string(&mut text).ok();
+        }
+        text
+    };
     child.wait().unwrap();
 
-    h.until(
-        "the new coordinator cancels the job of a command that stopped",
-        Duration::from_secs(40),
-        || h.state_of(&id) == "cancelled",
-    );
+    // SAY WHY, ON FAILURE ONLY.
+    //
+    // The question is one thing: did `qex run` ask the NEW coordinator for the
+    // ownership of its job, and what did that coordinator answer? Its stderr
+    // holds the client half, and the log of the coordinator holds the other.
+    // A test that fails in silence costs a whole run of CI and teaches nothing.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut cancelled = false;
+    while Instant::now() < deadline {
+        if h.state_of(&id) == "cancelled" {
+            cancelled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !cancelled {
+        let log = std::fs::read_to_string(h.root.join("state/qex/run/daemon.log"))
+            .unwrap_or_else(|e| format!("(no log: {e})"));
+        // REPORT WHAT THE CLIENT DID, AND MATCH NOTHING BY ACCIDENT.
+        //
+        // An earlier form of this line tested `said.contains("own")`, and the
+        // directory of this test is named `ownagain`, which the warning about
+        // the id file prints. It answered `true` whatever the client did.
+        //
+        // `noticed` is the fact that decides everything: the client prints that
+        // line when it meets the loss, and it reconnects and asks again in the
+        // same function. No line means the client never got there, so the
+        // ownership went to the coordinator that died, or nowhere.
+        let noticed = said.contains("the coordinator stopped");
+        let refused = said.contains("keeps the job");
+        let about_ownership: Vec<&str> = said
+            .lines()
+            .filter(|l| l.contains("keeps the job") || l.contains("the coordinator stopped"))
+            .collect();
+        panic!(
+            "the new coordinator did not cancel the job of a command that stopped.\n\
+             \n--- the job ---\nstate: {}\n\
+             \n--- the time from the kill of the first coordinator to the answer of the \
+             second ---\n{:?}\n\
+             \n--- did the client MEET the loss and reconnect? ---\n{}\n\
+             \n--- did the new coordinator refuse the ownership? ---\n{}\n\
+             \n--- the lines about the ownership ---\n{}\n\
+             \n--- stderr of the `qex run` that had to ask again ---\n{}\n\
+             \n--- the log of the coordinator ---\n{}\n\
+             \n--- qex list ---\n{}",
+            h.state_of(&id),
+            new_coordinator_took,
+            noticed,
+            refused,
+            if about_ownership.is_empty() {
+                "none".to_string()
+            } else {
+                about_ownership.join("\n")
+            },
+            if said.trim().is_empty() {
+                "no output".to_string()
+            } else {
+                said
+            },
+            log,
+            h.ok(&["list"]),
+        );
+    }
 
     h.ok(&["kill", &blocker]);
+}
+
+/// The limit for a coordinator that does not answer, in seconds.
+///
+/// The tests below bound themselves ABOVE this number, so a command that keeps
+/// its limit passes and a command with no limit fails.
+const COORDINATOR_LIMIT_SECS: u64 = 3;
+
+/// Names the variable that gives the ceiling for a coordinator a short value.
+fn qex_ceiling_variable() -> String {
+    "QEX_COORDINATOR_CEILING_SECS".to_string()
+}
+
+/// A command must end when a socket gives no answer.
+///
+/// A process that holds the socket and never accepts makes a connect with no
+/// limit wait for ever. The queue of a busy coordinator fills in the same way,
+/// so this is not a rare state on a machine that many agents share.
+#[test]
+fn a_socket_that_gives_no_answer_does_not_stop_a_command() {
+    let mut h = Harness::with_default_config("nocoordans");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    let out = h.qex_within(&["list"], Duration::from_secs(COORDINATOR_LIMIT_SECS + 20));
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a command that reached the limit for a coordinator gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("gave no answer"),
+        "the message must name what qex tried: {said}"
+    );
+    assert!(
+        said.contains("qex info --no-start"),
+        "the message must name the step for the reader: {said}"
+    );
+}
+
+/// A command must end when a different command holds the spawn lock.
+///
+/// The lock covers the start of a coordinator, so a command that stopped while
+/// it held the lock kept every later command waiting with no end.
+#[test]
+fn a_spawn_lock_that_nobody_gives_back_does_not_stop_a_command() {
+    use std::os::unix::io::AsRawFd;
+
+    let mut h = Harness::with_default_config("nocoordlock");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let path = run.join("spawn.lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test cannot hold the spawn lock");
+
+    let out = h.qex_within(&["list"], Duration::from_secs(COORDINATOR_LIMIT_SECS + 20));
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a command that reached the limit for the lock gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("held the lock"),
+        "the message must name the lock: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A limit must NOT start a second coordinator.
+///
+/// Two coordinators on one state directory each hold the whole budget, and the
+/// machine then gets the kill for memory that qex exists to prevent. A socket
+/// that gives no answer proves nothing about the process that holds it, so it
+/// can never authorise a second coordinator.
+#[test]
+fn a_socket_that_gives_no_answer_starts_no_second_coordinator() {
+    let mut h = Harness::with_default_config("nosecond");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    let Some(_open) = a_socket_that_never_answers(&socket) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    let out = h.qex_within(
+        &["submit", "--", "true"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+    assert_eq!(out.status.code(), Some(124));
+
+    // The socket of the test is still the socket. A command that bound its own
+    // over it would have taken the state directory from the process that holds
+    // it.
+    assert!(
+        socket.exists(),
+        "the socket of the process that holds it must stay"
+    );
+    assert!(
+        !h.root.join("state/qex/run/daemon.log").exists()
+            || std::fs::read_to_string(h.root.join("state/qex/run/daemon.log"))
+                .unwrap_or_default()
+                .is_empty(),
+        "no coordinator of this command may have started"
+    );
+}
+
+/// `qex wait` must not take the spawn lock to print a notice.
+///
+/// The notice about a pause is a courtesy, and the command already drops its
+/// result. A full connect takes the spawn lock and can start a coordinator, so
+/// the command whose whole contract is a bounded wait began with a wait that
+/// had no end.
+#[test]
+fn a_wait_does_not_take_the_spawn_lock_for_a_notice() {
+    use std::os::unix::io::AsRawFd;
+
+    let h = Harness::with_default_config("waitnolock");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(run.join("spawn.lock"))
+        .unwrap();
+    let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test cannot hold the spawn lock");
+
+    // No coordinator operates, and the id names nothing. The answer is "there
+    // is no job with that id", and the lock must not delay it.
+    let start = Instant::now();
+    let out = h.qex_within(
+        &["wait", "11111111-2222-3333-4444-555555555555"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+    let took = start.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a wait for an id that names nothing gives 127: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        took < Duration::from_secs(COORDINATOR_LIMIT_SECS),
+        "the wait must not take the spawn lock: it took {took:?}"
+    );
+}
+
+/// `qex top --once` is a QUERY, and a query that qex could not answer gives 124.
+///
+/// The page that a person watches keeps drawing and gives 0, because a display
+/// that drew did its work. An agent scripts `--once`, and 0 from a query says
+/// that qex answered the question. A page that qex could not fill must not
+/// carry that code: the agent reads an empty page as the state of the machine.
+///
+/// Both forms write the SAME page. Only the code differs.
+#[test]
+fn a_page_that_qex_could_not_fill_gives_124_for_a_query() {
+    let mut h = Harness::with_default_config("topquery");
+    // The ceiling for a coordinator is long on purpose: a loaded machine
+    // answers late, and a short ceiling gives a FALSE failure. A test
+    // cannot wait that long, so it gives the product a short ceiling.
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    let out = h.qex_within(
+        &["top", "--once"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a query that qex could not answer gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The page is still there. The two forms write one page, and a reader who
+    // compares them must see the same text.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("budget"),
+        "the page must still be written: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("gave no answer"),
+        "the cause must reach the reader: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// NO COORDINATOR IS AN ANSWER, and it gives 0.
+///
+/// The records on the disk describe a machine with no coordinator, so the page
+/// is true and the query succeeded. Only a coordinator that qex could not reach
+/// gives 124.
+#[test]
+fn a_page_with_no_coordinator_gives_zero_for_a_query() {
+    let h = Harness::with_default_config("topnocoord");
+
+    let out = h.qex_within(&["top", "--once"], Duration::from_secs(30));
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no coordinator is an answer, so the query succeeded: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("budget"));
+}
+
+/// Answers the connect and NEVER answers a request.
+///
+/// The helper that fills a backlog exercises the CONNECT. This one exercises
+/// the READ: qex reaches the coordinator, sends its request, and the answer
+/// never arrives. The two faults are different, and a test of one says nothing
+/// about the other.
+///
+/// The result holds the listener. A caller that drops it ends the test socket.
+struct ASocketThatAcceptsAndSaysNothing {
+    _listener: std::os::unix::net::UnixListener,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ASocketThatAcceptsAndSaysNothing {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn a_socket_that_accepts_and_says_nothing(path: &Path) -> ASocketThatAcceptsAndSaysNothing {
+    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let copy = listener.try_clone().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let thread = std::thread::spawn(move || {
+        // Hold every connection open and answer nothing. A connection that
+        // closes would give the reader an end of file, which is a different
+        // answer from silence.
+        let mut held = Vec::new();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match copy.accept() {
+                Ok((stream, _)) => held.push(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    });
+    ASocketThatAcceptsAndSaysNothing {
+        _listener: listener,
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// A coordinator that takes a request and answers nothing must not hold a
+/// command for ever.
+///
+/// This test drives the READ, and no other test does: the connect succeeds, so
+/// a limit on the connect alone leaves this fault open.
+///
+/// The reader gives `--timeout`, because the ceiling for a coordinator is long
+/// on purpose — a loaded machine answers late and a short ceiling gives a false
+/// failure. The number of the reader bounds the whole command.
+#[test]
+fn a_coordinator_that_answers_nothing_does_not_stop_a_command() {
+    let h = Harness::with_default_config("readstall");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+
+    let start = Instant::now();
+    let out = h.qex_within(&["wait", "--timeout", "3s", "abc"], Duration::from_secs(60));
+    let took = start.elapsed();
+
+    assert!(
+        took < Duration::from_secs(30),
+        "the read must end: it took {took:?}"
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(127),
+        "a coordinator that did not answer is NOT `no such job`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A coordinator that did not answer is NEVER "there is no job with that id".
+///
+/// `status`, `logs`, `cancel` and `kill` resolve an id through the coordinator.
+/// A resolver that reported a LIMIT was read as "no such job", so a caller was
+/// told that its RUNNING job does not exist, and the caller then stopped
+/// watching work that continues. That is the worst answer a queue can give.
+#[test]
+fn a_coordinator_that_answers_nothing_is_not_no_such_job() {
+    let mut h = Harness::with_default_config("notnosuchjob");
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+
+    for form in [
+        vec!["status", "abc"],
+        vec!["logs", "abc"],
+        vec!["cancel", "abc"],
+        vec!["kill", "abc"],
+    ] {
+        let out = h.qex_within(&form, Duration::from_secs(60));
+        assert_ne!(
+            out.status.code(),
+            Some(127),
+            "`qex {}` said that a job does not exist, and the coordinator gave no answer: {}",
+            form.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A coordinator that answers CORRECTLY, but later than one step of the wait.
+///
+/// Every other instrument in this file answers NEVER. That proves a wait ends,
+/// and it says nothing about the wait that must NOT end: a coordinator on a
+/// loaded machine answers late, and a client that gives up at its first step
+/// turns a healthy machine into a failure.
+///
+/// This helper is the one that stops a short client coming back. It forwards
+/// every request to the real coordinator, and it holds back the FIRST answer
+/// only.
+///
+/// One slow answer, and not one for each request: a command opens several
+/// connections and asks several questions, so a delay on every answer makes the
+/// time of the test depend on the number of round trips and on the speed of the
+/// machine that runs the proxy. One delay proves the same property — the client
+/// waits past a step instead of refusing — and it costs the same on a fast
+/// machine and a slow one.
+struct ASlowCoordinator {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// What the proxy did, and when. A failure prints it.
+    ///
+    /// The test cannot see the machine that CI runs, so the proxy says what it
+    /// accepted and what it wrote. A proxy that holds several connections, or
+    /// that writes later than it was told to, shows here.
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ASlowCoordinator {
+    fn what_it_did(&self) -> String {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join("\n")
+    }
+}
+
+impl Drop for ASlowCoordinator {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Puts a slow coordinator in front of a real one.
+///
+/// `front` is the socket that qex reaches. `real` is the socket of the
+/// coordinator that answers.
+fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -> ASlowCoordinator {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(front).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let real = real.to_path_buf();
+    // The first answer of the whole test waits. Every answer after it goes
+    // straight through.
+    let held_one = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = events.clone();
+    let began = Instant::now();
+    let thread = std::thread::spawn(move || {
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((front_side, _)) => {
+                    // AN ACCEPTED SOCKET MUST BLOCK.
+                    //
+                    // The listener is not blocking, so that the accept loop can
+                    // stop. One system gives the accepted socket that flag as
+                    // well, and a read on it then answers `WouldBlock` the
+                    // moment the client is slow to send its next request. A
+                    // proxy that reads that answer as an end of file serves one
+                    // request and closes, and the client then meets a broken
+                    // pipe that qex did not cause.
+                    front_side.set_nonblocking(false).unwrap();
+                    let real = real.clone();
+                    let first = held_one.clone();
+                    let note = log.clone();
+                    note.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("{:?} accepted a connection", began.elapsed()));
+                    workers.push(std::thread::spawn(move || {
+                        let Ok(back) = std::os::unix::net::UnixStream::connect(&real) else {
+                            return;
+                        };
+                        let mut from_qex = BufReader::new(front_side.try_clone().unwrap());
+                        let mut to_real = back.try_clone().unwrap();
+                        let mut from_real = BufReader::new(back);
+                        let mut to_qex = front_side;
+                        let mut line = String::new();
+                        let mut served = 0usize;
+                        // One request, one answer, and the FIRST answer waits.
+                        // AN ERROR IS NOT AN END OF FILE: a proxy that reads it
+                        // as one closes the connection under the client, and the
+                        // failure then names qex for a fault of this helper.
+                        loop {
+                            line.clear();
+                            match from_qex.read_line(&mut line) {
+                                Ok(0) => {
+                                    note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                        "{:?} the client closed after {} request(s)",
+                                        began.elapsed(),
+                                        served
+                                    ));
+                                    return;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                        "{:?} READING THE REQUEST FAILED after {} request(s): {e}",
+                                        began.elapsed(),
+                                        served
+                                    ));
+                                    return;
+                                }
+                            }
+                            served += 1;
+                            if to_real.write_all(line.as_bytes()).is_err() {
+                                note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                    "{:?} FORWARDING REQUEST {} FAILED",
+                                    began.elapsed(),
+                                    served
+                                ));
+                                return;
+                            }
+                            to_real.flush().ok();
+                            let mut answer = String::new();
+                            match from_real.read_line(&mut answer) {
+                                Ok(0) | Err(_) => {
+                                    note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                        "{:?} THE REAL COORDINATOR GAVE NO ANSWER TO REQUEST {}",
+                                        began.elapsed(),
+                                        served
+                                    ));
+                                    return;
+                                }
+                                Ok(_) => {}
+                            }
+                            // THE COORDINATOR IS BUSY. The answer is correct and
+                            // it arrives late. Only the first one waits, so the
+                            // cost of this test does not follow the number of
+                            // questions that the command asks.
+                            // HOLD THE FIRST ANSWER, THEN BEHAVE. A coordinator
+                            // does not close after one answer, and a proxy that
+                            // did would test the closing and not the waiting.
+                            let held = !first.swap(true, std::sync::atomic::Ordering::SeqCst);
+                            if held {
+                                std::thread::sleep(delay);
+                            }
+                            note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                "{:?} answered request {} with {} bytes, held: {}",
+                                began.elapsed(),
+                                served,
+                                answer.len(),
+                                held
+                            ));
+                            if to_qex.write_all(answer.as_bytes()).is_err() {
+                                note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                    "{:?} WRITING ANSWER {} FAILED",
+                                    began.elapsed(),
+                                    served
+                                ));
+                                return;
+                            }
+                            to_qex.flush().ok();
+                        }
+                    }));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+    ASlowCoordinator {
+        stop,
+        thread: Some(thread),
+        events,
+    }
+}
+
+/// A COORDINATOR THAT ANSWERS LATE MUST BE ANSWERED, AND NOT REFUSED.
+///
+/// This is the test that stops a short client coming back. The client looks at
+/// the socket in steps, so that it can say that it still waits — and a client
+/// that gave up at the END of its first step would refuse a coordinator that
+/// was working. A loaded machine answers late, and a false failure costs more
+/// than a wait.
+///
+/// The answer must also be CORRECT. A client that read a part of a line, or
+/// that took the answer of an earlier question, would give a wrong answer here
+/// rather than a slow one.
+#[test]
+fn a_coordinator_that_answers_late_is_answered_and_not_refused() {
+    let mut h = Harness::with_default_config("slowcoord");
+    // A step of the wait is one second, so the answer arrives after several
+    // steps and the client must keep waiting through them.
+    h.extra_env
+        .push(("QEX_SAY_WAITING_AFTER_SECS".into(), "1".into()));
+
+    // A real coordinator, and its socket.
+    let first = h.qex(&["submit", "--", "sh", "-c", "exit 7"]);
+    assert!(first.status.success(), "the test needs a real coordinator");
+    let id = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    h.qex(&["wait", &id]);
+
+    let run = h.root.join("state/qex/run");
+    let real = run.join("real");
+    std::fs::rename(run.join("s"), &real).unwrap();
+    let _slow = a_coordinator_that_answers_late(&run.join("s"), &real, Duration::from_secs(3));
+
+    let started = Instant::now();
+    let out = h.qex_within(&["status", &id, "--json"], Duration::from_secs(60));
+    let took = started.elapsed();
+
+    // THE PROXY MUST PROVE ITS OWN BEHAVIOUR.
+    //
+    // This helper is an instrument, and an instrument that is wrong in a way
+    // that looks like a product fault costs a whole run of CI. If the proxy
+    // served fewer requests than the command sent, the failure must name the
+    // PROXY and not qex.
+    let what_the_proxy_did = _slow.what_it_did();
+    assert!(
+        !what_the_proxy_did.contains("READING THE REQUEST FAILED")
+            && !what_the_proxy_did.contains("FORWARDING REQUEST")
+            && !what_the_proxy_did.contains("WRITING ANSWER")
+            && !what_the_proxy_did.contains("GAVE NO ANSWER"),
+        "THE PROXY OF THIS TEST FAILED, and qex is not the cause:\n{what_the_proxy_did}"
+    );
+
+    // SAY WHY, ON FAILURE ONLY. An exit status with no code means a SIGNAL
+    // ended the command, which is this test taking it away rather than qex
+    // refusing. The proxy log then says whether it wrote when it was told to.
+    if out.status.code() != Some(0) {
+        use std::os::unix::process::ExitStatusExt as _;
+        panic!(
+            "a coordinator that answers late must be answered.\n\
+             \ncode: {:?}   signal: {:?}   wall time: {:?}\n\
+             \n--- what the proxy did ---\n{}\n\
+             \n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.status.code(),
+            out.status.signal(),
+            took,
+            _slow.what_it_did(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    let said = String::from_utf8_lossy(&out.stdout);
+    let record: serde_json::Value = serde_json::from_str(&said)
+        .unwrap_or_else(|e| panic!("the answer must be whole and correct: {e}: {said}"));
+    assert_eq!(
+        record["exit_code"], 7,
+        "the answer must belong to the question that qex asked: {said}"
+    );
+}
+
+/// Sends the FIRST HALF of each answer and then goes quiet.
+///
+/// A coordinator writes a large answer in several writes. A machine that stops
+/// it between two of them leaves a line with no end, and the socket reports
+/// READABLE for the part that arrived. A client that treats readable as
+/// answered then reads with no limit and waits for ever.
+///
+/// This is not the same instrument as a coordinator that says nothing: that one
+/// never writes a byte, and this one writes most of the answer.
+fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordinator {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(front).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let real = real.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((front_side, _)) => {
+                    // The accepted socket must BLOCK. One system gives it the
+                    // flag of the listener, and a read then answers
+                    // `WouldBlock` when the client is merely slow.
+                    front_side.set_nonblocking(false).unwrap();
+                    let real = real.clone();
+                    let mine = flag.clone();
+                    workers.push(std::thread::spawn(move || {
+                        let Ok(back) = std::os::unix::net::UnixStream::connect(&real) else {
+                            return;
+                        };
+                        let mut from_qex = BufReader::new(front_side.try_clone().unwrap());
+                        let mut to_real = back.try_clone().unwrap();
+                        let mut from_real = BufReader::new(back);
+                        let mut to_qex = front_side;
+                        // ONE request, and half of ONE answer. This helper never
+                        // serves a second question: the connection it cut can
+                        // carry no more answers, which is the state under test.
+                        let mut line = String::new();
+                        if from_qex.read_line(&mut line).unwrap_or(0) > 0 {
+                            if to_real.write_all(line.as_bytes()).is_err() {
+                                return;
+                            }
+                            to_real.flush().ok();
+                            let mut answer = String::new();
+                            if from_real.read_line(&mut answer).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            // A CUT THAT LEAVES NO END OF LINE, AND NO BROKEN
+                            // CHARACTER.
+                            //
+                            // The test needs an answer that BEGINS and does not
+                            // finish, so that the socket is readable and the
+                            // line has no end. A cut in the middle of a
+                            // character would make the client fail on text that
+                            // it cannot read, and the test would then pass for
+                            // the wrong reason.
+                            //
+                            // Cut at a boundary of a character, near the middle.
+                            let mut at = answer.len() / 2;
+                            while at > 0 && !answer.is_char_boundary(at) {
+                                at -= 1;
+                            }
+                            let half = &answer.as_bytes()[..at];
+                            if to_qex.write_all(half).is_err() {
+                                return;
+                            }
+                            to_qex.flush().ok();
+                            // Hold the connection open and write nothing more.
+                            while !mine.load(std::sync::atomic::Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                        }
+                    }));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+    ASlowCoordinator {
+        stop,
+        thread: Some(thread),
+        events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    }
+}
+
+/// READABLE IS NOT ANSWERED.
+///
+/// A wait ends when qex holds the WHOLE answer, or when the budget is gone. It
+/// never ends because the first byte arrived. A coordinator stopped between two
+/// writes leaves a line with no end, and a read with no limit then waits for
+/// ever — with no message, and with no limit of the reader reaching it.
+#[test]
+fn an_answer_that_never_finishes_does_not_stop_a_command() {
+    let mut h = Harness::with_default_config("cutanswer");
+    h.extra_env.push((qex_ceiling_variable(), "4".to_string()));
+
+    let first = h.qex(&["submit", "--", "true"]);
+    assert!(first.status.success(), "the test needs a real coordinator");
+    let id = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    h.qex(&["wait", &id]);
+
+    let run = h.root.join("state/qex/run");
+    let real = run.join("real");
+    std::fs::rename(run.join("s"), &real).unwrap();
+    let _cut = a_coordinator_that_cuts_its_answer(&run.join("s"), &real);
+
+    let start = Instant::now();
+    let out = h.qex_within(&["list", "--json"], Duration::from_secs(60));
+    let took = start.elapsed();
+
+    assert!(
+        took < Duration::from_secs(30),
+        "a cut answer must reach a limit: it took {took:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a cut answer reaches the limit of a wait: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("did not finish it"),
+        "the message must say that the answer began and did not finish: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A coordinator that closes the connection must not KILL the command.
+///
+/// `main` restores the default action of SIGPIPE, so that `qex list | head`
+/// ends in silence like every other tool. That is right for the pipe of the
+/// reader. It is WRONG for the socket of the coordinator: a coordinator that
+/// closes a connection in the middle of a conversation would then stop the
+/// command with a signal — no message, no exit code, and no cause.
+///
+/// A reader who gets nothing is the fault that this whole area exists to
+/// remove, so a write to the coordinator must give an ERROR and not a signal.
+///
+/// **THIS TEST DOES NOT DISCRIMINATE ON EVERY SYSTEM.** On a system where the
+/// close of the peer reaches the READ before the command writes again, the
+/// command reports the fault either way and the signal never rises. The test
+/// still holds the answer that a reader gets — a cause, and not silence — and
+/// the system where the signal rises is the one that proves the rest.
+#[test]
+fn a_coordinator_that_closes_the_connection_does_not_kill_the_command() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut h = Harness::with_default_config("closemid");
+    h.extra_env.push((qex_ceiling_variable(), "5".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+
+    // Answer the FIRST request, then close. The command asks more than one
+    // question, so its next write meets a socket that is gone.
+    let listener = std::os::unix::net::UnixListener::bind(run.join("s")).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let door = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok((client, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut writer = client;
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                // One answer that qex cannot use, and then the door shuts.
+                let _ = writer.write_all(b"{\"kind\":\"error\",\"message\":\"go away\"}\n");
+                let _ = writer.flush();
+            }
+            drop(writer);
+            drop(reader);
+        }
+    });
+
+    let out = h.qex_within(&["list"], Duration::from_secs(40));
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::os::unix::net::UnixStream::connect(run.join("s")).ok();
+    let _ = door.join();
+
+    use std::os::unix::process::ExitStatusExt as _;
+    assert!(
+        out.status.signal().is_none(),
+        "a coordinator that closed the connection stopped the command with the signal {:?}. \
+         A write to the socket of the coordinator must give an error, and not a signal.\n\
+         stdout: {}\nstderr: {}",
+        out.status.signal(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "the reader must get a cause, and not silence"
+    );
+}
+
+/// A coordinator that did not answer must not read as NO coordinator.
+///
+/// `qex version` reports whether a coordinator operates and which version it
+/// is. Reporting `none` for one that qex could not reach answers the question
+/// wrongly AND exits 0, so an agent reads a false success. The exit-code table
+/// promises 124 for this state in every command, and a promise that one command
+/// breaks is a promise that an agent cannot use.
+#[test]
+fn a_command_that_asks_about_a_coordinator_does_not_report_absence_for_silence() {
+    let mut h = Harness::with_default_config("askscoord");
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    // A SOCKET THAT DOES NOT ACCEPT, so the CONNECT reaches the limit.
+    //
+    // The other instrument accepts and then says nothing, which reaches the
+    // limit of the READ. The two are different arms of the same rule, and a
+    // test of one says nothing about the other.
+    let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    for form in [vec!["version"], vec!["version", "--json"], vec!["pause"]] {
+        let out = h.qex_within(&form, Duration::from_secs(60));
+        assert_eq!(
+            out.status.code(),
+            Some(124),
+            "`qex {}` must say that it stopped waiting, and not that no coordinator \
+             operates: {}",
+            form.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

@@ -31,6 +31,9 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
     }
     let interval = Duration::from_secs_f64(args.interval.max(0.2));
     let mut previous: HashMap<uuid::Uuid, Previous> = HashMap::new();
+    // Say the cause ONE TIME. The page refreshes every second, and a line for
+    // each refresh would push the page off the screen of the reader.
+    let mut said_the_cause = false;
 
     // Read the keys, so `q` stops the command. This step also puts the terminal
     // back when a signal stops the process.
@@ -54,28 +57,53 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
         // when no coordinator operates: the supervisor of each job writes its
         // own record, so those records hold the truth at every moment, and a
         // job that operates can still be measured by its process group.
-        let (jobs, info) = match Client::connect_existing() {
-            Some(mut client) => {
-                let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
-                    bail!("the coordinator did not give the job list");
-                };
-                jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
-                (jobs, Some(client.call(&Request::Info)?))
+        // NO COORDINATOR IS AN ANSWER. A coordinator that does not answer is
+        // not. The first is the true state of a machine with an empty queue,
+        // and the records on the disk describe it. The second means that qex
+        // could not read the state at all, and the page then shows the disk
+        // alone while a coordinator holds jobs that the page does not name.
+        let mut reached = true;
+        let (jobs, info) = match Client::connect_existing_result() {
+            Ok(Some(mut client)) => match read_the_queue(&mut client) {
+                Ok(answer) => answer,
+                Err(e) => {
+                    say_once(&mut said_the_cause, &e);
+                    reached = false;
+                    (crate::job::read_all_from_disk(), None)
+                }
+            },
+            Ok(None) => (crate::job::read_all_from_disk(), None),
+            Err(e) => {
+                say_once(&mut said_the_cause, &e);
+                reached = false;
+                (crate::job::read_all_from_disk(), None)
             }
-            None => (crate::job::read_all_from_disk(), None),
         };
 
         if args.once {
             // The CPU column is the change in the CPU time between two
             // measurements, so one page needs two of them. Take the first
             // measurement, wait a short time, then write the page.
-            render(&jobs, info.as_ref(), &mut previous);
+            render(&jobs, info.as_ref(), &mut previous, !reached);
             std::thread::sleep(Duration::from_millis(400));
-            print!("{}", render(&jobs, info.as_ref(), &mut previous));
-            return Ok(0);
+            print!("{}", render(&jobs, info.as_ref(), &mut previous, !reached));
+            // THE TWO FORMS MAKE TWO PROMISES, AND THE PAGE IS THE SAME.
+            //
+            // The form that a person watches is a DISPLAY: its promise is to
+            // keep drawing in every state, and a display that drew succeeded.
+            // `--once` is a QUERY, and an agent scripts it. The code 0 from a
+            // query says that qex answered the question, so a page that qex
+            // could not fill must not carry it: an agent then reads an empty
+            // page as the state of the machine and acts on it, and a false
+            // success is worse than a wait, because nobody sees it.
+            return Ok(if reached {
+                0
+            } else {
+                crate::commands::EXIT_TIMEOUT
+            });
         }
 
-        let page = render(&jobs, info.as_ref(), &mut previous);
+        let page = render(&jobs, info.as_ref(), &mut previous, !reached);
 
         print!("{CLEAR}{page}");
         use std::io::Write;
@@ -98,6 +126,7 @@ fn render(
     jobs: &[JobStatus],
     info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
+    unreachable: bool,
 ) -> String {
     let mut out = String::new();
 
@@ -206,10 +235,24 @@ fn render(
             format_size(cfg.budget_mem().unwrap_or(0)),
             active.len(),
         ));
-        out.push_str(
+        out.push_str(if unreachable {
+            // A coordinator that did not answer is NOT a coordinator that is
+            // absent, and this page must not say that nothing operates. The
+            // screen clears at each refresh, so the cause on stderr is gone by
+            // the next page and only this line carries it.
+            // EVERY CAUSE THAT REACHES THIS LINE, and not one of them.
+            //
+            // A coordinator that did not answer reaches it, and so does one
+            // that answered with words this version cannot read. The page must
+            // not name a cause that it did not test: what is true for both is
+            // that qex holds no answer from a coordinator.
+            "      qex has no answer from a coordinator. These records come from the state \
+             directory,\n\
+             \x20     and a coordinator can hold jobs that this page does not name.\n"
+        } else {
             "      no coordinator operates. These records come from the state directory.\n\
-             \x20     qex starts a coordinator when you submit a job.\n",
-        );
+             \x20     qex starts a coordinator when you submit a job.\n"
+        });
     }
 
     out.push_str(&format!(
@@ -446,6 +489,24 @@ fn note_for(job: &JobStatus) -> String {
     }
 }
 
+/// Reads the queue and the state of the machine from a coordinator.
+fn read_the_queue(client: &mut Client) -> Result<(Vec<crate::job::JobStatus>, Option<Response>)> {
+    let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+    let info = client.call(&Request::Info)?;
+    Ok((jobs, Some(info)))
+}
+
+/// Writes the cause one time, whatever the number of refreshes.
+fn say_once(said: &mut bool, error: &anyhow::Error) {
+    if !*said {
+        *said = true;
+        eprintln!("qex: {error:#}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,7 +642,7 @@ mod tests {
         };
 
         let mut previous = HashMap::new();
-        let page = render(&[], Some(&paused), &mut previous);
+        let page = render(&[], Some(&paused), &mut previous, false);
         assert!(page.contains("QUEUE PAUSED"), "got: {page}");
         assert!(
             page.contains("recording a demo"),
@@ -601,7 +662,7 @@ mod tests {
     fn the_page_holds_the_budget_and_the_jobs() {
         let jobs = vec![job(JobState::Running, 2, 4 << 30)];
         let mut previous = HashMap::new();
-        let page = render(&jobs, Some(&info()), &mut previous);
+        let page = render(&jobs, Some(&info()), &mut previous, false);
 
         assert!(page.contains("2/12 cores"), "the budget is missing: {page}");
         assert!(page.contains("example"), "the job name is missing");
@@ -638,11 +699,11 @@ mod tests {
         let jobs = vec![job(JobState::Running, 1, 1 << 30)];
         let mut previous = HashMap::new();
 
-        let first = render(&jobs, Some(&info()), &mut previous);
+        let first = render(&jobs, Some(&info()), &mut previous, false);
         assert!(first.contains("..."), "the first page has no earlier value");
 
         std::thread::sleep(Duration::from_millis(50));
-        let second = render(&jobs, Some(&info()), &mut previous);
+        let second = render(&jobs, Some(&info()), &mut previous, false);
         assert!(
             !second.contains("..."),
             "the second page must give a number: {second}"
@@ -657,7 +718,7 @@ mod tests {
         j.finished_at = Some(10);
 
         let mut previous = HashMap::new();
-        let page = render(&[j], Some(&info()), &mut previous);
+        let page = render(&[j], Some(&info()), &mut previous, false);
         assert!(page.contains("500MB"), "the measurement is missing: {page}");
         assert!(page.contains("ok"), "the result is missing");
     }
@@ -673,7 +734,7 @@ mod tests {
         j.finished_at = Some(5);
 
         let mut previous = HashMap::new();
-        let page = render(&[j], None, &mut previous);
+        let page = render(&[j], None, &mut previous, false);
 
         assert!(page.contains("example"), "the job is missing: {page}");
         assert!(
@@ -766,7 +827,7 @@ mod tests {
     #[test]
     fn the_page_gives_the_time() {
         let mut previous = HashMap::new();
-        let page = render(&[], Some(&info()), &mut previous);
+        let page = render(&[], Some(&info()), &mut previous, false);
         let clock = crate::sys::clock_text(crate::sys::now_secs());
         assert!(page.contains(&clock[..5]), "the time is missing: {page}");
     }
@@ -774,7 +835,7 @@ mod tests {
     #[test]
     fn an_empty_queue_says_so() {
         let mut previous = HashMap::new();
-        let page = render(&[], Some(&info()), &mut previous);
+        let page = render(&[], Some(&info()), &mut previous, false);
         assert!(page.contains("no jobs"));
     }
 
@@ -786,7 +847,7 @@ mod tests {
         j.started_at = None;
 
         let mut previous = HashMap::new();
-        let page = render(&[j], Some(&info()), &mut previous);
+        let page = render(&[j], Some(&info()), &mut previous, false);
         assert!(page.contains("waits for cores"), "got: {page}");
     }
 }

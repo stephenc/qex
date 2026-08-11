@@ -138,13 +138,22 @@ fn main() {
             // Write the cause of each error. An agent then sees the full
             // sequence and does not need to run the command a second time.
             eprintln!("qex: {e:#}");
+            // The limit for an answer of the coordinator gives 124 in EVERY
+            // command. That code says one thing: qex stopped waiting because it
+            // reached a limit. It is a fact about the COMMAND and not about a
+            // job, so it holds for `qex list` and `qex top` as much as for
+            // `qex wait`. This takes no promise away: each of those commands
+            // waited for ever before, and gave no code at all.
+            if client::is_a_coordinator_timeout(&e) {
+                commands::EXIT_TIMEOUT
+            }
             // A command that gives the code of a JOB must not report a fault of
             // its own with a code from the job band. The code 1 is the most
             // common code of a program that failed, so a `qex run` that could
             // not start looked exactly like a job that failed. Every other
             // command keeps the code 1, which is conventional and unambiguous:
             // `qex list` never claims to speak for a job.
-            if speaks_for_a_job(&subcommand_word()) {
+            else if speaks_for_a_job(&subcommand_word()) {
                 commands::EXIT_QEX_FAILED
             } else {
                 1

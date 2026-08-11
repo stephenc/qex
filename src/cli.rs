@@ -651,6 +651,11 @@ pub struct TopArgs {
     pub interval: f64,
 
     /// Write the page one time and stop. Use this option in a script.
+    ///
+    /// This form is a QUERY, and it gives 124 when the coordinator did not
+    /// answer inside its limit. The page that a person watches keeps drawing
+    /// and gives 0, because a display that drew did its work. Both forms write
+    /// the same page.
     #[arg(long)]
     pub once: bool,
 

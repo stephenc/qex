@@ -787,6 +787,121 @@ fn connect_once(address: &libc::sockaddr_un, deadline: std::time::Instant) -> Op
     }
 }
 
+/// The answer of a connect that KEEPS the connection.
+///
+/// `ask_socket` tests a socket and closes what it opened. A command needs the
+/// connection itself, and it needs the three answers apart, because the answer
+/// decides whether qex may start a coordinator.
+pub enum Connected {
+    /// A coordinator accepted, and this is the connection to it.
+    Open(std::os::unix::net::UnixStream),
+    /// Nobody listens at the socket. A caller may start a coordinator.
+    NobodyListens,
+    /// The socket gave no answer inside the limit. A process can hold that
+    /// socket, so a caller MUST NOT start a second coordinator.
+    NoAnswer,
+}
+
+/// Connects to a socket inside `limit`, and gives the connection back.
+///
+/// A connect with no limit waits for ever when a process holds the socket and
+/// never accepts. The queue of a busy coordinator fills in the same way, so
+/// this is not a rare state on a machine that many agents share.
+///
+/// `NoAnswer` is not `NobodyListens`. A caller that reads the two as one starts
+/// a second coordinator beside a coordinator that operates, and two
+/// coordinators on one state directory each hold the whole budget.
+pub fn connect_within(socket: &std::path::Path, limit: std::time::Duration) -> Connected {
+    use std::os::unix::io::FromRawFd;
+
+    // ONLY "THERE IS NO FILE" MEANS THAT NOBODY LISTENS.
+    //
+    // This answer is the one that lets a caller START A COORDINATOR, so every
+    // other error must not give it. A directory that this user cannot read, a
+    // chain of links that has no end, a file system that answers nothing: none
+    // of those says that no coordinator operates, and a second coordinator on
+    // one state directory holds the whole budget again.
+    //
+    // An unknown answer authorises nothing.
+    if let Err(e) = std::fs::symlink_metadata(socket) {
+        return match e.kind() {
+            std::io::ErrorKind::NotFound => Connected::NobodyListens,
+            _ => Connected::NoAnswer,
+        };
+    }
+    let Some(address) = unix_address(socket) else {
+        return Connected::NoAnswer;
+    };
+
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match open_once(&address, deadline) {
+            Some(Ok(fd)) => {
+                // Give the connection back in the blocking form. Every reader
+                // of this stream expects a read that waits, and the limit of a
+                // read belongs to the caller that makes the request.
+                unsafe {
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+                        libc::close(fd);
+                        return Connected::NoAnswer;
+                    }
+                    return Connected::Open(std::os::unix::net::UnixStream::from_raw_fd(fd));
+                }
+            }
+            Some(Err(SocketAnswer::NobodyListens)) => return Connected::NobodyListens,
+            Some(Err(_)) => return Connected::NoAnswer,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    return Connected::NoAnswer;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// Makes one attempt to connect, and keeps the descriptor when it succeeds.
+///
+/// `Some(Ok(fd))` is a connection. `Some(Err(answer))` is an answer that ends
+/// the attempts. `None` says that the caller can try again.
+fn open_once(
+    address: &libc::sockaddr_un,
+    deadline: std::time::Instant,
+) -> Option<Result<libc::c_int, SocketAnswer>> {
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Some(Err(SocketAnswer::Unknown));
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            libc::close(fd);
+            return Some(Err(SocketAnswer::Unknown));
+        }
+        let result = libc::connect(
+            fd,
+            address as *const libc::sockaddr_un as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        );
+        if result == 0 {
+            return Some(Ok(fd));
+        }
+        let error = std::io::Error::last_os_error().raw_os_error();
+        let answer = match error {
+            Some(libc::EINPROGRESS) => match finish_connect(fd, deadline) {
+                Some(SocketAnswer::Answers) => return Some(Ok(fd)),
+                Some(other) => Some(Err(other)),
+                None => None,
+            },
+            Some(libc::EAGAIN) | Some(libc::EINTR) => None,
+            other => Some(Err(answer_of(other))),
+        };
+        libc::close(fd);
+        answer
+    }
+}
+
 /// Gives a short name for a long path.
 ///
 /// This function uses the FNV-1a method. The result identifies the path. It is
@@ -887,6 +1002,45 @@ pub fn ensure_dir(path: &std::path::Path, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// AN UNKNOWN ANSWER AUTHORISES NOTHING.
+    ///
+    /// `NobodyListens` is the answer that lets a caller start a coordinator. A
+    /// socket that qex cannot even LOOK at says nothing about whether one
+    /// operates, and a second coordinator on one state directory holds the
+    /// whole budget again.
+    #[test]
+    fn a_socket_that_qex_cannot_look_at_does_not_say_that_nobody_listens() {
+        let dir = std::env::temp_dir().join(format!("qex-lookat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shut = dir.join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        let hidden = shut.join("s");
+
+        // A directory that this user cannot enter. `symlink_metadata` then
+        // gives `PermissionDenied`, which is not `NotFound`.
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+
+        let answer = connect_within(&hidden, std::time::Duration::from_millis(50));
+        let says_nobody = matches!(answer, Connected::NobodyListens);
+
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The root user reads every directory, so this test cannot make the
+        // state that it needs there. Say so, and hold nothing.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("this test did not run: the root user can look at every directory");
+            return;
+        }
+        assert!(
+            !says_nobody,
+            "a socket that qex cannot look at must not say that nobody listens: \
+             that answer lets a caller start a SECOND coordinator"
+        );
+    }
+
     use super::*;
 
     use crate::testutil::{env_lock, EnvVar};
