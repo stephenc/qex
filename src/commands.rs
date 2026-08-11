@@ -4901,7 +4901,7 @@ fn own_the_job(client: &mut Client, id: uuid::Uuid) {
     let answer = match client.call(&Request::OwnJob { id }) {
         Ok(Response::Ok) => OwnershipAnswer::Taken,
         Ok(Response::Error { message, .. }) => OwnershipAnswer::Refused(message),
-        Ok(_) => OwnershipAnswer::NotUnderstood,
+        Ok(_) => OwnershipAnswer::Unexpected,
         Err(e) => OwnershipAnswer::NoAnswer(e.to_string()),
     };
     if let Some(text) = ownership_message(id, &answer) {
@@ -4913,9 +4913,12 @@ fn own_the_job(client: &mut Client, id: uuid::Uuid) {
 enum OwnershipAnswer {
     Taken,
     Refused(String),
-    /// The coordinator gave an answer that this program cannot read. A
-    /// coordinator that does not know the request answers in this way.
-    NotUnderstood,
+    /// The coordinator answered, and the answer was neither a success nor an
+    /// error. qex read the answer correctly; it says nothing about the job.
+    ///
+    /// A coordinator that does not KNOW this request does not reach this
+    /// variant. Such a coordinator gives an error, and `Refused` carries it.
+    Unexpected,
     NoAnswer(String),
 }
 
@@ -4933,12 +4936,11 @@ fn ownership_message(id: uuid::Uuid, answer: &OwnershipAnswer) -> Option<String>
         OwnershipAnswer::Refused(message) => {
             format!("qex: the coordinator keeps the job {id} after this command stops: {message}")
         }
-        // A coordinator that cannot read the request answers about the request.
-        // Say the thing that is true for the reader, and keep the words of the
-        // protocol out of it.
-        OwnershipAnswer::NotUnderstood => format!(
-            "qex: this coordinator does not take the ownership of a job, so it keeps the job \
-             {id} after this command stops."
+        // Say only what this answer proves. It proves that qex has no promise
+        // about the job, and it does not prove why.
+        OwnershipAnswer::Unexpected => format!(
+            "qex: the coordinator gave an answer that does not say if it took the job {id}, so \
+             qex treats that job as one that the coordinator keeps after this command stops."
         ),
         OwnershipAnswer::NoAnswer(e) => format!(
             "qex: the coordinator did not answer, so it keeps the job {id} after this command \
@@ -5767,15 +5769,20 @@ mod tests {
             "a refusal carries the words of the coordinator: {refused}"
         );
 
-        let unread = ownership_message(id, &OwnershipAnswer::NotUnderstood)
-            .expect("an answer that qex cannot read must speak");
+        // qex READ this answer correctly, so the message must not say that it
+        // could not. It must say only that the answer proves nothing.
+        let unexpected = ownership_message(id, &OwnershipAnswer::Unexpected)
+            .expect("an answer that says nothing about the job must speak");
         assert!(
-            !unread.contains("unknown variant") && !unread.contains("could not read this request"),
-            "the words of the protocol must not reach a reader: {unread}"
+            !unexpected.contains("unknown variant")
+                && !unexpected.contains("could not read")
+                && !unexpected.contains("cannot read"),
+            "the words of the protocol must not reach a reader, and qex read this answer: \
+             {unexpected}"
         );
         assert!(
-            unread.contains("does not take the ownership"),
-            "the message says the thing that is true for the reader: {unread}"
+            unexpected.contains("does not say if it took the job"),
+            "the message says only what the answer proves: {unexpected}"
         );
 
         let silent = ownership_message(id, &OwnershipAnswer::NoAnswer(String::from("broken pipe")))
@@ -5786,7 +5793,7 @@ mod tests {
         );
 
         // Every answer that speaks names the job and the step.
-        for text in [&refused, &unread, &silent] {
+        for text in [&refused, &unexpected, &silent] {
             assert!(
                 text.contains(&format!("qex cancel {id}")),
                 "each answer gives the step that removes the job: {text}"

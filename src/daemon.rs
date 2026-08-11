@@ -1868,6 +1868,13 @@ fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
 /// `reason` says WHY qex cancelled the job, for a cancel that no person asked
 /// for. The state stays `cancelled`, so it never reads as a failure of the
 /// work, and the reason separates it from a cancel that a person typed.
+///
+/// THE REASON REPLACES THE ERROR OF THE JOB, AND `None` CLEARS IT. The error
+/// field of a cancelled job says why QEX cancelled it, and nothing else. A
+/// queued job can carry the error of an earlier attempt: a job with `--retries`
+/// goes back to the queue and keeps the text of the attempt that failed. That
+/// text on a cancelled record tells a reader that the job failed and starts
+/// again, and both of those are then false.
 fn cancel_queued(coord: &Arc<Coordinator>, id: uuid::Uuid, reason: Option<String>) -> bool {
     let mut state = coord.state.lock().unwrap();
 
@@ -1881,9 +1888,7 @@ fn cancel_queued(coord: &Arc<Coordinator>, id: uuid::Uuid, reason: Option<String
     job.status.state = JobState::Cancelled;
     job.status.finished_at = Some(sys::now_secs());
     job.status.blocked_reason = None;
-    if reason.is_some() {
-        job.status.error = reason;
-    }
+    job.status.error = reason;
     let status = job.status.clone();
     state.queue.retain(|q| *q != id);
     state.publish_changes();
@@ -2016,6 +2021,60 @@ pub fn log(message: &str) {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// A cancel must leave no error text from an earlier attempt on the record.
+    ///
+    /// WHAT THIS TEST OBSERVES: the field, in the function that writes it. A
+    /// job that waits again after a failed attempt carries the text of that
+    /// attempt, and a cancel that keeps the text gives a record with the state
+    /// `cancelled` and a sentence that says the job failed and starts again.
+    ///
+    /// WHAT IT DOES NOT OBSERVE: the way that a coordinator reaches that state.
+    /// The supervisor writes `queued` with the text for about one second before
+    /// it starts the attempt again, and a coordinator that recovers in that
+    /// second reads both from the disk. A test cannot hold that window open, so
+    /// this test makes the state instead of racing for it.
+    #[test]
+    fn a_cancel_leaves_no_error_text_from_an_earlier_attempt() {
+        let coord = Arc::new(Coordinator::new(Config::default()));
+        let id = uuid::Uuid::new_v4();
+
+        {
+            let mut state = coord.state.lock().unwrap();
+            let mut spec = spec_with_key("retried");
+            spec.id = id;
+            let mut status = JobStatus::new(&spec);
+            status.state = JobState::Queued;
+            // The exact text that the supervisor writes for a job that waits
+            // again after a failed attempt.
+            status.error = Some(String::from(
+                "attempt 1 failed with the exit code 3; qex starts the job again",
+            ));
+            state.jobs.insert(
+                id,
+                Job {
+                    spec,
+                    status,
+                    supervisor_pid: None,
+                },
+            );
+            state.queue.push(id);
+        }
+
+        assert!(
+            cancel_queued(&coord, id, None),
+            "a job that waits must cancel"
+        );
+
+        let state = coord.state.lock().unwrap();
+        let status = &state.jobs.get(&id).unwrap().status;
+        assert_eq!(status.state, JobState::Cancelled);
+        assert!(
+            status.error.is_none(),
+            "a cancel that a person typed leaves no error on the record: {:?}",
+            status.error
+        );
+    }
 
     /// A cancel that did not happen must name the step that fits the state.
     ///
