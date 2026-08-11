@@ -51,8 +51,8 @@ Every command that reads data accepts `--json`.
 | 0 to 96 | **The job.** qex gives the exit code of the job, unchanged. `qex run -- sh -c 'exit 7'` gives 7. |
 | 97 to 127 | **qex.** The code describes the queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal stopped the job, and qex did not attribute it to a stop. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. The record holds the number of the signal. |
-| 99 | The kernel stopped the job for memory. Give a larger `--mem`. **qex needs proof**: `[enforce] mode`, or a kill that the kernel attributed. With no enforcement a claim is a promise and not a limit, so a job that passes its claim is not stopped at all and never gives 99. |
+| 98 | **A signal ended the job** — one that qex did not send, and that was not TERM or KILL. Read the number in the record before you act: a fault inside the job, such as SIGSEGV, means the work must change; a signal from outside, such as `kill -INT`, means the same command can run again. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. |
+| 99 | **The kernel stopped the job for memory.** qex reports this with no configuration. Give a larger `--mem` and submit again: qex starts no new attempt. With no `[enforce] mode` a claim is a promise, so the kill comes from the memory of the **machine** and not from your claim. A machine that keeps no cgroup counter, such as macOS, gives 125 for the same kill. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and the job did not. Attach to it again. |
