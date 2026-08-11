@@ -5,11 +5,13 @@ description: Run a long local task (a build, a test suite, a training run, a dat
 
 # qex — run long tasks and wait for them correctly
 
-qex holds a task in a queue, starts it when the machine has the cores and the
-memory, records the result on the disk, and gives you one command that waits for
-it. `command -v qex` says whether it is installed; `cargo install qex` or a
-binary from https://github.com/stephenc/qex/releases/latest installs it. The
-first command starts the coordinator, and there is no service to configure.
+You cannot see the work that another agent is about to start, and it cannot see
+yours. qex holds the work of every agent on this machine in one queue. It starts
+each job when the claim of the job fits the machine, records the result on the
+disk, and gives you one command that waits for it. `command -v qex` says whether
+it is installed; `cargo install qex` or a binary from
+https://github.com/stephenc/qex/releases/latest installs it, and the first
+command starts the coordinator.
 
 `qex help agents` is the complete page inside the binary.
 
@@ -51,11 +53,10 @@ find the coordinator, use `qex info` — never search the process list.
 Each gives the exit code of the job. They differ in what they **write**: the
 output of the job, the record of the job, or nothing.
 
-`--quiet` silences the record and the reason that a job waits, and `--json`
-puts the record on stdout as JSON. **Neither silences a fault of the wait** —
-no such job, a wait that reached its limit, a wait that a signal stopped —
-because those lines give the id that attaches to the job again. They go to
-stderr, so they never mix with JSON.
+`--quiet` silences the record and the reason that a job waits, and `--json` puts
+the record on stdout as JSON. **Neither silences a fault of the wait** — no such
+job, a wait that reached its limit, a wait that a signal stopped — because those
+lines give the id that attaches to the job again. They go to stderr, not stdout.
 
 **Use `qex submit --wait` for your long work:**
 
@@ -89,9 +90,8 @@ jobs that did not stop then have no watcher, so wait again for them.
 
 ## The exit codes
 
-**One table.** Every command that gives you the result of a job obeys it:
-`qex run`, `qex submit --wait`, `qex submit --follow`, `qex wait`,
-`qex status --wait`, `qex status --follow` and `qex status --quiet`.
+**One table.** Every command that gives you a job result obeys it: `qex run`,
+`qex submit --wait/--follow`, `qex wait` and `qex status --wait/--follow/-q`.
 
 | Code | Meaning |
 | --- | --- |
@@ -135,8 +135,8 @@ you lose an id, `qex list --cwd .` gives the jobs of this directory.
 
 ## Claims
 
-Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate
-together, which is what stops several agents from filling the machine. Use
+Give `--cpu` and `--mem`. qex compares the claims against a budget for the
+machine, which is what stops several agents from filling it. Use
 `--cpu guess --mem guess` when you do not know the size (`half`/`guess` take one
 half of the budget, `full`/`max` take all of it).
 
@@ -220,8 +220,8 @@ Every command that reads data accepts `--json`.
   the code is 123; nothing ran, so there is no output.
 - **`pid` is null once a job stops.** The machine reuses that number. `last_pid`
   is history for a reader; never signal it.
-- **A claim is a promise, not a measurement.** A job that claims 2GB and uses
-  20GB still fills the machine.
+- **A claim is a promise, not a limit.** qex stops no job that goes above its
+  claim, so a job that claims 2GB and uses 20GB still fills the machine.
 - **`--lock NAME` keeps two jobs apart** when they share something a claim
   cannot express: a build directory, a port, a database.
 - **`status --follow` writes the log from its first line.** For a job that

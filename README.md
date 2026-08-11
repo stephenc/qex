@@ -6,12 +6,23 @@
 [![Earliest Rust that qex needs](https://img.shields.io/crates/msrv/qex)](https://crates.io/crates/qex)
 [![Licence: Apache 2.0](https://img.shields.io/crates/l/qex)](LICENSE)
 
-qex is a job queue for long tasks on one machine. It controls the number of
-cores and the quantity of memory that the jobs use together.
+qex gives independent agents and harnesses one shared resource scheduler for one
+machine.
 
-qex is for coding agents and for the people who work with them. Several agents
-on one machine each start work, and no agent sees the load of the others. The
-machine then runs out of memory. qex gives those agents one queue.
+A coding agent sees how much CPU and memory the machine has free now. It does
+not see the jobs that another agent, another subagent or another harness is
+about to start. Ten agents can therefore each decide that the same free memory
+is theirs.
+
+qex makes those decisions in one place. Claude Code, Codex, subagents, harnesses
+such as CI, and ordinary shells all submit work independently. They do not know
+each other, and they do not have to. qex admits only the set of jobs whose
+claims fit the machine together.
+
+Each job declares a claim: a number of cores and a quantity of memory. qex
+compares the claims against a budget for the machine, and it holds a job in the
+queue until its claim fits. qex does not measure your program before it starts,
+and by default it applies no limit to the job.
 
 ```sh
 qex submit --wait --cpu guess --mem guess --id-file train.id -- uv run train.py
@@ -24,12 +35,12 @@ streams. The output of the job stays in the log file.
 
 **Agents: run `qex help agents` first.** It is one page and it covers everything.
 
-## The three problems that qex solves
+## Three faults that one scheduler removes
 
-**1. No agent sees the load of the others.** Each agent finds free memory,
-starts a large task, and the out-of-memory killer selects a victim. qex holds a
-budget for the machine. A job starts when the machine has capacity for its
-claim, and it waits when the machine does not.
+**1. The machine runs out of memory.** Each agent measures correctly and each
+agent decides alone. The out-of-memory killer then selects a victim. One queue
+holds every claim. A job starts when the machine has capacity for its claim, and
+it waits when the machine does not.
 
 **2. Every hand-rolled watcher waits on a proxy, and a proxy can go permanently
 false.** An agent with no way to wait writes a monitor. That monitor watches a
@@ -80,15 +91,15 @@ Or build it from the source:
 cargo install --path .
 ```
 
-qex needs Linux or macOS. It has no other requirement.
+qex needs Linux or macOS. It has no other requirement. The first command starts
+the background coordinator for you, and you configure no service.
 
 **On Windows, use WSL2** — qex builds and runs there unchanged, and the jobs an
 agent starts (`make`, `cargo`, `uv`) usually live in WSL2 anyway. A native
 Windows build is a port, not a flag: qex holds a job with `waitpid` on one
 process id and stops a job tree with a process group, and Windows has neither.
 Building for Windows fails with one message that says this, rather than a page
-of errors. The first command starts
-the background coordinator for you, and you do not configure a service.
+of errors.
 
 ## Five minutes
 
@@ -194,6 +205,12 @@ There is no share for each agent.
 
 **qex controls one machine.** Two machines that farm work to each other are not
 coordinated.
+
+**One coordinator serves one user.** Every agent that runs as you shares one
+queue. A second user on the machine gets a second coordinator, and each
+coordinator reads the claims of the other from `/tmp/qex` before it starts a
+job. That accounting is cooperative. It needs no administrator rights, and it
+trusts what the other coordinator writes.
 
 **A claim is a promise — but the job is told what it promised.** Give both
 `--cpu` and `--mem`, and qex writes the claim into the environment

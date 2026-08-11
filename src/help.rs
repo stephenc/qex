@@ -60,10 +60,10 @@ pub const AGENTS: &str = "\
 qex for agents
 ==============
 
-qex runs a long task for you. It holds the task in a queue, starts it when the
-machine has capacity, records the result on the disk, and gives you one command
-that waits for it. The record survives your session, your terminal and the
-coordinator itself.
+You cannot see the work that another agent is about to start, and it cannot see
+yours. qex holds the work of every agent on this machine in one queue. Declare
+what your job claims. qex starts the job when the claim fits the machine, writes
+the result to the disk, and gives you one command that waits for it.
 
 Which command
 -------------
@@ -139,8 +139,8 @@ Exit codes
       97        the job gave a code from 97 to 255. Read the record for it.
       98        a signal stopped the job, and qex did not attribute it to a
                 stop. A kill from anywhere gives 125 instead.
-      99        the kernel stopped the job for memory. See the note below:
-                qex must be able to prove it.
+      99        the kernel stopped the job at a limit that qex applied with
+                `[enforce] mode`. With no limit, a job never gives 99.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -158,8 +158,7 @@ A code from 125 does NOT say that your work failed: another agent on this
 machine can stop your job, so read the line on stderr before you run it again.
 
 `qex list`, `qex logs` and the other commands never speak for a job, so they use
-0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the reason for
-the band.
+0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the band.
 
 If qex cannot start at all
 --------------------------
@@ -239,8 +238,10 @@ names them when it returns.
 Resource claims
 ---------------
 
-Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate
-together, and that is what stops two agents from filling the machine.
+Give `--cpu` and `--mem`. qex compares the claims of every job against a budget
+for the machine, and that is what stops two agents from filling it. A CLAIM IS A
+PROMISE AND NOT A LIMIT: qex measures nothing before a job starts, and it stops
+no job that goes above its claim, unless `[enforce] mode` applies a limit.
 
     half, guess   one half of the budget. Two such jobs operate together.
     full, max     the full budget. The job operates alone.
@@ -255,9 +256,8 @@ different work. Give `guess` and start the REAL task:
 qex records what each job really used, and it uses those numbers as the claim
 for the next job of the same command. It keeps the LARGEST measurement and adds
 a margin. A job that the kernel stopped for memory gives a lower bound, so the
-next claim is above it, and a smaller run later does not remove that lesson.
-`qex status` says where a claim came from, and `qex status --json` gives
-`max_rss` and `cpu_secs`.
+next claim is above it. `qex status` says where a claim came from, and
+`qex status --json` gives `max_rss` and `cpu_secs`.
 
 A claim that is larger than the whole budget still runs: qex starts the job
 alone when nothing else operates, and the field `forced` is true. The job can
@@ -328,8 +328,8 @@ Other options
     --timeout 4h       stop the JOB after this time. `--wait-timeout` stops
                        your wait instead, and the job continues.
     --retries 3        run the job again when it fails. One id, one record,
-                       every attempt in the log. You do not need this for a
-                       kill for memory: qex raises the claim by itself.
+                       every attempt in the log. qex raises the claim by itself
+                       after a kill at a limit that `[enforce] mode` applied.
     --lock NAME        two jobs with one lock name never operate together. Use
                        it for a build directory, a port or a database.
     --nice N           -20 to 19. A larger number gives way to a person. The
@@ -1281,8 +1281,8 @@ these conditions are true:
 The `usage` field gives `max_rss` in bytes and `cpu_secs`. A task that always
 uses much less than its claim wastes capacity: put an exact claim in a job file,
 and more jobs then operate together. A task that the kernel stops for memory
-needs a larger claim, and qex gives it that claim itself: it multiplies the
-claim and starts the job again.
+needs a larger claim. qex multiplies the claim and starts the job again when it
+applied the limit itself, with `[enforce] mode`.
 
 For one task, this step is not necessary.
 

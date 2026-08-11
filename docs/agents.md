@@ -7,9 +7,11 @@ description: The one page that an agent needs, and the property that makes qex s
 
 # qex for agents
 
-qex holds a task in a queue, starts it when the machine has the cores and the
-memory, records the result on the disk, and gives you one command that waits for
-it. Install it with `cargo install qex`, or take a binary from the
+You cannot see the work that another agent is about to start, and it cannot see
+yours. qex holds the work of every agent on this machine in one queue. It starts
+each job when the claim of the job fits the machine, records the result on the
+disk, and gives you one command that waits for it. Install it with
+`cargo install qex`, or take a binary from the
 [releases](https://github.com/stephenc/qex/releases/latest). The first command
 starts the coordinator, and there is no service to configure.
 
@@ -163,8 +165,8 @@ you lose an id, `qex list --cwd .` gives the jobs of this directory.
 
 ## Claims
 
-Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate
-together, which is what stops several agents from filling the machine. Use
+Give `--cpu` and `--mem`. qex compares the claims against a budget for the
+machine, which is what stops several agents from filling it. Use
 `--cpu guess --mem guess` when you do not know the size (`half`/`guess` take one
 half of the budget, `full`/`max` take all of it).
 
@@ -248,8 +250,8 @@ Every command that reads data accepts `--json`.
   the code is 123; nothing ran, so there is no output.
 - **`pid` is null once a job stops.** The machine reuses that number. `last_pid`
   is history for a reader; never signal it.
-- **A claim is a promise, not a measurement.** A job that claims 2GB and uses
-  20GB still fills the machine.
+- **A claim is a promise, not a limit.** qex stops no job that goes above its
+  claim, so a job that claims 2GB and uses 20GB still fills the machine.
 - **`--lock NAME` keeps two jobs apart** when they share something a claim
   cannot express: a build directory, a port, a database.
 - **`status --follow` writes the log from its first line.** For a job that
