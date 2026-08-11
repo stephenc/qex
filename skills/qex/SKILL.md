@@ -9,9 +9,10 @@ You cannot see the work that another agent is about to start, and it cannot see
 yours. qex holds the work of every agent on this machine in one queue. It starts
 each job when the claim of the job fits the machine, records the result on the
 disk, and gives you one command that waits for it. `command -v qex` says whether
-it is installed; `cargo install qex` or a binary from
-https://github.com/stephenc/qex/releases/latest installs it, and the first
-command starts the coordinator.
+it is installed. `mise x ubi:stephenc/qex -- qex …` runs qex and changes no
+configuration of this machine; `cargo install qex` or a binary from
+https://github.com/stephenc/qex/releases/latest installs it. The first command
+starts the coordinator.
 
 `qex help agents` is the complete page inside the binary.
 
