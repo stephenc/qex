@@ -1087,16 +1087,24 @@ const KEYS_THAT_WENT: &[(&str, &str)] = &[
 
 /// Names a key that this qex no longer accepts, if the message holds one.
 ///
-/// THE NAME MUST MATCH IN FULL. serde writes ``unknown field `X` ``, and this
-/// function tests for that complete form. A test for the name alone also
-/// answers a key that only STARTS with the name: `[system] retry_mem` is such a
-/// key, and the answer for it names `retry` and tells the reader to delete a
-/// key that the file does not hold.
+/// THE NAME MUST MATCH IN FULL. A test for the name alone also answers a key
+/// that only STARTS with the name: `[system] retry_mem` is such a key, and the
+/// answer for it names `retry` and tells the reader to delete a key that the
+/// file does not hold.
+///
+/// TWO FORMS CARRY THE NAME, because the shape of the file decides which one
+/// serde writes. A key in its section gives ``unknown field `X` ``. The same
+/// key in an array of tables, `[[enforce]]`, gives ``unknown variant `X` ``,
+/// because that shape makes qex read the name as the VALUE of `mode`. The
+/// reader who wrote the key needs the same answer either way.
 fn key_that_went(error: &toml::de::Error) -> Option<(&'static str, &'static str)> {
     let message = error.message();
     KEYS_THAT_WENT
         .iter()
-        .find(|(key, _)| message.contains(&format!("unknown field `{key}`")))
+        .find(|(key, _)| {
+            message.contains(&format!("unknown field `{key}`"))
+                || message.contains(&format!("unknown variant `{key}`"))
+        })
         .map(|(key, what)| (*key, *what))
 }
 

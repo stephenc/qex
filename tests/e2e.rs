@@ -12496,14 +12496,32 @@ fn a_job_that_a_user_killed_is_not_retried_and_teaches_the_learner_nothing() {
 /// promise that no code holds.
 ///
 /// This test reads the text that SHIPS — the documentation, the skill file, the
-/// help topics and the JSON schema — and refuses the words of that feature. A
-/// later change that writes one of them meets this test and not a reader.
+/// help topics, the command line help and the JSON schema — and refuses the
+/// words of that feature. A later change that writes one of them meets this
+/// test and not a reader.
 ///
 /// THE PAGES COME FROM THE DIRECTORY, and not from a list. A list covers the
 /// pages that exist on the day that somebody writes it, and a page that joins
 /// the product after that day gets no gate. A file that this test cannot read
 /// is a FAILURE and not a page to pass over: a gate that reads nothing refuses
 /// nothing, and it reports success.
+///
+/// # Why this gate reads four files of `src/` and not all of them
+///
+/// It reads the files that hold text FOR A READER. It must not read the rest,
+/// because a word that names a key that went HAS TO appear in the code that
+/// refuses that key: `src/config.rs` holds `mem_overcommit`, `use_systemd` and
+/// `[retry]` so that a file which sets one of them gets an answer, and
+/// `src/usage.rs` holds `lower-bound` so that qex can read the file of an
+/// earlier version. A gate over every file needs a list of exceptions, and such
+/// a list grows until it hides the thing that the gate looks for.
+///
+/// EACH REFUSED WORD MUST NOT MATCH INNOCENT TEXT. A gate that stops a correct
+/// change gets deleted, and then it guards nothing. Two words here carry more
+/// than the name of the feature for that reason: the section name holds the end
+/// of its line, because `[retry]` alone matches a link in markdown, and the
+/// words of the raise hold the word that follows them, because "the new claim"
+/// alone matches an honest sentence about `qex rerun --mem 2GB`.
 #[test]
 fn no_shipped_word_promises_the_limit_that_went() {
     // Each word, and why it may not come back.
@@ -12522,10 +12540,15 @@ fn no_shipped_word_promises_the_limit_that_went() {
         ("cgroup of the job", "a cgroup that qex no longer makes"),
         ("raises the claim", "a correction that qex no longer makes"),
         ("raise the claim", "the same"),
-        ("[retry]", "a section that went"),
+        // The section name holds the end of its line. A section in TOML is
+        // alone on its line, and `[retry]` with no line end also matches the
+        // link `[retry](docs/reference.md)`, which is innocent.
+        ("[retry]\n", "a section that went"),
         // The words of the raise, in the form that carries no verb. A gate
         // that names the verbs only passes over a description of the record.
-        ("the new claim", "a claim that qex no longer makes"),
+        // The word `and` comes with them, because a sentence about `qex rerun`
+        // says "the new claim" and says nothing about an attempt of qex.
+        ("the new claim and", "a claim that qex no longer makes"),
         ("claim that failed", "the same, in the words of a record"),
     ];
 
@@ -12533,9 +12556,12 @@ fn no_shipped_word_promises_the_limit_that_went() {
     let mut pages: Vec<std::path::PathBuf> = vec![
         root.join("README.md"),
         root.join("skills/qex/SKILL.md"),
-        // The help topics and the JSON schema ship INSIDE the program, so read
-        // them from the source of the program.
+        root.join("CONTRIBUTING.md"),
+        root.join("SECURITY.md"),
+        // The help topics, the command line help and the JSON schema ship
+        // INSIDE the program, so read them from the source of the program.
         root.join("src/help.rs"),
+        root.join("src/cli.rs"),
         root.join("src/schema.rs"),
     ];
     // Every page of `docs/` ships. Read the directory, so that a new page gets
@@ -12575,13 +12601,22 @@ fn no_shipped_word_promises_the_limit_that_went() {
 /// A reader wrote that key because an earlier qex asked for it. "unknown field"
 /// is true and it names no remedy, so qex names the key, says what it does now,
 /// and gives the step.
+///
+/// THE ANSWER MUST NAME THE KEY THAT THE FILE HOLDS. Every message here says
+/// "does not limit a job", so a test for those words alone passes when qex
+/// gives the answer of one key for a different key. The name is what the reader
+/// deletes.
 #[test]
 fn a_config_that_names_a_key_that_went_says_what_to_do() {
-    for (section, text) in [
-        ("[enforce]", "mem_overcommit = 1.5"),
-        ("[enforce]", "use_systemd = true"),
-        ("[retry]", "on_oom = 2"),
-        ("[enforce]", "mode = \"hard\""),
+    for (section, text, must_name) in [
+        ("[enforce]", "mem_overcommit = 1.5", "mem_overcommit"),
+        ("[enforce]", "use_systemd = true", "use_systemd"),
+        ("[retry]", "on_oom = 2", "retry"),
+        ("[enforce]", "mode = \"hard\"", "[enforce] mode"),
+        // An array of tables makes serde read the name as the VALUE of `mode`,
+        // so the message carries `unknown variant` and not `unknown field`. The
+        // reader wrote the same key and needs the same answer.
+        ("[[enforce]]", "mem_overcommit = 1.5", "mem_overcommit"),
     ] {
         let h = Harness::new("wentkey", &format!("{section}\n{text}\n"));
         let out = h.qex(&["config", "show"]);
@@ -12593,7 +12628,11 @@ fn a_config_that_names_a_key_that_went_says_what_to_do() {
         assert_ne!(out.status.code(), Some(0), "qex must refuse: {said}");
         assert!(
             said.contains("does not limit a job"),
-            "the answer must say what qex does now, for `{text}`: {said}"
+            "the answer must say what qex does now, for `{section} {text}`: {said}"
+        );
+        assert!(
+            said.contains(must_name),
+            "the answer must name `{must_name}`, for `{section} {text}`: {said}"
         );
     }
 }
@@ -12661,6 +12700,67 @@ fn config_show_gives_the_values_in_force_in_both_forms() {
             "{mode}: the text form must name the mode as `{label}`: {text}"
         );
     }
+}
+
+/// A RERUN TAKES THE CLAIM OF THE SPECIFICATION, and not the claim of a record.
+///
+/// For a job that this qex submits the two agree. They disagree for a record of
+/// an EARLIER qex, which could write a larger number in the record after a kill
+/// for memory. A rerun that took that number would carry `learned` with it, and
+/// tell the reader that a job measured a value that qex invented.
+///
+/// This test writes the record of such a job, because this version cannot make
+/// one. It is a test of what `rerun` READS, and the shape it reads from disk is
+/// the shape that an earlier qex left there.
+#[test]
+fn a_rerun_takes_the_claim_of_the_specification_and_not_of_the_record() {
+    let h = Harness::new("rerunclaim", "[peers]\nenabled = false\n");
+
+    let first = h.submit(&["submit", "--cpu", "1", "--mem", "300MB", "--", "true"]);
+    h.ok(&["wait", &first, "--timeout", "60s"]);
+
+    // Put the record in the shape that an earlier qex left after a raise: the
+    // claim of the record is above the claim that the submission asked for.
+    let record = h.root.join(format!("state/qex/jobs/{first}/status.json"));
+    let text = std::fs::read_to_string(&record).expect("the record must be readable");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).expect("the record must be JSON");
+    value["mem"] = serde_json::json!(2u64 << 30);
+    value["cpu"] = serde_json::json!(4);
+    value["claim_source"] = serde_json::json!("learned");
+    std::fs::write(&record, value.to_string()).expect("the record must be writable");
+
+    // THE INSTRUMENT MUST PROVE ITSELF, or this test judges nothing. Read the
+    // FILE back, and not `qex status`: that command asks the coordinator, which
+    // answers from the record that it holds in memory, and `rerun` reads the
+    // file. A test that asked the coordinator here would find its own write
+    // missing and blame the product.
+    let back: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).expect("the record must be read"))
+            .expect("the record must be JSON");
+    assert_eq!(
+        back["mem"], 2147483648u64,
+        "this test needs a record whose claim is above the specification: {back}"
+    );
+
+    let out = h.ok(&["rerun", &first]);
+    let second = out.split_whitespace().last().unwrap().to_string();
+    h.ok(&["wait", &second, "--timeout", "60s"]);
+
+    let s = h.status_json(&second);
+    assert_eq!(
+        s["mem"], 314572800u64,
+        "the rerun must take the 300MB of the specification, and not the claim of the \
+         record: {s}"
+    );
+    assert_eq!(
+        s["cpu"], 1,
+        "the rerun must take the cores of the specification: {s}"
+    );
+    assert_eq!(
+        s["claim_source"], "explicit",
+        "the claim came from a person, so the record must not say that a job measured it: {s}"
+    );
 }
 
 /// qex makes NO cgroup for a job, in any configuration.

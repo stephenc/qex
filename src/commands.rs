@@ -5437,12 +5437,16 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     let mut spec = crate::job::read_spec(&dir)
         .with_context(|| format!("reading the specification of the job {id}"))?;
 
-    // The specification gives the claim of the new job.
+    // THE SPECIFICATION GIVES THE CLAIM OF THE NEW JOB, and the record does not.
     //
-    // qex writes the claim of the record from the specification when the job
-    // starts, and it changes that value for no job: nothing raises a claim. The
-    // record and the specification thus agree, and a rerun gets the claim that
-    // the first submission gave.
+    // For a job that this qex submits the two agree: qex writes the claim of the
+    // record from the specification, and it changes that value for no job.
+    //
+    // They disagree for a record of an EARLIER qex, which could put a larger
+    // number in the record after a kill for memory. A rerun that took the larger
+    // number would carry `learned` with it, and tell the reader that a job
+    // measured a value that qex invented. The specification holds what a person
+    // asked for, so the claim of such a record does not go forward.
 
     // A new job needs a new id, and it must not keep the dependencies of the
     // first job: those jobs have stopped, and a dependency on a job that

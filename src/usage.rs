@@ -125,7 +125,14 @@ pub struct Sample {
     pub at: u64,
 }
 
+/// The measurements of one command.
+///
+/// EVERY FIELD TAKES A DEFAULT, for the reason that `Sample` gives: the store
+/// loads as ONE value, so an entry that is missing a field empties the store of
+/// EVERY command. The guard on `Sample` alone is not enough, because a later
+/// qex can change this level and not that one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Entry {
     /// The name of the job, for a person to read. qex does not use it as a key.
     pub name: String,
@@ -620,6 +627,61 @@ mod tests {
         }
     }
 
+    /// An ENTRY that this version cannot read in full must not empty the store.
+    ///
+    /// The guard on `Sample` holds the level of one measurement. A later qex can
+    /// change the level ABOVE it, and the store still loads as one value, so an
+    /// entry that is missing a field would take the peaks of every OTHER command
+    /// with it.
+    ///
+    /// The command `good` holds the peak in each shape here, and the damage is
+    /// always in the command beside it.
+    #[test]
+    fn an_entry_that_this_version_cannot_read_in_full_keeps_the_other_commands() {
+        let good = r#"{"name":"t","samples":[{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}"#;
+        for (what, entry) in [
+            ("an entry with no name", r#"{"samples":[]}"#),
+            ("an entry where the samples went", r#"{"name":"t"}"#),
+            ("an entry with no field at all", r#"{}"#),
+            (
+                "an entry with a field of a later qex",
+                r#"{"name":"t","samples":[],"ceiling":42}"#,
+            ),
+        ] {
+            let text = format!(r#"{{"commands":{{"good":{good},"damaged":{entry}}}}}"#);
+            let store: Store = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{what} must not empty the store: {e}"));
+            let peaks: Vec<u64> = store.commands["good"]
+                .samples
+                .iter()
+                .filter(|s| s.kind == Measurement::Peak)
+                .map(|s| s.max_rss)
+                .collect();
+            assert_eq!(
+                peaks,
+                vec![1 << 30],
+                "{what} must leave the peak of the command beside it"
+            );
+        }
+    }
+
+    /// A STORE that this version cannot read in full must not lose its commands.
+    ///
+    /// This is the level above the entry. A later qex can add a field beside
+    /// `commands`, or write a file that has no `commands` field at all.
+    #[test]
+    fn a_store_with_a_field_of_a_later_qex_keeps_its_commands() {
+        let good = r#"{"name":"t","samples":[{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}"#;
+        let text = format!(r#"{{"commands":{{"good":{good}}},"written_by":"a later qex"}}"#);
+        let store: Store = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("a field of a later qex must not empty the store: {e}"));
+        assert_eq!(store.commands["good"].samples[0].max_rss, 1 << 30);
+
+        let empty: Store = serde_json::from_str(r#"{"written_by":"a later qex"}"#)
+            .expect("a file with no commands field must read as an empty store");
+        assert!(empty.commands.is_empty());
+    }
+
     /// A command whose only history is a BOUND gives NO claim.
     ///
     /// An entry can hold samples and no peak: an earlier qex wrote a bound for
@@ -668,6 +730,15 @@ mod tests {
     }
 
     /// A peak of zero bytes takes no peak of the same command with it.
+    ///
+    /// THIS TEST DOES NOT GUARD THE FILTER ON A PEAK OF ZERO. It passes with
+    /// that filter gone, because the largest of `0` and `1GB` is `1GB` either
+    /// way. `a_peak_of_zero_bytes_gives_no_claim` is the test that fails when
+    /// the filter goes.
+    ///
+    /// This test guards a DIFFERENT wrong answer: a version that refused the
+    /// whole entry because one sample in it holds a zero. The command keeps its
+    /// claim, and only the sample that measures nothing goes.
     #[test]
     fn a_peak_of_zero_bytes_leaves_the_claim_of_the_true_peaks() {
         let cmd: Vec<String> = vec!["train".into()];

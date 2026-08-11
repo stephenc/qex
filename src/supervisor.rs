@@ -712,10 +712,11 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let timed_out = outcome.load(std::sync::atomic::Ordering::SeqCst) == RACE_TIMER;
 
     status.state = classify(&spec, code, signal, timed_out, &dir);
-    // Keep an earlier message. The two messages that this field can already
-    // hold say that the memory limit is NOT active, or that qex could not read
-    // the configuration. Each of those is the cause of the note below, and not
-    // a smaller fact than it.
+    // Keep an earlier message. Three messages reach this field before this
+    // point: qex could not read the configuration, the politeness values have a
+    // fault, or the output of the job did not close. Each of those NAMES a
+    // cause. The note below says only that qex cannot explain the kill, so it
+    // must never take the place of a message that explains it.
     if status.error.is_none() {
         if let Some(note) = unexplained_kill_note(status.state, signal, &dir) {
             status.error = Some(note);
@@ -985,14 +986,11 @@ const RACE_TIMER: u8 = 2;
 
 /// Adds a fault to the record of a job, and keeps the faults that are there.
 ///
-/// # The fault that this removes
-///
-/// A job can meet more than one fault before it starts. `error` held ONE of
-/// them, because each writer replaced the field. Measured with
-/// `[enforce] mode = "hard"` on a machine with no cgroup delegation AND
-/// `[politeness] nice = 100`: `qex status --json` gave the memory-limit fault
-/// only. The politeness fault reached `supervisor.log`, which no command reads,
-/// so a user saw a job that ran at a priority nobody asked for and had nothing
+/// A job can meet more than one fault before it starts: a configuration file
+/// that qex cannot read AND politeness values that it refuses. A writer that
+/// REPLACED `error` would give the reader one of them and hide the rest, and
+/// the fault that it hid reaches `supervisor.log` only, which no command reads.
+/// The user then has a job that ran in a way that nobody asked for, and nothing
 /// to read about it.
 ///
 /// The reader needs every fault, so this function joins them.
@@ -1417,22 +1415,24 @@ mod tests {
 
     /// A second fault must not push the first one out of the record.
     ///
-    /// A job can meet more than one fault before it starts. Measured with
-    /// `[enforce] mode = "hard"` on a machine with no cgroup delegation AND
-    /// `[politeness] nice = 100`: `qex status --json` gave the memory-limit
-    /// fault only, and the politeness fault reached `supervisor.log`, which no
-    /// command reads. The user then had a job at a priority that nobody asked
-    /// for and nothing to read about it.
+    /// A job can meet a configuration file that qex cannot read AND politeness
+    /// values that it refuses. `qex status --json` must give both. A fault that
+    /// this field loses reaches `supervisor.log` only, which no command reads,
+    /// so the user has a job that ran in a way that nobody asked for and
+    /// nothing to read about it.
     #[test]
     fn a_job_with_two_faults_keeps_both_of_them() {
         let mut error = None;
-        add_fault(&mut error, "the memory limit is not active.".into());
-        assert_eq!(error.as_deref(), Some("the memory limit is not active."));
+        add_fault(&mut error, "qex could not read the configuration.".into());
+        assert_eq!(
+            error.as_deref(),
+            Some("qex could not read the configuration.")
+        );
 
         add_fault(&mut error, "the politeness values have a fault.".into());
         let both = error.unwrap();
         assert!(
-            both.contains("memory limit") && both.contains("politeness"),
+            both.contains("configuration") && both.contains("politeness"),
             "the record must keep both faults, and it said: {both}"
         );
     }
