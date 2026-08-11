@@ -149,9 +149,9 @@ qex submit --wait -- ./task                           # run 2: the claim is read
 ```
 
 qex records what each job really used and uses it as the claim for the next job
-of the same command. A job that the kernel stopped for memory gives a lower
-bound, so the next claim is above it. `qex status --json` gives `max_rss` and
-`cpu_secs`.
+of the same command. A job that the kernel stopped for memory teaches qex
+nothing today, so give a larger `--mem` yourself. `qex status --json` gives
+`max_rss` and `cpu_secs`.
 
 ## A key, so a second run starts nothing
 

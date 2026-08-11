@@ -227,9 +227,15 @@ THAT QEX APPLIED. The second kind is a lower bound and not a peak: the job did
 not finish, so the true need is above the value. qex records that bound when it
 made the cgroup of the job and read the counter of that cgroup; the counter of
 the login session also counts a kill in a different program of the same user,
-and the machine can be full while the claim of the job is correct. qex keeps the two kinds apart in `usage.json`, and
-the next claim goes above the largest of both. A lower bound costs a whole run
-to obtain, and an average with the smaller runs would lose it.
+and the machine can be full while the claim of the job is correct. qex keeps the
+two kinds apart in `usage.json`, and the next claim goes above the largest of
+both. A lower bound costs a whole run to obtain, and an average with the smaller
+runs would lose it.
+
+The second kind does not reach `usage.json` in this build. The supervisor stops
+every process in the cgroup of the job, so it stops itself before it writes the
+bound. Issue [#88](https://github.com/stephenc/qex/issues/88) holds the fault,
+and qex learns from a job that COMPLETED only.
 
 qex records nothing else. A job that somebody stopped, or that reached its time
 limit, shows the memory that it reached and not the memory that it needs, and

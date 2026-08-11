@@ -292,33 +292,35 @@ trusts what the other coordinator writes.
 
 ## When the kernel stops a job for memory
 
-A training run with `--mem guess` that the kernel stops at hour four gets the
-state `oom`. That state says one thing: **the claim was too small**.
+A training run that the kernel stops at hour four gets the state `oom`.
 
-qex corrects it. It multiplies the claim, starts the job again with the same id
-and the same record, and says in the record what it did:
+**qex reports it, and it starts no new attempt.** The record says what you can
+do. Give a larger `--mem` value and submit the work again:
 
-```
-claim:     1 core(s), 16GB  (qex raised it, because the earlier claim was too small)
-note:      the kernel stopped attempt 1 of this job, because the job used more
-           memory than its claim of 8GB. THE CLAIM WAS TOO SMALL. qex raised
-           the claim to 16GB and starts the job again.
+```sh
+qex submit --wait --mem 16GB --id-file train.id -- uv run train.py
 ```
 
-The job goes through the queue again, so its new claim meets the budget in the
-same way as a new job. qex also keeps the lesson: that kill says that the
-command needs **more than** 8GB, so the next run of the same command starts
-above that value and does not die in the same way.
+qex cannot do more than report while it applies no limit, which is the default.
+A claim is then a promise, and the count that the kernel keeps also rises when
+the kernel stops a different program of the same user. The machine can be full
+while your claim is correct, and a larger claim is then the wrong answer.
 
-qex makes this correction when it applied the memory limit itself, with
-`[enforce] mode`. The kernel then stopped the job at the claim, and the kill is
-proof. With no limit — the default — qex can read the count of the login session
-only, and that count also rises when the kernel stops a different program of the
-same user. qex then reports the state `oom`, says what you can do, and starts no
-new attempt: the machine can be full while your claim is correct.
+`[enforce] mode` puts each job in a cgroup of its own and applies the claim as a
+real limit. The kernel counts a kill at that limit separately, and that count is
+proof that the claim was too small. With that proof, qex is designed to multiply
+the claim, start the job again with the same id, and keep the lesson for the
+next job of the same command.
+
+**That correction does not run in this build.** The supervisor joins the cgroup
+of the job and then stops every process in it, so it stops itself before it
+reaches the code that raises the claim. Issue
+[#88](https://github.com/stephenc/qex/issues/88) holds the fault. While it is
+open, `[enforce] mode` gives you a real memory limit and the state `oom`, and no
+job runs a second time.
 
 See [the reference](docs/reference.md#a-job-that-the-kernel-stops-for-memory)
-for the limit on the raises.
+for the rules of the correction.
 
 ## The documentation
 
