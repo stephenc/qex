@@ -15317,8 +15317,11 @@ fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordin
                         let mut to_real = back.try_clone().unwrap();
                         let mut from_real = BufReader::new(back);
                         let mut to_qex = front_side;
+                        // ONE request, and half of ONE answer. This helper never
+                        // serves a second question: the connection it cut can
+                        // carry no more answers, which is the state under test.
                         let mut line = String::new();
-                        while from_qex.read_line(&mut line).unwrap_or(0) > 0 {
+                        if from_qex.read_line(&mut line).unwrap_or(0) > 0 {
                             if to_real.write_all(line.as_bytes()).is_err() {
                                 return;
                             }
@@ -15338,7 +15341,6 @@ fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordin
                             while !mine.load(std::sync::atomic::Ordering::SeqCst) {
                                 std::thread::sleep(Duration::from_millis(50));
                             }
-                            return;
                         }
                     }));
                 }
