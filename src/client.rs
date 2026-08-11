@@ -310,7 +310,43 @@ impl Client {
         }
     }
 
+    /// Stops a write to THIS socket from killing the process.
+    ///
+    /// `main` restores the default action of SIGPIPE, so that `qex list | head`
+    /// ends in silence like every other tool. That is right for the pipe of the
+    /// reader, and it is WRONG for the socket of the coordinator: a coordinator
+    /// that closes a connection in the middle of a conversation would then kill
+    /// the command with a signal — no message, no exit code, no cause. That is
+    /// the fault that this module exists to remove.
+    ///
+    /// The disposition of a signal belongs to the whole process, so the answer
+    /// is per SOCKET: one system carries the option, and the other carries a
+    /// flag on each write. A write to a socket that closed then gives `EPIPE`,
+    /// which becomes an error with a message and a code.
+    fn quiet_a_broken_pipe(stream: &UnixStream) {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::io::AsRawFd;
+            let on: libc::c_int = 1;
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &on as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            // Linux carries the flag on each write instead. See `write_quietly`.
+            let _ = stream;
+        }
+    }
+
     fn with_stream(stream: UnixStream) -> Result<Self> {
+        Self::quiet_a_broken_pipe(&stream);
         let reader = BufReader::new(stream.try_clone().context("copying the socket handle")?);
         Ok(Self {
             stream,
@@ -426,10 +462,44 @@ impl Client {
     pub fn send(&mut self, request: &Request) -> Result<()> {
         let mut line = serde_json::to_string(request).context("writing the request")?;
         line.push('\n');
-        self.stream
-            .write_all(line.as_bytes())
+        self.write_quietly(line.as_bytes())
             .context("sending the request to the coordinator")?;
         self.stream.flush().ok();
+        Ok(())
+    }
+
+    /// Writes every byte, and never raises SIGPIPE.
+    ///
+    /// A coordinator that closed the connection gives `EPIPE` here, and the
+    /// caller then reports it with a message and a code. Without this, the
+    /// write would stop the process with a signal and say nothing.
+    fn write_quietly(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.stream.as_raw_fd();
+        let mut sent = 0;
+        while sent < bytes.len() {
+            #[cfg(target_vendor = "apple")]
+            let flags = 0;
+            #[cfg(not(target_vendor = "apple"))]
+            let flags = libc::MSG_NOSIGNAL;
+            let wrote = unsafe {
+                libc::send(
+                    fd,
+                    bytes[sent..].as_ptr() as *const libc::c_void,
+                    bytes.len() - sent,
+                    flags,
+                )
+            };
+            if wrote > 0 {
+                sent += wrote as usize;
+                continue;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
         Ok(())
     }
 

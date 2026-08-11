@@ -14818,19 +14818,42 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
     if !cancelled {
         let log = std::fs::read_to_string(h.root.join("state/qex/run/daemon.log"))
             .unwrap_or_else(|e| format!("(no log: {e})"));
-        let asked = said.contains("keeps the job") || said.contains("own");
+        // REPORT WHAT THE CLIENT DID, AND MATCH NOTHING BY ACCIDENT.
+        //
+        // An earlier form of this line tested `said.contains("own")`, and the
+        // directory of this test is named `ownagain`, which the warning about
+        // the id file prints. It answered `true` whatever the client did.
+        //
+        // `noticed` is the fact that decides everything: the client prints that
+        // line when it meets the loss, and it reconnects and asks again in the
+        // same function. No line means the client never got there, so the
+        // ownership went to the coordinator that died, or nowhere.
+        let noticed = said.contains("the coordinator stopped");
+        let refused = said.contains("keeps the job");
+        let about_ownership: Vec<&str> = said
+            .lines()
+            .filter(|l| l.contains("keeps the job") || l.contains("the coordinator stopped"))
+            .collect();
         panic!(
             "the new coordinator did not cancel the job of a command that stopped.\n\
              \n--- the job ---\nstate: {}\n\
              \n--- the time from the kill of the first coordinator to the answer of the \
              second ---\n{:?}\n\
-             \n--- did the client speak about the ownership? ---\n{}\n\
+             \n--- did the client MEET the loss and reconnect? ---\n{}\n\
+             \n--- did the new coordinator refuse the ownership? ---\n{}\n\
+             \n--- the lines about the ownership ---\n{}\n\
              \n--- stderr of the `qex run` that had to ask again ---\n{}\n\
              \n--- the log of the coordinator ---\n{}\n\
              \n--- qex list ---\n{}",
             h.state_of(&id),
             new_coordinator_took,
-            asked,
+            noticed,
+            refused,
+            if about_ownership.is_empty() {
+                "none".to_string()
+            } else {
+                about_ownership.join("\n")
+            },
             if said.trim().is_empty() {
                 "no output".to_string()
             } else {
@@ -15304,6 +15327,9 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                             // it arrives late. Only the first one waits, so the
                             // cost of this test does not follow the number of
                             // questions that the command asks.
+                            // HOLD THE FIRST ANSWER, THEN BEHAVE. A coordinator
+                            // does not close after one answer, and a proxy that
+                            // did would test the closing and not the waiting.
                             let held = !first.swap(true, std::sync::atomic::Ordering::SeqCst);
                             if held {
                                 std::thread::sleep(delay);
@@ -15508,5 +15534,75 @@ fn an_answer_that_never_finishes_does_not_stop_a_command() {
         String::from_utf8_lossy(&out.stderr).contains("did not finish it"),
         "the message must say that the answer began and did not finish: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A coordinator that closes the connection must not KILL the command.
+///
+/// `main` restores the default action of SIGPIPE, so that `qex list | head`
+/// ends in silence like every other tool. That is right for the pipe of the
+/// reader. It is WRONG for the socket of the coordinator: a coordinator that
+/// closes a connection in the middle of a conversation would then stop the
+/// command with a signal — no message, no exit code, and no cause.
+///
+/// A reader who gets nothing is the fault that this whole area exists to
+/// remove, so a write to the coordinator must give an ERROR and not a signal.
+///
+/// **THIS TEST DOES NOT DISCRIMINATE ON EVERY SYSTEM.** On a system where the
+/// close of the peer reaches the READ before the command writes again, the
+/// command reports the fault either way and the signal never rises. The test
+/// still holds the answer that a reader gets — a cause, and not silence — and
+/// the system where the signal rises is the one that proves the rest.
+#[test]
+fn a_coordinator_that_closes_the_connection_does_not_kill_the_command() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut h = Harness::with_default_config("closemid");
+    h.extra_env.push((qex_ceiling_variable(), "5".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+
+    // Answer the FIRST request, then close. The command asks more than one
+    // question, so its next write meets a socket that is gone.
+    let listener = std::os::unix::net::UnixListener::bind(run.join("s")).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let door = std::thread::spawn(move || {
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            let Ok((client, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            let mut writer = client;
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                // One answer that qex cannot use, and then the door shuts.
+                let _ = writer.write_all(b"{\"kind\":\"error\",\"message\":\"go away\"}\n");
+                let _ = writer.flush();
+            }
+            drop(writer);
+            drop(reader);
+        }
+    });
+
+    let out = h.qex_within(&["list"], Duration::from_secs(40));
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::os::unix::net::UnixStream::connect(run.join("s")).ok();
+    let _ = door.join();
+
+    use std::os::unix::process::ExitStatusExt as _;
+    assert!(
+        out.status.signal().is_none(),
+        "a coordinator that closed the connection stopped the command with the signal {:?}. \
+         A write to the socket of the coordinator must give an error, and not a signal.\n\
+         stdout: {}\nstderr: {}",
+        out.status.signal(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).is_empty(),
+        "the reader must get a cause, and not silence"
     );
 }
