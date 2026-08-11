@@ -15124,3 +15124,34 @@ fn a_coordinator_that_answers_nothing_does_not_stop_a_command() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A coordinator that did not answer is NEVER "there is no job with that id".
+///
+/// `status`, `logs`, `cancel` and `kill` resolve an id through the coordinator.
+/// A resolver that reported a LIMIT was read as "no such job", so a caller was
+/// told that its RUNNING job does not exist, and the caller then stopped
+/// watching work that continues. That is the worst answer a queue can give.
+#[test]
+fn a_coordinator_that_answers_nothing_is_not_no_such_job() {
+    let mut h = Harness::with_default_config("notnosuchjob");
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+
+    for form in [
+        vec!["status", "abc"],
+        vec!["logs", "abc"],
+        vec!["cancel", "abc"],
+        vec!["kill", "abc"],
+    ] {
+        let out = h.qex_within(&form, Duration::from_secs(60));
+        assert_ne!(
+            out.status.code(),
+            Some(127),
+            "`qex {}` said that a job does not exist, and the coordinator gave no answer: {}",
+            form.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
