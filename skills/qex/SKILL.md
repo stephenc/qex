@@ -98,7 +98,7 @@ jobs that did not stop then have no watcher, so wait again for them.
 | 0 to 96 | **The job.** The exit code of the job, unchanged. |
 | 97 to 127 | **qex.** The queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal stopped the job, and qex did not attribute it to a stop. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. The record holds the number of the signal. |
+| 98 | **The job crashed.** A signal that is not TERM and not KILL stopped it: SIGSEGV, SIGABRT, or an external `kill -INT`. The record holds the number. TERM and KILL give 125 instead, so read 98 as a fault inside the job. The process that must crash is the command that qex started: `-- sh -c my_binary` gives qex the shell, and a shell that survives its child exits 139, which qex reports as 97. |
 | 99 | The kernel stopped the job for memory. Give a larger `--mem` and run it again. **qex needs proof**: `[enforce] mode`, or a kill that the kernel attributed. With no enforcement a claim is a promise and not a limit, so a job that passes its claim is not stopped at all and never gives 99. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
@@ -135,10 +135,10 @@ you lose an id, `qex list --cwd .` gives the jobs of this directory.
 
 ## Claims
 
-Give `--cpu` and `--mem`. qex compares the claims against a budget for the
-machine, which is what stops several agents from filling it. Use
-`--cpu guess --mem guess` when you do not know the size (`half`/`guess` take one
-half of the budget, `full`/`max` take all of it).
+Give `--cpu` and `--mem`. qex compares the claims against the budget, which is
+75% of the machine and which `qex info` gives. Use `--cpu guess --mem guess`
+when you do not know the size: `half`/`guess` take one half of the budget, and
+`full`/`max` take all of it.
 
 **Do not run a small test job to measure a task.** It costs time and measures
 different work. Give `guess` and start the real task:

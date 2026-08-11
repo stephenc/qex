@@ -137,8 +137,8 @@ Exit codes
     0 to 96     THE JOB. The exit code of the job, unchanged.
     97 to 127   QEX. The queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job, and qex did not attribute it to a
-                stop. A kill from anywhere gives 125 instead.
+      98        THE JOB CRASHED. A signal that is not TERM and not KILL stopped
+                it, such as SIGSEGV. The record names the number.
       99        the kernel stopped the job at a limit that qex applied with
                 `[enforce] mode`. With no limit, a job never gives 99.
       100       the job has not stopped, so there is no result.
@@ -238,10 +238,10 @@ names them when it returns.
 Resource claims
 ---------------
 
-Give `--cpu` and `--mem`. qex compares the claims of every job against a budget
-for the machine, and that is what stops two agents from filling it. A CLAIM IS A
-PROMISE AND NOT A LIMIT: qex measures nothing before a job starts, and it stops
-no job that goes above its claim, unless `[enforce] mode` applies a limit.
+Give `--cpu` and `--mem`. qex compares the claims against the budget, which is
+75% of the cores and the memory. `qex info` gives it. A CLAIM IS A PROMISE AND
+NOT A LIMIT: qex measures a job WHILE it runs, and nothing stops a job that goes
+above its claim, unless `[enforce] mode` applies a limit.
 
     half, guess   one half of the budget. Two such jobs operate together.
     full, max     the full budget. The job operates alone.
@@ -1975,8 +1975,8 @@ One table. Every command that gives you the result of a job obeys it.
     0 to 96     THE JOB. qex gives the exit code of the job, unchanged.
     97 to 127   QEX. The code describes the queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job, and qex did not attribute it to a
-                stop. A kill from anywhere gives 125 instead.
+      98        THE JOB CRASHED. A signal that is not TERM and not KILL stopped
+                it, such as SIGSEGV. The record names the number.
       99        the kernel stopped the job for memory. See the note below:
                 qex must be able to prove it.
       100       the job has not stopped, so there is no result.
@@ -1990,10 +1990,20 @@ One table. Every command that gives you the result of a job obeys it.
     128 and up  QEX ITSELF died from a signal. The job is not described. It can
                 still operate, so attach to it again.
 
-The code 98 says that a signal stopped the job and that qex did not attribute
-that signal to a stop. A kill, a cancel and a time limit give 125, and an
-EXTERNAL `kill -9` gives 125 as well: qex cannot know who sent it. The record
-holds the number of the signal in both cases, so nothing is lost.
+The code 98 says that THE JOB CRASHED. A signal that is not TERM and not KILL
+stopped the job, and the job gave no exit code of its own. SIGSEGV, SIGABRT and
+SIGFPE are the usual ones, and an external `kill -INT` gives 98 as well. The
+record holds the number.
+
+TERM and KILL are the two signals that qex keeps for 125. A kill, a cancel and a
+time limit give 125, and an EXTERNAL `kill -9` gives 125 as well: qex cannot
+know who sent it. Read 98 as a fault INSIDE the job, and 125 as a stop from
+outside it.
+
+THE PROCESS THAT MUST CRASH IS THE COMMAND THAT QEX STARTED. `qex submit -- sh
+-c my_binary` gives the shell to qex, and a shell that survives the crash of its
+child exits 139 itself. That is a code from the band, so qex gives 97 and the
+record holds 139.
 
 The code 99 needs proof that memory stopped the job. qex has that proof when
 `[enforce] mode` applies a limit, and when the kernel names the job that it
