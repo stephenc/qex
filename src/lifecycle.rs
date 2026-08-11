@@ -191,32 +191,44 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
         //
         // Without this rule, the record of the cause disappears, and a job that
         // waits for it cannot report why it did not run.
-        let waiting: Vec<String> = state
+        //
+        // This test is the LAST one, so every deletion meets it, whatever asked
+        // for the deletion. It uses the rule of `crate::deps`, which `qex clean`
+        // and `qex gc` use as well: one rule gives one answer, and a command
+        // cannot say that it kept a record while this code deletes it.
+        let nodes: Vec<crate::deps::Node> = state
             .jobs
             .values()
-            .filter(|j| !j.status.state.is_terminal())
-            .filter(|j| j.spec.needs.contains(&id) || j.spec.after.contains(&id))
-            .map(|j| {
-                format!(
-                    "{} ({})",
-                    &j.status.id.to_string()[..8],
-                    j.status.display_name()
-                )
+            .map(|j| crate::deps::Node {
+                id: j.status.id,
+                group: j.status.group,
+                terminal: j.status.state.is_terminal(),
+                needs: j.spec.needs.clone(),
+                after: j.spec.after.clone(),
             })
             .collect();
 
-        if !waiting.is_empty() {
+        if crate::deps::held_by_unfinished(&nodes).contains(&id) {
+            let waiting: Vec<String> = crate::deps::holders_of(&nodes, id)
+                .iter()
+                .filter_map(|holder| state.jobs.get(holder))
+                .map(|j| {
+                    format!(
+                        "{} ({})",
+                        &j.status.id.to_string()[..8],
+                        j.status.display_name()
+                    )
+                })
+                .collect();
+
+            let one = waiting.len() == 1;
             return Response::error(
                 ErrorKind::WrongState,
                 format!(
                     "the job {id} is needed by {}. Wait for {}, or cancel {}.",
                     waiting.join(", "),
-                    if waiting.len() == 1 {
-                        "that job"
-                    } else {
-                        "those jobs"
-                    },
-                    if waiting.len() == 1 { "it" } else { "them" }
+                    if one { "that job" } else { "those jobs" },
+                    if one { "it" } else { "them" }
                 ),
             );
         }
