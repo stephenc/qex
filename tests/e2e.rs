@@ -15539,9 +15539,22 @@ fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordin
                             if from_real.read_line(&mut answer).unwrap_or(0) == 0 {
                                 return;
                             }
-                            // HALF THE ANSWER, AND NO END OF LINE. The socket is
-                            // readable and the answer is not there.
-                            let half = &answer.as_bytes()[..answer.len() / 2];
+                            // A CUT THAT LEAVES NO END OF LINE, AND NO BROKEN
+                            // CHARACTER.
+                            //
+                            // The test needs an answer that BEGINS and does not
+                            // finish, so that the socket is readable and the
+                            // line has no end. A cut in the middle of a
+                            // character would make the client fail on text that
+                            // it cannot read, and the test would then pass for
+                            // the wrong reason.
+                            //
+                            // Cut at a boundary of a character, near the middle.
+                            let mut at = answer.len() / 2;
+                            while at > 0 && !answer.is_char_boundary(at) {
+                                at -= 1;
+                            }
+                            let half = &answer.as_bytes()[..at];
                             if to_qex.write_all(half).is_err() {
                                 return;
                             }
@@ -15677,4 +15690,32 @@ fn a_coordinator_that_closes_the_connection_does_not_kill_the_command() {
         !String::from_utf8_lossy(&out.stderr).is_empty(),
         "the reader must get a cause, and not silence"
     );
+}
+
+/// A coordinator that did not answer must not read as NO coordinator.
+///
+/// `qex version` reports whether a coordinator operates and which version it
+/// is. Reporting `none` for one that qex could not reach answers the question
+/// wrongly AND exits 0, so an agent reads a false success. The exit-code table
+/// promises 124 for this state in every command, and a promise that one command
+/// breaks is a promise that an agent cannot use.
+#[test]
+fn a_command_that_asks_about_a_coordinator_does_not_report_absence_for_silence() {
+    let mut h = Harness::with_default_config("askscoord");
+    h.extra_env.push((qex_ceiling_variable(), "3".to_string()));
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let _silent = a_socket_that_accepts_and_says_nothing(&run.join("s"));
+
+    for form in [vec!["version"], vec!["version", "--json"], vec!["pause"]] {
+        let out = h.qex_within(&form, Duration::from_secs(60));
+        assert_eq!(
+            out.status.code(),
+            Some(124),
+            "`qex {}` must say that it stopped waiting, and not that no coordinator \
+             operates: {}",
+            form.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

@@ -98,14 +98,6 @@ static READER_DEADLINE: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
 /// line for each of them teaches the reader to read none of them.
 static SAID_IT_WAITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Says whether qex reported already that it could not reach the coordinator.
-///
-/// A command that watches a job asks for a connection in a loop. One line for
-/// the whole command keeps that loop quiet, and it keeps the stderr of the
-/// command small: a pipe that fills stops the command that writes to it.
-static SAID_IT_CANNOT_REACH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 fn reader_deadline() -> &'static std::sync::Mutex<Option<Instant>> {
     READER_DEADLINE.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -274,23 +266,20 @@ impl Client {
         // cause in one line instead of a silent answer.
         //
         // No caller of this function starts a coordinator.
-        match Self::connect_existing_result() {
-            Ok(client) => client,
-            Err(e) => {
-                // SAY IT ONCE FOR THE WHOLE COMMAND.
-                //
-                // A command that watches a job calls this function in a loop,
-                // every few milliseconds. A line for each call fills the pipe
-                // that a reader gives this command, and a command whose stderr
-                // is full STOPS AT THE WRITE — so a diagnosis about a slow
-                // coordinator would freeze the command that reports it.
-                use std::sync::atomic::Ordering;
-                if !SAID_IT_CANNOT_REACH.swap(true, Ordering::SeqCst) {
-                    eprintln!("qex: {e:#}");
-                }
-                None
-            }
-        }
+        // THIS FORM CANNOT CARRY THE DIFFERENCE, so use it only where the two
+        // answers lead to ONE action.
+        //
+        // `None` says "no coordinator operates" to every caller of this
+        // function. A coordinator that did not ANSWER is a different fact, and
+        // a command that reports absence for it gives a FALSE SUCCESS: an agent
+        // reads "no coordinator" and acts on it, which costs more than the wait
+        // that this module removes.
+        //
+        // A command whose ANSWER TO THE READER differs between the two must use
+        // `connect_existing_result`, which keeps the limit as an error. This
+        // form suits a loop that polls, and a path that falls back to a record
+        // on the disk, because those do the same thing either way.
+        Self::connect_existing_result().ok().flatten()
     }
 
     /// Connects to a coordinator that operates, and keeps the timeout as an

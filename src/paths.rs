@@ -814,8 +814,20 @@ pub enum Connected {
 pub fn connect_within(socket: &std::path::Path, limit: std::time::Duration) -> Connected {
     use std::os::unix::io::FromRawFd;
 
-    if std::fs::symlink_metadata(socket).is_err() {
-        return Connected::NobodyListens;
+    // ONLY "THERE IS NO FILE" MEANS THAT NOBODY LISTENS.
+    //
+    // This answer is the one that lets a caller START A COORDINATOR, so every
+    // other error must not give it. A directory that this user cannot read, a
+    // chain of links that has no end, a file system that answers nothing: none
+    // of those says that no coordinator operates, and a second coordinator on
+    // one state directory holds the whole budget again.
+    //
+    // An unknown answer authorises nothing.
+    if let Err(e) = std::fs::symlink_metadata(socket) {
+        return match e.kind() {
+            std::io::ErrorKind::NotFound => Connected::NobodyListens,
+            _ => Connected::NoAnswer,
+        };
     }
     let Some(address) = unix_address(socket) else {
         return Connected::NoAnswer;
@@ -990,6 +1002,45 @@ pub fn ensure_dir(path: &std::path::Path, mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// AN UNKNOWN ANSWER AUTHORISES NOTHING.
+    ///
+    /// `NobodyListens` is the answer that lets a caller start a coordinator. A
+    /// socket that qex cannot even LOOK at says nothing about whether one
+    /// operates, and a second coordinator on one state directory holds the
+    /// whole budget again.
+    #[test]
+    fn a_socket_that_qex_cannot_look_at_does_not_say_that_nobody_listens() {
+        let dir = std::env::temp_dir().join(format!("qex-lookat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shut = dir.join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        let hidden = shut.join("s");
+
+        // A directory that this user cannot enter. `symlink_metadata` then
+        // gives `PermissionDenied`, which is not `NotFound`.
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+
+        let answer = connect_within(&hidden, std::time::Duration::from_millis(50));
+        let says_nobody = matches!(answer, Connected::NobodyListens);
+
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The root user reads every directory, so this test cannot make the
+        // state that it needs there. Say so, and hold nothing.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("this test did not run: the root user can look at every directory");
+            return;
+        }
+        assert!(
+            !says_nobody,
+            "a socket that qex cannot look at must not say that nobody listens: \
+             that answer lets a caller start a SECOND coordinator"
+        );
+    }
+
     use super::*;
 
     use crate::testutil::{env_lock, EnvVar};

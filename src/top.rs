@@ -240,7 +240,13 @@ fn render(
             // absent, and this page must not say that nothing operates. The
             // screen clears at each refresh, so the cause on stderr is gone by
             // the next page and only this line carries it.
-            "      qex could not reach the coordinator. These records come from the state \
+            // EVERY CAUSE THAT REACHES THIS LINE, and not one of them.
+            //
+            // A coordinator that did not answer reaches it, and so does one
+            // that answered with words this version cannot read. The page must
+            // not name a cause that it did not test: what is true for both is
+            // that qex holds no answer from a coordinator.
+            "      qex has no answer from a coordinator. These records come from the state \
              directory,\n\
              \x20     and a coordinator can hold jobs that this page does not name.\n"
         } else {

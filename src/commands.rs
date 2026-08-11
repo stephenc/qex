@@ -4312,7 +4312,10 @@ pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
 /// must not make the thing that it asks about. When no coordinator operates,
 /// the file on the disk holds the answer.
 fn pause_report(json: bool) -> Result<i32> {
-    if let Some(mut client) = Client::connect_existing() {
+    // A coordinator that did not answer must not read as no coordinator: this
+    // command reports what is paused NOW, and the file alone is that answer
+    // only when nothing operates.
+    if let Some(mut client) = Client::connect_existing_result()? {
         let response = client.call(&Request::PauseState)?;
         if let Response::PauseState { queue, locks } = response {
             return print_pause_state(queue.as_ref(), &locks, json);
@@ -4524,15 +4527,25 @@ pub fn version(args: cli::VersionArgs) -> Result<i32> {
 
     // Do not start a coordinator. A question about a version must not change
     // the machine.
-    let coordinator = Client::connect_existing().and_then(|mut c| match c.call(&Request::Info) {
-        Ok(Response::Info {
-            version,
-            pid,
-            program_replaced,
-            ..
-        }) => Some((version, pid, program_replaced)),
-        _ => None,
-    });
+    // A COORDINATOR THAT DID NOT ANSWER IS NOT A COORDINATOR THAT IS ABSENT.
+    //
+    // This command reports whether one operates and which version it is, so
+    // reporting "none" for a coordinator that qex could not reach would answer
+    // the question wrongly and exit 0. The limit reaches the reader instead,
+    // with the code that says qex stopped waiting.
+    let coordinator = match Client::connect_existing_result()? {
+        Some(mut c) => match c.call(&Request::Info) {
+            Ok(Response::Info {
+                version,
+                pid,
+                program_replaced,
+                ..
+            }) => Some((version, pid, program_replaced)),
+            Err(e) if crate::client::is_a_coordinator_timeout(&e) => return Err(e),
+            _ => None,
+        },
+        None => None,
+    };
 
     if args.json {
         let mut value = match &coordinator {
