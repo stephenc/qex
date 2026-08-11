@@ -14793,3 +14793,173 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
 
     h.ok(&["kill", &blocker]);
 }
+
+/// The limit for a coordinator that does not answer, in seconds.
+///
+/// The tests below bound themselves ABOVE this number, so a command that keeps
+/// its limit passes and a command with no limit fails.
+const COORDINATOR_LIMIT_SECS: u64 = 10;
+
+/// A command must end when a socket gives no answer.
+///
+/// A process that holds the socket and never accepts makes a connect with no
+/// limit wait for ever. The queue of a busy coordinator fills in the same way,
+/// so this is not a rare state on a machine that many agents share.
+#[test]
+fn a_socket_that_gives_no_answer_does_not_stop_a_command() {
+    let h = Harness::with_default_config("nocoordans");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let Some(_open) = a_socket_that_never_answers(&run.join("s")) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    let out = h.qex_within(
+        &["list"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a command that reached the limit for a coordinator gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("did not accept a connection"),
+        "the message must name what qex tried: {said}"
+    );
+    assert!(
+        said.contains("qex info --no-start"),
+        "the message must name the step for the reader: {said}"
+    );
+}
+
+/// A command must end when a different command holds the spawn lock.
+///
+/// The lock covers the start of a coordinator, so a command that stopped while
+/// it held the lock kept every later command waiting with no end.
+#[test]
+fn a_spawn_lock_that_nobody_gives_back_does_not_stop_a_command() {
+    use std::os::unix::io::AsRawFd;
+
+    let h = Harness::with_default_config("nocoordlock");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let path = run.join("spawn.lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test cannot hold the spawn lock");
+
+    let out = h.qex_within(
+        &["list"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a command that reached the limit for the lock gives 124: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("held the lock"),
+        "the message must name the lock: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A limit must NOT start a second coordinator.
+///
+/// Two coordinators on one state directory each hold the whole budget, and the
+/// machine then gets the kill for memory that qex exists to prevent. A socket
+/// that gives no answer proves nothing about the process that holds it, so it
+/// can never authorise a second coordinator.
+#[test]
+fn a_socket_that_gives_no_answer_starts_no_second_coordinator() {
+    let h = Harness::with_default_config("nosecond");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let socket = run.join("s");
+    let Some(_open) = a_socket_that_never_answers(&socket) else {
+        eprintln!(
+            "this test did not run: this system gives a refusal, and not a wait, for a \
+             socket with a full queue"
+        );
+        return;
+    };
+
+    let out = h.qex_within(
+        &["submit", "--", "true"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+    assert_eq!(out.status.code(), Some(124));
+
+    // The socket of the test is still the socket. A command that bound its own
+    // over it would have taken the state directory from the process that holds
+    // it.
+    assert!(
+        socket.exists(),
+        "the socket of the process that holds it must stay"
+    );
+    assert!(
+        !h.root.join("state/qex/run/daemon.log").exists()
+            || std::fs::read_to_string(h.root.join("state/qex/run/daemon.log"))
+                .unwrap_or_default()
+                .is_empty(),
+        "no coordinator of this command may have started"
+    );
+}
+
+/// `qex wait` must not take the spawn lock to print a notice.
+///
+/// The notice about a pause is a courtesy, and the command already drops its
+/// result. A full connect takes the spawn lock and can start a coordinator, so
+/// the command whose whole contract is a bounded wait began with a wait that
+/// had no end.
+#[test]
+fn a_wait_does_not_take_the_spawn_lock_for_a_notice() {
+    use std::os::unix::io::AsRawFd;
+
+    let h = Harness::with_default_config("waitnolock");
+    let run = h.root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(run.join("spawn.lock"))
+        .unwrap();
+    let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(rc, 0, "the test cannot hold the spawn lock");
+
+    // No coordinator operates, and the id names nothing. The answer is "there
+    // is no job with that id", and the lock must not delay it.
+    let start = Instant::now();
+    let out = h.qex_within(
+        &["wait", "11111111-2222-3333-4444-555555555555"],
+        Duration::from_secs(COORDINATOR_LIMIT_SECS + 20),
+    );
+    let took = start.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a wait for an id that names nothing gives 127: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        took < Duration::from_secs(COORDINATOR_LIMIT_SECS),
+        "the wait must not take the spawn lock: it took {took:?}"
+    );
+}

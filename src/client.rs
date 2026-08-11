@@ -15,6 +15,31 @@ use std::time::{Duration, Instant};
 /// The maximum time to wait for a new coordinator to open its socket.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The maximum time to wait for the COORDINATOR to answer.
+///
+/// # Two kinds of wait, and only one of them takes a limit
+///
+/// A command waits for two different things, and they are not one promise:
+///
+/// * **The coordinator answers.** A connect, the spawn lock, and the answer to
+///   a request that costs no work. A wait with no end is never correct here.
+///   The coordinator answers at once, or something is wrong and the reader
+///   must be told.
+/// * **A job finishes.** `qex wait`, `qex status --wait`, `qex logs --follow`.
+///   A wait of four hours is the POINT there, because the reader asked for it.
+///
+/// This limit belongs to the FIRST kind only. **Do not give the second kind a
+/// limit of its own.** A ceiling on a job wait breaks the thing that qex is
+/// for.
+///
+/// The code keeps the two apart: `call` sends one request and reads one
+/// answer, so it takes this limit; `send` with `recv_opt` or `wait_readable`
+/// leaves the limit to the caller that waits for a job.
+///
+/// The value is the limit for a coordinator that starts, so a reader who
+/// learns one number learns them all.
+const COORDINATOR_LIMIT: Duration = SPAWN_TIMEOUT;
+
 /// A connection to the coordinator.
 pub struct Client {
     stream: UnixStream,
@@ -30,8 +55,9 @@ impl Client {
     fn connect_or_explain() -> Result<Self> {
         let socket = paths::socket_path()?;
 
-        if let Some(stream) = try_connect(&socket) {
-            return Client::with_stream(stream);
+        match try_connect(&socket)? {
+            Some(stream) => return Client::with_stream(stream),
+            None => {}
         }
 
         // Take the lock before the start. Two CLI processes can arrive here at
@@ -40,8 +66,9 @@ impl Client {
 
         // Test the socket again. A different process can start the coordinator
         // while this process waits for the lock.
-        if let Some(stream) = try_connect(&socket) {
-            return Client::with_stream(stream);
+        match try_connect(&socket)? {
+            Some(stream) => return Client::with_stream(stream),
+            None => {}
         }
 
         spawn_daemon()?;
@@ -54,9 +81,37 @@ impl Client {
     /// `qex wait` uses this function. If no coordinator operates, that command
     /// reads the status file of the job instead.
     pub fn connect_existing() -> Option<Self> {
-        let socket = paths::socket_path().ok()?;
-        let stream = try_connect(&socket)?;
-        Client::with_stream(stream).ok()
+        // A socket that gives NO ANSWER is not the same as NO COORDINATOR, and
+        // this function must not tell the caller that nothing is there when a
+        // process holds the socket. The caller continues without a coordinator,
+        // because that is the only thing it can do, and the reader gets the
+        // cause in one line instead of a silent answer.
+        //
+        // No caller of this function starts a coordinator.
+        match Self::connect_existing_result() {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!("qex: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Connects to a coordinator that operates, and keeps the timeout as an
+    /// error.
+    ///
+    /// `qex info --no-start` answers the question "is a coordinator there".
+    /// A socket that gives no answer is not a `no`, so that command must not
+    /// print `no coordinator operates`: it reports the limit instead, and the
+    /// exit code says that qex stopped waiting.
+    pub fn connect_existing_result() -> Result<Option<Self>> {
+        let Ok(socket) = paths::socket_path() else {
+            return Ok(None);
+        };
+        match try_connect(&socket)? {
+            Some(stream) => Ok(Some(Client::with_stream(stream)?)),
+            None => Ok(None),
+        }
     }
 
     fn with_stream(stream: UnixStream) -> Result<Self> {
@@ -64,10 +119,26 @@ impl Client {
         Ok(Self { stream, reader })
     }
 
-    /// Sends one request and reads one response.
+    /// Sends one request and reads one answer, inside the limit for a
+    /// coordinator.
+    ///
+    /// This function is the FIRST kind of wait: the coordinator answers a
+    /// question that costs it no work. A command that waits for a JOB does not
+    /// use this function — it sends the request and holds its own limit, so
+    /// this limit never shortens a wait that a reader asked for.
     pub fn call(&mut self, request: &Request) -> Result<Response> {
         self.send(request)?;
-        self.recv()
+        let previous = self.stream.read_timeout().ok().flatten();
+        // A caller that set its own limit keeps it. `qex logs --follow` and the
+        // reporter of a wait each hold a limit that belongs to their own work.
+        if previous.is_none() {
+            self.set_read_timeout(Some(COORDINATOR_LIMIT)).ok();
+        }
+        let answer = self.recv();
+        if previous.is_none() {
+            self.set_read_timeout(None).ok();
+        }
+        answer.map_err(|e| name_a_silent_coordinator(e, previous.is_none()))
     }
 
     pub fn send(&mut self, request: &Request) -> Result<()> {
@@ -156,9 +227,89 @@ impl Client {
     }
 }
 
-/// Tries to connect. Gives `None` if no coordinator listens.
-fn try_connect(socket: &Path) -> Option<UnixStream> {
-    UnixStream::connect(socket).ok()
+/// Marks an error that the limit for a COORDINATOR ended.
+///
+/// Every command answers 124 for this condition, and 124 says one thing: qex
+/// stopped waiting because it reached a limit. That is a fact about the
+/// COMMAND and not about a job, so it holds for `qex list` and `qex top` as
+/// well as for `qex wait`.
+#[derive(Debug)]
+pub struct CoordinatorTimeout;
+
+impl std::fmt::Display for CoordinatorTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the limit for an answer of the coordinator ended this wait")
+    }
+}
+
+impl std::error::Error for CoordinatorTimeout {}
+
+/// Gives an error that carries the mark, so that the command answers 124.
+fn timed_out(message: String) -> anyhow::Error {
+    anyhow::Error::new(CoordinatorTimeout).context(message)
+}
+
+/// Says whether the limit for a coordinator ended this error.
+pub fn is_a_coordinator_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CoordinatorTimeout>().is_some()
+}
+
+/// Names the cause when a coordinator accepted and then said nothing.
+///
+/// The message says what qex TRIED and what did not happen. It does not say
+/// that the coordinator is wedged, because qex cannot know that: a coordinator
+/// that is busy and a coordinator that will never answer look the same from
+/// here.
+fn name_a_silent_coordinator(error: anyhow::Error, ours: bool) -> anyhow::Error {
+    if !ours {
+        return error;
+    }
+    let expired = error
+        .downcast_ref::<std::io::Error>()
+        .map(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
+        .unwrap_or(false);
+    if !expired {
+        return error;
+    }
+    timed_out(format!(
+        "the coordinator took the request and gave no answer in {} seconds.\n\
+         Run `qex info --no-start` to see whether it answers now, and read {} \
+         for what it did.",
+        COORDINATOR_LIMIT.as_secs(),
+        paths::daemon_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "the log of the coordinator".to_string())
+    ))
+}
+
+/// Tries to connect inside the limit for a coordinator.
+///
+/// `Ok(None)` says that NOBODY LISTENS, and a caller may start a coordinator.
+/// An `Err` says that a socket is there and gave no answer, and a caller must
+/// NOT start a second coordinator: two coordinators on one state directory
+/// each hold the whole budget, and the machine then gets the kill for memory
+/// that qex exists to prevent.
+fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
+    match paths::connect_within(socket, COORDINATOR_LIMIT) {
+        paths::Connected::Open(stream) => Ok(Some(stream)),
+        paths::Connected::NobodyListens => Ok(None),
+        paths::Connected::NoAnswer => Err(timed_out(format!(
+            "the coordinator did not accept a connection in {} seconds.\n\
+             The socket {} is there, so a process holds it.\n\
+             Run `qex info --no-start` to see whether a coordinator answers, \
+             and read {} for what it did.",
+            COORDINATOR_LIMIT.as_secs(),
+            socket.display(),
+            paths::daemon_log_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "the log of the coordinator".to_string())
+        ))),
+    }
 }
 
 /// Waits until the new coordinator opens its socket.
@@ -174,7 +325,12 @@ fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<UnixStream> {
     let mut probed = false;
 
     while Instant::now() < deadline {
-        if let Some(stream) = try_connect(socket) {
+        // A SHORT limit for each attempt. This loop holds the deadline, so an
+        // attempt that waits the whole limit would make one attempt of the
+        // whole wait. A socket that is there and gives no answer is not a
+        // refusal here: the coordinator is starting, and the next attempt asks
+        // again.
+        if let paths::Connected::Open(stream) = paths::connect_within(socket, delay) {
             return Ok(stream);
         }
         if !probed && Instant::now() >= probe_at {
@@ -464,14 +620,40 @@ impl SpawnLock {
             .with_context(|| format!("opening the lock file {}", path.display()))?;
 
         use std::os::unix::io::AsRawFd;
-        // This call blocks until the lock is free.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("locking {}", path.display()));
+        // Take the lock inside the limit for a coordinator.
+        //
+        // A lock that blocks with no end holds every later command behind the
+        // one process that holds it. The lock covers the start of a
+        // coordinator, so a coordinator that is slow to bind holds the others
+        // for that time — and a process that stops while it holds the lock
+        // held them for ever.
+        //
+        // A SIGNAL IS NOT A REFUSAL. `flock` ends with EINTR when a signal
+        // arrives, and the caller tries again.
+        let deadline = Instant::now() + COORDINATOR_LIMIT;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => {}
+                _ => {
+                    return Err(error).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(timed_out(format!(
+                    "a different qex command held the lock {} for {} seconds.\n\
+                     That lock covers the start of a coordinator, so a command \
+                     that stopped while it held the lock keeps this one waiting.\n\
+                     Run `qex info --no-start` to see whether a coordinator answers.",
+                    path.display(),
+                    COORDINATOR_LIMIT.as_secs()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-
-        Ok(Self { file })
     }
 }
 

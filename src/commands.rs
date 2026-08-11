@@ -1364,8 +1364,14 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
     //
     // `--json` keeps its silence, in the same way as the answers below: a
     // reader that asked for JSON reads the exit code.
+    //
+    // Use the connection that does NOT start a coordinator. This notice is a
+    // courtesy, and the code already drops its result. A full connect takes
+    // the spawn lock and can start a coordinator, so a command whose whole
+    // contract is a bounded wait began with a wait that had no end. A reader
+    // who has no coordinator has no pause either, so there is nothing to say.
     if !args.json && !args.quiet {
-        if let Ok(mut client) = Client::connect() {
+        if let Some(mut client) = Client::connect_existing() {
             warn_if_paused(&mut client);
         }
     }
@@ -3782,7 +3788,11 @@ pub fn queue_line(info: &Response) -> String {
 /// because that pattern also matches the command that contains it.
 pub fn info(args: cli::InfoArgs) -> Result<i32> {
     let mut client = if args.no_start {
-        match Client::connect_existing() {
+        // A socket that gives no answer is not a `no`. This command answers the
+        // question "is a coordinator there", so it must not print that nothing
+        // operates when it could not reach the socket. The error carries the
+        // limit, and the exit code says that qex stopped waiting.
+        match Client::connect_existing_result()? {
             Some(c) => c,
             None => {
                 if args.json {
