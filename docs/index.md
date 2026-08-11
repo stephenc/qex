@@ -199,6 +199,18 @@ a SIGTERM stops the command that waits for it.
 
 ## Install
 
+With [mise](https://mise.jdx.dev/), which needs no build:
+
+```sh
+mise x ubi:stephenc/qex -- qex --version   # run it, and change no configuration
+mise use -g ubi:stephenc/qex               # for this account, and every project in it
+```
+
+`mise use` alone does not put qex on your path: mise must be active in the
+shell, or its shims must be on the path. `mise doctor` says whether it is.
+
+Or with cargo:
+
 ```sh
 cargo install qex
 ```

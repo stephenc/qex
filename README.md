@@ -73,7 +73,34 @@ queue.
 
 ## Install
 
-Take the file for your machine from [the latest
+With [mise](https://mise.jdx.dev/), which needs no build:
+
+```sh
+mise x ubi:stephenc/qex -- qex --version   # run it, and change no configuration
+mise use ubi:stephenc/qex                  # for this project: writes mise.toml here
+mise use -g ubi:stephenc/qex               # for this account, and every project in it
+```
+
+Start with the first line. It changes no file that you keep, and mise holds the
+program in its cache. The other two write a configuration file: `mise use`
+writes `mise.toml` in the directory that you are in, and `-g` changes the
+configuration of the account, which every project of that account and every
+person who signs in as it then gets.
+
+**`mise use` alone does not put qex on your path.** mise must be active in the
+shell, or its shims must be on the path; `mise doctor` says whether it is. Until
+then, `mise x ubi:stephenc/qex -- qex …` runs qex, and
+`mise x ubi:stephenc/qex -- sh -c 'command -v qex'` gives the full name of the
+file that mise holds.
+
+The `ubi` backend reads the releases of this repository and takes the file for
+the machine that it runs on, so the four systems that qex supports (Linux and
+macOS, x86-64 and arm64) need no more configuration. mise can hold a release
+back until it has existed for some time (the `minimum_release_age` setting), so
+you can get an older qex than the newest one; mise says so when it does. Name
+the version to get an exact one: `mise use -g ubi:stephenc/qex@0.25.0`.
+
+Or take the file for your machine from [the latest
 release](https://github.com/stephenc/qex/releases/latest):
 
 ```sh
