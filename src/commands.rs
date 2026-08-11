@@ -790,6 +790,16 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
 }
 
 pub fn status(args: cli::StatusArgs) -> Result<i32> {
+    // TAKE THE LIMIT OF THE READER BEFORE THE FIRST CONNECT.
+    //
+    // A command that connects, resolves an id, and only then reads `--timeout`
+    // has already spent the wait that the limit was for. The reader said how
+    // long the WHOLE command may take.
+    if let Some(t) = &args.timeout {
+        if let Some(d) = parse_duration(t).map_err(|e| anyhow::anyhow!("--timeout: {e}"))? {
+            crate::client::take_the_limit_of_the_reader(d);
+        }
+    }
     let mut client = Client::connect()?;
     // Use one exit code for every "no such job" result. Without this test, a
     // name that is not a UUID gives the code 1 and a UUID gives the code 127,

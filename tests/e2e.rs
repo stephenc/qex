@@ -15155,3 +15155,133 @@ fn a_coordinator_that_answers_nothing_is_not_no_such_job() {
         );
     }
 }
+
+/// A coordinator that answers CORRECTLY, but later than one step of the wait.
+///
+/// Every other instrument in this file answers NEVER. That proves a wait ends,
+/// and it says nothing about the wait that must NOT end: a coordinator on a
+/// loaded machine answers late, and a client that gives up at its first step
+/// turns a healthy machine into a failure.
+///
+/// This helper is the one that stops a short client coming back. It forwards
+/// each request to the real coordinator and holds the answer back for `delay`.
+struct ASlowCoordinator {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ASlowCoordinator {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Puts a slow coordinator in front of a real one.
+///
+/// `front` is the socket that qex reaches. `real` is the socket of the
+/// coordinator that answers.
+fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -> ASlowCoordinator {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(front).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let real = real.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((front_side, _)) => {
+                    let real = real.clone();
+                    workers.push(std::thread::spawn(move || {
+                        let Ok(back) = std::os::unix::net::UnixStream::connect(&real) else {
+                            return;
+                        };
+                        let mut from_qex = BufReader::new(front_side.try_clone().unwrap());
+                        let mut to_real = back.try_clone().unwrap();
+                        let mut from_real = BufReader::new(back);
+                        let mut to_qex = front_side;
+                        let mut line = String::new();
+                        // One request, one answer, and the answer waits.
+                        while from_qex.read_line(&mut line).unwrap_or(0) > 0 {
+                            if to_real.write_all(line.as_bytes()).is_err() {
+                                return;
+                            }
+                            to_real.flush().ok();
+                            let mut answer = String::new();
+                            if from_real.read_line(&mut answer).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            // THE COORDINATOR IS BUSY. The answer is correct and
+                            // it arrives late.
+                            std::thread::sleep(delay);
+                            if to_qex.write_all(answer.as_bytes()).is_err() {
+                                return;
+                            }
+                            to_qex.flush().ok();
+                            line.clear();
+                        }
+                    }));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+    ASlowCoordinator {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// A COORDINATOR THAT ANSWERS LATE MUST BE ANSWERED, AND NOT REFUSED.
+///
+/// This is the test that stops a short client coming back. The client looks at
+/// the socket in steps, so that it can say that it still waits — and a client
+/// that gave up at the END of its first step would refuse a coordinator that
+/// was working. A loaded machine answers late, and a false failure costs more
+/// than a wait.
+///
+/// The answer must also be CORRECT. A client that read a part of a line, or
+/// that took the answer of an earlier question, would give a wrong answer here
+/// rather than a slow one.
+#[test]
+fn a_coordinator_that_answers_late_is_answered_and_not_refused() {
+    let mut h = Harness::with_default_config("slowcoord");
+    // A step of the wait is one second, so the answer arrives after several
+    // steps and the client must keep waiting through them.
+    h.extra_env
+        .push(("QEX_SAY_WAITING_AFTER_SECS".into(), "1".into()));
+
+    // A real coordinator, and its socket.
+    let first = h.qex(&["submit", "--", "sh", "-c", "exit 7"]);
+    assert!(first.status.success(), "the test needs a real coordinator");
+    let id = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    h.qex(&["wait", &id]);
+
+    let run = h.root.join("state/qex/run");
+    let real = run.join("real");
+    std::fs::rename(run.join("s"), &real).unwrap();
+    let _slow = a_coordinator_that_answers_late(&run.join("s"), &real, Duration::from_secs(3));
+
+    let out = h.qex_within(&["status", &id, "--json"], Duration::from_secs(60));
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a coordinator that answers late must be answered: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    let record: serde_json::Value = serde_json::from_str(&said)
+        .unwrap_or_else(|e| panic!("the answer must be whole and correct: {e}: {said}"));
+    assert_eq!(
+        record["exit_code"], 7,
+        "the answer must belong to the question that qex asked: {said}"
+    );
+}
