@@ -446,23 +446,39 @@ these rules follow from that:
 
 #### When qex acts, and when it only reports
 
-qex finds a kill for memory with the count in `memory.events`, which Linux keeps
-for each cgroup. The counter of a cgroup counts the kills in each cgroup below
-it, so **where qex reads it decides what qex may do**:
+qex finds a kill for memory with the counts in `memory.events`, which Linux
+keeps for each cgroup. That file holds TWO counts, and they answer two different
+questions:
 
-| `[enforce] mode` | What qex reads | What qex does |
-| ---------------- | -------------- | ------------- |
-| `soft` or `hard` | The cgroup that qex made for this job. | Reports `oom`, raises the claim, runs the job again, and teaches the learner. |
-| `off` (default)  | The cgroup of your login session. | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
+* `oom_kill` counts the processes of this cgroup that **any** out-of-memory
+  killer stopped. The killer of the whole machine raises it as well.
+* `oom` counts the times that this cgroup reached **its own** limit and the
+  kernel could not free memory. The limit of this cgroup alone raises it.
 
-With no limit, the count also rises when the kernel stops a **different program
-of the same user**. A machine that is short of memory is also the machine on
-which a person uses `kill -9`, so the two events arrive together. That evidence
-does not prove that the claim of this job was too small: the machine can be full
-while the claim is correct. qex therefore reports the state and stops.
+So the cgroup that qex reads, and the count that rises in it, together decide
+what qex may do:
 
-To get the correction, set `[enforce] mode`. The kernel then stops the job at
-the claim, and a kill is proof that the claim was too small.
+| What qex reads | Which count rises | What qex does |
+| -------------- | ----------------- | ------------- |
+| The cgroup that qex made for this job (`[enforce] mode` is `soft` or `hard`) | `oom` and `oom_kill` | Reports `oom`, raises the claim, runs the job again, and teaches the learner. The limit of this job stopped it, so the claim was too small. |
+| The cgroup that qex made for this job | `oom_kill` only | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
+| The cgroup of your login session (`[enforce] mode` is `off`, the default) | `oom_kill` | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
+
+**A kill is not proof that the claim was too small.** A rise in `oom_kill` with
+no rise in `oom` says that the memory of the machine, or a limit of a parent
+cgroup, stopped this job. The claim of the job can be correct, and a larger
+claim cannot move a limit that belongs to a parent. `[politeness] oom_score_adj`
+raises the score of a qex job on purpose, so a qex job is the job that the
+killer of the machine takes first.
+
+With no limit from qex, the count also rises when the kernel stops a
+**different program of the same user**. A machine that is short of memory is
+also the machine on which a person uses `kill -9`, so the two events arrive
+together. qex then cannot name the job that the kernel stopped.
+
+To get the correction, set `[enforce] mode`. qex then holds a count for this job
+alone, and it can separate a kill at your claim from a kill that the machine
+made.
 
 `qex kill` writes a mark before it sends the signal, and that mark always wins.
 A job that you stopped never runs again with a larger claim, and it teaches the

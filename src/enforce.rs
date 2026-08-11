@@ -211,12 +211,21 @@ pub fn leave_cgroup(cgroup: &Path) {
     }
 }
 
-/// The counts of `memory.events` that say what stopped a job.
+/// The two counts of `memory.events` that say what stopped a job.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OomCounts {
+    /// The times that this cgroup reached ITS OWN limit and the kernel could
+    /// not free memory.
+    pub oom: u64,
+    /// The processes of this cgroup that ANY out-of-memory killer stopped.
+    pub oom_kill: u64,
+}
+
+/// Reads the counts of a cgroup.
 ///
-/// The result is `(oom, oom_kill)`. A count that the file does not name is
-/// zero. This function reads a file and nothing else, so a test can give it a
-/// directory that the test made.
-fn memory_events(cgroup: &Path) -> Option<(u64, u64)> {
+/// A count that the file does not name is zero. This function reads a file and
+/// nothing else, so a test gives it a directory that the test made.
+pub fn read_oom_counts(cgroup: &Path) -> Option<OomCounts> {
     let text = std::fs::read_to_string(cgroup.join("memory.events")).ok()?;
     let count = |name: &str| -> u64 {
         text.lines()
@@ -225,7 +234,10 @@ fn memory_events(cgroup: &Path) -> Option<(u64, u64)> {
             .next()
             .unwrap_or(0)
     };
-    Some((count("oom "), count("oom_kill ")))
+    Some(OomCounts {
+        oom: count("oom "),
+        oom_kill: count("oom_kill "),
+    })
 }
 
 /// Says whether the kernel stopped a job, and at which limit.
@@ -237,30 +249,39 @@ fn memory_events(cgroup: &Path) -> Option<(u64, u64)> {
 /// - `oom` counts the times that this cgroup reached ITS OWN limit and the
 ///   kernel could not free memory. The limit of this cgroup alone raises it.
 ///
-/// A kill with `oom` above zero is thus a kill at the limit that qex made from
-/// the claim: the claim was too small, and qex can act on that. A kill with
-/// `oom` at zero came from outside this cgroup, so the claim can be correct.
+/// A kill with a rise in `oom` is thus a kill at the limit that qex made from
+/// the claim: the claim was too small, and qex can act on that. A kill with no
+/// rise in `oom` came from outside this cgroup, so the claim can be correct.
 ///
 /// The limit of a PARENT cgroup gives the second answer as well. The parent
 /// counts the event and this cgroup counts the kill. That answer is correct for
 /// the parent too, because a larger claim for this job cannot move a limit that
 /// belongs to a parent.
 ///
-/// `kills_before` is the count that qex read before the job started. qex reads
-/// the counter of the login session when it makes no cgroup, and that counter
-/// holds the kills of every program of this user, so an INCREASE alone belongs
-/// to this job. A cgroup that qex makes for one job starts at zero.
+/// # Both counts need the value from the start of the attempt
+///
+/// `before` holds the counts that qex read before this attempt started. NEITHER
+/// count starts at zero:
+///
+/// - qex reads the counter of the login session when it makes no cgroup, and
+///   that counter holds the kills of every program of this user.
+/// - qex names the cgroup of a job after the id of that job, so every attempt
+///   of one job uses the SAME cgroup. The counts of an earlier attempt stay in
+///   it. Without the value from the start, a job that raised `oom` on attempt 1
+///   reads that rise again on attempt 2, and a kill from the machine then names
+///   the claim.
 ///
 /// `qex_made_cgroup` says whose counter this is. With no cgroup of its own, qex
 /// cannot say which program the kernel stopped, so the answer is the weakest
 /// one.
-pub fn classify_oom(cgroup: &Path, qex_made_cgroup: bool, kills_before: u64) -> Option<OomScope> {
-    let (oom, oom_kill) = memory_events(cgroup)?;
+pub fn classify_oom(cgroup: &Path, qex_made_cgroup: bool, before: OomCounts) -> Option<OomScope> {
+    let now = read_oom_counts(cgroup)?;
 
-    // No kill, no answer. A cgroup can reach its limit and free enough memory
-    // after that, which raises `oom` and stops no process. The job then stopped
-    // for a different reason, and qex must not report a kill for memory.
-    if oom_kill <= kills_before {
+    // No new kill, no answer. A cgroup can reach its limit and free enough
+    // memory after that, which raises `oom` and stops no process. The job then
+    // stopped for a different reason, and qex must not report a kill for
+    // memory.
+    if now.oom_kill <= before.oom_kill {
         return None;
     }
 
@@ -268,10 +289,26 @@ pub fn classify_oom(cgroup: &Path, qex_made_cgroup: bool, kills_before: u64) -> 
         return Some(OomScope::Session);
     }
 
-    if oom > 0 {
+    if now.oom > before.oom {
         Some(OomScope::Job)
     } else {
         Some(OomScope::Machine)
+    }
+}
+
+/// Records what the counters say about THIS attempt.
+///
+/// Both places where the supervisor tests a cgroup call this function, so the
+/// rule lives in one place and a test drives the same code that the supervisor
+/// drives.
+pub fn record_oom_evidence(
+    job_dir: &Path,
+    cgroup: &Path,
+    qex_made_cgroup: bool,
+    before: OomCounts,
+) {
+    if let Some(scope) = classify_oom(cgroup, qex_made_cgroup, before) {
+        mark_oom(job_dir, scope);
     }
 }
 
@@ -325,32 +362,6 @@ pub fn own_cgroup() -> Option<PathBuf> {
     None
 }
 
-/// Gives the number of processes that the out-of-memory killer stopped in a
-/// cgroup.
-///
-/// Read this value before the job starts and after it stops. An increase shows
-/// that the kernel stopped a process for memory.
-///
-/// This measurement needs no limit from qex. Without it, the state `oom` is not
-/// available in the usual configuration, and qex would report `killed` for a
-/// job that no command stopped.
-#[cfg(target_os = "linux")]
-pub fn oom_count(cgroup: &Path) -> u64 {
-    let Ok(text) = std::fs::read_to_string(cgroup.join("memory.events")) else {
-        return 0;
-    };
-    text.lines()
-        .filter_map(|l| l.strip_prefix("oom_kill "))
-        .filter_map(|n| n.trim().parse::<u64>().ok())
-        .next()
-        .unwrap_or(0)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn oom_count(_cgroup: &Path) -> u64 {
-    0
-}
-
 /// Tests if the out-of-memory killer stopped a job.
 ///
 /// The kernel stops a process with `SIGKILL` for an out-of-memory event. That
@@ -380,8 +391,8 @@ pub enum OomScope {
     /// correct.
     ///
     /// This evidence REPORTS the state `oom`. It does not support a new attempt
-    /// with a larger claim, and it teaches the learner nothing: the work needs
-    /// no more memory than it asked for, and the machine changed.
+    /// with a larger claim, and it teaches the learner nothing: the work can
+    /// need no more memory than it asked for, and qex did not measure a need.
     Machine,
     /// qex read the counter of the session, because it made no cgroup.
     ///
@@ -433,12 +444,14 @@ pub fn oom_evidence(job_dir: &Path) -> Option<OomScope> {
             _ => OomScope::Session,
         });
     }
-    // qex made the cgroup of the job, so its counts belong to this job. The
-    // cgroup starts at zero, so no earlier count can reach this answer.
-    match job_cgroup_path(job_dir) {
-        Some(cgroup) => classify_oom(&cgroup, true, 0),
-        None => None,
-    }
+    // THE RECORD IS THE ONLY SOURCE. This function does not read the cgroup.
+    //
+    // A count in a cgroup means nothing without the value from the start of the
+    // attempt, and the supervisor alone holds that value: qex names the cgroup
+    // of a job after the id of the job, so every attempt of one job uses the
+    // same cgroup and the counts of an earlier attempt stay in it. The
+    // supervisor records what it found, and this function reads that record.
+    None
 }
 
 /// Records an out-of-memory event for a job, with the evidence for it.
@@ -446,7 +459,7 @@ pub fn mark_oom(job_dir: &Path, scope: OomScope) {
     // Keep the stronger evidence. The supervisor makes more than one test, and
     // a later test can read the counter of the session.
     if let Some(held) = oom_evidence(job_dir) {
-        if held.strength() >= scope.strength() {
+        if held.strength() > scope.strength() {
             return;
         }
     }
@@ -721,7 +734,10 @@ mod tests {
     #[test]
     fn a_kill_at_the_limit_of_the_job_names_the_job() {
         let dir = a_cgroup_with_events("atlimit", "low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n");
-        assert_eq!(classify_oom(&dir, true, 0), Some(OomScope::Job));
+        assert_eq!(
+            classify_oom(&dir, true, OomCounts::default()),
+            Some(OomScope::Job)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -736,7 +752,10 @@ mod tests {
     #[test]
     fn a_kill_that_the_machine_made_names_the_machine() {
         let dir = a_cgroup_with_events("machine", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 1\n");
-        assert_eq!(classify_oom(&dir, true, 0), Some(OomScope::Machine));
+        assert_eq!(
+            classify_oom(&dir, true, OomCounts::default()),
+            Some(OomScope::Machine)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -744,7 +763,7 @@ mod tests {
     #[test]
     fn a_cgroup_with_no_kill_gives_no_answer() {
         let dir = a_cgroup_with_events("nokill", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n");
-        assert_eq!(classify_oom(&dir, true, 0), None);
+        assert_eq!(classify_oom(&dir, true, OomCounts::default()), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -757,7 +776,7 @@ mod tests {
     #[test]
     fn a_limit_that_stopped_no_process_gives_no_answer() {
         let dir = a_cgroup_with_events("noproc", "low 0\nhigh 0\nmax 5\noom 2\noom_kill 0\n");
-        assert_eq!(classify_oom(&dir, true, 0), None);
+        assert_eq!(classify_oom(&dir, true, OomCounts::default()), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -767,7 +786,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qex-events-{}-none", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(classify_oom(&dir, true, 0), None);
+        assert_eq!(classify_oom(&dir, true, OomCounts::default()), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -775,7 +794,7 @@ mod tests {
     #[test]
     fn a_file_with_no_counts_gives_no_answer() {
         let dir = a_cgroup_with_events("odd", "this file holds no count\n\noom_kill\n");
-        assert_eq!(classify_oom(&dir, true, 0), None);
+        assert_eq!(classify_oom(&dir, true, OomCounts::default()), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -784,7 +803,10 @@ mod tests {
     #[test]
     fn a_counter_of_the_session_names_the_session() {
         let dir = a_cgroup_with_events("session", "low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n");
-        assert_eq!(classify_oom(&dir, false, 0), Some(OomScope::Session));
+        assert_eq!(
+            classify_oom(&dir, false, OomCounts::default()),
+            Some(OomScope::Session)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -795,8 +817,28 @@ mod tests {
     #[test]
     fn a_count_from_before_the_job_gives_no_answer() {
         let dir = a_cgroup_with_events("before", "low 0\nhigh 0\nmax 0\noom 0\noom_kill 4\n");
-        assert_eq!(classify_oom(&dir, false, 4), None);
-        assert_eq!(classify_oom(&dir, false, 3), Some(OomScope::Session));
+        assert_eq!(
+            classify_oom(
+                &dir,
+                false,
+                OomCounts {
+                    oom: 0,
+                    oom_kill: 4
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            classify_oom(
+                &dir,
+                false,
+                OomCounts {
+                    oom: 0,
+                    oom_kill: 3
+                }
+            ),
+            Some(OomScope::Session)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -822,6 +864,96 @@ mod tests {
         assert_eq!(oom_evidence(&dir), Some(OomScope::Job));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The cgroup of a job holds the counts of every attempt of that job.
+    ///
+    /// qex names the cgroup of a job after the id of the job, so attempt 2 uses
+    /// the cgroup of attempt 1. A raise on attempt 1 leaves `oom` above zero.
+    /// Without the value from the start of attempt 2, a kill of the MACHINE on
+    /// attempt 2 reads that earlier rise and names the claim.
+    ///
+    /// This is the answer that decides whether qex repeats hours of work.
+    #[test]
+    fn a_count_of_an_earlier_attempt_does_not_name_the_claim() {
+        let dir = a_cgroup_with_events("reused", "oom 1\noom_kill 1\n");
+
+        // Attempt 1 raised both counts, and qex acted on that.
+        assert_eq!(
+            classify_oom(&dir, true, OomCounts::default()),
+            Some(OomScope::Job)
+        );
+
+        // Attempt 2 starts with those counts already in the cgroup.
+        let before = read_oom_counts(&dir).unwrap();
+
+        // The machine stops attempt 2. Only `oom_kill` rises.
+        std::fs::write(dir.join("memory.events"), b"oom 1\noom_kill 2\n").unwrap();
+        assert_eq!(
+            classify_oom(&dir, true, before),
+            Some(OomScope::Machine),
+            "a count of an earlier attempt must not name the claim of this attempt"
+        );
+
+        // The limit of the job stops attempt 2. Both counts rise.
+        std::fs::write(dir.join("memory.events"), b"oom 2\noom_kill 3\n").unwrap();
+        assert_eq!(
+            classify_oom(&dir, true, before),
+            Some(OomScope::Job),
+            "a rise above the count of the earlier attempt must name the claim"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The supervisor must WRITE the answer that it found.
+    ///
+    /// This test drives the same function that the supervisor drives, with a
+    /// cgroup that the test made. Without it, the classification is correct and
+    /// nothing records the result.
+    #[test]
+    fn the_answer_of_an_attempt_reaches_the_record() {
+        let job = std::env::temp_dir().join(format!("qex-record-{}", std::process::id()));
+        std::fs::remove_dir_all(&job).ok();
+        std::fs::create_dir_all(&job).unwrap();
+        let cgroup = a_cgroup_with_events("record", "oom 0\noom_kill 1\n");
+
+        record_oom_evidence(&job, &cgroup, true, OomCounts::default());
+        assert_eq!(
+            oom_evidence(&job),
+            Some(OomScope::Machine),
+            "the answer must reach the record of the job"
+        );
+
+        // The stronger answer of the second test must replace the first one.
+        std::fs::write(cgroup.join("memory.events"), b"oom 1\noom_kill 2\n").unwrap();
+        record_oom_evidence(&job, &cgroup, true, OomCounts::default());
+        assert_eq!(oom_evidence(&job), Some(OomScope::Job));
+
+        std::fs::remove_dir_all(&job).ok();
+        std::fs::remove_dir_all(&cgroup).ok();
+    }
+
+    /// A cgroup with a count says nothing by itself.
+    ///
+    /// Only the supervisor holds the counts from the start of the attempt, so
+    /// the record that the supervisor writes is the one source of this answer.
+    #[test]
+    fn the_evidence_comes_from_the_record_and_not_from_the_cgroup() {
+        let job = std::env::temp_dir().join(format!("qex-nofall-{}", std::process::id()));
+        std::fs::remove_dir_all(&job).ok();
+        std::fs::create_dir_all(&job).unwrap();
+        let cgroup = a_cgroup_with_events("nofall", "oom 1\noom_kill 1\n");
+        record_cgroup_path(&job, &cgroup);
+
+        assert_eq!(
+            oom_evidence(&job),
+            None,
+            "a count with no record must give no answer"
+        );
+
+        std::fs::remove_dir_all(&job).ok();
+        std::fs::remove_dir_all(&cgroup).ok();
     }
 
     /// The test must give a clear answer on this machine, and it must not stop.
