@@ -12602,21 +12602,34 @@ fn no_shipped_word_promises_the_limit_that_went() {
 /// is true and it names no remedy, so qex names the key, says what it does now,
 /// and gives the step.
 ///
-/// THE ANSWER MUST NAME THE KEY THAT THE FILE HOLDS. Every message here says
-/// "does not limit a job", so a test for those words alone passes when qex
-/// gives the answer of one key for a different key. The name is what the reader
-/// deletes.
+/// THE ANSWER MUST GIVE THE REMEDY FOR THE KEY THAT THE FILE HOLDS. Every
+/// message here says "does not limit a job", so a test for those words alone
+/// passes when qex gives the answer of one key for a different key.
+///
+/// A test that the message merely NAMES the key is not enough either. The
+/// answer for a bad value of `[enforce] mode` carries the words of the parser,
+/// and those words hold the name of whatever the file wrote. This test thus
+/// asks for the STEP that the reader must take, which only the right answer
+/// holds.
 #[test]
 fn a_config_that_names_a_key_that_went_says_what_to_do() {
-    for (section, text, must_name) in [
-        ("[enforce]", "mem_overcommit = 1.5", "mem_overcommit"),
-        ("[enforce]", "use_systemd = true", "use_systemd"),
-        ("[retry]", "on_oom = 2", "retry"),
-        ("[enforce]", "mode = \"hard\"", "[enforce] mode"),
+    for (section, text, must_say) in [
+        (
+            "[enforce]",
+            "mem_overcommit = 1.5",
+            "Delete `mem_overcommit`",
+        ),
+        ("[enforce]", "use_systemd = true", "Delete `use_systemd`"),
+        ("[retry]", "on_oom = 2", "Delete `retry`"),
+        ("[enforce]", "mode = \"hard\"", "Use `cooperative`"),
         // An array of tables makes serde read the name as the VALUE of `mode`,
         // so the message carries `unknown variant` and not `unknown field`. The
         // reader wrote the same key and needs the same answer.
-        ("[[enforce]]", "mem_overcommit = 1.5", "mem_overcommit"),
+        (
+            "[[enforce]]",
+            "mem_overcommit = 1.5",
+            "Delete `mem_overcommit`",
+        ),
     ] {
         let h = Harness::new("wentkey", &format!("{section}\n{text}\n"));
         let out = h.qex(&["config", "show"]);
@@ -12631,8 +12644,8 @@ fn a_config_that_names_a_key_that_went_says_what_to_do() {
             "the answer must say what qex does now, for `{section} {text}`: {said}"
         );
         assert!(
-            said.contains(must_name),
-            "the answer must name `{must_name}`, for `{section} {text}`: {said}"
+            said.contains(must_say),
+            "the answer must give the step `{must_say}`, for `{section} {text}`: {said}"
         );
     }
 }
