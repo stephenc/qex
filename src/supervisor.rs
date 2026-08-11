@@ -715,27 +715,26 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // If qex made a cgroup, stop each process in it. A process cannot leave a
     // cgroup, so this method finds a process that changed its process group.
     if let Some(cgroup) = crate::enforce::job_cgroup_path(&dir) {
-        if crate::enforce::cgroup_had_oom(&cgroup) {
-            // This cgroup belongs to this job, so the count belongs to this job.
-            crate::enforce::mark_oom(&dir, crate::enforce::OomScope::Job);
+        // This cgroup belongs to this job and it started at zero, so every
+        // count in it belongs to this job.
+        if let Some(scope) = crate::enforce::classify_oom(&cgroup, true, 0) {
+            crate::enforce::mark_oom(&dir, scope);
         }
         crate::enforce::kill_cgroup(&cgroup);
     }
 
-    // Test the out-of-memory count again. An increase during this job, with a
-    // SIGKILL that no qex command sent, is the out-of-memory killer.
+    // Test the counts again. A kill during this job, with a SIGKILL that no qex
+    // command sent, is the out-of-memory killer.
     //
-    // Say WHICH cgroup gave the count. With a cgroup of its own, the count is
-    // about this job. Without one, qex reads the cgroup of the session, and the
-    // counter of a cgroup counts the kills in each cgroup below it: a kill in a
-    // different program of this user raises the same number.
+    // The answer says WHICH limit stopped the job. With a cgroup of its own,
+    // the counts are about this job, and the count `oom` separates the limit of
+    // this job from the memory of the whole machine. Without a cgroup, qex
+    // reads the cgroup of the session: that counter counts the kills in each
+    // cgroup below it, so a kill in a different program of this user raises the
+    // same number and qex cannot name the victim.
     if let Some(cgroup) = &watch_cgroup {
-        if crate::enforce::oom_count(cgroup) > oom_before {
-            let scope = if cgroup_dir.is_some() {
-                crate::enforce::OomScope::Job
-            } else {
-                crate::enforce::OomScope::Session
-            };
+        if let Some(scope) = crate::enforce::classify_oom(cgroup, cgroup_dir.is_some(), oom_before)
+        {
             crate::enforce::mark_oom(&dir, scope);
         }
     }
@@ -852,22 +851,43 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         // that THIS job was the victim, and it does not say that the claim was
         // too small: the machine can be full while the claim is correct.
         //
+        // A cgroup of its own is not sufficient by itself. The count `oom_kill`
+        // counts the processes that ANY out-of-memory killer stopped, and the
+        // killer of the whole machine raises it as well. The count `oom` rises
+        // at the limit of THIS cgroup alone, so it is the count that says the
+        // claim was too small. `[politeness] oom_score_adj` raises the score of
+        // a qex job on purpose, so a qex job is the job that the killer of the
+        // machine takes first.
+        //
         // qex therefore REPORTS the state `oom` on the weaker evidence, and it
         // ACTS on the stronger evidence only. A new attempt with a larger claim
         // repeats work, holds more of the machine, and teaches the learner a
         // number that no measurement supports.
         let scope = crate::enforce::oom_evidence(&dir);
         if scope != Some(crate::enforce::OomScope::Job) {
-            let note = format!(
-                "the kernel stopped this job for memory, and its claim was {}. qex applies no \
-                 memory limit to a job in this configuration, so it counts the kills of the \
-                 whole login session and it cannot prove that the claim of this job was too \
-                 small: the machine can be full while the claim is correct. qex therefore did \
-                 NOT start the job again. Compare the `usage` field with the claim. Give a \
-                 larger `--mem` value, or set `[enforce] mode` in the config file, and qex then \
-                 corrects the claim itself.",
-                crate::units::format_size(status.mem)
-            );
+            let note = if scope == Some(crate::enforce::OomScope::Machine) {
+                format!(
+                    "the kernel stopped this job for memory, and NOT at the limit of this job. \
+                     qex made a limit of {} for this job, and that limit counted no event. The \
+                     machine was short of memory, and this job gave way to other work. THE \
+                     CLAIM CAN BE CORRECT, so qex did NOT start the job again and it learned \
+                     nothing from this attempt. Run the same work again, with the same claim, \
+                     when the machine has memory free. A limit of a parent cgroup gives this \
+                     same answer, and a larger claim for this job cannot move that limit.",
+                    crate::units::format_size(status.mem)
+                )
+            } else {
+                format!(
+                    "the kernel stopped this job for memory, and its claim was {}. qex applies \
+                     no memory limit to a job in this configuration, so it counts the kills of \
+                     the whole login session and it cannot prove that the claim of this job was \
+                     too small: the machine can be full while the claim is correct. qex \
+                     therefore did NOT start the job again. Compare the `usage` field with the \
+                     claim. Give a larger `--mem` value, or set `[enforce] mode` in the config \
+                     file, and qex then corrects the claim itself.",
+                    crate::units::format_size(status.mem)
+                )
+            };
             log(&format!("job {id}: {note}"));
             // JOIN, and do not replace. This field can already hold "the
             // memory limit is not active for this job", which is the reason
