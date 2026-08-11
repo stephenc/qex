@@ -3730,6 +3730,27 @@ fn clean_accepts_a_state_name() {
     assert_eq!(states, vec!["failed"], "qex deleted the wrong jobs");
 }
 
+/// Gives the command of a job that waits until the test releases it.
+///
+/// A TEST CONTROLS THE BUDGET AND THE END OF ITS OWN JOBS. It controls nothing
+/// else about the machine: not the moment a job starts, and not the speed of
+/// the runner.
+///
+/// A job that ends on a timer is therefore a race. A slow machine finishes the
+/// job before the test reads the answer, and the failure then names the test
+/// and not a fault of qex. This job waits for a FILE, so it stays unfinished
+/// until the test makes that file, however slow the machine is.
+///
+/// Use `release` to end every job that waits for the same file.
+fn waits_for_the_test(gate: &std::path::Path) -> String {
+    format!("while [ ! -f {} ]; do sleep 0.05; done", gate.display())
+}
+
+/// Ends every job that waits for this file.
+fn release(gate: &std::path::Path) {
+    std::fs::write(gate, "go").expect("the test makes its own gate file");
+}
+
 /// A record that an unfinished pipeline needs must survive a deletion.
 ///
 /// A pipeline of three stages runs its last stage. The reader deletes the jobs
@@ -3739,13 +3760,15 @@ fn clean_accepts_a_state_name() {
 #[test]
 fn clean_keeps_every_record_of_a_pipeline_that_operates() {
     let h = Harness::with_default_config("cleanchain");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
 
     let a = h.submit(&["submit", "--name", "c-a", "--mem", "64MB", "--", "true"]);
     let b = h.submit(&[
         "submit", "--name", "c-b", "--mem", "64MB", "--needs", &a, "--", "true",
     ]);
     let c = h.submit(&[
-        "submit", "--name", "c-c", "--mem", "64MB", "--needs", &b, "--", "sleep", "45",
+        "submit", "--name", "c-c", "--mem", "64MB", "--needs", &b, "--", "sh", "-c", &waiting,
     ]);
     h.until("the last stage operates", Duration::from_secs(30), || {
         h.state_of(&c) == "running"
@@ -3778,12 +3801,24 @@ fn clean_keeps_every_record_of_a_pipeline_that_operates() {
 /// of qex as fact, so a message may state only the relation that qex computed.
 #[test]
 fn the_message_names_the_work_that_holds_a_record() {
-    let h = Harness::with_default_config("cleanwho");
+    // THREE jobs must be unfinished in one moment, so the budget must admit
+    // three. The test sets that; it does not control how fast a runner starts
+    // a job. With a smaller budget the queue runs them one after the other,
+    // which is what a queue exists to do.
+    let h = Harness::new(
+        "cleanwho",
+        "[budget]\ncpu = \"4\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
 
     let dep = h.submit(&["submit", "--name", "m-dep", "--mem", "64MB", "--", "true"]);
     h.ok(&["wait", &dep, "--timeout", "30s"]);
     let holder = h.submit(&[
-        "submit", "--name", "m-holder", "--mem", "64MB", "--needs", &dep, "--", "sleep", "45",
+        "submit", "--name", "m-holder", "--mem", "64MB", "--needs", &dep, "--", "sh", "-c",
+        &waiting,
     ]);
     // Two jobs that hold nothing. They wait for no record and no pipeline
     // carries them.
@@ -3794,8 +3829,9 @@ fn the_message_names_the_work_that_holds_a_record() {
         "--mem",
         "64MB",
         "--",
-        "sleep",
-        "45",
+        "sh",
+        "-c",
+        &waiting,
     ]);
     let lone_two = h.submit(&[
         "submit",
@@ -3804,8 +3840,9 @@ fn the_message_names_the_work_that_holds_a_record() {
         "--mem",
         "64MB",
         "--",
-        "sleep",
-        "45",
+        "sh",
+        "-c",
+        &waiting,
     ]);
     for id in [&holder, &lone_one, &lone_two] {
         h.until("each job operates", Duration::from_secs(45), || {
@@ -3828,9 +3865,7 @@ fn the_message_names_the_work_that_holds_a_record() {
         "the message must not name a job that holds nothing: {out}"
     );
 
-    for id in [&holder, &lone_one, &lone_two] {
-        h.ok(&["kill", id]);
-    }
+    release(&gate);
 }
 
 /// `qex gc` counts a record as held only when the age selected it.
@@ -3841,11 +3876,13 @@ fn the_message_names_the_work_that_holds_a_record() {
 #[test]
 fn gc_counts_only_the_records_that_the_age_selected() {
     let h = Harness::with_default_config("gccount");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
 
     let a = h.submit(&["submit", "--name", "g-a", "--mem", "64MB", "--", "true"]);
     h.ok(&["wait", &a, "--timeout", "30s"]);
     let b = h.submit(&[
-        "submit", "--name", "g-b", "--mem", "64MB", "--needs", &a, "--", "sleep", "45",
+        "submit", "--name", "g-b", "--mem", "64MB", "--needs", &a, "--", "sh", "-c", &waiting,
     ]);
     h.until("the second job operates", Duration::from_secs(30), || {
         h.state_of(&b) == "running"
@@ -3860,7 +3897,7 @@ fn gc_counts_only_the_records_that_the_age_selected() {
         "the count must hold the records that the age selected, and it said: {out}"
     );
 
-    h.ok(&["kill", &b]);
+    release(&gate);
 }
 
 /// The coordinator refuses a deletion that breaks a chain.
@@ -3875,13 +3912,15 @@ fn gc_counts_only_the_records_that_the_age_selected() {
 #[test]
 fn the_coordinator_refuses_a_deletion_that_a_chain_needs() {
     let h = Harness::with_default_config("cleandeep");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
 
     let a = h.submit(&["submit", "--name", "d-a", "--mem", "64MB", "--", "true"]);
     let b = h.submit(&[
         "submit", "--name", "d-b", "--mem", "64MB", "--needs", &a, "--", "true",
     ]);
     let c = h.submit(&[
-        "submit", "--name", "d-c", "--mem", "64MB", "--needs", &b, "--", "sleep", "45",
+        "submit", "--name", "d-c", "--mem", "64MB", "--needs", &b, "--", "sh", "-c", &waiting,
     ]);
     h.until("the last stage operates", Duration::from_secs(30), || {
         h.state_of(&c) == "running"
@@ -3904,7 +3943,7 @@ fn the_coordinator_refuses_a_deletion_that_a_chain_needs() {
         "the record must stay"
     );
 
-    h.ok(&["kill", &c]);
+    release(&gate);
 }
 
 /// The coordinator keeps every stage of a pipeline that operates.
@@ -3917,15 +3956,19 @@ fn the_coordinator_refuses_a_deletion_that_a_chain_needs() {
 fn the_coordinator_keeps_a_stage_of_a_pipeline_that_operates() {
     let h = Harness::with_default_config("cleanbranch");
 
+    let gate = h.root.join("gate");
     let file = h.root.join("p.toml");
     std::fs::write(
         &file,
-        "[[jobs]]\nname = \"s1\"\ncommand = [\"true\"]\n\
-         [jobs.resources]\nmem = \"64MB\"\n\
-         [[jobs]]\nname = \"s2b\"\ncommand = [\"true\"]\nneeds = [\"s1\"]\n\
-         [jobs.resources]\nmem = \"64MB\"\n\
-         [[jobs]]\nname = \"s3\"\ncommand = [\"sleep\", \"45\"]\nneeds = [\"s1\"]\n\
-         [jobs.resources]\nmem = \"64MB\"\n",
+        format!(
+            "[[jobs]]\nname = \"s1\"\ncommand = [\"true\"]\n\
+             [jobs.resources]\nmem = \"64MB\"\n\
+             [[jobs]]\nname = \"s2b\"\ncommand = [\"true\"]\nneeds = [\"s1\"]\n\
+             [jobs.resources]\nmem = \"64MB\"\n\
+             [[jobs]]\nname = \"s3\"\ncommand = [\"sh\", \"-c\", \"{}\"]\nneeds = [\"s1\"]\n\
+             [jobs.resources]\nmem = \"64MB\"\n",
+            waits_for_the_test(&gate)
+        ),
     )
     .expect("the test writes its own pipeline file");
 
@@ -3956,13 +3999,7 @@ fn the_coordinator_keeps_a_stage_of_a_pipeline_that_operates() {
         "the record of the branch stage must stay"
     );
 
-    let running = h
-        .list_json()
-        .iter()
-        .find(|j| j["name"] == "s3")
-        .map(|j| j["id"].as_str().unwrap().to_string())
-        .expect("the running stage has a record");
-    h.ok(&["kill", &running]);
+    release(&gate);
 }
 
 /// The count of a deletion says what the command did.
@@ -3974,11 +4011,13 @@ fn the_coordinator_keeps_a_stage_of_a_pipeline_that_operates() {
 #[test]
 fn clean_counts_only_the_records_that_the_reader_asked_for() {
     let h = Harness::with_default_config("cleancount");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
 
     let a = h.submit(&["submit", "--name", "n-a", "--mem", "64MB", "--", "true"]);
     h.ok(&["wait", &a, "--timeout", "30s"]);
     let b = h.submit(&[
-        "submit", "--name", "n-b", "--mem", "64MB", "--needs", &a, "--", "sleep", "45",
+        "submit", "--name", "n-b", "--mem", "64MB", "--needs", &a, "--", "sh", "-c", &waiting,
     ]);
     h.until("the second job operates", Duration::from_secs(30), || {
         h.state_of(&b) == "running"
@@ -3998,7 +4037,7 @@ fn clean_counts_only_the_records_that_the_reader_asked_for() {
         "the count must hold the records that the reader asked for, and it said: {text}"
     );
 
-    h.ok(&["kill", &b]);
+    release(&gate);
 }
 
 /// A word that names WORK and a state must give an error, and delete nothing.
