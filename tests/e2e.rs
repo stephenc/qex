@@ -14769,6 +14769,11 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
     unsafe { libc::kill(pid, libc::SIGKILL) };
 
     // `qex run` meets the loss, finds the new coordinator, and asks it again.
+    //
+    // Measure how long the new coordinator takes to answer. A reconnect that
+    // ends before it binds loses the ownership in silence, so the number
+    // belongs in the failure.
+    let killed_at = Instant::now();
     h.until("a new coordinator answers", Duration::from_secs(40), || {
         h.state_of(&id) == "queued" && {
             let fresh: serde_json::Value =
@@ -14777,19 +14782,64 @@ fn the_ownership_of_a_job_survives_a_new_coordinator() {
         }
     });
 
+    let new_coordinator_took = killed_at.elapsed();
+
     // `qex run` must MEET the loss and ask the new coordinator before this test
     // takes the command away. The command reads the state every 80ms, so this
     // wait is far longer than it needs.
     std::thread::sleep(Duration::from_secs(3));
 
     unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    let said = {
+        use std::io::Read as _;
+        let mut text = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_string(&mut text).ok();
+        }
+        text
+    };
     child.wait().unwrap();
 
-    h.until(
-        "the new coordinator cancels the job of a command that stopped",
-        Duration::from_secs(40),
-        || h.state_of(&id) == "cancelled",
-    );
+    // SAY WHY, ON FAILURE ONLY.
+    //
+    // The question is one thing: did `qex run` ask the NEW coordinator for the
+    // ownership of its job, and what did that coordinator answer? Its stderr
+    // holds the client half, and the log of the coordinator holds the other.
+    // A test that fails in silence costs a whole run of CI and teaches nothing.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let mut cancelled = false;
+    while Instant::now() < deadline {
+        if h.state_of(&id) == "cancelled" {
+            cancelled = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !cancelled {
+        let log = std::fs::read_to_string(h.root.join("state/qex/run/daemon.log"))
+            .unwrap_or_else(|e| format!("(no log: {e})"));
+        let asked = said.contains("keeps the job") || said.contains("own");
+        panic!(
+            "the new coordinator did not cancel the job of a command that stopped.\n\
+             \n--- the job ---\nstate: {}\n\
+             \n--- the time from the kill of the first coordinator to the answer of the \
+             second ---\n{:?}\n\
+             \n--- did the client speak about the ownership? ---\n{}\n\
+             \n--- stderr of the `qex run` that had to ask again ---\n{}\n\
+             \n--- the log of the coordinator ---\n{}\n\
+             \n--- qex list ---\n{}",
+            h.state_of(&id),
+            new_coordinator_took,
+            asked,
+            if said.trim().is_empty() {
+                "no output".to_string()
+            } else {
+                said
+            },
+            log,
+            h.ok(&["list"]),
+        );
+    }
 
     h.ok(&["kill", &blocker]);
 }
@@ -15176,6 +15226,21 @@ fn a_coordinator_that_answers_nothing_is_not_no_such_job() {
 struct ASlowCoordinator {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// What the proxy did, and when. A failure prints it.
+    ///
+    /// The test cannot see the machine that CI runs, so the proxy says what it
+    /// accepted and what it wrote. A proxy that holds several connections, or
+    /// that writes later than it was told to, shows here.
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ASlowCoordinator {
+    fn what_it_did(&self) -> String {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .join("\n")
+    }
 }
 
 impl Drop for ASlowCoordinator {
@@ -15201,6 +15266,10 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
     // The first answer of the whole test waits. Every answer after it goes
     // straight through.
     let held_one = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let events: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = events.clone();
+    let began = Instant::now();
     let thread = std::thread::spawn(move || {
         let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
@@ -15208,6 +15277,10 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                 Ok((front_side, _)) => {
                     let real = real.clone();
                     let first = held_one.clone();
+                    let note = log.clone();
+                    note.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(format!("{:?} accepted a connection", began.elapsed()));
                     workers.push(std::thread::spawn(move || {
                         let Ok(back) = std::os::unix::net::UnixStream::connect(&real) else {
                             return;
@@ -15231,9 +15304,16 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                             // it arrives late. Only the first one waits, so the
                             // cost of this test does not follow the number of
                             // questions that the command asks.
-                            if !first.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            let held = !first.swap(true, std::sync::atomic::Ordering::SeqCst);
+                            if held {
                                 std::thread::sleep(delay);
                             }
+                            note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                "{:?} wrote an answer of {} bytes, held: {}",
+                                began.elapsed(),
+                                answer.len(),
+                                held
+                            ));
                             if to_qex.write_all(answer.as_bytes()).is_err() {
                                 return;
                             }
@@ -15252,6 +15332,7 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
     ASlowCoordinator {
         stop,
         thread: Some(thread),
+        events,
     }
 }
 
@@ -15285,14 +15366,28 @@ fn a_coordinator_that_answers_late_is_answered_and_not_refused() {
     std::fs::rename(run.join("s"), &real).unwrap();
     let _slow = a_coordinator_that_answers_late(&run.join("s"), &real, Duration::from_secs(3));
 
+    let started = Instant::now();
     let out = h.qex_within(&["status", &id, "--json"], Duration::from_secs(60));
+    let took = started.elapsed();
 
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "a coordinator that answers late must be answered: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // SAY WHY, ON FAILURE ONLY. An exit status with no code means a SIGNAL
+    // ended the command, which is this test taking it away rather than qex
+    // refusing. The proxy log then says whether it wrote when it was told to.
+    if out.status.code() != Some(0) {
+        use std::os::unix::process::ExitStatusExt as _;
+        panic!(
+            "a coordinator that answers late must be answered.\n\
+             \ncode: {:?}   signal: {:?}   wall time: {:?}\n\
+             \n--- what the proxy did ---\n{}\n\
+             \n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.status.code(),
+            out.status.signal(),
+            took,
+            _slow.what_it_did(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
     let said = String::from_utf8_lossy(&out.stdout);
     let record: serde_json::Value = serde_json::from_str(&said)
         .unwrap_or_else(|e| panic!("the answer must be whole and correct: {e}: {said}"));
@@ -15370,6 +15465,7 @@ fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordin
     ASlowCoordinator {
         stop,
         thread: Some(thread),
+        events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     }
 }
 
