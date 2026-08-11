@@ -312,6 +312,10 @@ pub struct SubmitArgs {
     ///
     /// `qex run` is the short form of this option, and the two behave in the
     /// same way. Ctrl-C stops the job.
+    ///
+    /// This option OWNS the job until the job starts. When this command stops,
+    /// and the job still waits, the coordinator cancels that job. `--wait`
+    /// never cancels a job: it leaves the job in the queue to live on its own.
     #[arg(long, conflicts_with = "wait")]
     pub follow: bool,
 

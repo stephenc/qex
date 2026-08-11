@@ -4805,6 +4805,16 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     require_capabilities(&mut client, &spec)?;
 
+    // Ask BEFORE the job exists, so this answer is about a decision that the
+    // reader can still make.
+    let owns_jobs = coordinator_owns_jobs(&mut client);
+    if !owns_jobs {
+        eprintln!(
+            "qex: this coordinator keeps a job that waits when this command stops without notice; \
+             Ctrl-C and SIGTERM still stop it."
+        );
+    }
+
     let (id, deduplicated) = match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
@@ -4842,7 +4852,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     // arrives in the moment between the submit and the handler meets the
     // default behaviour of the system. The connection covers each of those,
     // because the kernel closes it when this process stops.
-    if !deduplicated {
+    if owns_jobs && !deduplicated {
         own_the_job(&mut client, id);
     }
 
@@ -4874,19 +4884,34 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
 /// keeps a place in the queue for a reader that went away holds every job
 /// behind it, and it later takes a claim for output that nobody reads.
 ///
-/// A coordinator without this rule leaves such a job in the queue. This
-/// command still operates, and Ctrl-C and SIGTERM still stop the job, so it
-/// says the difference and continues. It does not refuse the work: the reader
-/// asked for a job, and not for this option.
+/// Each answer here names ONLY what it proves. A coordinator that does not know
+/// this request is a different thing from a coordinator that did not answer,
+/// and `coordinator_owns_jobs` reports the first one before the job exists.
 fn own_the_job(client: &mut Client, id: uuid::Uuid) {
     match client.call(&Request::OwnJob { id }) {
         Ok(Response::Ok) => {}
-        _ => eprintln!(
-            "qex: this coordinator cannot cancel the job {id} if this command stops without \
-             notice. Ctrl-C and SIGTERM still stop it. After a stop that this command cannot \
-             catch, run `qex cancel {id}`."
-        ),
+        Ok(Response::Error { message, .. }) => {
+            eprintln!("qex: the coordinator keeps the job {id} after this command stops: {message}")
+        }
+        Ok(_) => eprintln!("qex: the coordinator gave an answer that qex cannot read for the job {id}, so it keeps that job after this command stops"),
+        Err(e) => eprintln!("qex: the coordinator did not answer, so it keeps the job {id} after this command stops: {e}"),
     }
+}
+
+/// True when the coordinator cancels the job of a command that stopped.
+///
+/// This question comes BEFORE the submit, so the answer is honest: a message
+/// after the submit describes a job that is already in the queue, and it can
+/// never become a refusal.
+///
+/// qex warns and continues here. The rule that a coordinator must REFUSE an
+/// option covers an option that the reader typed and relies on. This reader
+/// typed `qex run` and asked for a job, so a refusal would take the work away
+/// to protect the cleanup of the work. Ctrl-C and SIGTERM still stop the job,
+/// and only a stop that this command cannot catch loses the rule.
+fn coordinator_owns_jobs(client: &mut Client) -> bool {
+    let (have, _, _) = coordinator_capabilities(client);
+    have.iter().any(|n| n == "own-job")
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
@@ -5031,7 +5056,9 @@ fn stream_until_done(
         let status = match client.call(&Request::Status { id }) {
             Ok(Response::Status { status }) => status,
             Ok(other) => return report_for_a_job(other),
-            Err(_) => status_without_the_coordinator(client, id, dir, &mut announced_loss)?,
+            Err(_) => {
+                status_without_the_coordinator(client, id, dir, owns_job, &mut announced_loss)?
+            }
         };
 
         // Say why nothing happens yet. A user of `qex run` sees no output while
@@ -5078,6 +5105,7 @@ fn status_without_the_coordinator(
     client: &mut Client,
     id: uuid::Uuid,
     dir: &std::path::Path,
+    owns_job: bool,
     announced: &mut bool,
 ) -> Result<Box<JobStatus>> {
     if !*announced {
@@ -5092,6 +5120,13 @@ fn status_without_the_coordinator(
     // go the fast way again.
     if let Some(fresh) = Client::connect_existing() {
         *client = fresh;
+        // A CONNECTION carries the ownership of a job, so a new connection
+        // holds none. Ask the new coordinator again, or this command keeps a
+        // job that no cleanup can reach. qex replaces the coordinator at every
+        // update of the program, so this path is the usual one.
+        if owns_job {
+            own_the_job(client, id);
+        }
         if let Ok(Response::Status { status }) = client.call(&Request::Status { id }) {
             return Ok(status);
         }

@@ -14108,3 +14108,118 @@ fn a_kill_of_qex_run_leaves_a_job_that_operates() {
 
     h.ok(&["kill", &id]);
 }
+
+/// A command that does not own its job must leave that job in the queue.
+///
+/// `qex submit --wait` puts the job in the queue to live on its own. A reader
+/// that stops the wait has not asked qex to throw the work away, so the job
+/// waits for a reader that attaches again.
+///
+/// This test holds the boundary from the other side. Nothing else fails when
+/// the ownership reaches this path, because a job that goes away looks like a
+/// job that a person cancelled.
+#[test]
+fn a_kill_of_submit_with_a_wait_leaves_the_job_in_the_queue() {
+    let h = Harness::new("subwaitkill", "[budget]\ncpu = \"1\"\n");
+
+    let blocker = h.submit(&["submit", "--cpu", "1", "--", "sleep", "30"]);
+    h.until("the blocker operates", Duration::from_secs(30), || {
+        h.state_of(&blocker) == "running"
+    });
+
+    let id_file = h.root.join("subwait.id");
+    let id_path = id_file.to_str().unwrap().to_string();
+    let mut child = h.spawn(&[
+        "submit",
+        "--wait",
+        "--id-file",
+        &id_path,
+        "--cpu",
+        "1",
+        "--",
+        "sleep",
+        "5",
+    ]);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let id = loop {
+        if let Ok(text) = std::fs::read_to_string(&id_file) {
+            let id = text.trim().to_string();
+            if id.parse::<uuid::Uuid>().is_ok() {
+                break id;
+            }
+        }
+        assert!(Instant::now() < deadline, "submit --wait wrote no id");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    h.until("the job waits", Duration::from_secs(30), || {
+        h.state_of(&id) == "queued"
+    });
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    // Give the coordinator more time than it needs to make a wrong decision.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        h.state_of(&id),
+        "queued",
+        "a job of `qex submit --wait` must wait for a reader that attaches again"
+    );
+
+    h.ok(&["cancel", &id]);
+    h.ok(&["kill", &blocker]);
+}
+
+/// The ownership of a job must survive a new coordinator.
+///
+/// A CONNECTION carries the ownership, so a new connection holds none. qex
+/// replaces the coordinator at every update of the program, so a command that
+/// asks once and never again loses the rule on the path that qex takes most
+/// often, and it says nothing.
+#[test]
+fn the_ownership_of_a_job_survives_a_new_coordinator() {
+    let h = Harness::new("ownagain", "[budget]\ncpu = \"1\"\n");
+
+    let blocker = h.submit(&["submit", "--cpu", "1", "--", "sleep", "60"]);
+    h.until("the blocker operates", Duration::from_secs(30), || {
+        h.state_of(&blocker) == "running"
+    });
+
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--", "sleep", "5"]);
+    h.until("the job of qex run waits", Duration::from_secs(30), || {
+        h.state_of(&id) == "queued"
+    });
+
+    // Stop the coordinator. The supervisor of the blocker continues, and a
+    // later command starts a new coordinator that reads the same records.
+    let info: serde_json::Value =
+        serde_json::from_str(&h.ok(&["info", "--no-start", "--json"])).unwrap();
+    let pid = info["pid"].as_i64().unwrap() as i32;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    // `qex run` meets the loss, finds the new coordinator, and asks it again.
+    h.until("a new coordinator answers", Duration::from_secs(40), || {
+        h.state_of(&id) == "queued" && {
+            let fresh: serde_json::Value =
+                serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+            fresh["pid"].as_i64().unwrap() as i32 != pid
+        }
+    });
+
+    // `qex run` must MEET the loss and ask the new coordinator before this test
+    // takes the command away. The command reads the state every 80ms, so this
+    // wait is far longer than it needs.
+    std::thread::sleep(Duration::from_secs(3));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    h.until(
+        "the new coordinator cancels the job of a command that stopped",
+        Duration::from_secs(40),
+        || h.state_of(&id) == "cancelled",
+    );
+
+    h.ok(&["kill", &blocker]);
+}

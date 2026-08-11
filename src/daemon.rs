@@ -1915,8 +1915,14 @@ fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     drop(state);
 
     match state_now {
+        // The job went back to the queue in the moment between the two steps
+        // above. The cancel did not happen, and the remedy is the same command.
+        JobState::Queued => Response::error(
+            ErrorKind::WrongState,
+            format!("the job {id} went back to the queue. Run `qex cancel {id}` again."),
+        ),
         // The job started in the moment between the two steps above.
-        JobState::Queued | JobState::Starting | JobState::Running => Response::error(
+        JobState::Starting | JobState::Running => Response::error(
             ErrorKind::WrongState,
             format!("the job {id} operates now. Use `qex kill {id}` to stop it."),
         ),

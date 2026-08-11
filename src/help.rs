@@ -124,7 +124,7 @@ output waits in the log file for `qex status <id> --follow`.
 
 Every other command leaves the job. `qex submit --wait` and `qex wait` put the
 job in the queue, or find it there, to live on its own, so a reader that stops
-waiting has not asked qex to throw the work away. Use `qex submit` for work
+the wait has not asked qex to throw the work away. Use `qex submit` for work
 that must live longer than the command that starts it, and `qex cancel <id>`
 to remove a job that waits.
 
