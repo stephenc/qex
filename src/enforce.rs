@@ -1023,6 +1023,31 @@ mod tests {
         std::fs::remove_dir_all(&cgroup).ok();
     }
 
+    /// The watch says qex made the cgroup only when THIS attempt made it.
+    ///
+    /// A recorded path can name the cgroup of an earlier attempt, because the
+    /// removal of a cgroup fails while the supervisor is inside it. A watch
+    /// that read such a path would give the counts of that earlier attempt the
+    /// weight of a measurement of this one.
+    #[test]
+    fn the_watch_owns_a_cgroup_only_when_this_attempt_made_it() {
+        let dir = a_cgroup_with_events("owned", "oom 0\noom_kill 0\n");
+
+        let made = OomWatch::start(Some(&dir));
+        assert!(
+            made.qex_made_cgroup,
+            "a cgroup that this attempt made belongs to this attempt"
+        );
+
+        let not_made = OomWatch::start(None);
+        assert!(
+            !not_made.qex_made_cgroup,
+            "with no cgroup of its own, qex cannot name the job that the kernel stopped"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A cgroup with a count says nothing by itself.
     ///
     /// Only the supervisor holds the counts from the start of the attempt, so
