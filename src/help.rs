@@ -1633,6 +1633,8 @@ Delete the records
                                    below. A job of the last hour stays,
                                    because it is frequently the job that you
                                    read now.
+    qex clean --older-than 7d      each job older than 7 days
+    qex clean --all                every job
     qex gc                         every record of every directory that
                                    stopped more than one day ago. It also
                                    deletes a job directory that holds no
@@ -1649,8 +1651,18 @@ A job that a job in the queue still needs is NOT finished for a deletion,
 whatever its own state says. The job in the queue reads that record to decide
 whether to run, and to explain why it did not. `qex clean` and `qex gc` keep
 such a record and say so, and it goes when the other job stops.
-    qex clean --older-than 7d      each job older than 7 days
-    qex clean --all                every job
+
+Two rules keep a record, and a record that one rule keeps stays:
+
+  * every job that an unfinished job waits for, through the WHOLE chain. A job
+    that waits for one job also depends on the jobs behind that job.
+  * every job of a pipeline that has one job which has not stopped. The jobs of
+    a pipeline are one piece of work, and a pipeline can divide, so a stage
+    that no later stage waits for is still a stage of that pipeline.
+
+Each rule needs a job that has not stopped, so no record stays after that work
+stops. A job that never stops, such as a stage that waits for a lock, holds its
+records while it waits.
 
 `qex clean` deletes the directory of the job. It does not stop a job that
 operates.

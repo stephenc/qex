@@ -191,34 +191,63 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
         //
         // Without this rule, the record of the cause disappears, and a job that
         // waits for it cannot report why it did not run.
-        let waiting: Vec<String> = state
+        //
+        // This test is the LAST one, so every deletion meets it, whatever asked
+        // for the deletion. It uses the rule of `crate::deps`, which `qex clean`
+        // and `qex gc` use as well: one rule gives one answer, and a command
+        // cannot say that it kept a record while this code deletes it.
+        let nodes: Vec<crate::deps::Node> = state
             .jobs
             .values()
-            .filter(|j| !j.status.state.is_terminal())
-            .filter(|j| j.spec.needs.contains(&id) || j.spec.after.contains(&id))
-            .map(|j| {
-                format!(
-                    "{} ({})",
-                    &j.status.id.to_string()[..8],
-                    j.status.display_name()
-                )
+            .map(|j| crate::deps::Node {
+                id: j.status.id,
+                group: j.status.group,
+                terminal: j.status.state.is_terminal(),
+                needs: &j.spec.needs,
+                after: &j.spec.after,
             })
             .collect();
 
-        if !waiting.is_empty() {
-            return Response::error(
-                ErrorKind::WrongState,
-                format!(
-                    "the job {id} is needed by {}. Wait for {}, or cancel {}.",
-                    waiting.join(", "),
-                    if waiting.len() == 1 {
-                        "that job"
-                    } else {
-                        "those jobs"
-                    },
-                    if waiting.len() == 1 { "it" } else { "them" }
-                ),
-            );
+        if let Some(hold) = crate::deps::hold_reason(&nodes, id) {
+            let name = |holder: &uuid::Uuid| -> Option<String> {
+                state.jobs.get(holder).map(|j| {
+                    format!(
+                        "{} ({})",
+                        &j.status.id.to_string()[..8],
+                        j.status.display_name()
+                    )
+                })
+            };
+
+            // Each rule is a DIFFERENT relation, so each gets its own words. A
+            // stage of a pipeline that no other stage waits for is not a job
+            // that another job needs, and a message that says so is false.
+            let text = match &hold {
+                crate::deps::Hold::Needed(holders) => {
+                    let waiting: Vec<String> = holders.iter().filter_map(name).collect();
+                    let one = waiting.len() == 1;
+                    format!(
+                        "the job {id} is needed by {}. Wait for {}, or cancel {}.",
+                        waiting.join(", "),
+                        if one { "that job" } else { "those jobs" },
+                        if one { "it" } else { "them" }
+                    )
+                }
+                crate::deps::Hold::Pipeline(holders) => {
+                    let working: Vec<String> = holders.iter().filter_map(name).collect();
+                    let one = working.len() == 1;
+                    format!(
+                        "the job {id} belongs to a pipeline that has work left: {}. \
+                         The record of a stage stays while the pipeline operates, so that \
+                         a reader can see the whole pipeline. Wait for {}, or cancel {}.",
+                        working.join(", "),
+                        if one { "that job" } else { "those jobs" },
+                        if one { "it" } else { "them" }
+                    )
+                }
+            };
+
+            return Response::error(ErrorKind::WrongState, text);
         }
     }
 

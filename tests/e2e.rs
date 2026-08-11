@@ -3730,6 +3730,339 @@ fn clean_accepts_a_state_name() {
     assert_eq!(states, vec!["failed"], "qex deleted the wrong jobs");
 }
 
+/// Gives the command of a job that waits until the test releases it.
+///
+/// A TEST CONTROLS THE BUDGET AND THE END OF ITS OWN JOBS. It controls nothing
+/// else about the machine: not the moment a job starts, and not the speed of
+/// the runner.
+///
+/// A job that ends on a timer is therefore a race. A slow machine finishes the
+/// job before the test reads the answer, and the failure then names the test
+/// and not a fault of qex. This job waits for a FILE, so it stays unfinished
+/// until the test makes that file, however slow the machine is.
+///
+/// Use `release` to end every job that waits for the same file.
+///
+/// THE JOB MUST ALSO END BY ITSELF. A test that fails, or one that stops
+/// before it releases the job, leaves a job that waits for a file which
+/// nobody will make. A job that sleeps ends by itself; a job that waits does
+/// not, so this command gives it two more ways to stop:
+///
+/// * the directory of the test goes. The harness deletes it when the test
+///   ends, so the job stops with it, and the machine keeps no process that
+///   waits for a file in a directory that is not there.
+/// * a count of the attempts. It is the last guard, for a state that neither
+///   the gate nor the directory covers.
+///
+/// The gate is what the TEST uses. The other two are what the MACHINE needs.
+fn waits_for_the_test(gate: &std::path::Path) -> String {
+    let root = gate
+        .parent()
+        .expect("the gate file is in the directory of the test");
+    format!(
+        "i=0; while [ ! -f {gate} ]; do \
+         [ -d {root} ] || exit 0; \
+         i=$((i+1)); [ $i -gt 2400 ] && exit 0; \
+         sleep 0.05; done",
+        gate = gate.display(),
+        root = root.display()
+    )
+}
+
+/// Ends every job that waits for this file.
+fn release(gate: &std::path::Path) {
+    std::fs::write(gate, "go").expect("the test makes its own gate file");
+}
+
+/// A record that an unfinished pipeline needs must survive a deletion.
+///
+/// A pipeline of three stages runs its last stage. The reader deletes the jobs
+/// that stopped. The records of BOTH earlier stages must stay: the work of
+/// those stages happened, and the record is the only proof of it. A rule that
+/// walks one step keeps the middle stage and loses the first.
+#[test]
+fn clean_keeps_every_record_of_a_pipeline_that_operates() {
+    let h = Harness::with_default_config("cleanchain");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
+
+    let a = h.submit(&["submit", "--name", "c-a", "--mem", "64MB", "--", "true"]);
+    let b = h.submit(&[
+        "submit", "--name", "c-b", "--mem", "64MB", "--needs", &a, "--", "true",
+    ]);
+    let c = h.submit(&[
+        "submit", "--name", "c-c", "--mem", "64MB", "--needs", &b, "--", "sh", "-c", &waiting,
+    ]);
+    h.until("the last stage operates", Duration::from_secs(30), || {
+        h.state_of(&c) == "running"
+    });
+
+    h.ok(&["clean", "--state", "done"]);
+
+    let ids: Vec<String> = h
+        .list_json()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        ids.contains(&b),
+        "the stage that the running stage waits for must stay: {ids:?}"
+    );
+    assert!(
+        ids.contains(&a),
+        "the FIRST stage must stay: a walk of one step loses it, and its work happened: {ids:?}"
+    );
+
+    h.ok(&["kill", &c]);
+}
+
+/// The message names the work that HOLDS a record, and no other work.
+///
+/// A queue holds jobs that have no relation to each other. A message that
+/// lists every job which has not stopped says that each one needs the records
+/// that stayed, and that relation does not exist. A reader acts on the output
+/// of qex as fact, so a message may state only the relation that qex computed.
+#[test]
+fn the_message_names_the_work_that_holds_a_record() {
+    // THREE jobs must be unfinished in one moment, so the budget must admit
+    // three. The test sets that; it does not control how fast a runner starts
+    // a job. With a smaller budget the queue runs them one after the other,
+    // which is what a queue exists to do.
+    let h = Harness::new(
+        "cleanwho",
+        "[budget]\ncpu = \"4\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
+
+    let dep = h.submit(&["submit", "--name", "m-dep", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &dep, "--timeout", "30s"]);
+    let holder = h.submit(&[
+        "submit", "--name", "m-holder", "--mem", "64MB", "--needs", &dep, "--", "sh", "-c",
+        &waiting,
+    ]);
+    // Two jobs that hold nothing. They wait for no record and no pipeline
+    // carries them.
+    let lone_one = h.submit(&[
+        "submit",
+        "--name",
+        "m-lone-one",
+        "--mem",
+        "64MB",
+        "--",
+        "sh",
+        "-c",
+        &waiting,
+    ]);
+    let lone_two = h.submit(&[
+        "submit",
+        "--name",
+        "m-lone-two",
+        "--mem",
+        "64MB",
+        "--",
+        "sh",
+        "-c",
+        &waiting,
+    ]);
+    for id in [&holder, &lone_one, &lone_two] {
+        h.until("each job operates", Duration::from_secs(45), || {
+            h.state_of(id) == "running"
+        });
+    }
+
+    let out = h.ok(&["clean", "--state", "done"]);
+
+    assert!(
+        out.contains(&holder[..8]),
+        "the message must name the job that holds the record: {out}"
+    );
+    assert!(
+        !out.contains(&lone_one[..8]),
+        "the message must not name a job that holds nothing: {out}"
+    );
+    assert!(
+        !out.contains(&lone_two[..8]),
+        "the message must not name a job that holds nothing: {out}"
+    );
+
+    release(&gate);
+}
+
+/// `qex gc` counts a record as held only when the age selected it.
+///
+/// `gc` deletes a record when it is old enough. A record that is too young is
+/// not a record that a job holds back, and a count that mixes the two tells the
+/// reader that qex refused a deletion which the reader never asked for.
+#[test]
+fn gc_counts_only_the_records_that_the_age_selected() {
+    let h = Harness::with_default_config("gccount");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
+
+    let a = h.submit(&["submit", "--name", "g-a", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &a, "--timeout", "30s"]);
+    let b = h.submit(&[
+        "submit", "--name", "g-b", "--mem", "64MB", "--needs", &a, "--", "sh", "-c", &waiting,
+    ]);
+    h.until("the second job operates", Duration::from_secs(30), || {
+        h.state_of(&b) == "running"
+    });
+
+    // Nothing is an hour old, so `gc` selects nothing. The record of `a` is
+    // held, and the reader did not ask for it.
+    let out = h.ok(&["gc", "--older-than", "1h"]);
+
+    assert!(
+        !out.contains("stayed"),
+        "the count must hold the records that the age selected, and it said: {out}"
+    );
+
+    release(&gate);
+}
+
+/// The coordinator refuses a deletion that breaks a chain.
+///
+/// `qex clean <id>` names one record, and the coordinator decides every
+/// deletion. That decision must use the same rule as the selection, and it must
+/// look through the WHOLE chain: a record two steps behind a job that operates
+/// is still a record that the work needs.
+///
+/// The refusal must carry an exit code and name the job to wait for. A reader
+/// who names one record must learn that qex kept it.
+#[test]
+fn the_coordinator_refuses_a_deletion_that_a_chain_needs() {
+    let h = Harness::with_default_config("cleandeep");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
+
+    let a = h.submit(&["submit", "--name", "d-a", "--mem", "64MB", "--", "true"]);
+    let b = h.submit(&[
+        "submit", "--name", "d-b", "--mem", "64MB", "--needs", &a, "--", "true",
+    ]);
+    let c = h.submit(&[
+        "submit", "--name", "d-c", "--mem", "64MB", "--needs", &b, "--", "sh", "-c", &waiting,
+    ]);
+    h.until("the last stage operates", Duration::from_secs(30), || {
+        h.state_of(&c) == "running"
+    });
+
+    // `a` is TWO steps behind the job that operates.
+    let out = h.qex(&["clean", &a]);
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !out.status.success(),
+        "qex must refuse this deletion and say so with a code: {text}"
+    );
+    assert!(
+        text.contains("is needed by"),
+        "the refusal must name the job to wait for: {text}"
+    );
+    assert!(
+        h.list_json().iter().any(|j| j["id"] == a),
+        "the record must stay"
+    );
+
+    release(&gate);
+}
+
+/// The coordinator keeps every stage of a pipeline that operates.
+///
+/// A pipeline can divide. A stage on one branch is not a step behind the stage
+/// that operates, so a rule that follows the dependencies alone lets that
+/// record go while the pipeline is still work in progress. The coordinator
+/// decides every deletion, so it must hold the pipeline rule as well.
+#[test]
+fn the_coordinator_keeps_a_stage_of_a_pipeline_that_operates() {
+    let h = Harness::with_default_config("cleanbranch");
+
+    let gate = h.root.join("gate");
+    let file = h.root.join("p.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[[jobs]]\nname = \"s1\"\ncommand = [\"true\"]\n\
+             [jobs.resources]\nmem = \"64MB\"\n\
+             [[jobs]]\nname = \"s2b\"\ncommand = [\"true\"]\nneeds = [\"s1\"]\n\
+             [jobs.resources]\nmem = \"64MB\"\n\
+             [[jobs]]\nname = \"s3\"\ncommand = [\"sh\", \"-c\", \"{}\"]\nneeds = [\"s1\"]\n\
+             [jobs.resources]\nmem = \"64MB\"\n",
+            waits_for_the_test(&gate)
+        ),
+    )
+    .expect("the test writes its own pipeline file");
+
+    h.ok(&["pipeline", file.to_str().unwrap()]);
+    h.until("the last stage operates", Duration::from_secs(45), || {
+        h.list_json()
+            .iter()
+            .any(|j| j["name"] == "s3" && j["state"] == "running")
+    });
+
+    let branch = h
+        .list_json()
+        .iter()
+        .find(|j| j["name"] == "s2b")
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .expect("the branch stage has a record");
+
+    // Nothing waits for `s2b`, and its pipeline has work left.
+    let out = h.qex(&["clean", &branch]);
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !out.status.success(),
+        "qex must refuse to delete a stage of a pipeline that operates: {text}"
+    );
+    assert!(
+        h.list_json().iter().any(|j| j["id"] == branch),
+        "the record of the branch stage must stay"
+    );
+
+    release(&gate);
+}
+
+/// The count of a deletion says what the command did.
+///
+/// `qex clean` keeps a record that a job which has not stopped needs, and it
+/// says how many records stayed. That count must hold the records that the
+/// reader ASKED for. A count that holds a record which no option selected tells
+/// the reader that qex refused a deletion that the reader never requested.
+#[test]
+fn clean_counts_only_the_records_that_the_reader_asked_for() {
+    let h = Harness::with_default_config("cleancount");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
+
+    let a = h.submit(&["submit", "--name", "n-a", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &a, "--timeout", "30s"]);
+    let b = h.submit(&[
+        "submit", "--name", "n-b", "--mem", "64MB", "--needs", &a, "--", "sh", "-c", &waiting,
+    ]);
+    h.until("the second job operates", Duration::from_secs(30), || {
+        h.state_of(&b) == "running"
+    });
+
+    // The reader asks about ONE job that operates. The record of `a` stays,
+    // and the reader did not ask for it.
+    let out = h.qex(&["clean", &b]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !text.contains("stayed"),
+        "the count must hold the records that the reader asked for, and it said: {text}"
+    );
+
+    release(&gate);
+}
+
 /// A word that names WORK and a state must give an error, and delete nothing.
 ///
 /// `qex clean completed` deletes every job that succeeded, and a job or a
@@ -5479,10 +5812,14 @@ fn a_dependency_of_a_queued_job_is_not_finished() {
 
     // The first job completed, and a job in the queue needs it.
     let out = h.ok(&["clean", "--all"]);
-    assert!(out.contains("0 job(s)"), "nothing must go: {out}");
+    assert!(out.contains("deleted 0 records"), "nothing must go: {out}");
     assert!(
-        out.contains("still needs them"),
+        out.contains("record stayed") && out.contains("needs a record"),
         "the message must give the reason: {out}"
+    );
+    assert!(
+        out.contains(&second[..8]),
+        "the message must name the work that holds the record: {out}"
     );
     assert!(
         h.list_json().iter().any(|j| j["id"] == first),

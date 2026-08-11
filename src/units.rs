@@ -130,6 +130,18 @@ pub fn count_of(count: usize, word: &str) -> String {
     }
 }
 
+/// Gives a count and the word `directory`, with the correct plural.
+///
+/// The plural of a word that ends with `y` is not the word plus `s`, so
+/// `count_of` cannot give it. ASD-STE100 does not accept `directory(s)`.
+pub fn plural_directories(count: usize) -> String {
+    if count == 1 {
+        "1 directory".to_string()
+    } else {
+        format!("{count} directories")
+    }
+}
+
 /// Writes a duration in a short form for the status output.
 ///
 /// Examples: `1h5m`, `45s`, `2d3h`.

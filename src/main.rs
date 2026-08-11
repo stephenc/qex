@@ -42,6 +42,7 @@ mod commands;
 mod config;
 #[cfg(unix)]
 mod daemon;
+mod deps;
 #[cfg(unix)]
 mod enforce;
 #[cfg(unix)]

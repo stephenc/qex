@@ -7,7 +7,7 @@ use crate::job::{safe_name, JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
 use crate::spec::{JobSpec, SubmitOptions};
-use crate::units::{count_of, format_duration, format_size, parse_duration};
+use crate::units::{count_of, format_duration, format_size, parse_duration, plural_directories};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
@@ -2760,8 +2760,11 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     let now = crate::sys::now_secs();
     // A job that a job in the queue still needs is not finished for the purpose
     // of a deletion, whatever its own state says.
-    let held = needed_by_unfinished(&jobs);
-    let mut held_back = 0usize;
+    let held = held_by_unfinished(&jobs);
+    // The records that this command chose and then kept. The reason for each
+    // one comes from the same rule that kept it, so the message states the
+    // relation that qex COMPUTED and never one that it assumed.
+    let mut stayed: Vec<uuid::Uuid> = Vec::new();
     let mut targets: Vec<uuid::Uuid> = Vec::new();
     let mut word_filters: Vec<StateFilter> = Vec::new();
 
@@ -2801,12 +2804,6 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         if !j.state.is_terminal() {
             continue;
         }
-        if held.contains(&j.id) {
-            // A job that a job in the queue needs. It is not finished yet for
-            // this purpose.
-            held_back += 1;
-            continue;
-        }
 
         // A directory is a filter and not a selector. A job outside the
         // directory is never deleted, whatever the other options say.
@@ -2821,15 +2818,6 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
             .map(|limit| now.saturating_sub(j.finished_at.unwrap_or(j.submitted_at)) >= limit)
             .unwrap_or(false);
 
-        // `--auto` needs BOTH conditions. A job that stopped a minute ago is
-        // frequently the job that the user reads now.
-        if args.auto {
-            if by_state && by_age {
-                targets.push(j.id);
-            }
-            continue;
-        }
-
         // A directory with no other option means every job that stopped in
         // that directory. `qex clean --under` is then the whole answer for a
         // user who wants the records of one project.
@@ -2839,14 +2827,36 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
             && word_filters.is_empty()
             && older_than.is_none();
 
-        if args.all || by_state || by_age || by_directory_alone {
-            targets.push(j.id);
+        // `--auto` needs BOTH conditions. A job that stopped a minute ago is
+        // frequently the job that the user reads now.
+        let selected = if args.auto {
+            by_state && by_age
+        } else {
+            args.all || by_state || by_age || by_directory_alone
+        };
+        if !selected {
+            continue;
         }
+
+        // Count a record as held ONLY when the reader asked for it. The count
+        // says what this command did, and a record that no option selected is
+        // not a record that qex kept back.
+        if held.contains(&j.id) {
+            stayed.push(j.id);
+            continue;
+        }
+
+        targets.push(j.id);
     }
 
     targets.sort();
     targets.dedup();
 
+    // A job id that the reader gave by hand goes to the coordinator, which
+    // holds the same rule and refuses the deletion with the name of the job
+    // that needs the record. That answer carries an exit code, and this
+    // command must not take it away: a reader who names one record must learn
+    // that qex kept it.
     let mut deleted = 0usize;
     let mut worst = 0;
     for id in targets {
@@ -2856,12 +2866,62 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         }
     }
 
-    println!("qex deleted the records of {deleted} job(s)");
-    if held_back > 0 {
-        println!(
-            "{held_back} record(s) stayed, because a job that has not stopped still needs \
-             them. They go when that job stops."
-        );
+    println!("qex deleted {}", count_of(deleted, "record"));
+    if !stayed.is_empty() {
+        // Name the work that HOLDS these records, and no other work.
+        //
+        // The reason comes from the same rule that kept each record, so this
+        // message states a relation that qex computed. A list of every job
+        // that has not stopped is a different thing, and most of those jobs
+        // hold nothing.
+        let nodes = dep_nodes(&jobs);
+        let mut needed_by: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+        let mut in_pipeline: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+        for id in &stayed {
+            match crate::deps::hold_reason(&nodes, *id) {
+                Some(crate::deps::Hold::Needed(holders)) => needed_by.extend(holders),
+                Some(crate::deps::Hold::Pipeline(holders)) => in_pipeline.extend(holders),
+                None => {}
+            }
+        }
+
+        let name = |id: &uuid::Uuid| -> Option<String> {
+            jobs.iter()
+                .find(|j| j.id == *id)
+                .map(|j| format!("{} ({})", short_id(&j.id), j.display_name()))
+        };
+
+        println!("{} stayed.", count_of(stayed.len(), "record"));
+
+        // The two rules are different relations, so each one gets its own
+        // sentence. One sentence for both would say something false about
+        // half of the records.
+        let needs_list: Vec<String> = needed_by.iter().filter_map(name).collect();
+        if !needs_list.is_empty() {
+            println!(
+                "  {} that {} not stopped {} a record: {}",
+                if needs_list.len() == 1 {
+                    "1 job"
+                } else {
+                    "These jobs"
+                },
+                if needs_list.len() == 1 { "has" } else { "have" },
+                if needs_list.len() == 1 {
+                    "needs"
+                } else {
+                    "need"
+                },
+                needs_list.join(", ")
+            );
+        }
+        let pipeline_list: Vec<String> = in_pipeline.iter().filter_map(name).collect();
+        if !pipeline_list.is_empty() {
+            println!(
+                "  A pipeline has work left, so the record of each stage stays: {}",
+                pipeline_list.join(", ")
+            );
+        }
+        println!("  Each record goes when the work that holds it stops.");
     }
 
     Ok(worst)
@@ -5469,13 +5529,21 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
         bail!("the coordinator did not give the job list");
     };
 
-    let held = needed_by_unfinished(&jobs);
+    let held = held_by_unfinished(&jobs);
     let mut held_back = 0usize;
     let mut targets: Vec<(uuid::Uuid, String, u64)> = Vec::new();
     for j in &jobs {
         if !j.state.is_terminal() {
             continue;
         }
+        let stopped = j.finished_at.unwrap_or(j.submitted_at);
+        let age = now.saturating_sub(stopped);
+        if age < keep {
+            continue;
+        }
+        // Count a record as held ONLY when the age selected it. A record that
+        // is too young to collect is not a record that a job holds back, and a
+        // count that mixes the two says something false to the reader.
         if held.contains(&j.id) {
             // A job that a job in the queue needs is not finished for this
             // purpose. Its record answers a question that the other job has
@@ -5483,16 +5551,12 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
             held_back += 1;
             continue;
         }
-        let stopped = j.finished_at.unwrap_or(j.submitted_at);
-        let age = now.saturating_sub(stopped);
-        if age >= keep {
-            targets.push((
-                j.id,
-                // For a READER. See `for_display`.
-                j.display_name(),
-                directory_size(&paths::job_dir(&j.id)?),
-            ));
-        }
+        targets.push((
+            j.id,
+            // For a READER. See `for_display`.
+            j.display_name(),
+            directory_size(&paths::job_dir(&j.id)?),
+        ));
     }
 
     // A directory with no record belongs to no job. It cannot be deleted by an
@@ -5538,9 +5602,9 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
     if args.dry_run {
         if !args.json {
             println!(
-                "qex would delete {} record(s) and {} directory(s) with no record, and free {}.",
-                targets.len(),
-                orphans.len(),
+                "qex would delete {}, and {}, with no record, and free {}.",
+                count_of(targets.len(), "record"),
+                plural_directories(orphans.len()),
                 format_size(bytes)
             );
             println!("Nothing changed. Run the command without `--dry-run` to delete them.");
@@ -5560,20 +5624,28 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
 
     if !args.json {
         println!(
-            "qex deleted {deleted} record(s) and {} directory(s) with no record, and freed {}.",
-            orphans.len(),
+            "qex deleted {}, and {}, with no record, and freed {}.",
+            count_of(deleted, "record"),
+            plural_directories(orphans.len()),
             format_size(bytes)
         );
         if held_back > 0 {
+            // "holds" and not "needs": a record can stay because a job waits
+            // for it, and it can stay because its pipeline has work left. The
+            // second is not a job that needs the record. Use `qex clean <id>`
+            // for one record to read which rule kept it.
             println!(
-                "{held_back} record(s) stayed, because a job that has not stopped still \
-                 needs them. They go at the next run, after that job stops."
+                "{} stayed, because work that has not stopped holds {}. \
+                 {} at the next run, after that work stops.",
+                count_of(held_back, "record"),
+                if held_back == 1 { "it" } else { "them" },
+                if held_back == 1 { "It goes" } else { "They go" },
             );
         }
         if deleted < targets.len() {
             println!(
-                "{} record(s) that this command chose stayed. The coordinator refused them.",
-                targets.len() - deleted
+                "{} that this command chose stayed. The coordinator refused them.",
+                count_of(targets.len() - deleted, "record")
             );
         }
     }
@@ -5592,26 +5664,26 @@ fn directory_size(path: &std::path::Path) -> u64 {
         .sum()
 }
 
-/// Gives the jobs that a job which has not stopped still needs.
+/// Gives the records that a job which has not stopped still needs.
 ///
-/// Such a job is not finished for the purpose of a deletion, whatever its own
-/// state says. A job in the queue reads the record of the job that it waits
-/// for: it needs the state to decide whether to run, and it needs the name and
-/// the log to explain why it did not.
-///
-/// A deletion of that record would take the answer away from a job that has not
-/// yet asked the question.
-fn needed_by_unfinished(jobs: &[JobStatus]) -> std::collections::BTreeSet<uuid::Uuid> {
-    let mut held = std::collections::BTreeSet::new();
-    for job in jobs {
-        if job.state.is_terminal() {
-            continue;
-        }
-        for id in job.needs.iter().chain(job.after.iter()) {
-            held.insert(*id);
-        }
-    }
-    held
+/// The rule lives in `crate::deps`, so this command and the coordinator give
+/// one answer. See [`crate::deps::held_by_unfinished`] for the two rules and
+/// the reason for each.
+fn held_by_unfinished(jobs: &[JobStatus]) -> std::collections::BTreeSet<uuid::Uuid> {
+    crate::deps::held_by_unfinished(&dep_nodes(jobs))
+}
+
+/// Gives the records in the form that the rule of `crate::deps` reads.
+fn dep_nodes(jobs: &[JobStatus]) -> Vec<crate::deps::Node<'_>> {
+    jobs.iter()
+        .map(|j| crate::deps::Node {
+            id: j.id,
+            group: j.group,
+            terminal: j.state.is_terminal(),
+            needs: &j.needs,
+            after: &j.after,
+        })
+        .collect()
 }
 
 /// Shows how much disk space qex holds.
@@ -5700,14 +5772,15 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
 
     println!("qex holds {} in {}", format_size(total), state.display());
     println!(
-        "  {} in {} job record(s)",
+        "  {} in {}",
         format_size(total_jobs),
-        per_job.len()
+        count_of(per_job.len(), "job record")
     );
     if orphan_count > 0 {
         println!(
-            "  {} in {orphan_count} directory(s) with no record",
-            format_size(orphans)
+            "  {} in {} with no record",
+            format_size(orphans),
+            plural_directories(orphan_count)
         );
     }
     println!("  {} in the other files", format_size(other));
@@ -6444,5 +6517,141 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         assert_eq!(short_id(&id).len(), 8);
         assert!(id.to_string().starts_with(&short_id(&id)));
+    }
+
+    /// A record that a job needs through a CHAIN stays.
+    ///
+    /// A job that waits for one job also depends on the jobs behind that job.
+    /// A walk of one step keeps the job in the middle and deletes the job at
+    /// the start, so a pipeline that operates loses the record of its first
+    /// stage. The work of that stage happened, and the record is the only
+    /// proof of it.
+    ///
+    /// This test calls the function that decides, so the answer it reads is
+    /// the answer that `qex clean` and `qex gc` use.
+    #[test]
+    fn a_record_that_an_unfinished_job_needs_through_a_chain_stays() {
+        let mut a = status_with(JobState::Completed, Some(0));
+        let mut b = status_with(JobState::Completed, Some(0));
+        let mut c = status_with(JobState::Running, None);
+        a.name = "t-a".into();
+        b.name = "t-b".into();
+        c.name = "t-c".into();
+        b.needs = vec![a.id];
+        c.needs = vec![b.id];
+
+        let held = held_by_unfinished(&[a.clone(), b.clone(), c.clone()]);
+
+        assert!(
+            held.contains(&b.id),
+            "the job that the running job waits for"
+        );
+        assert!(
+            held.contains(&a.id),
+            "the job at the start of the chain: a walk of one step loses it"
+        );
+    }
+
+    /// A record stays for `after` as well as for `needs`.
+    ///
+    /// The two fields both make a job wait, so a walk that reads one and not
+    /// the other keeps half of the answer.
+    #[test]
+    fn a_record_that_a_chain_of_after_holds_stays() {
+        let a = status_with(JobState::Completed, Some(0));
+        let mut b = status_with(JobState::Completed, Some(0));
+        let mut c = status_with(JobState::Queued, None);
+        b.after = vec![a.id];
+        c.after = vec![b.id];
+
+        let held = held_by_unfinished(&[a.clone(), b.clone(), c.clone()]);
+
+        assert!(
+            held.contains(&b.id),
+            "the job that the queued job waits for"
+        );
+        assert!(held.contains(&a.id), "the job at the start of the chain");
+    }
+
+    /// Every stage of a pipeline that has work left stays.
+    ///
+    /// A pipeline can divide. A stage that no later stage waits for is still a
+    /// stage of that pipeline, and a reader reads the whole pipeline to see
+    /// where the work is. A rule that follows the dependencies alone deletes
+    /// such a stage while the pipeline operates.
+    #[test]
+    fn every_stage_of_a_pipeline_that_operates_stays() {
+        let group = uuid::Uuid::new_v4();
+        let mut s1 = status_with(JobState::Completed, Some(0));
+        let mut s2a = status_with(JobState::Completed, Some(0));
+        let mut s2b = status_with(JobState::Completed, Some(0));
+        let mut s3 = status_with(JobState::Running, None);
+        for j in [&mut s1, &mut s2a, &mut s2b, &mut s3] {
+            j.group = Some(group);
+        }
+        s2a.needs = vec![s1.id];
+        s2b.needs = vec![s1.id];
+        s3.needs = vec![s2a.id];
+
+        let held = held_by_unfinished(&[s1.clone(), s2a.clone(), s2b.clone(), s3.clone()]);
+
+        assert!(held.contains(&s1.id), "the first stage");
+        assert!(
+            held.contains(&s2a.id),
+            "the stage that the running stage needs"
+        );
+        assert!(
+            held.contains(&s2b.id),
+            "the stage of the other branch: no later stage waits for it"
+        );
+    }
+
+    /// A record goes when the work of its pipeline stops.
+    ///
+    /// A rule that keeps a record for ever is as wrong as a rule that keeps
+    /// none. `qex clean` must remove what a reader asks it to remove.
+    #[test]
+    fn a_pipeline_that_stopped_holds_no_record() {
+        let group = uuid::Uuid::new_v4();
+        let mut s1 = status_with(JobState::Completed, Some(0));
+        let mut s2 = status_with(JobState::Completed, Some(0));
+        s1.group = Some(group);
+        s2.group = Some(group);
+        s2.needs = vec![s1.id];
+
+        let held = held_by_unfinished(&[s1.clone(), s2.clone()]);
+
+        assert!(held.is_empty(), "every job stopped, so no record stays");
+    }
+
+    /// A job with no relation to the work that operates goes.
+    #[test]
+    fn a_job_that_nothing_waits_for_holds_no_record() {
+        let lone = status_with(JobState::Completed, Some(0));
+        let running = status_with(JobState::Running, None);
+
+        let held = held_by_unfinished(&[lone.clone(), running.clone()]);
+
+        assert!(!held.contains(&lone.id), "nothing waits for this job");
+    }
+
+    /// A circle of dependencies ends the walk.
+    ///
+    /// The queue refuses such a file, and a record on the disk is not a
+    /// promise. A walk that reads a record twice does not stop, so the test
+    /// holds the guard that ends it.
+    #[test]
+    fn a_circle_of_dependencies_ends_the_walk() {
+        let mut a = status_with(JobState::Completed, Some(0));
+        let mut b = status_with(JobState::Completed, Some(0));
+        let mut c = status_with(JobState::Running, None);
+        a.needs = vec![b.id];
+        b.needs = vec![a.id];
+        c.needs = vec![a.id];
+
+        let held = held_by_unfinished(&[a.clone(), b.clone(), c.clone()]);
+
+        assert!(held.contains(&a.id));
+        assert!(held.contains(&b.id));
     }
 }
