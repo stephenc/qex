@@ -15298,6 +15298,16 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
             match listener.accept() {
                 Ok((front_side, _)) => {
+                    // AN ACCEPTED SOCKET MUST BLOCK.
+                    //
+                    // The listener is not blocking, so that the accept loop can
+                    // stop. One system gives the accepted socket that flag as
+                    // well, and a read on it then answers `WouldBlock` the
+                    // moment the client is slow to send its next request. A
+                    // proxy that reads that answer as an end of file serves one
+                    // request and closes, and the client then meets a broken
+                    // pipe that qex did not cause.
+                    front_side.set_nonblocking(false).unwrap();
                     let real = real.clone();
                     let first = held_one.clone();
                     let note = log.clone();
@@ -15313,15 +15323,53 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                         let mut from_real = BufReader::new(back);
                         let mut to_qex = front_side;
                         let mut line = String::new();
+                        let mut served = 0usize;
                         // One request, one answer, and the FIRST answer waits.
-                        while from_qex.read_line(&mut line).unwrap_or(0) > 0 {
+                        // AN ERROR IS NOT AN END OF FILE: a proxy that reads it
+                        // as one closes the connection under the client, and the
+                        // failure then names qex for a fault of this helper.
+                        loop {
+                            line.clear();
+                            match from_qex.read_line(&mut line) {
+                                Ok(0) => {
+                                    note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                        "{:?} the client closed after {} request(s)",
+                                        began.elapsed(),
+                                        served
+                                    ));
+                                    return;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                        "{:?} READING THE REQUEST FAILED after {} request(s): {e}",
+                                        began.elapsed(),
+                                        served
+                                    ));
+                                    return;
+                                }
+                            }
+                            served += 1;
                             if to_real.write_all(line.as_bytes()).is_err() {
+                                note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                    "{:?} FORWARDING REQUEST {} FAILED",
+                                    began.elapsed(),
+                                    served
+                                ));
                                 return;
                             }
                             to_real.flush().ok();
                             let mut answer = String::new();
-                            if from_real.read_line(&mut answer).unwrap_or(0) == 0 {
-                                return;
+                            match from_real.read_line(&mut answer) {
+                                Ok(0) | Err(_) => {
+                                    note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                        "{:?} THE REAL COORDINATOR GAVE NO ANSWER TO REQUEST {}",
+                                        began.elapsed(),
+                                        served
+                                    ));
+                                    return;
+                                }
+                                Ok(_) => {}
                             }
                             // THE COORDINATOR IS BUSY. The answer is correct and
                             // it arrives late. Only the first one waits, so the
@@ -15335,16 +15383,21 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                                 std::thread::sleep(delay);
                             }
                             note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
-                                "{:?} wrote an answer of {} bytes, held: {}",
+                                "{:?} answered request {} with {} bytes, held: {}",
                                 began.elapsed(),
+                                served,
                                 answer.len(),
                                 held
                             ));
                             if to_qex.write_all(answer.as_bytes()).is_err() {
+                                note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
+                                    "{:?} WRITING ANSWER {} FAILED",
+                                    began.elapsed(),
+                                    served
+                                ));
                                 return;
                             }
                             to_qex.flush().ok();
-                            line.clear();
                         }
                     }));
                 }
@@ -15396,6 +15449,21 @@ fn a_coordinator_that_answers_late_is_answered_and_not_refused() {
     let out = h.qex_within(&["status", &id, "--json"], Duration::from_secs(60));
     let took = started.elapsed();
 
+    // THE PROXY MUST PROVE ITS OWN BEHAVIOUR.
+    //
+    // This helper is an instrument, and an instrument that is wrong in a way
+    // that looks like a product fault costs a whole run of CI. If the proxy
+    // served fewer requests than the command sent, the failure must name the
+    // PROXY and not qex.
+    let what_the_proxy_did = _slow.what_it_did();
+    assert!(
+        !what_the_proxy_did.contains("READING THE REQUEST FAILED")
+            && !what_the_proxy_did.contains("FORWARDING REQUEST")
+            && !what_the_proxy_did.contains("WRITING ANSWER")
+            && !what_the_proxy_did.contains("GAVE NO ANSWER"),
+        "THE PROXY OF THIS TEST FAILED, and qex is not the cause:\n{what_the_proxy_did}"
+    );
+
     // SAY WHY, ON FAILURE ONLY. An exit status with no code means a SIGNAL
     // ended the command, which is this test taking it away rather than qex
     // refusing. The proxy log then says whether it wrote when it was told to.
@@ -15444,6 +15512,10 @@ fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordin
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
             match listener.accept() {
                 Ok((front_side, _)) => {
+                    // The accepted socket must BLOCK. One system gives it the
+                    // flag of the listener, and a read then answers
+                    // `WouldBlock` when the client is merely slow.
+                    front_side.set_nonblocking(false).unwrap();
                     let real = real.clone();
                     let mine = flag.clone();
                     workers.push(std::thread::spawn(move || {
