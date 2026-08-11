@@ -7,7 +7,7 @@ use crate::job::{safe_name, JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
 use crate::spec::{JobSpec, SubmitOptions};
-use crate::units::{count_of, format_duration, format_size, parse_duration};
+use crate::units::{count_of, format_duration, format_size, parse_duration, plural_directories};
 use anyhow::{bail, Context, Result};
 use std::time::{Duration, Instant};
 
@@ -2863,20 +2863,36 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         }
     }
 
-    if deleted == 1 {
-        println!("qex deleted 1 record");
-    } else {
-        println!("qex deleted {deleted} records");
-    }
-    if held_back == 1 {
+    println!("qex deleted {}", count_of(deleted, "record"));
+    if held_back > 0 {
+        // Name the work that holds the records. A count with no name gives the
+        // reader nothing to wait for, and a list of every job makes a page, so
+        // this message names the jobs that have not stopped. They are the
+        // queue, and a queue holds tens of jobs.
+        let unfinished: Vec<String> = jobs
+            .iter()
+            .filter(|j| !j.state.is_terminal())
+            .map(|j| format!("{} ({})", short_id(&j.id), j.display_name()))
+            .collect();
+        let one = held_back == 1;
         println!(
-            "1 record stayed, because a job that has not stopped needs it. \
-             It goes when that job stops."
-        );
-    } else if held_back > 1 {
-        println!(
-            "{held_back} records stayed, because a job that has not stopped needs them. \
-             They go when that job stops."
+            "{} stayed, because {} that {} not stopped {} {}: {}. \
+             {} when that work stops.",
+            count_of(held_back, "record"),
+            if unfinished.len() == 1 {
+                "a job"
+            } else {
+                "the jobs"
+            },
+            if unfinished.len() == 1 { "has" } else { "have" },
+            if unfinished.len() == 1 {
+                "needs"
+            } else {
+                "need"
+            },
+            if one { "it" } else { "them" },
+            unfinished.join(", "),
+            if one { "It goes" } else { "They go" },
         );
     }
 
@@ -5558,9 +5574,9 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
     if args.dry_run {
         if !args.json {
             println!(
-                "qex would delete {} record(s) and {} directory(s) with no record, and free {}.",
-                targets.len(),
-                orphans.len(),
+                "qex would delete {}, and {}, with no record, and free {}.",
+                count_of(targets.len(), "record"),
+                plural_directories(orphans.len()),
                 format_size(bytes)
             );
             println!("Nothing changed. Run the command without `--dry-run` to delete them.");
@@ -5580,20 +5596,26 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
 
     if !args.json {
         println!(
-            "qex deleted {deleted} record(s) and {} directory(s) with no record, and freed {}.",
-            orphans.len(),
+            "qex deleted {}, and {}, with no record, and freed {}.",
+            count_of(deleted, "record"),
+            plural_directories(orphans.len()),
             format_size(bytes)
         );
-        if held_back > 0 {
+        if held_back == 1 {
             println!(
-                "{held_back} record(s) stayed, because a job that has not stopped still \
-                 needs them. They go at the next run, after that job stops."
+                "1 record stayed, because a job that has not stopped needs it. \
+                 It goes at the next run, after that job stops."
+            );
+        } else if held_back > 1 {
+            println!(
+                "{held_back} records stayed, because a job that has not stopped needs them. \
+                 They go at the next run, after that job stops."
             );
         }
         if deleted < targets.len() {
             println!(
-                "{} record(s) that this command chose stayed. The coordinator refused them.",
-                targets.len() - deleted
+                "{} that this command chose stayed. The coordinator refused them.",
+                count_of(targets.len() - deleted, "record")
             );
         }
     }
@@ -5624,8 +5646,8 @@ fn held_by_unfinished(jobs: &[JobStatus]) -> std::collections::BTreeSet<uuid::Uu
             id: j.id,
             group: j.group,
             terminal: j.state.is_terminal(),
-            needs: j.needs.clone(),
-            after: j.after.clone(),
+            needs: &j.needs,
+            after: &j.after,
         })
         .collect();
     crate::deps::held_by_unfinished(&nodes)
@@ -5717,14 +5739,15 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
 
     println!("qex holds {} in {}", format_size(total), state.display());
     println!(
-        "  {} in {} job record(s)",
+        "  {} in {}",
         format_size(total_jobs),
-        per_job.len()
+        count_of(per_job.len(), "job record")
     );
     if orphan_count > 0 {
         println!(
-            "  {} in {orphan_count} directory(s) with no record",
-            format_size(orphans)
+            "  {} in {} with no record",
+            format_size(orphans),
+            plural_directories(orphan_count)
         );
     }
     println!("  {} in the other files", format_size(other));

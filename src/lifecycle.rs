@@ -203,34 +203,51 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
                 id: j.status.id,
                 group: j.status.group,
                 terminal: j.status.state.is_terminal(),
-                needs: j.spec.needs.clone(),
-                after: j.spec.after.clone(),
+                needs: &j.spec.needs,
+                after: &j.spec.after,
             })
             .collect();
 
-        if crate::deps::held_by_unfinished(&nodes).contains(&id) {
-            let waiting: Vec<String> = crate::deps::holders_of(&nodes, id)
-                .iter()
-                .filter_map(|holder| state.jobs.get(holder))
-                .map(|j| {
+        if let Some(hold) = crate::deps::hold_reason(&nodes, id) {
+            let name = |holder: &uuid::Uuid| -> Option<String> {
+                state.jobs.get(holder).map(|j| {
                     format!(
                         "{} ({})",
                         &j.status.id.to_string()[..8],
                         j.status.display_name()
                     )
                 })
-                .collect();
+            };
 
-            let one = waiting.len() == 1;
-            return Response::error(
-                ErrorKind::WrongState,
-                format!(
-                    "the job {id} is needed by {}. Wait for {}, or cancel {}.",
-                    waiting.join(", "),
-                    if one { "that job" } else { "those jobs" },
-                    if one { "it" } else { "them" }
-                ),
-            );
+            // Each rule is a DIFFERENT relation, so each gets its own words. A
+            // stage of a pipeline that no other stage waits for is not a job
+            // that another job needs, and a message that says so is false.
+            let text = match &hold {
+                crate::deps::Hold::Needed(holders) => {
+                    let waiting: Vec<String> = holders.iter().filter_map(name).collect();
+                    let one = waiting.len() == 1;
+                    format!(
+                        "the job {id} is needed by {}. Wait for {}, or cancel {}.",
+                        waiting.join(", "),
+                        if one { "that job" } else { "those jobs" },
+                        if one { "it" } else { "them" }
+                    )
+                }
+                crate::deps::Hold::Pipeline(holders) => {
+                    let working: Vec<String> = holders.iter().filter_map(name).collect();
+                    let one = working.len() == 1;
+                    format!(
+                        "the job {id} belongs to a pipeline that has work left: {}. \
+                         The record of a stage stays while the pipeline operates, so that \
+                         a reader can see the whole pipeline. Wait for {}, or cancel {}.",
+                        working.join(", "),
+                        if one { "that job" } else { "those jobs" },
+                        if one { "it" } else { "them" }
+                    )
+                }
+            };
+
+            return Response::error(ErrorKind::WrongState, text);
         }
     }
 

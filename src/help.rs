@@ -1633,6 +1633,8 @@ Delete the records
                                    below. A job of the last hour stays,
                                    because it is frequently the job that you
                                    read now.
+    qex clean --older-than 7d      each job older than 7 days
+    qex clean --all                every job
     qex gc                         every record of every directory that
                                    stopped more than one day ago. It also
                                    deletes a job directory that holds no
@@ -1658,9 +1660,9 @@ Two rules keep a record, and a record that one rule keeps stays:
     a pipeline are one piece of work, and a pipeline can divide, so a stage
     that no later stage waits for is still a stage of that pipeline.
 
-Each rule needs a job that has not stopped, so no record stays for ever.
-    qex clean --older-than 7d      each job older than 7 days
-    qex clean --all                every job
+Each rule needs a job that has not stopped, so no record stays after that work
+stops. A job that never stops, such as a stage that waits for a lock, holds its
+records while it waits.
 
 `qex clean` deletes the directory of the job. It does not stop a job that
 operates.

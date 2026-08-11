@@ -3770,6 +3770,36 @@ fn clean_keeps_every_record_of_a_pipeline_that_operates() {
     h.ok(&["kill", &c]);
 }
 
+/// `qex gc` counts a record as held only when the age selected it.
+///
+/// `gc` deletes a record when it is old enough. A record that is too young is
+/// not a record that a job holds back, and a count that mixes the two tells the
+/// reader that qex refused a deletion which the reader never asked for.
+#[test]
+fn gc_counts_only_the_records_that_the_age_selected() {
+    let h = Harness::with_default_config("gccount");
+
+    let a = h.submit(&["submit", "--name", "g-a", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &a, "--timeout", "30s"]);
+    let b = h.submit(&[
+        "submit", "--name", "g-b", "--mem", "64MB", "--needs", &a, "--", "sleep", "45",
+    ]);
+    h.until("the second job operates", Duration::from_secs(30), || {
+        h.state_of(&b) == "running"
+    });
+
+    // Nothing is an hour old, so `gc` selects nothing. The record of `a` is
+    // held, and the reader did not ask for it.
+    let out = h.ok(&["gc", "--older-than", "1h"]);
+
+    assert!(
+        !out.contains("stayed"),
+        "the count must hold the records that the age selected, and it said: {out}"
+    );
+
+    h.ok(&["kill", &b]);
+}
+
 /// The coordinator refuses a deletion that breaks a chain.
 ///
 /// `qex clean <id>` names one record, and the coordinator decides every
@@ -5659,8 +5689,12 @@ fn a_dependency_of_a_queued_job_is_not_finished() {
     let out = h.ok(&["clean", "--all"]);
     assert!(out.contains("deleted 0 records"), "nothing must go: {out}");
     assert!(
-        out.contains("has not stopped needs"),
+        out.contains("stayed, because"),
         "the message must give the reason: {out}"
+    );
+    assert!(
+        out.contains(&second[..8]),
+        "the message must name the work that holds the record: {out}"
     );
     assert!(
         h.list_json().iter().any(|j| j["id"] == first),

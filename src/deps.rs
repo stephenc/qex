@@ -7,6 +7,19 @@
 //!
 //! This module holds the rule once. Each caller builds a [`Node`] for each job
 //! that it knows, and reads the answer from [`held_by_unfinished`].
+//!
+//! # The cost
+//!
+//! The walk is linear in the records that one request tests, and the
+//! coordinator runs it under the lock that the scheduler needs. That is
+//! acceptable because a queue holds TENS of records: `[gc] keep` deletes a
+//! record one day after the job stops, and `qex clean --auto` works on one
+//! hour. A queue of ten thousand records does not happen while `gc` operates.
+//!
+//! The lists in a [`Node`] therefore borrow, and each index is built once. A
+//! copy of each list would make one deletion pay for the whole history, which
+//! is the one shape that turns this cost into a wait for every job in the
+//! queue.
 
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
@@ -15,16 +28,20 @@ use uuid::Uuid;
 ///
 /// The coordinator holds a job as a specification and a status, and a command
 /// holds a record. This structure carries the fields that both have.
-pub struct Node {
+///
+/// The two lists BORROW from the job. The coordinator builds one of these for
+/// every job that it holds, under the lock that the scheduler needs, so a copy
+/// of each list would make a deletion pay for the whole history.
+pub struct Node<'a> {
     pub id: Uuid,
     /// The pipeline of this job, when a pipeline made it.
     pub group: Option<Uuid>,
     /// True when the job reached a final state.
     pub terminal: bool,
     /// The jobs that this job waits for.
-    pub needs: Vec<Uuid>,
+    pub needs: &'a [Uuid],
     /// The jobs that this job follows.
-    pub after: Vec<Uuid>,
+    pub after: &'a [Uuid],
 }
 
 /// Gives the records that a job which has not stopped still needs.
@@ -49,8 +66,8 @@ pub struct Node {
 ///    pipeline to see where it is. A pipeline can divide, so a stage that no
 ///    later stage waits for is still a stage of that pipeline.
 ///
-/// Each rule needs a job that has not stopped, so every record goes when that
-/// work stops. No record stays for ever.
+/// Each rule needs a job that has not stopped, so no record stays after that
+/// work stops. A job that never stops holds its records while it waits.
 pub fn held_by_unfinished(nodes: &[Node]) -> BTreeSet<Uuid> {
     let by_id: HashMap<Uuid, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
 
@@ -90,12 +107,25 @@ pub fn held_by_unfinished(nodes: &[Node]) -> BTreeSet<Uuid> {
     held
 }
 
-/// Gives the jobs that have not stopped and that hold this record.
+/// Why a record stays, and the jobs that hold it.
 ///
-/// The message of a refusal names them, so a reader knows what to wait for.
+/// The two rules are different relations, so they need different words. A
+/// message that gives the wrong one states a relation that does not exist, and
+/// a reader acts on the output of qex as fact.
+pub enum Hold {
+    /// A job that has not stopped waits for this record, through the chain.
+    Needed(Vec<Uuid>),
+    /// The record belongs to a pipeline that has work left. NO job waits for
+    /// it, so a message must not say that one does.
+    Pipeline(Vec<Uuid>),
+}
+
+/// Gives the reason that a record stays, and the jobs that hold it.
+///
 /// A job that waits for the record directly comes first, because that is the
-/// answer a reader can act on with no other step.
-pub fn holders_of(nodes: &[Node], id: Uuid) -> Vec<Uuid> {
+/// answer a reader can act on with no other step. The chain comes next, and
+/// the pipeline last: a reader wants the nearest cause.
+pub fn hold_reason(nodes: &[Node], id: Uuid) -> Option<Hold> {
     let direct: Vec<Uuid> = nodes
         .iter()
         .filter(|n| !n.terminal)
@@ -103,34 +133,39 @@ pub fn holders_of(nodes: &[Node], id: Uuid) -> Vec<Uuid> {
         .map(|n| n.id)
         .collect();
     if !direct.is_empty() {
-        return direct;
+        return Some(Hold::Needed(direct));
     }
 
-    // No job waits for this record directly. Give the jobs of the same
-    // pipeline that have work left, and then the jobs whose chain reaches it.
-    let group = nodes.iter().find(|n| n.id == id).and_then(|n| n.group);
-    if let Some(group) = group {
-        let same: Vec<Uuid> = nodes
-            .iter()
-            .filter(|n| !n.terminal && n.group == Some(group))
-            .map(|n| n.id)
-            .collect();
-        if !same.is_empty() {
-            return same;
-        }
-    }
-
-    nodes
+    // Build the index ONCE. A walk for each job that has not stopped would
+    // build it again for each one, and the cost is then the number of records
+    // multiplied by the size of the queue. That shape holds the lock of the
+    // scheduler while no job starts.
+    let by_id: HashMap<Uuid, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+    let through_chain: Vec<Uuid> = nodes
         .iter()
         .filter(|n| !n.terminal)
-        .filter(|n| reaches(nodes, n, id))
+        .filter(|n| reaches(&by_id, n, id))
         .map(|n| n.id)
-        .collect()
+        .collect();
+    if !through_chain.is_empty() {
+        return Some(Hold::Needed(through_chain));
+    }
+
+    // No job waits for this record, through any step. The pipeline holds it.
+    let group = nodes.iter().find(|n| n.id == id).and_then(|n| n.group)?;
+    let same: Vec<Uuid> = nodes
+        .iter()
+        .filter(|n| !n.terminal && n.group == Some(group))
+        .map(|n| n.id)
+        .collect();
+    if same.is_empty() {
+        return None;
+    }
+    Some(Hold::Pipeline(same))
 }
 
 /// True when the chain of one job reaches this record.
-fn reaches(nodes: &[Node], from: &Node, id: Uuid) -> bool {
-    let by_id: HashMap<Uuid, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+fn reaches(by_id: &HashMap<Uuid, &Node>, from: &Node, id: Uuid) -> bool {
     let mut seen = BTreeSet::new();
     let mut todo: Vec<Uuid> = from
         .needs
