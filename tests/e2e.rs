@@ -10908,6 +10908,222 @@ fn a_coordinator_that_has_no_event_stream_refuses_the_command() {
     );
 }
 
+/// A coordinator that cannot obey an option of a LATER stage must refuse the
+/// whole pipeline, and no job of that file may start.
+///
+/// A test of the first stage speaks for that stage alone. The coordinator then
+/// takes the later stage, ignores the option, and gives an id, so the reader
+/// receives a pipeline that does not hold the rule that they wrote.
+///
+/// The test uses a coordinator of its own that answers like an earlier version.
+/// It never starts a qex coordinator, so it never kills a process. It also
+/// RECORDS every request, so the test proves that no job reached the queue.
+#[test]
+fn a_pipeline_with_an_option_on_a_later_stage_is_refused() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+
+    let root = std::env::temp_dir().join(format!("qxpipecap{}", std::process::id()));
+    let run = root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::create_dir_all(root.join("cfg")).unwrap();
+    let socket = run.join("s");
+
+    let file = root.join("p.toml");
+    std::fs::write(
+        &file,
+        "[[jobs]]\nname = \"build\"\ncommand = [\"true\"]\n\n\
+         [[jobs]]\nname = \"test\"\ncommand = [\"true\"]\nneeds = [\"build\"]\nnice = 19\n",
+    )
+    .unwrap();
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let recorder = Arc::clone(&seen);
+    let server = std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().unwrap();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            recorder.lock().unwrap().push(line.clone());
+            // An earlier version knows the groups and the dependencies, and it
+            // does not know the politeness.
+            let answer = if line.contains("\"info\"") {
+                serde_json::json!({
+                    "result": "info", "pid": 4321, "version": "0.7.1",
+                    "started_at": 0, "program_replaced": false,
+                    "jobs_running": 0, "jobs_queued": 0,
+                    "cpu_budget": 1, "mem_budget": 1, "cpu_claimed": 0, "mem_claimed": 0,
+                })
+            } else if line.contains("\"capabilities\"") {
+                serde_json::json!({
+                    "result": "capabilities",
+                    "names": ["dependencies", "groups", "locks", "retries"],
+                })
+            } else {
+                serde_json::json!({
+                    "result": "error", "kind": "internal",
+                    "message": "qex could not read this request",
+                })
+            };
+            writeln!(writer, "{answer}").ok();
+            writer.flush().ok();
+        }
+    });
+
+    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
+        .args(["pipeline", file.to_str().unwrap()])
+        .env("XDG_CONFIG_HOME", root.join("cfg"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .output()
+        .expect("qex did not start");
+
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let requests = seen.lock().unwrap().clone();
+    drop(server);
+    std::fs::remove_dir_all(&root).ok();
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "the command must fail. stdout: {stdout} stderr: {err}"
+    );
+    assert!(
+        err.contains("--nice"),
+        "the message must name the option: {err}"
+    );
+    assert!(
+        err.contains("`test`"),
+        "the message must name the stage that the reader corrects: {err}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains("\"submit\"")),
+        "no job of the file may reach the queue: {requests:?}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "a refused pipeline must give no job id: {stdout}"
+    );
+}
+
+/// A `qex rerun` against a coordinator that cannot obey an option of the job
+/// must be refused.
+///
+/// A rerun keeps the locks, the retries, the politeness, the queue limit and
+/// the claims of the first job. Without this test the coordinator takes the new
+/// job, ignores each of those, and gives an id: the reader asked qex to run the
+/// work AGAIN, and receives work that holds none of its rules.
+///
+/// The test starts a real coordinator to make the record, stops it, and then
+/// answers the socket itself like an earlier version. The answer to the list
+/// comes from the record on the disk, so no JSON of a job is written by hand.
+#[test]
+fn a_rerun_of_a_job_that_holds_a_lock_is_refused_by_an_earlier_coordinator() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::sync::{Arc, Mutex};
+
+    let h = Harness::with_default_config("reruncap");
+    let id = h.submit(&["submit", "--lock", "deploy", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &id]);
+
+    // Stop the coordinator, and take its socket. The pid comes from qex, and
+    // never from a search of the process table.
+    let info = h.ok(&["info", "--no-start", "--json"]);
+    let pid: i32 = serde_json::from_str::<serde_json::Value>(&info).unwrap()["pid"]
+        .as_i64()
+        .expect("the coordinator must report its pid") as i32;
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let socket = h.root.join("state/qex/run/s");
+    for _ in 0..200 {
+        if !socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::fs::remove_file(&socket).ok();
+
+    // The record of the job, as the coordinator would give it.
+    let raw = std::fs::read_to_string(h.root.join(format!("state/qex/jobs/{id}/status.json")))
+        .expect("the record of the job must exist");
+    // The protocol gives one answer for each line, and the record on the disk
+    // is written for a reader. Take the value, and write it as one line.
+    let status: serde_json::Value =
+        serde_json::from_str(&raw).expect("the record must hold one job");
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let recorder = Arc::clone(&seen);
+    let server = std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().unwrap();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            recorder.lock().unwrap().push(line.clone());
+            let answer = if line.contains("\"info\"") {
+                serde_json::json!({
+                    "result": "info", "pid": 4321, "version": "0.7.1",
+                    "started_at": 0, "program_replaced": false,
+                    "jobs_running": 0, "jobs_queued": 0,
+                    "cpu_budget": 1, "mem_budget": 1, "cpu_claimed": 0, "mem_claimed": 0,
+                })
+                .to_string()
+            } else if line.contains("\"capabilities\"") {
+                // An earlier version with no locks.
+                serde_json::json!({
+                    "result": "capabilities",
+                    "names": ["dependencies", "groups", "retries", "politeness"],
+                })
+                .to_string()
+            } else if line.contains("\"list\"") {
+                serde_json::json!({ "result": "jobs", "jobs": [status] }).to_string()
+            } else {
+                serde_json::json!({
+                    "result": "error", "kind": "internal",
+                    "message": "qex could not read this request",
+                })
+                .to_string()
+            };
+            writeln!(writer, "{answer}").ok();
+            writer.flush().ok();
+        }
+    });
+
+    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
+        .args(["rerun", &id])
+        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
+        .env("XDG_STATE_HOME", h.root.join("state"))
+        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .output()
+        .expect("qex did not start");
+
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let requests = seen.lock().unwrap().clone();
+    drop(server);
+
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "the command must fail. stdout: {stdout} stderr: {err}"
+    );
+    assert!(
+        err.contains("--lock"),
+        "the message must name the option: {err}"
+    );
+    assert!(
+        !requests.iter().any(|r| r.contains("\"submit\"")),
+        "no job may reach the queue: {requests:?}"
+    );
+}
+
 /// A number from a coordinator that stopped must give a gap, and never a
 /// silent continuation.
 ///

@@ -4338,15 +4338,15 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     warn_if_version_differs(&mut client);
 
-    // Test the coordinator once, before the first job. A pipeline that stops
-    // in the middle leaves jobs with no end.
-    {
-        let mut probe = crate::pipeline::stage_spec(&file.jobs[0], &cfg, group, &group_name)?;
-        probe.group = Some(group);
-        // A pipeline always needs the groups and the dependencies.
-        probe.needs.push(uuid::Uuid::new_v4());
-        require_capabilities(&mut client, &probe)?;
-    }
+    // Test the coordinator once, before the first job, and test EVERY stage.
+    //
+    // A pipeline that stops in the middle leaves jobs with no end, so the test
+    // comes before the first submission. Each stage carries its own options, so
+    // one stage speaks for that stage alone.
+    require_pipeline_capabilities(
+        &mut client,
+        &pipeline_stage_needs(&file, &cfg, group, &group_name)?,
+    )?;
 
     // The id of each stage that qex already submitted, by its name in the file.
     let mut ids: std::collections::BTreeMap<String, uuid::Uuid> = Default::default();
@@ -5395,6 +5395,15 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     spec.dedupe_key = None;
     spec.dedupe_window = 0;
 
+    // Test the specification that this command SUBMITS, and not the record that
+    // it read.
+    //
+    // A rerun keeps the locks, the retries, the politeness, the queue limit and
+    // the claims of the first job, and it clears the dependencies, the group
+    // and the dedupe key. The two sets differ, so the record answers a question
+    // that this command does not ask.
+    require_capabilities(&mut client, &spec)?;
+
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
@@ -5439,6 +5448,52 @@ fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
         Ok(Response::Capabilities { names }) => (names, version, pid),
         _ => (Vec::new(), version, pid),
     }
+}
+
+/// Gives what each stage of a pipeline file asks of the coordinator.
+///
+/// The answer holds the name of each stage, because a reader corrects a LINE of
+/// the file and the name is what names that line.
+///
+/// A stage carries `locks`, `retries`, `nice`, `max_queue_time` and its claims,
+/// so five capabilities can differ from one stage to the next.
+fn pipeline_stage_needs(
+    file: &crate::pipeline::PipelineFile,
+    cfg: &crate::config::Config,
+    group: uuid::Uuid,
+    group_name: &str,
+) -> Result<Vec<crate::capabilities::StageNeeds>> {
+    let mut out = Vec::with_capacity(file.jobs.len());
+    for stage in &file.jobs {
+        // The specification that this stage becomes. `stage_spec` copies every
+        // field of the stage, so the answer covers every option of the file.
+        let spec = crate::pipeline::stage_spec(stage, cfg, group, group_name)?;
+        out.push(crate::capabilities::StageNeeds {
+            stage: stage.name.clone(),
+            needs: crate::capabilities::required_by(&spec),
+        });
+    }
+    Ok(out)
+}
+
+/// Refuses a pipeline that the coordinator cannot obey.
+///
+/// Every pipeline asks for the groups and the dependencies: qex gives each
+/// stage the same group, and it links the stages to each other.
+fn require_pipeline_capabilities(
+    client: &mut Client,
+    stages: &[crate::capabilities::StageNeeds],
+) -> Result<()> {
+    let (have, version, pid) = coordinator_capabilities(client);
+
+    if let crate::capabilities::Floor::Below(message) =
+        crate::capabilities::check_floor(&version, pid)
+    {
+        return Err(anyhow::anyhow!("{message}"));
+    }
+
+    crate::capabilities::check_pipeline(&have, &version, pid, &["dependencies", "groups"], stages)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Refuses a job that the coordinator cannot obey.
@@ -6653,5 +6708,49 @@ mod tests {
 
         assert!(held.contains(&a.id));
         assert!(held.contains(&b.id));
+    }
+
+    /// The capability test of a pipeline reads EVERY stage.
+    ///
+    /// A test of the first stage speaks for that stage alone. The coordinator
+    /// then takes a later stage, ignores the option, and gives an id, and the
+    /// reader asked for a rule that the stage does not get.
+    #[test]
+    fn the_needs_of_a_pipeline_come_from_every_stage() {
+        let first = crate::pipeline::Stage {
+            name: "build".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+
+        let later = crate::pipeline::Stage {
+            name: "test".into(),
+            command: vec!["true".into()],
+            // Only the LATER stage asks for this.
+            nice: Some(19),
+            ..Default::default()
+        };
+
+        let file = crate::pipeline::PipelineFile {
+            name: Some("p".into()),
+            jobs: vec![first, later],
+        };
+
+        let cfg = crate::config::Config::default();
+        let needs = pipeline_stage_needs(&file, &cfg, uuid::Uuid::new_v4(), "p").unwrap();
+
+        assert_eq!(needs.len(), 2, "every stage answers for itself");
+        assert_eq!(needs[0].stage, "build");
+        assert_eq!(needs[1].stage, "test");
+        assert!(
+            !needs[0].needs.contains(&"politeness"),
+            "the first stage asks for nothing: {:?}",
+            needs[0].needs
+        );
+        assert!(
+            needs[1].needs.contains(&"politeness"),
+            "the later stage asks for the politeness: {:?}",
+            needs[1].needs
+        );
     }
 }
