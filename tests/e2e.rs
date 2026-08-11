@@ -15164,7 +15164,15 @@ fn a_coordinator_that_answers_nothing_is_not_no_such_job() {
 /// turns a healthy machine into a failure.
 ///
 /// This helper is the one that stops a short client coming back. It forwards
-/// each request to the real coordinator and holds the answer back for `delay`.
+/// every request to the real coordinator, and it holds back the FIRST answer
+/// only.
+///
+/// One slow answer, and not one for each request: a command opens several
+/// connections and asks several questions, so a delay on every answer makes the
+/// time of the test depend on the number of round trips and on the speed of the
+/// machine that runs the proxy. One delay proves the same property — the client
+/// waits past a step instead of refusing — and it costs the same on a fast
+/// machine and a slow one.
 struct ASlowCoordinator {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -15190,12 +15198,16 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
     let real = real.to_path_buf();
+    // The first answer of the whole test waits. Every answer after it goes
+    // straight through.
+    let held_one = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread = std::thread::spawn(move || {
         let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
             match listener.accept() {
                 Ok((front_side, _)) => {
                     let real = real.clone();
+                    let first = held_one.clone();
                     workers.push(std::thread::spawn(move || {
                         let Ok(back) = std::os::unix::net::UnixStream::connect(&real) else {
                             return;
@@ -15205,7 +15217,7 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                         let mut from_real = BufReader::new(back);
                         let mut to_qex = front_side;
                         let mut line = String::new();
-                        // One request, one answer, and the answer waits.
+                        // One request, one answer, and the FIRST answer waits.
                         while from_qex.read_line(&mut line).unwrap_or(0) > 0 {
                             if to_real.write_all(line.as_bytes()).is_err() {
                                 return;
@@ -15216,8 +15228,12 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                                 return;
                             }
                             // THE COORDINATOR IS BUSY. The answer is correct and
-                            // it arrives late.
-                            std::thread::sleep(delay);
+                            // it arrives late. Only the first one waits, so the
+                            // cost of this test does not follow the number of
+                            // questions that the command asks.
+                            if !first.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                std::thread::sleep(delay);
+                            }
                             if to_qex.write_all(answer.as_bytes()).is_err() {
                                 return;
                             }
