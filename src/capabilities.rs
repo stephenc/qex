@@ -261,6 +261,29 @@ pub fn required_by(spec: &JobSpec) -> Vec<&'static str> {
     out
 }
 
+/// Gives the option that a reader writes for one capability.
+///
+/// The reader knows the option and not the name of the capability, so every
+/// message names the option. One place holds this table, because two places
+/// give a reader two names for one thing.
+pub fn option_for(capability: &'static str) -> &'static str {
+    match capability {
+        "locks" => "--lock",
+        "max-queue-time" => "--max-queue-time",
+        "pools" => "--gpu, --vram and --claim",
+        "retries" => "--retries",
+        "dependencies" => "--needs and --after",
+        "groups" => "qex pipeline",
+        "politeness" => "--nice",
+        "dedupe" => "--dedupe-key",
+        // A capability that no option names keeps its own name. Every
+        // capability that a JOB asks for has an option above. A name that
+        // reaches this arm gates a COMMAND, and `check_command` names the
+        // command itself.
+        other => other,
+    }
+}
+
 /// Tests one job against a coordinator.
 ///
 /// The message names the option that the coordinator cannot obey, and it gives
@@ -281,20 +304,7 @@ pub fn check(
         return Ok(());
     }
 
-    let options: Vec<&str> = missing
-        .iter()
-        .map(|m| match *m {
-            "locks" => "--lock",
-            "max-queue-time" => "--max-queue-time",
-            "pools" => "--gpu, --vram and --claim",
-            "retries" => "--retries",
-            "dependencies" => "--needs and --after",
-            "groups" => "qex pipeline",
-            "politeness" => "--nice",
-            "dedupe" => "--dedupe-key",
-            other => other,
-        })
-        .collect();
+    let options: Vec<&str> = missing.iter().map(|m| option_for(m)).collect();
 
     Err(format!(
         "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and it \
@@ -306,6 +316,124 @@ pub fn check(
          \x20   kill {coordinator_pid}\n\n\
          The jobs that operate now continue; a new coordinator reads the same records.",
         options.join(" and ")
+    ))
+}
+
+/// What one stage of a pipeline asks of the coordinator.
+///
+/// The name is the name in the file, because that is what the reader edits.
+#[derive(Debug)]
+pub struct StageNeeds {
+    pub stage: String,
+    pub needs: Vec<&'static str>,
+}
+
+/// What asks for one capability, so that the message names the right place.
+///
+/// A reader corrects the thing that asked. A stage names a line of the file, the
+/// file itself names the shape of a pipeline, and the configuration names a file
+/// that the pipeline file never mentions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Every pipeline asks for it, whatever the file holds.
+    EveryPipeline,
+    /// The configuration of qex fills the field, and no stage names it.
+    Configuration,
+}
+
+/// Tests a WHOLE pipeline file against a coordinator.
+///
+/// A pipeline submits many jobs, and each stage carries its own options. A test
+/// of one stage therefore speaks for that stage alone: the coordinator takes a
+/// later stage, ignores the option, and gives an id. The user asked for a stage
+/// that gives way, or that holds a lock, and the stage does NEITHER. That
+/// silence is the fault that this module exists to remove.
+///
+/// This function tests every stage, and it names the stage beside the option,
+/// because the reader corrects a LINE of a file.
+///
+/// It gives ONE message for the whole file. A file with the same fault in three
+/// stages gives one refusal that names the three, and not three refusals: the
+/// reader corrects every line in one pass, and a command that writes three
+/// refusals for one file teaches a reader to read none of them.
+///
+/// A message names ONLY the source that the caller computed. A capability that
+/// a default of the configuration fills belongs to that file, and a reader who
+/// is sent to a line that does not exist looks for a fault that is not there.
+pub fn check_pipeline(
+    have: &[String],
+    coordinator_version: &str,
+    coordinator_pid: i32,
+    elsewhere: &[(&'static str, Source)],
+    stages: &[StageNeeds],
+) -> Result<(), String> {
+    let absent = |need: &'static str| !have.iter().any(|h| h == need);
+
+    // The option, and what asks for it. A `Source` says that no line of the
+    // file asks for it, so no stage is more responsible than another.
+    let mut missing: std::collections::BTreeMap<&'static str, Result<Vec<String>, Source>> =
+        Default::default();
+
+    for (need, source) in elsewhere.iter().filter(|(n, _)| absent(n)) {
+        missing.entry(need).or_insert(Err(*source));
+    }
+    for stage in stages {
+        for need in stage.needs.iter().copied().filter(|n| absent(n)) {
+            match missing.entry(need).or_insert_with(|| Ok(Vec::new())) {
+                Ok(names) => names.push(stage.stage.clone()),
+                // Every pipeline asks for this one whatever the file holds, so
+                // the name of a stage adds nothing.
+                Err(Source::EveryPipeline) => {}
+                // A stage that names the option is the better answer, because
+                // the reader corrects a line of the file.
+                slot @ Err(Source::Configuration) => *slot = Ok(vec![stage.stage.clone()]),
+            }
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // One column for the options, so a reader compares the names down the page.
+    let width = missing
+        .keys()
+        .map(|need| option_for(need).len())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines = String::new();
+    for (need, who) in &missing {
+        let option = option_for(need);
+        let reason = match who {
+            Err(Source::EveryPipeline) => String::from("every pipeline asks for it"),
+            Err(Source::Configuration) => {
+                String::from("a default of the configuration, and no stage of this file")
+            }
+            Ok(names) if names.len() == 1 => format!("the stage `{}`", names[0]),
+            Ok(names) => format!(
+                "the stages {}",
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        lines.push_str(&format!("\x20   {option:width$}   {reason}\n"));
+    }
+
+    Err(format!(
+        "the coordinator (pid {coordinator_pid}) is version {coordinator_version}, and it \
+         cannot obey:\n\n\
+         {lines}\n\
+         qex refuses this pipeline, and it started no job. The coordinator would ignore each \
+         option in silence, give you an id for every stage, and run the pipeline without the \
+         rules that you asked for.\n\n\
+         The coordinator stops when no job operates, and the next command then starts one \
+         that can obey. To change it now:\n\
+         \x20   kill {coordinator_pid}\n\n\
+         The jobs that operate now continue; a new coordinator reads the same records."
     ))
 }
 
@@ -861,5 +989,141 @@ mod tests {
             err.contains("--lock") && err.contains("--retries"),
             "got: {err}"
         );
+    }
+
+    /// Gives a coordinator that answers with everything except one name.
+    fn without(name: &str) -> Vec<String> {
+        ALL.iter()
+            .filter(|c| **c != name)
+            .map(|c| c.to_string())
+            .collect()
+    }
+
+    fn stage(name: &str, needs: &[&'static str]) -> StageNeeds {
+        StageNeeds {
+            stage: name.to_string(),
+            needs: needs.to_vec(),
+        }
+    }
+
+    /// An option on a stage AFTER the first must be refused.
+    ///
+    /// A test of the first stage alone speaks for that stage. The coordinator
+    /// then takes the later stage, ignores the option, and gives an id.
+    #[test]
+    fn an_option_on_a_later_stage_is_refused() {
+        // The first stage asks for nothing, and the second asks for politeness.
+        let stages = [stage("build", &[]), stage("test", &["politeness"])];
+        let err = check_pipeline(
+            &without("politeness"),
+            "0.6.0",
+            4321,
+            &[
+                ("dependencies", Source::EveryPipeline),
+                ("groups", Source::EveryPipeline),
+            ],
+            &stages,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("--nice"),
+            "the message must name the option: {err}"
+        );
+        assert!(
+            err.contains("`test`"),
+            "the message must name the stage that the reader corrects: {err}"
+        );
+        assert!(
+            !err.contains("`build`"),
+            "the message must not name a stage that asks for nothing: {err}"
+        );
+        assert!(
+            err.contains("kill 4321"),
+            "the message must give the remedy: {err}"
+        );
+    }
+
+    /// Every capability that a stage can carry is tested.
+    ///
+    /// A `Stage` holds the locks, the retries, the politeness, the queue limit
+    /// and the claims, so five capabilities differ from one stage to the next.
+    #[test]
+    fn each_capability_of_a_later_stage_is_refused() {
+        for (capability, option) in [
+            ("locks", "--lock"),
+            ("retries", "--retries"),
+            ("politeness", "--nice"),
+            ("max-queue-time", "--max-queue-time"),
+            ("pools", "--gpu"),
+        ] {
+            let stages = [stage("one", &[]), stage("two", &[capability])];
+            let err = check_pipeline(&without(capability), "0.6.0", 1, &[], &stages)
+                .expect_err(&format!("{capability} on a later stage must be refused"));
+            assert!(
+                err.contains(option) && err.contains("`two`"),
+                "the message must name {option} and the stage: {err}"
+            );
+        }
+    }
+
+    /// One message names every stage that has the same fault.
+    ///
+    /// Three refusals for one file teach a reader to read none of them.
+    #[test]
+    fn one_message_names_every_stage_with_the_same_fault() {
+        let stages = [
+            stage("build", &["politeness"]),
+            stage("test", &["politeness"]),
+            stage("ship", &["locks"]),
+        ];
+        let err = check_pipeline(&without("politeness"), "0.6.0", 1, &[], &stages).unwrap_err();
+
+        assert_eq!(
+            err.matches("--nice").count(),
+            1,
+            "one option gives one line: {err}"
+        );
+        assert!(
+            err.contains("`build`") && err.contains("`test`"),
+            "the line must name every stage that asks for it: {err}"
+        );
+        // The coordinator obeys the locks, so that stage is not named.
+        assert!(
+            !err.contains("--lock"),
+            "a capability that the coordinator has must not appear: {err}"
+        );
+    }
+
+    /// A capability that EVERY pipeline needs names no stage.
+    ///
+    /// No stage of the file is more responsible than another for it.
+    #[test]
+    fn a_capability_of_every_pipeline_names_no_stage() {
+        let stages = [stage("only", &[])];
+        let err = check_pipeline(
+            &without("groups"),
+            "0.6.0",
+            1,
+            &[("groups", Source::EveryPipeline)],
+            &stages,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("every pipeline asks for it"),
+            "the message must say that the file itself asks for it: {err}"
+        );
+        assert!(
+            !err.contains("`only`"),
+            "no stage is responsible for it: {err}"
+        );
+    }
+
+    /// A pipeline that a coordinator can obey passes.
+    #[test]
+    fn a_pipeline_that_needs_nothing_passes_every_coordinator() {
+        let now: Vec<String> = ALL.iter().map(|c| c.to_string()).collect();
+        let stages = [stage("one", &[]), stage("two", &["locks"])];
+        assert!(check_pipeline(&now, env!("CARGO_PKG_VERSION"), 1, &[], &stages).is_ok());
     }
 }

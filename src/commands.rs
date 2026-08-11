@@ -4338,15 +4338,15 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     warn_if_version_differs(&mut client);
 
-    // Test the coordinator once, before the first job. A pipeline that stops
-    // in the middle leaves jobs with no end.
-    {
-        let mut probe = crate::pipeline::stage_spec(&file.jobs[0], &cfg, group, &group_name)?;
-        probe.group = Some(group);
-        // A pipeline always needs the groups and the dependencies.
-        probe.needs.push(uuid::Uuid::new_v4());
-        require_capabilities(&mut client, &probe)?;
-    }
+    // Test the coordinator once, before the first job, and test EVERY stage.
+    //
+    // A pipeline that stops in the middle leaves jobs with no end, so the test
+    // comes before the first submission. Each stage carries its own options, so
+    // one stage speaks for that stage alone.
+    require_pipeline_capabilities(
+        &mut client,
+        &pipeline_stage_needs(&file, &cfg, group, &group_name)?,
+    )?;
 
     // The id of each stage that qex already submitted, by its name in the file.
     let mut ids: std::collections::BTreeMap<String, uuid::Uuid> = Default::default();
@@ -5395,6 +5395,15 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     spec.dedupe_key = None;
     spec.dedupe_window = 0;
 
+    // Test the specification that this command SUBMITS, and not the record that
+    // it read.
+    //
+    // A rerun keeps the locks, the retries, the politeness, the queue limit and
+    // the claims of the first job, and it clears the dependencies, the group
+    // and the dedupe key. The two sets differ, so the record answers a question
+    // that this command does not ask.
+    require_capabilities(&mut client, &spec)?;
+
     match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
@@ -5439,6 +5448,106 @@ fn coordinator_capabilities(client: &mut Client) -> (Vec<String>, String, i32) {
         Ok(Response::Capabilities { names }) => (names, version, pid),
         _ => (Vec::new(), version, pid),
     }
+}
+
+/// Gives what each stage of a pipeline file asks of the coordinator.
+///
+/// The answer holds the name of each stage, because a reader corrects a LINE of
+/// the file and the name is what names that line.
+///
+/// A stage carries `locks`, `retries`, `nice`, `max_queue_time` and its claims,
+/// so five capabilities can differ from one stage to the next.
+fn pipeline_stage_needs(
+    file: &crate::pipeline::PipelineFile,
+    cfg: &crate::config::Config,
+    group: uuid::Uuid,
+    group_name: &str,
+) -> Result<PipelineNeeds> {
+    // A configuration with no default of its own. The difference between the
+    // two answers is what the CONFIGURATION asks for, and not the file.
+    //
+    // This is a second question to the same function, and not a second table of
+    // fields. A table here would go out of date the day somebody adds a field,
+    // and the message would then name the wrong place in silence.
+    let bare = crate::config::Config::default();
+
+    let mut stages = Vec::with_capacity(file.jobs.len());
+    let mut from_config: Vec<&'static str> = Vec::new();
+
+    for stage in &file.jobs {
+        // The specification that this stage becomes. `stage_spec` copies every
+        // field of the stage, so the answer covers every option of the file.
+        let spec = crate::pipeline::stage_spec(stage, cfg, group, group_name)
+            .with_context(|| format!("the stage `{}` of this pipeline file", stage.name))?;
+        let with_defaults = crate::capabilities::required_by(&spec);
+
+        let own = crate::pipeline::stage_spec(stage, &bare, group, group_name)
+            .with_context(|| format!("the stage `{}` of this pipeline file", stage.name))?;
+        let declared = crate::capabilities::required_by(&own);
+
+        for need in &with_defaults {
+            if !declared.contains(need) && !from_config.contains(need) {
+                from_config.push(need);
+            }
+        }
+
+        stages.push(crate::capabilities::StageNeeds {
+            stage: stage.name.clone(),
+            needs: declared,
+        });
+    }
+
+    Ok(PipelineNeeds {
+        stages,
+        from_config,
+        // A pipeline always makes a group, so every file asks for it.
+        //
+        // The dependencies are different: a file whose stages name no `needs`
+        // and no `after` submits jobs that wait for nothing, and a coordinator
+        // with no dependencies runs it correctly. To ask for the capability
+        // there would refuse a file that the coordinator can obey.
+        links_stages: file
+            .jobs
+            .iter()
+            .any(|s| !s.needs.is_empty() || !s.after.is_empty()),
+    })
+}
+
+/// What a whole pipeline file asks of the coordinator.
+#[derive(Debug)]
+struct PipelineNeeds {
+    /// What each stage of the file names for itself.
+    stages: Vec<crate::capabilities::StageNeeds>,
+    /// What a default of the configuration fills in, and no stage names.
+    from_config: Vec<&'static str>,
+    /// True when a stage of the file waits for another stage.
+    links_stages: bool,
+}
+
+/// Refuses a pipeline that the coordinator cannot obey.
+///
+/// Every pipeline makes a group, so every file asks for the groups. It asks for
+/// the dependencies only when a stage waits for another stage.
+fn require_pipeline_capabilities(client: &mut Client, needs: &PipelineNeeds) -> Result<()> {
+    let (have, version, pid) = coordinator_capabilities(client);
+
+    if let crate::capabilities::Floor::Below(message) =
+        crate::capabilities::check_floor(&version, pid)
+    {
+        return Err(anyhow::anyhow!("{message}"));
+    }
+
+    let mut elsewhere: Vec<(&'static str, crate::capabilities::Source)> =
+        vec![("groups", crate::capabilities::Source::EveryPipeline)];
+    if needs.links_stages {
+        elsewhere.push(("dependencies", crate::capabilities::Source::EveryPipeline));
+    }
+    for need in &needs.from_config {
+        elsewhere.push((need, crate::capabilities::Source::Configuration));
+    }
+
+    crate::capabilities::check_pipeline(&have, &version, pid, &elsewhere, &needs.stages)
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Refuses a job that the coordinator cannot obey.
@@ -6653,5 +6762,172 @@ mod tests {
 
         assert!(held.contains(&a.id));
         assert!(held.contains(&b.id));
+    }
+
+    /// The capability test of a pipeline reads EVERY stage.
+    ///
+    /// A test of the first stage speaks for that stage alone. The coordinator
+    /// then takes a later stage, ignores the option, and gives an id, and the
+    /// reader asked for a rule that the stage does not get.
+    #[test]
+    fn the_needs_of_a_pipeline_come_from_every_stage() {
+        let first = crate::pipeline::Stage {
+            name: "build".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+
+        let later = crate::pipeline::Stage {
+            name: "test".into(),
+            command: vec!["true".into()],
+            // Only the LATER stage asks for this.
+            nice: Some(19),
+            ..Default::default()
+        };
+
+        let file = crate::pipeline::PipelineFile {
+            name: Some("p".into()),
+            jobs: vec![first, later],
+        };
+
+        let cfg = crate::config::Config::default();
+        let answer = pipeline_stage_needs(&file, &cfg, uuid::Uuid::new_v4(), "p").unwrap();
+        let needs = &answer.stages;
+
+        assert_eq!(needs.len(), 2, "every stage answers for itself");
+        assert_eq!(needs[0].stage, "build");
+        assert_eq!(needs[1].stage, "test");
+        assert!(
+            !needs[0].needs.contains(&"politeness"),
+            "the first stage asks for nothing: {:?}",
+            needs[0].needs
+        );
+        assert!(
+            needs[1].needs.contains(&"politeness"),
+            "the later stage asks for the politeness: {:?}",
+            needs[1].needs
+        );
+    }
+
+    /// A file whose stages wait for nothing must not ask for the dependencies.
+    ///
+    /// A coordinator with no dependencies runs such a file correctly, so a test
+    /// for that capability refuses work that the coordinator can obey.
+    #[test]
+    fn a_file_with_no_link_between_stages_does_not_ask_for_the_dependencies() {
+        let lone = crate::pipeline::Stage {
+            name: "only".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+        let file = crate::pipeline::PipelineFile {
+            name: Some("p".into()),
+            jobs: vec![lone],
+        };
+        let answer = pipeline_stage_needs(
+            &file,
+            &crate::config::Config::default(),
+            uuid::Uuid::new_v4(),
+            "p",
+        )
+        .unwrap();
+        assert!(
+            !answer.links_stages,
+            "no stage of this file waits for another stage"
+        );
+
+        // A file that links two stages does ask for it.
+        let first = crate::pipeline::Stage {
+            name: "build".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+        let second = crate::pipeline::Stage {
+            name: "test".into(),
+            command: vec!["true".into()],
+            needs: vec!["build".into()],
+            ..Default::default()
+        };
+        let linked = crate::pipeline::PipelineFile {
+            name: Some("p".into()),
+            jobs: vec![first, second],
+        };
+        let answer = pipeline_stage_needs(
+            &linked,
+            &crate::config::Config::default(),
+            uuid::Uuid::new_v4(),
+            "p",
+        )
+        .unwrap();
+        assert!(answer.links_stages, "a stage waits for another stage");
+    }
+
+    /// A default of the configuration must not name a line of the file.
+    ///
+    /// `[defaults] max_queue_time` fills the field of every stage. A message
+    /// that names the stages sends the reader to lines that never mention it.
+    #[test]
+    fn a_default_of_the_configuration_names_no_stage() {
+        let stage = crate::pipeline::Stage {
+            name: "build".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+        let file = crate::pipeline::PipelineFile {
+            name: Some("p".into()),
+            jobs: vec![stage],
+        };
+
+        let mut cfg = crate::config::Config::default();
+        cfg.defaults.max_queue_time = Some("20m".into());
+
+        let answer = pipeline_stage_needs(&file, &cfg, uuid::Uuid::new_v4(), "p").unwrap();
+        assert!(
+            answer.from_config.contains(&"max-queue-time"),
+            "the configuration asks for it: {:?}",
+            answer.from_config
+        );
+        assert!(
+            !answer.stages[0].needs.contains(&"max-queue-time"),
+            "the stage names no queue limit: {:?}",
+            answer.stages[0].needs
+        );
+    }
+
+    /// A fault in a later stage must name that stage.
+    ///
+    /// Every stage becomes a specification before the first job starts, so a
+    /// fault in the last stage of twenty stops the command with no job. The
+    /// reader must learn which line holds the fault.
+    #[test]
+    fn a_fault_in_a_stage_names_that_stage() {
+        let good = crate::pipeline::Stage {
+            name: "build".into(),
+            command: vec!["true".into()],
+            ..Default::default()
+        };
+        let bad = crate::pipeline::Stage {
+            name: "test".into(),
+            command: vec!["true".into()],
+            // A value that no job accepts.
+            nice: Some(100),
+            ..Default::default()
+        };
+        let file = crate::pipeline::PipelineFile {
+            name: Some("p".into()),
+            jobs: vec![good, bad],
+        };
+        let err = pipeline_stage_needs(
+            &file,
+            &crate::config::Config::default(),
+            uuid::Uuid::new_v4(),
+            "p",
+        )
+        .expect_err("a nice value of 100 must be refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("`test`"),
+            "the message must name the stage that holds the fault: {text}"
+        );
     }
 }
