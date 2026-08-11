@@ -1914,14 +1914,28 @@ fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     let state_now = job.status.state;
     drop(state);
 
-    match state_now {
+    refusal_for_a_cancel(id, state_now)
+}
+
+/// Says why a cancel did not happen, for the state that the job holds now.
+///
+/// Each state gets the step that fits it. A job that went back to the queue
+/// takes the SAME command again, and a message that names `qex kill` for such
+/// a job sends the reader to a command that refuses it.
+///
+/// This function is separate because the states that reach it need a race, and
+/// a race is not a test. The words are the part that a reader acts on, and
+/// they are testable here.
+fn refusal_for_a_cancel(id: uuid::Uuid, state: JobState) -> Response {
+    match state {
         // The job went back to the queue in the moment between the two steps
-        // above. The cancel did not happen, and the remedy is the same command.
+        // of the cancel. The cancel did not happen, and the remedy is the same
+        // command.
         JobState::Queued => Response::error(
             ErrorKind::WrongState,
             format!("the job {id} went back to the queue. Run `qex cancel {id}` again."),
         ),
-        // The job started in the moment between the two steps above.
+        // The job started in the moment between those two steps.
         JobState::Starting | JobState::Running => Response::error(
             ErrorKind::WrongState,
             format!("the job {id} operates now. Use `qex kill {id}` to stop it."),
@@ -2002,6 +2016,45 @@ pub fn log(message: &str) {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// A cancel that did not happen must name the step that fits the state.
+    ///
+    /// The job that went back to the QUEUE is the case that matters. A message
+    /// that names `qex kill` for such a job sends the reader to a command that
+    /// refuses it, and the reader then has no step that works.
+    #[test]
+    fn a_refused_cancel_names_the_step_for_the_state_of_the_job() {
+        let id = uuid::Uuid::new_v4();
+
+        let message = |state| match refusal_for_a_cancel(id, state) {
+            Response::Error { message, .. } => message,
+            other => panic!("a refusal must give an error, and it gave {other:?}"),
+        };
+
+        let queued = message(JobState::Queued);
+        assert!(
+            queued.contains("went back to the queue") && queued.contains("qex cancel"),
+            "a job that waits again takes the same command: {queued}"
+        );
+        assert!(
+            !queued.contains("qex kill"),
+            "a job that waits has no process, so `qex kill` refuses it: {queued}"
+        );
+
+        for state in [JobState::Starting, JobState::Running] {
+            let text = message(state);
+            assert!(
+                text.contains("operates now") && text.contains("qex kill"),
+                "a job that operates takes `qex kill`: {text}"
+            );
+        }
+
+        let done = message(JobState::Completed);
+        assert!(
+            done.contains("completed") && !done.contains("qex kill"),
+            "a job that stopped names its state and no step: {done}"
+        );
+    }
 
     /// A file that a writer changed a moment ago is not a configuration.
     ///

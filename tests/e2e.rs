@@ -1523,8 +1523,9 @@ fn a_coordinator_that_stops_while_the_wait_opens_gives_no_answer_about_the_job()
 ///
 /// Issue #45: the wait died with the code 1, which is the code of a job that
 /// failed, and a pipeline of two hours that had entirely succeeded reported a
-/// failure. qex replaces the coordinator at every update of the program, so
-/// this is the normal upgrade path and not an exotic case.
+/// failure. A coordinator stops for a new program only when no job is active,
+/// so a wait meets this loss when something stops the coordinator abnormally:
+/// a signal, an out-of-memory kill, or a failure of the machine.
 #[test]
 fn a_wait_survives_a_coordinator_that_stops() {
     let h = Harness::with_default_config("waitcrash");
@@ -14173,10 +14174,10 @@ fn a_kill_of_submit_with_a_wait_leaves_the_job_in_the_queue() {
 
 /// The ownership of a job must survive a new coordinator.
 ///
-/// A CONNECTION carries the ownership, so a new connection holds none. qex
-/// replaces the coordinator at every update of the program, so a command that
-/// asks once and never again loses the rule on the path that qex takes most
-/// often, and it says nothing.
+/// A CONNECTION carries the ownership, so a new connection holds none. A
+/// command that asks once and never again loses the rule in silence, and it
+/// loses it exactly when the rule is most needed: something stopped the
+/// coordinator abnormally, and the job of that command waits in the queue.
 #[test]
 fn the_ownership_of_a_job_survives_a_new_coordinator() {
     let h = Harness::new("ownagain", "[budget]\ncpu = \"1\"\n");
