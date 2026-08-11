@@ -15285,3 +15285,114 @@ fn a_coordinator_that_answers_late_is_answered_and_not_refused() {
         "the answer must belong to the question that qex asked: {said}"
     );
 }
+
+/// Sends the FIRST HALF of each answer and then goes quiet.
+///
+/// A coordinator writes a large answer in several writes. A machine that stops
+/// it between two of them leaves a line with no end, and the socket reports
+/// READABLE for the part that arrived. A client that treats readable as
+/// answered then reads with no limit and waits for ever.
+///
+/// This is not the same instrument as a coordinator that says nothing: that one
+/// never writes a byte, and this one writes most of the answer.
+fn a_coordinator_that_cuts_its_answer(front: &Path, real: &Path) -> ASlowCoordinator {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::os::unix::net::UnixListener::bind(front).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let real = real.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((front_side, _)) => {
+                    let real = real.clone();
+                    let mine = flag.clone();
+                    workers.push(std::thread::spawn(move || {
+                        let Ok(back) = std::os::unix::net::UnixStream::connect(&real) else {
+                            return;
+                        };
+                        let mut from_qex = BufReader::new(front_side.try_clone().unwrap());
+                        let mut to_real = back.try_clone().unwrap();
+                        let mut from_real = BufReader::new(back);
+                        let mut to_qex = front_side;
+                        let mut line = String::new();
+                        while from_qex.read_line(&mut line).unwrap_or(0) > 0 {
+                            if to_real.write_all(line.as_bytes()).is_err() {
+                                return;
+                            }
+                            to_real.flush().ok();
+                            let mut answer = String::new();
+                            if from_real.read_line(&mut answer).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            // HALF THE ANSWER, AND NO END OF LINE. The socket is
+                            // readable and the answer is not there.
+                            let half = &answer.as_bytes()[..answer.len() / 2];
+                            if to_qex.write_all(half).is_err() {
+                                return;
+                            }
+                            to_qex.flush().ok();
+                            // Hold the connection open and write nothing more.
+                            while !mine.load(std::sync::atomic::Ordering::SeqCst) {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            return;
+                        }
+                    }));
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        for w in workers {
+            let _ = w.join();
+        }
+    });
+    ASlowCoordinator {
+        stop,
+        thread: Some(thread),
+    }
+}
+
+/// READABLE IS NOT ANSWERED.
+///
+/// A wait ends when qex holds the WHOLE answer, or when the budget is gone. It
+/// never ends because the first byte arrived. A coordinator stopped between two
+/// writes leaves a line with no end, and a read with no limit then waits for
+/// ever — with no message, and with no limit of the reader reaching it.
+#[test]
+fn an_answer_that_never_finishes_does_not_stop_a_command() {
+    let mut h = Harness::with_default_config("cutanswer");
+    h.extra_env.push((qex_ceiling_variable(), "4".to_string()));
+
+    let first = h.qex(&["submit", "--", "true"]);
+    assert!(first.status.success(), "the test needs a real coordinator");
+    let id = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    h.qex(&["wait", &id]);
+
+    let run = h.root.join("state/qex/run");
+    let real = run.join("real");
+    std::fs::rename(run.join("s"), &real).unwrap();
+    let _cut = a_coordinator_that_cuts_its_answer(&run.join("s"), &real);
+
+    let start = Instant::now();
+    let out = h.qex_within(&["list", "--json"], Duration::from_secs(60));
+    let took = start.elapsed();
+
+    assert!(
+        took < Duration::from_secs(30),
+        "a cut answer must reach a limit: it took {took:?}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "a cut answer reaches the limit of a wait: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("did not finish it"),
+        "the message must say that the answer began and did not finish: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

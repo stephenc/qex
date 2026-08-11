@@ -175,17 +175,33 @@ pub fn take_the_limit_of_the_reader(limit: Duration) {
 /// line is the difference, and it does not end the wait: a coordinator on a
 /// loaded machine answers a slow question correctly, and a command that gives
 /// up on it turns a healthy machine into a failure.
-fn say_that_qex_still_waits(since: Instant, what: &str) {
+fn say_that_qex_still_waits(since: Instant, deadline: Instant, what: &str) {
     use std::sync::atomic::Ordering;
     if since.elapsed() < step_of_a_wait() || SAID_IT_WAITS.swap(true, Ordering::SeqCst) {
         return;
     }
-    eprintln!(
-        "qex: still waiting for the coordinator: {what}. \
-         qex gives each answer {} seconds, and `--timeout` gives the command a \
-         shorter limit.",
-        ceiling().as_secs()
-    );
+    // NAME THE LIMIT THAT GOVERNS THIS WAIT. A reader who gave `--timeout 14s`
+    // must not be told about 300 seconds, and must not be advised to use the
+    // option that they used already.
+    let left = deadline.saturating_duration_since(Instant::now());
+    let reader_gave = reader_deadline()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if reader_gave {
+        eprintln!(
+            "qex: still waiting for the coordinator: {what}. \
+             Your `--timeout` gives it {} seconds more.",
+            left.as_secs().max(1)
+        );
+    } else {
+        eprintln!(
+            "qex: still waiting for the coordinator: {what}. \
+             qex gives this answer {} seconds more, and `--timeout` gives the \
+             command a shorter limit.",
+            left.as_secs().max(1)
+        );
+    }
 }
 
 /// A connection to the coordinator.
@@ -338,12 +354,41 @@ impl Client {
             // answer that crosses a step would misparse. This call reads
             // nothing, so a step can never divide an answer.
             match self.wait_readable(left.min(step_of_a_wait())) {
-                Ok(true) => break self.recv(),
+                // READABLE IS NOT ANSWERED.
+                //
+                // The socket reports the FIRST BYTE, and an answer is a whole
+                // line. A coordinator writes a large answer in several writes,
+                // so a machine that stops it between two of them leaves a line
+                // with no end. A read with no limit then waits for ever, and
+                // neither the ceiling nor the limit of the reader reaches it.
+                //
+                // Give the read what is left of the budget. A line that never
+                // ends thus reaches the same limit as an answer that never
+                // starts.
+                Ok(true) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break Err(timed_out(a_silent_coordinator(started.elapsed())));
+                    }
+                    self.set_read_timeout(Some(left)).ok();
+                    let got = self.recv();
+                    self.set_read_timeout(None).ok();
+                    // A read that reached the limit took the first part of a
+                    // line and lost it, so this connection can no longer say
+                    // where one answer ends and the next begins. The flag below
+                    // stops every later question on it.
+                    break match got {
+                        Err(e) if a_read_that_reached_its_limit(&e) => {
+                            Err(timed_out(a_cut_answer(started.elapsed())))
+                        }
+                        other => other,
+                    };
+                }
                 Ok(false) => {
                     // The answer did not arrive YET. The coordinator can be
                     // busy, and a command that gives up here turns a healthy
                     // machine into a failure.
-                    say_that_qex_still_waits(started, "an answer to a request");
+                    say_that_qex_still_waits(started, deadline, "an answer to a request");
                 }
                 Err(e) => {
                     break Err(anyhow::Error::new(e).context("watching the socket for an answer"))
@@ -476,6 +521,38 @@ pub fn is_a_coordinator_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CoordinatorTimeout>().is_some()
 }
 
+/// Says whether a read ended because it reached its own limit.
+fn a_read_that_reached_its_limit(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|e| e.downcast_ref::<std::io::Error>())
+        .any(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
+}
+
+/// Names the cause when an answer began and never finished.
+///
+/// This is not the same fault as an answer that never started. The coordinator
+/// wrote a part of the answer, so it was alive and working, and the machine
+/// stopped it between two writes. A large answer needs several writes, so a
+/// long queue meets this state and a short one does not.
+fn a_cut_answer(waited: Duration) -> String {
+    format!(
+        "the coordinator began an answer and did not finish it in {} seconds.\n\
+         The part that arrived is not a whole answer, so qex read none of it.\n\
+         Run `qex info --no-start` to see whether it answers now, and read {} \
+         for what it did.",
+        waited.as_secs().max(1),
+        paths::daemon_log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "the log of the coordinator".to_string())
+    )
+}
+
 /// Names the cause when a coordinator took a request and gave no answer.
 ///
 /// The message says what qex TRIED and how long it waited. It names the time
@@ -531,7 +608,7 @@ fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
             // The socket is there and it did not answer YET. A busy coordinator
             // answers late, so keep asking until this wait reaches its limit.
             paths::Connected::NoAnswer => {
-                say_that_qex_still_waits(started, "a connection to the socket");
+                say_that_qex_still_waits(started, deadline, "a connection to the socket");
             }
         }
     }
@@ -869,7 +946,7 @@ impl SpawnLock {
                     return Err(error).with_context(|| format!("locking {}", path.display()));
                 }
             }
-            say_that_qex_still_waits(started, "the lock that guards a start");
+            say_that_qex_still_waits(started, deadline, "the lock that guards a start");
             if Instant::now() >= deadline {
                 return Err(timed_out(format!(
                     "a different qex command held the lock {} for {} seconds.\n\
