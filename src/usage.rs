@@ -177,16 +177,33 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
 ///
 /// # The caller must hold the evidence of THIS JOB
 ///
-/// Call this function only when qex made the cgroup of the job and read the
-/// counter of that cgroup. The kernel then stopped the job at the limit that
-/// qex made from the claim, so the claim was too small and the need is above
-/// it.
+/// Call this function only when qex made the cgroup of the job AND that cgroup
+/// counted a NEW event at its own limit during that attempt. The kernel then
+/// stopped the job at the
+/// limit that qex made from the claim, so the claim was too small and the need
+/// is above it.
 ///
-/// The counter of the session does not support this record. It also counts a
-/// kill in a different program of the same user, and the machine can be full
-/// while the claim of this job is correct. A bound from that evidence would
-/// raise the claim of a command that needs no more memory, and the ladder of
-/// attempts would raise it again at each run.
+/// Two other kinds of evidence do NOT support this record.
+///
+/// The counter of the session also counts a kill in a different program of the
+/// same user, and the machine can be full while the claim of this job is
+/// correct.
+///
+/// A kill in the cgroup of the job, with no NEW event at the limit of that
+/// cgroup,
+/// says that the memory of the machine stopped this job, or that a limit of a
+/// parent cgroup did. The claim can be correct there as well.
+///
+/// A bound from either one raises the claim of a command that needs no more
+/// memory, and the ladder of attempts raises it again at each run.
+///
+/// # A bound outlives the job that made it
+///
+/// `suggest` takes the LARGEST bound of a command and puts every later claim
+/// above it, and only a larger bound replaces it. A bound that a wrong answer
+/// wrote thus changes every later run of that command, and no command of qex
+/// deletes one. The file `usage.json` in the state directory holds them, and a
+/// reader who suspects a wrong bound corrects that file.
 pub fn record_lower_bound(spec: &JobSpec, status: &JobStatus) {
     if status.state != crate::job::JobState::Oom {
         return;
