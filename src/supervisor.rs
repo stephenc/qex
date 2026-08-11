@@ -713,8 +713,8 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     if let Some(cgroup) = crate::enforce::job_cgroup_path(&dir) {
         // Ask the WATCH, and not this path. This path comes from the record of
         // the job, and an earlier attempt can have written it: the removal of a
-        // cgroup fails while the supervisor is inside it, so the directory of
-        // an earlier attempt survives with its counts. The watch holds the
+        // cgroup CAN fail, so the directory of an earlier attempt can survive
+        // with its counts. The watch holds the
         // cgroup that THIS attempt made, and the counts at its start.
         oom_watch.record(&dir);
         crate::enforce::kill_cgroup(&cgroup);
@@ -726,7 +726,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // The answer says WHICH limit stopped the job. With a cgroup of its own,
     // the counts are about this job, and a rise in `oom` separates the limit of
     // this job from the memory of the whole machine. Without a cgroup, qex
-    // reads the cgroup of the session: that counter counts the kills in each
+    // reads the cgroup of its own process: that counter counts the kills in each
     // cgroup below it, so a kill in a different program of this user raises the
     // same number and qex cannot name the victim.
     oom_watch.record(&dir);

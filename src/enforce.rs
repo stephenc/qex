@@ -223,8 +223,20 @@ pub struct OomCounts {
 
 /// Reads the counts of a cgroup.
 ///
-/// A count that the file does not name is zero. This function reads a file and
-/// nothing else, so a test gives it a directory that the test made.
+/// A count is ZERO in two cases: the file does not name that count, and the
+/// file names it with a value that qex cannot read as a number.
+///
+/// Zero is the correct answer for both, because zero is the answer that ACTS
+/// LEAST. A count that qex cannot read is a count that qex cannot use as
+/// evidence, and a count of zero starts no attempt and records no bound. A
+/// count that qex guessed would raise a claim from a value that qex did not
+/// measure.
+///
+/// A file that qex cannot read at all gives `None`, which is a different
+/// answer: there is then no cgroup to ask, and qex reports no kill for memory.
+///
+/// This function reads a file and nothing else, so a test gives it a directory
+/// that the test made.
 pub fn read_oom_counts(cgroup: &Path) -> Option<OomCounts> {
     let text = std::fs::read_to_string(cgroup.join("memory.events")).ok()?;
     let count = |name: &str| -> u64 {
@@ -262,11 +274,12 @@ pub fn read_oom_counts(cgroup: &Path) -> Option<OomCounts> {
 ///
 /// # Both counts need the value from the start of the attempt
 ///
-/// `before` holds the counts that qex read before this attempt started. NEITHER
-/// count starts at zero:
+/// `before` holds the counts that qex read before this attempt started.
+/// NEITHER count can be ASSUMED to start at zero. A cgroup that qex makes for
+/// attempt 1 does start at zero, and these two cases do not:
 ///
-/// - qex reads the counter of the login session when it makes no cgroup, and
-///   that counter holds the kills of every program of this user.
+/// - qex reads the cgroup of its own process when it makes no cgroup, and that
+///   counter holds the kills of every program in that cgroup.
 /// - qex names the cgroup of a job after the id of that job, so every attempt
 ///   of one job uses the SAME cgroup. The counts of an earlier attempt stay in
 ///   it. Without the value from the start, a job that raised `oom` on attempt 1
@@ -355,18 +368,18 @@ pub fn own_cgroup() -> Option<PathBuf> {
 /// start live in here, so no caller passes them and no caller can pass the
 /// wrong ones.
 ///
-/// That matters because NEITHER count starts at zero. The counter of the login
-/// session holds the kills of every program of this user, and qex names the
-/// cgroup of a job after the id of the job, so every attempt of one job uses
-/// the same cgroup and the counts of an earlier attempt stay in it.
+/// That matters because NEITHER count can be ASSUMED to start at zero. The
+/// cgroup of this process holds the kills of every program in it, and qex names
+/// the cgroup of a job after the id of the job, so every attempt of one job
+/// uses the same cgroup and the counts of an earlier attempt stay in it.
 pub struct OomWatch {
     /// The cgroup that qex reads for this attempt.
     cgroup: Option<PathBuf>,
     /// True when qex made that cgroup for THIS attempt.
     ///
     /// This value comes from the cgroup that this attempt made, and never from
-    /// a path that an earlier attempt recorded. A cgroup of an earlier attempt
-    /// survives, so a recorded path can name a cgroup that this attempt did not
+    /// a path that an earlier attempt recorded. The removal of a cgroup CAN
+    /// fail, so a recorded path can name a cgroup that this attempt did not
     /// make, and the counts in it belong to that earlier attempt.
     qex_made_cgroup: bool,
     /// The counts at the start of this attempt.
@@ -377,8 +390,9 @@ impl OomWatch {
     /// Reads the counts before the program of the attempt starts.
     ///
     /// `job_cgroup` is the cgroup that THIS attempt made, and `None` when qex
-    /// made none. With no cgroup of its own, qex reads the cgroup of the login
-    /// session: it then still finds a kill, and it cannot name the victim.
+    /// made none. With no cgroup of its own, qex reads the cgroup of THIS
+    /// PROCESS, whatever made that cgroup: it then still finds a kill, and it
+    /// cannot name the victim.
     pub fn start(job_cgroup: Option<&Path>) -> Self {
         let cgroup = job_cgroup.map(|p| p.to_path_buf()).or_else(own_cgroup);
         let before = cgroup
@@ -438,7 +452,12 @@ pub enum OomScope {
     /// with a larger claim, and it teaches the learner nothing: the work can
     /// need no more memory than it asked for, and qex did not measure a need.
     Machine,
-    /// qex read the counter of the session, because it made no cgroup.
+    /// qex cannot name the job that the kernel stopped.
+    ///
+    /// Two states give this answer. qex made no cgroup for the job, so it read
+    /// the cgroup of its own process. Or qex read a record that an earlier
+    /// version wrote, which names no scope, and qex cannot say what that
+    /// version measured.
     ///
     /// The counter of a cgroup counts the kills in each cgroup below it, so it
     /// also counts a kill in a different program of the same user. A machine
@@ -838,6 +857,26 @@ mod tests {
     #[test]
     fn a_file_with_no_counts_gives_no_answer() {
         let dir = a_cgroup_with_events("odd", "this file holds no count\n\noom_kill\n");
+        assert_eq!(classify_oom(&dir, true, OomCounts::default()), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A count that qex cannot read as a number is zero.
+    ///
+    /// Zero is the answer that ACTS LEAST: it starts no attempt and it records
+    /// no bound. A count that qex guessed would raise a claim from a value that
+    /// qex did not measure.
+    #[test]
+    fn a_count_that_qex_cannot_read_is_zero() {
+        let dir = a_cgroup_with_events("unread", "oom what\noom_kill later\n");
+        assert_eq!(
+            read_oom_counts(&dir),
+            Some(OomCounts {
+                oom: 0,
+                oom_kill: 0
+            }),
+            "a count that qex cannot read must not become evidence"
+        );
         assert_eq!(classify_oom(&dir, true, OomCounts::default()), None);
         std::fs::remove_dir_all(&dir).ok();
     }
