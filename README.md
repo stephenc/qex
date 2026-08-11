@@ -6,12 +6,18 @@
 [![Earliest Rust that qex needs](https://img.shields.io/crates/msrv/qex)](https://crates.io/crates/qex)
 [![Licence: Apache 2.0](https://img.shields.io/crates/l/qex)](LICENSE)
 
-qex is a job queue for long tasks on one machine. It controls the number of
-cores and the quantity of memory that the jobs use together.
+qex gives independent agents and harnesses one shared resource scheduler for one
+machine.
 
-qex is for coding agents and for the people who work with them. Several agents
-on one machine each start work, and no agent sees the load of the others. The
-machine then runs out of memory. qex gives those agents one queue.
+A coding agent sees how much CPU and memory the machine has free now. It does
+not see the jobs that another agent, another subagent or another harness is
+about to start. Ten agents can therefore each decide that the same free memory
+is theirs.
+
+qex makes those decisions in one place. Claude Code, Codex, subagents, harnesses
+such as CI, and ordinary shells all submit work independently. They do not know
+each other, and they do not have to. qex admits only the set of jobs whose
+claims fit the machine together.
 
 ```sh
 qex submit --wait --cpu guess --mem guess --id-file train.id -- uv run train.py
@@ -20,16 +26,17 @@ qex logs "$(cat train.id)" --grep 'ERROR|FAIL'
 
 `--wait` holds the command until the job stops, gives you the exit code of the
 job, and ends with the record: the state, the code and the last lines of both
-streams. The output of the job stays in the log file.
+streams. The output of the job stays in the log file. `guess` claims one half of
+the budget, which is 75% of the machine by default; `qex info` gives the number.
 
 **Agents: run `qex help agents` first.** It is one page and it covers everything.
 
-## The three problems that qex solves
+## Three faults that one scheduler removes
 
-**1. No agent sees the load of the others.** Each agent finds free memory,
-starts a large task, and the out-of-memory killer selects a victim. qex holds a
-budget for the machine. A job starts when the machine has capacity for its
-claim, and it waits when the machine does not.
+**1. The machine runs out of memory.** Each agent measures correctly and each
+agent decides alone. The out-of-memory killer then selects a victim. One queue
+holds every claim. A job starts when the machine has capacity for its claim, and
+it waits when the machine does not.
 
 **2. Every hand-rolled watcher waits on a proxy, and a proxy can go permanently
 false.** An agent with no way to wait writes a monitor. That monitor watches a
@@ -80,15 +87,15 @@ Or build it from the source:
 cargo install --path .
 ```
 
-qex needs Linux or macOS. It has no other requirement.
+qex needs Linux or macOS. It has no other requirement. The first command starts
+the background coordinator for you, and you configure no service.
 
 **On Windows, use WSL2** — qex builds and runs there unchanged, and the jobs an
 agent starts (`make`, `cargo`, `uv`) usually live in WSL2 anyway. A native
 Windows build is a port, not a flag: qex holds a job with `waitpid` on one
 process id and stops a job tree with a process group, and Windows has neither.
 Building for Windows fails with one message that says this, rather than a page
-of errors. The first command starts
-the background coordinator for you, and you do not configure a service.
+of errors.
 
 ## Five minutes
 
@@ -177,15 +184,97 @@ run the same script in the same moment get one job and one id. A test that a
 script makes itself — read `qex list`, decide, submit — has a gap between the
 read and the submission, and both agents start a job in that gap.
 
+## The budget, and what a claim is
+
+A claim is a number of cores and a quantity of memory. qex starts a job when the
+claims of the jobs that operate, plus this claim, stay inside the budget.
+
+**The budget is 75% of the cores and 75% of the memory of the machine.** Set
+another value in `~/.config/qex.toml`, as a percentage or as an exact size:
+
+```toml
+[budget]
+cpu = "50%"
+mem = "20GB"
+```
+
+`qex info` gives the budget and what the jobs hold now:
+
+```console
+$ qex info
+cores:           2 of 12 in use
+memory:          4GB of 24GB in use
+```
+
+**`guess` and `half` claim one half of the budget**, so two such jobs operate
+together. `full` and `max` claim all of it, so the job operates alone. qex
+calculates the word at the submission, and the record then holds an exact value.
+
+**A job with no claim is not free.** It gets 1 core and the memory of the machine
+divided by the number of cores, or the values in `[defaults]`. qex also learns:
+a command that ran before gets a claim from its own measurements. No claim is
+ever zero, because a claim of zero would let qex start jobs without end.
+
+**A claim larger than the budget is accepted, and the job then operates alone.**
+qex gives a warning at the submission. It starts the job when no other job
+operates and the queue was quiet for 3 seconds. The field `forced` is true for
+such a job, and the job can swap or stop for memory. Set `[queue] oversized` to
+`reject` to refuse it at the submission, or to `queue` to hold it. A claim above
+a pool, such as a GPU, is always refused: an empty machine makes no fifth device.
+
+**Jobs start in the order of submission, and one large job does not hold the
+queue.** A smaller job behind it starts while the capacity is free. After 2 such
+jobs, qex keeps the capacity for the job at the front and starts nothing else, so
+the large job always gets its turn. `[queue] max_bypass` sets that number, and
+`0` gives a strict order. `--priority N` puts a job before the jobs with a
+smaller number.
+
+qex keeps no capacity when another user, or a program that qex never started,
+holds it. Such a wait has no known end, so the jobs behind continue to start.
+
+## qex tells the job what it claimed
+
+Give both `--cpu` and `--mem`, and qex writes the claim into the environment of
+the job:
+
+```
+QEX_CPU=2  GOMAXPROCS=2  OMP_NUM_THREADS=2  QEX_MEM=4294967296
+GOMEMLIMIT=4294967296  NODE_OPTIONS=--max-old-space-size=3072
+```
+
+A runtime then sizes its thread pool and its heap to the claim, and not to the
+machine. This is the one place where qex changes how your program runs, and it
+can decide whether a job succeeds.
+
+**The value is the claim, and not a measurement.** qex writes the number that
+you asked for.
+
+**Both halves must come from you.** `--cpu 2` with no `--mem` writes nothing,
+and a claim that qex chose or learned writes nothing. A claim of 1 core that qex
+invented would otherwise make a build of 16 cores 16 times slower, with no
+message.
+
+**qex never replaces a value that you set.** A program that asks the operating
+system directly still sees the whole machine.
+
+`--no-limit-env-hints` turns this off for one job, and `[claims] export_env =
+false` turns it off for every job.
+
 ## What qex does not do
+
+**qex does not measure your program before it starts.** A claim is a promise,
+and qex trusts it. qex measures a job while the job runs, and it uses that
+measurement as the claim for the next job of the same command.
+
+**qex applies no limit by default**, so nothing stops a job that goes above its
+claim. A job that claims 2GB and uses 20GB can still fill the machine. qex tests
+the free memory before each start, which limits the damage, but an accurate
+claim is better. Linux can apply a real limit with cgroup v2; set `[enforce]
+mode`. qex never reports a limit that it did not apply.
 
 **qex does not limit the CPU of a job.** The `cpu` controller of cgroup v2 is
 not available to a user on a usual Linux system, and macOS has no equivalent.
 The queue controls the number of cores instead.
-
-**qex does not limit the memory of a job by default.** A claim controls the
-queue only. Linux can apply a real limit with cgroup v2; set `[enforce] mode`.
-qex never reports a limit that it did not apply.
 
 **qex does not divide the machine between agents.** The budget controls the
 total load, and the queue is the order of submission. A fan-out of 11 jobs from
@@ -195,47 +284,43 @@ There is no share for each agent.
 **qex controls one machine.** Two machines that farm work to each other are not
 coordinated.
 
-**A claim is a promise — but the job is told what it promised.** Give both
-`--cpu` and `--mem`, and qex writes the claim into the environment
-(`GOMAXPROCS`, `OMP_NUM_THREADS`, `GOMEMLIMIT`, `NODE_OPTIONS`, `QEX_CPU` and
-more), so a runtime sizes its thread pool to the claim instead of to the
-machine. It never replaces a value you set yourself. A program that asks the
-operating system directly still sees the whole machine.
-
-**A claim is a promise, and not a measurement.** A job that claims 2GB and uses
-20GB can still fill the machine. qex tests the free memory before each start,
-which limits the damage, but an accurate claim is better. qex measures each job
-and uses the measurement for the next job of the same command.
+**One coordinator serves one user.** Every agent that runs as you shares one
+queue. A second user on the machine gets a second coordinator, and each
+coordinator reads the claims of the other from `/tmp/qex` before it starts a
+job. That accounting is cooperative. It needs no administrator rights, and it
+trusts what the other coordinator writes.
 
 ## When the kernel stops a job for memory
 
-A training run with `--mem guess` that the kernel stops at hour four gets the
-state `oom`. That state says one thing: **the claim was too small**.
+A training run that the kernel stops at hour four gets the state `oom`.
 
-qex corrects it. It multiplies the claim, starts the job again with the same id
-and the same record, and says in the record what it did:
+**qex reports it, and it starts no new attempt.** The record says what you can
+do. Give a larger `--mem` value and submit the work again:
 
-```
-claim:     1 core(s), 16GB  (qex raised it, because the earlier claim was too small)
-note:      the kernel stopped attempt 1 of this job, because the job used more
-           memory than its claim of 8GB. THE CLAIM WAS TOO SMALL. qex raised
-           the claim to 16GB and starts the job again.
+```sh
+qex submit --wait --mem 16GB --id-file train.id -- uv run train.py
 ```
 
-The job goes through the queue again, so its new claim meets the budget in the
-same way as a new job. qex also keeps the lesson: that kill says that the
-command needs **more than** 8GB, so the next run of the same command starts
-above that value and does not die in the same way.
+qex cannot do more than report while it applies no limit, which is the default.
+A claim is then a promise, and the count that the kernel keeps also rises when
+the kernel stops a different program of the same user. The machine can be full
+while your claim is correct, and a larger claim is then the wrong answer.
 
-qex makes this correction when it applied the memory limit itself, with
-`[enforce] mode`. The kernel then stopped the job at the claim, and the kill is
-proof. With no limit — the default — qex can read the count of the login session
-only, and that count also rises when the kernel stops a different program of the
-same user. qex then reports the state `oom`, says what you can do, and starts no
-new attempt: the machine can be full while your claim is correct.
+`[enforce] mode` puts each job in a cgroup of its own and applies the claim as a
+real limit. The kernel counts a kill at that limit separately, and that count is
+proof that the claim was too small. With that proof, qex is designed to multiply
+the claim, start the job again with the same id, and keep the lesson for the
+next job of the same command.
+
+**That correction does not run in this build.** The supervisor joins the cgroup
+of the job and then stops every process in it, so it stops itself before it
+reaches the code that raises the claim. Issue
+[#88](https://github.com/stephenc/qex/issues/88) holds the fault. While it is
+open, `[enforce] mode` gives you a real memory limit and the state `oom`, and no
+job runs a second time.
 
 See [the reference](docs/reference.md#a-job-that-the-kernel-stops-for-memory)
-for the limit on the raises.
+for the rules of the correction.
 
 ## The documentation
 

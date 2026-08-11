@@ -7,9 +7,11 @@ description: The one page that an agent needs, and the property that makes qex s
 
 # qex for agents
 
-qex holds a task in a queue, starts it when the machine has the cores and the
-memory, records the result on the disk, and gives you one command that waits for
-it. Install it with `cargo install qex`, or take a binary from the
+You cannot see the work that another agent is about to start, and it cannot see
+yours. qex holds the work of every agent on this machine in one queue. It starts
+each job when the claim of the job fits the machine, records the result on the
+disk, and gives you one command that waits for it. Install it with
+`cargo install qex`, or take a binary from the
 [releases](https://github.com/stephenc/qex/releases/latest). The first command
 starts the coordinator, and there is no service to configure.
 
@@ -101,8 +103,8 @@ jobs that did not stop then have no watcher, so wait again for them.
 | 0 to 96 | **The job.** The exit code of the job, unchanged. |
 | 97 to 127 | **qex.** The queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal stopped the job, and qex did not attribute it to a stop. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. The record holds the number of the signal. |
-| 99 | The kernel stopped the job for memory. Give a larger `--mem` and run it again. **qex needs proof**: `[enforce] mode`, or a kill that the kernel attributed. With no enforcement a claim is a promise and not a limit, so a job that passes its claim is not stopped at all and never gives 99. |
+| 98 | **A signal ended the job** — one that qex did not send, and that was not TERM or KILL. **Read the number in the record before you act**, because two causes give this code and need opposite answers: a fault inside the job, such as SIGSEGV or SIGABRT, means the work must change; a signal from outside, such as `kill -INT`, means somebody stopped you and the same command can run again. TERM and KILL give 125. The process that takes the signal is the command qex started: `-- sh -c my_binary` gives qex the shell, and a shell that survives its child exits 139, which qex reports as 97. |
+| 99 | **The kernel stopped the job for memory.** qex reports this with no configuration, so never treat 99 as impossible. Give a larger `--mem` and submit again: qex starts no new attempt. With no `[enforce] mode` a claim is a promise, so the kill comes from the memory of the **machine** and not from your claim — the machine can be full while your claim is correct. A machine that keeps no cgroup counter, such as macOS, gives 125 for the same kill. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and **the job continues.** Attach to it again. |
@@ -163,10 +165,10 @@ you lose an id, `qex list --cwd .` gives the jobs of this directory.
 
 ## Claims
 
-Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate
-together, which is what stops several agents from filling the machine. Use
-`--cpu guess --mem guess` when you do not know the size (`half`/`guess` take one
-half of the budget, `full`/`max` take all of it).
+Give `--cpu` and `--mem`. qex compares the claims against the budget, which is
+75% of the machine and which `qex info` gives. Use `--cpu guess --mem guess`
+when you do not know the size: `half`/`guess` take one half of the budget, and
+`full`/`max` take all of it.
 
 **Do not run a small test job to measure a task.** It costs time and measures
 different work. Give `guess` and start the real task:
@@ -177,9 +179,9 @@ qex submit --wait -- ./task                           # run 2: the claim is read
 ```
 
 qex records what each job really used and uses it as the claim for the next job
-of the same command. A job that the kernel stopped for memory gives a lower
-bound, so the next claim is above it. `qex status --json` gives `max_rss` and
-`cpu_secs`.
+of the same command. A job that the kernel stopped for memory teaches qex
+nothing today, so give a larger `--mem` yourself. `qex status --json` gives
+`max_rss` and `cpu_secs`.
 
 ## A key, so a second run starts nothing
 
@@ -248,8 +250,8 @@ Every command that reads data accepts `--json`.
   the code is 123; nothing ran, so there is no output.
 - **`pid` is null once a job stops.** The machine reuses that number. `last_pid`
   is history for a reader; never signal it.
-- **A claim is a promise, not a measurement.** A job that claims 2GB and uses
-  20GB still fills the machine.
+- **A claim is a promise, not a limit.** qex stops no job that goes above its
+  claim, so a job that claims 2GB and uses 20GB still fills the machine.
 - **`--lock NAME` keeps two jobs apart** when they share something a claim
   cannot express: a build directory, a port, a database.
 - **`status --follow` writes the log from its first line.** For a job that

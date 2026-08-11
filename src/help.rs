@@ -60,10 +60,10 @@ pub const AGENTS: &str = "\
 qex for agents
 ==============
 
-qex runs a long task for you. It holds the task in a queue, starts it when the
-machine has capacity, records the result on the disk, and gives you one command
-that waits for it. The record survives your session, your terminal and the
-coordinator itself.
+You cannot see the work that another agent is about to start, and it cannot see
+yours. qex holds the work of every agent on this machine in one queue. Declare
+what your job claims. qex starts the job when the claim fits the machine, writes
+the result to the disk, and gives you one command that waits for it.
 
 Which command
 -------------
@@ -137,10 +137,10 @@ Exit codes
     0 to 96     THE JOB. The exit code of the job, unchanged.
     97 to 127   QEX. The queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job, and qex did not attribute it to a
-                stop. A kill from anywhere gives 125 instead.
-      99        the kernel stopped the job for memory. See the note below:
-                qex must be able to prove it.
+      98        A SIGNAL ENDED THE JOB: not TERM, not KILL, and not from qex.
+                A fault in the job, or `kill -INT`. The record names it.
+      99        THE KERNEL STOPPED THE JOB FOR MEMORY. qex reports this with no
+                configuration. Give a larger `--mem` and submit the work again.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -158,8 +158,7 @@ A code from 125 does NOT say that your work failed: another agent on this
 machine can stop your job, so read the line on stderr before you run it again.
 
 `qex list`, `qex logs` and the other commands never speak for a job, so they use
-0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the reason for
-the band.
+0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the band.
 
 If qex cannot start at all
 --------------------------
@@ -239,8 +238,10 @@ names them when it returns.
 Resource claims
 ---------------
 
-Give `--cpu` and `--mem`. qex uses them to decide how many jobs operate
-together, and that is what stops two agents from filling the machine.
+Give `--cpu` and `--mem`. qex compares the claims against the budget, which is
+75% of the cores and the memory. `qex info` gives it. A CLAIM IS A PROMISE AND
+NOT A LIMIT: qex measures a job WHILE it runs, and nothing stops a job that goes
+above its claim, unless `[enforce] mode` applies a limit.
 
     half, guess   one half of the budget. Two such jobs operate together.
     full, max     the full budget. The job operates alone.
@@ -254,10 +255,9 @@ different work. Give `guess` and start the REAL task:
 
 qex records what each job really used, and it uses those numbers as the claim
 for the next job of the same command. It keeps the LARGEST measurement and adds
-a margin. A job that the kernel stopped for memory gives a lower bound, so the
-next claim is above it, and a smaller run later does not remove that lesson.
-`qex status` says where a claim came from, and `qex status --json` gives
-`max_rss` and `cpu_secs`.
+a margin. A job that the kernel stopped for memory teaches qex nothing today, so
+give a larger `--mem` yourself. `qex status` says where a claim came from, and
+`qex status --json` gives `max_rss` and `cpu_secs`.
 
 A claim that is larger than the whole budget still runs: qex starts the job
 alone when nothing else operates, and the field `forced` is true. The job can
@@ -328,8 +328,8 @@ Other options
     --timeout 4h       stop the JOB after this time. `--wait-timeout` stops
                        your wait instead, and the job continues.
     --retries 3        run the job again when it fails. One id, one record,
-                       every attempt in the log. You do not need this for a
-                       kill for memory: qex raises the claim by itself.
+                       every attempt in the log. A kill for memory starts no
+                       new attempt: give a larger `--mem` and submit again.
     --lock NAME        two jobs with one lock name never operate together. Use
                        it for a build directory, a port or a database.
     --nice N           -20 to 19. A larger number gives way to a person. The
@@ -984,9 +984,11 @@ A kill for memory
 -----------------
 
 The kernel stops a job that uses more memory than its claim. That kill says one
-thing: the claim was too small. qex raises the claim and starts the job again,
-up to `[retry] on_oom` times, and it multiplies the claim by `growth` at each
-raise. The default values give 2 raises and 4 times the first claim.
+thing: the claim was too small. qex is designed to raise the claim and start the
+job again, up to `[retry] on_oom` times, and to multiply the claim by `growth`
+at each raise. The default values give 2 raises and 4 times the first claim.
+ISSUE #88 STOPS THIS CORRECTION, so a kill for memory gives the state `oom` and
+no new attempt. Give a larger `--mem` value and submit the work again.
 
 This count is separate from `--retries`. `--retries` is for a fault outside the
 task, and you chose that number for that fault. The claim is usually the work of
@@ -1012,7 +1014,10 @@ login session, and that count also rises when the kernel stops a DIFFERENT
 program of the same user. qex then reports the state `oom` and starts no new
 attempt: the machine can be full while the claim of this job is correct.
 
-Set `[enforce] mode` to get the correction. Set `on_oom = 0` to stop it.
+THE CORRECTION DOES NOT RUN IN THIS BUILD. It needs `[enforce] mode`, and the
+supervisor stops every process in the cgroup of the job, so it stops itself
+before it raises the claim. Issue #88 holds the fault. Every job that the kernel
+stops for memory thus gets the state `oom` and no new attempt.
 
 The order of the queue
 ----------------------
@@ -1281,8 +1286,8 @@ these conditions are true:
 The `usage` field gives `max_rss` in bytes and `cpu_secs`. A task that always
 uses much less than its claim wastes capacity: put an exact claim in a job file,
 and more jobs then operate together. A task that the kernel stops for memory
-needs a larger claim, and qex gives it that claim itself: it multiplies the
-claim and starts the job again.
+needs a larger claim, and you must give it: the correction that raises a claim
+by itself does not run in this build. Issue #88 holds the fault.
 
 For one task, this step is not necessary.
 
@@ -1322,14 +1327,16 @@ The states `queued`, `starting` and `running` are not final. Each other state is
 final and does not change.
 
 The state `oom` is different from `failed`. It says that the kernel stopped the
-job for memory.
+job for memory. QEX REPORTS IT WITH NO CONFIGURATION, and the code is 99. What
+`[enforce] mode` changes is the ANSWER, and not the report.
 
-When qex applied the memory limit itself, that kill proves that the claim was
-too small: qex raises the claim and starts the job again, up to 2 times. With no
+A JOB WITH THIS STATE STARTS NO NEW ATTEMPT IN THIS BUILD. Give a larger `--mem`
+value and submit the work again. When qex applied the memory limit itself, that
+kill proves that the claim was too small, and qex is designed to raise the claim
+and start the job again up to 2 times. Issue #88 stops that correction. With no
 limit, which is the default, qex reads the count of the login session, and that
-count also rises for a different program of the same user. qex then reports the
-state and starts no new attempt. The record of the job says which of the two
-happened, and what you can do.
+count also rises for a different program of the same user. The record of the job
+says which of the two happened, and what you can do.
 
 The state `killed` also covers a kill that qex cannot explain. The kernel and
 `qex kill` both use the signal KILL, and a machine with no cgroup keeps no count
@@ -1975,10 +1982,10 @@ One table. Every command that gives you the result of a job obeys it.
     0 to 96     THE JOB. qex gives the exit code of the job, unchanged.
     97 to 127   QEX. The code describes the queue or the wait, never the job.
       97        the job gave a code from 97 to 255. Read the record for it.
-      98        a signal stopped the job, and qex did not attribute it to a
-                stop. A kill from anywhere gives 125 instead.
-      99        the kernel stopped the job for memory. See the note below:
-                qex must be able to prove it.
+      98        A SIGNAL ENDED THE JOB: not TERM, not KILL, and not from qex.
+                A fault in the job, or `kill -INT`. The record names it.
+      99        THE KERNEL STOPPED THE JOB FOR MEMORY. qex reports this with no
+                configuration. See the note below.
       100       the job has not stopped, so there is no result.
       121       qex could not do what you asked. No job ran.
       122       your wait stopped, and the job did not. Attach to it again.
@@ -1990,15 +1997,40 @@ One table. Every command that gives you the result of a job obeys it.
     128 and up  QEX ITSELF died from a signal. The job is not described. It can
                 still operate, so attach to it again.
 
-The code 98 says that a signal stopped the job and that qex did not attribute
-that signal to a stop. A kill, a cancel and a time limit give 125, and an
-EXTERNAL `kill -9` gives 125 as well: qex cannot know who sent it. The record
-holds the number of the signal in both cases, so nothing is lost.
+The code 98 says that a SIGNAL ended the job. qex tests three things: the job
+gave no exit code of its own, no qex command sent the signal, and the signal was
+not TERM and not KILL. The record holds the number.
 
-The code 99 needs proof that memory stopped the job. qex has that proof when
-`[enforce] mode` applies a limit, and when the kernel names the job that it
-stopped. WITH NO ENFORCEMENT A CLAIM IS A PROMISE AND NOT A LIMIT: a job that
-claims 64MB and uses 1.6GB is not stopped at all, and it never gives 99.
+READ THE NUMBER BEFORE YOU ACT, because two causes give this code and they need
+opposite answers. A fault INSIDE the job, such as SIGSEGV, SIGABRT or SIGFPE,
+says that the work must change. A signal from OUTSIDE, such as `kill -INT` or
+the SIGHUP of a terminal, says that somebody stopped the work and that the same
+command can run again.
+
+TERM and KILL are the two signals that qex keeps for 125. A kill, a cancel and a
+time limit give 125, and an EXTERNAL `kill -9` gives 125 as well: qex cannot
+know who sent it.
+
+THE PROCESS THAT TAKES THE SIGNAL IS THE COMMAND THAT QEX STARTED. `qex submit
+-- sh -c my_binary` gives the shell to qex, and a shell that survives the crash
+of its child exits 139 itself. That is a code from the band, so qex gives 97 and
+the record holds 139.
+
+The code 99 says that the kernel stopped the job for memory. QEX REPORTS IT WITH
+NO CONFIGURATION: qex reads a cgroup counter before and after the attempt, and a
+new kill in that counter, with a SIGKILL that no qex command sent, is the
+out-of-memory killer.
+
+`[enforce] mode` CHANGES THE ANSWER, AND NOT THE REPORT. With no mode a claim is
+a promise and not a limit, so a job that claims 64MB and uses 1.6GB is never
+stopped AT ITS CLAIM: the kill comes from the memory of the MACHINE. qex then
+reads the counter of your login session, which also rises when the kernel stops
+a DIFFERENT program of the same user, so the machine can be full while the claim
+of your job is correct. qex reports 99, says what you can do, and starts no new
+attempt.
+
+A machine that keeps no cgroup counter, such as macOS, gives the state `killed`
+and the code 125 for the same kill. qex reports what it can prove.
 
 THE CODE ANSWERS `PASS OR FAIL`. THE RECORD ANSWERS `WHY`. An agent that acts
 on the difference between \"the job failed\" and \"my wait stopped\" reads

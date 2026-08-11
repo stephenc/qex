@@ -51,8 +51,8 @@ Every command that reads data accepts `--json`.
 | 0 to 96 | **The job.** qex gives the exit code of the job, unchanged. `qex run -- sh -c 'exit 7'` gives 7. |
 | 97 to 127 | **qex.** The code describes the queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
-| 98 | A signal stopped the job, and qex did not attribute it to a stop. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. The record holds the number of the signal. |
-| 99 | The kernel stopped the job for memory. Give a larger `--mem`. **qex needs proof**: `[enforce] mode`, or a kill that the kernel attributed. With no enforcement a claim is a promise and not a limit, so a job that passes its claim is not stopped at all and never gives 99. |
+| 98 | **A signal ended the job** — one that qex did not send, and that was not TERM or KILL. Read the number in the record before you act: a fault inside the job, such as SIGSEGV, means the work must change; a signal from outside, such as `kill -INT`, means the same command can run again. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. |
+| 99 | **The kernel stopped the job for memory.** qex reports this with no configuration. Give a larger `--mem` and submit again: qex starts no new attempt. With no `[enforce] mode` a claim is a promise, so the kill comes from the memory of the **machine** and not from your claim. A machine that keeps no cgroup counter, such as macOS, gives 125 for the same kill. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and the job did not. Attach to it again. |
@@ -391,25 +391,42 @@ next claim is above it, and a smaller run that succeeds later does not remove
 it. A job that you stopped, or that reached its time limit, is never recorded:
 it shows the memory it reached, not the memory it needs.
 
+**qex records no lower bound in this build.** The code that writes one runs
+after the same gate as the correction below, and issue
+[#88](https://github.com/stephenc/qex/issues/88) stops both. A job that the
+kernel stops for memory thus teaches the learner nothing, and you give the next
+claim yourself.
+
 Turn it off with `[learn] enabled = false`.
 
 ### A job that the kernel stops for memory
 
-The kernel stops a job that uses more memory than its claim, and the job gets
-the state `oom`. That state says one thing: **the claim was too small**.
+The kernel stops a job for memory, and the job gets the state `oom`.
 
-qex corrects it. It multiplies the claim, starts the job again with the same id
-and the same record, and writes in the record what it did:
+**What a job gets today.** qex reports the state `oom`, writes in the record
+what you can do, and starts **no** new attempt. Give a larger `--mem` value and
+submit the work again:
 
+```sh
+qex submit --wait --mem 16GB -- uv run train.py
 ```
-$ qex status $ID
-state:     completed
-claim:     1 core(s), 16GB  (qex raised it, because the earlier claim was too small)
-note:      the kernel stopped attempt 1 of this job, because the job used more
-           memory than its claim of 8GB. THE CLAIM WAS TOO SMALL. qex raised
-           the claim to 16GB and starts the job again.
-attempts:  2
-```
+
+**What `[enforce] mode` is for.** With no limit, a claim is a promise, so qex
+cannot separate a kill at your claim from a kill that the machine made under
+pressure. `[enforce] mode` puts each job in a cgroup of its own and applies the
+claim as the limit. The kernel then counts a kill at that limit separately, and
+that count is the proof that the claim was too small. With the proof, qex is
+designed to multiply the claim, start the job again with the same id and the
+same record, and keep a lower bound for the next job of the same command.
+
+**That correction does not run in this build.** The supervisor joins the cgroup
+of the job, and it then stops every process in that cgroup. The supervisor stops
+itself, so nothing reaches the code that raises the claim. Issue
+[#88](https://github.com/stephenc/qex/issues/88) holds the fault. While it is
+open, `[enforce] mode` gives you a real memory limit and the state `oom`, and no
+job runs a second time.
+
+The rules below describe the correction that issue #88 blocks.
 
 | Rule | Value |
 | ---- | ----- |
@@ -430,7 +447,8 @@ of the claims stays inside the budget.
 #### One job, and not two
 
 A new attempt is the SAME job. It keeps its id, its record and its log file, and
-these rules follow from that:
+these rules follow from that. They hold when the correction runs, and issue #88
+stops it today.
 
 | Question | Answer |
 | -------- | ------ |
@@ -460,7 +478,7 @@ what qex may do:
 
 | What qex reads | Which count rises | What qex does |
 | -------------- | ----------------- | ------------- |
-| The cgroup that qex made for this job (`[enforce] mode` is `soft` or `hard`) | `oom` and `oom_kill` | Reports `oom`, raises the claim, runs the job again, and teaches the learner. The limit of this job stopped it, so the claim was too small. |
+| The cgroup that qex made for this job (`[enforce] mode` is `soft` or `hard`) | `oom` and `oom_kill` | Reports `oom`. The limit of this job stopped it, so the claim was too small. This is the row in which qex raises the claim, runs the job again and teaches the learner, and issue #88 stops that today. |
 | The cgroup that qex made for this job | `oom_kill` only | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
 | The cgroup of your login session (`[enforce] mode` is `off`, the default) | `oom_kill` | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
 
@@ -476,9 +494,9 @@ With no limit from qex, the count also rises when the kernel stops a
 also the machine on which a person uses `kill -9`, so the two events arrive
 together. qex then cannot name the job that the kernel stopped.
 
-To get the correction, set `[enforce] mode`. qex then holds a count for this job
-alone, and it can separate a kill at your claim from a kill that the machine
-made.
+`[enforce] mode` gives qex a count for this job alone, so it can separate a kill
+at your claim from a kill that the machine made. That is what the correction
+needs, and issue #88 stops the correction itself.
 
 `qex kill` writes a mark before it sends the signal, and that mark always wins.
 A job that you stopped never runs again with a larger claim, and it teaches the
