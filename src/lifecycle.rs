@@ -85,9 +85,9 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
     // Record the cause BEFORE the signal.
     //
     // The kernel uses SIGKILL for an out-of-memory kill, and this command uses
-    // the same signal. qex answers an out-of-memory kill with a larger claim
-    // and a new attempt, so a job that a person stopped must never receive that
-    // answer: it would repeat work that somebody stopped on purpose.
+    // the same signal. The state `oom` names the memory of the machine as the
+    // cause, so a job that a person stopped must never take it: the reader who
+    // sent this command knows the cause, and qex must not give a different one.
     //
     // The mark goes to the disk first, because the supervisor can read the
     // record in the moment after the signal.

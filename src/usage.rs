@@ -32,25 +32,24 @@
 //!
 //! # Which jobs qex records
 //!
-//! A job that completed, and a job that the kernel stopped for memory. Each of
-//! the two gives a different kind of evidence, and this module keeps them
-//! apart:
+//! A job that COMPLETED, and nothing else. The job did all its work, so its
+//! peak is the memory that the job needs.
 //!
-//! - A job that COMPLETED gives a peak. The job did all its work, so the peak
-//!   is the memory that the job needs.
-//! - A job that the kernel STOPPED FOR MEMORY gives a lower bound. The job did
-//!   not finish, so the true need is ABOVE this value. This is the most
-//!   valuable sample that qex holds: it costs a whole run to obtain, and it is
-//!   the answer to the question that the next claim asks.
+//! A job that did NOT complete gives the memory that it REACHED, which is the
+//! size at which something stopped it, and that number says nothing about the
+//! memory that the job needs. A sample from such a job would make the next
+//! claim too small, and the next job would stop in the same way. That covers a
+//! job that somebody stopped, a job that reached its time limit, and a job that
+//! the kernel stopped for memory.
 //!
-//! qex records nothing else. A job that somebody stopped, or that reached its
-//! time limit, gives a measurement that is too small and no bound: something
-//! outside the memory stopped it, and the memory that it reached says nothing
-//! about the memory that it needs. A sample from such a job would make the next
-//! claim too small, and the next job would stop in the same way.
+//! # A file of an earlier qex
 //!
-//! A lower bound is never averaged with a peak. `suggest` takes the largest
-//! peak AND the largest lower bound, and the claim is above both.
+//! An earlier qex wrote a second kind of sample, a `lower-bound`, after a kill
+//! for memory. This version writes none and uses none, and it still READS one,
+//! because the store loads as ONE value: a word that this version could not
+//! read would give an empty store and take every peak of every command with it.
+//! `suggest` passes over such a sample, and a command whose only history is one
+//! gives no claim at all.
 
 use crate::job::JobStatus;
 use crate::paths;
@@ -78,14 +77,44 @@ pub enum Measurement {
     /// field. An old file thus keeps its meaning.
     #[default]
     Peak,
-    /// The kernel stopped the job for memory. The true need is ABOVE this value.
+    /// A job that the kernel stopped for memory, in a file of an earlier qex.
+    ///
+    /// qex WRITES no sample of this kind and it USES none. The kind stays
+    /// readable because the store loads as one value: a kind that this version
+    /// could not read would give an empty store, and the reader would lose
+    /// every peak of every command with no message.
+    ///
+    /// `suggest` passes over these samples. The value is not a measurement of
+    /// the memory that a job used, so a claim must not come from it.
     LowerBound,
+    /// A kind that this version does not know.
+    ///
+    /// A LATER qex can write a kind that this one has never seen, and the store
+    /// loads as ONE value: without this arm, that one word would give an empty
+    /// store and the reader would lose every peak of every command with no
+    /// message. `suggest` passes over these samples, because qex cannot say
+    /// what they measure.
+    #[serde(other)]
+    Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One measurement of one job.
+///
+/// EVERY FIELD TAKES A DEFAULT, and the reason is the same as the reason for
+/// `Measurement::Unknown`: the store loads as one value, so a sample that is
+/// missing a field, or that a later qex wrote with a field that this one does
+/// not know, would give an EMPTY store. The reader would then lose every peak
+/// of every command, with no message, and would learn of the loss when a later
+/// claim came back too small.
+///
+/// A missing number reads as ZERO, and a peak of zero bytes is not a
+/// measurement: no job uses no memory. `suggest` thus passes over a peak of
+/// zero, in the same way that it passes over a kind that it cannot use. The
+/// sample stays in the file, and it gives no claim.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sample {
     /// What this measurement says. See [`Measurement`].
-    #[serde(default)]
     pub kind: Measurement,
     /// The peak memory of the job, in bytes.
     pub max_rss: u64,
@@ -96,7 +125,14 @@ pub struct Sample {
     pub at: u64,
 }
 
+/// The measurements of one command.
+///
+/// EVERY FIELD TAKES A DEFAULT, for the reason that `Sample` gives: the store
+/// loads as ONE value, so an entry that is missing a field empties the store of
+/// EVERY command. The guard on `Sample` alone is not enough, because a later
+/// qex can change this level and not that one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Entry {
     /// The name of the job, for a person to read. qex does not use it as a key.
     pub name: String,
@@ -173,56 +209,6 @@ pub fn record(spec: &JobSpec, status: &JobStatus) {
     add(spec, status, Measurement::Peak, status.usage.max_rss);
 }
 
-/// Records a lower bound from a job that the kernel stopped for memory.
-///
-/// # The caller must hold the evidence of THIS JOB
-///
-/// Call this function only when qex made the cgroup of the job AND that cgroup
-/// counted a NEW event at its own limit during that attempt. The kernel then
-/// stopped the job at the
-/// limit that qex made from the claim, so the claim was too small and the need
-/// is above it.
-///
-/// Two other kinds of evidence do NOT support this record.
-///
-/// The counter of the session also counts a kill in a different program of the
-/// same user, and the machine can be full while the claim of this job is
-/// correct.
-///
-/// A kill in the cgroup of the job, with no NEW event at the limit of that
-/// cgroup,
-/// says that the memory of the machine stopped this job, or that a limit of a
-/// parent cgroup did. The claim can be correct there as well.
-///
-/// A bound from either one raises the claim of a command that needs no more
-/// memory, and the ladder of attempts raises it again at each run.
-///
-/// # A bound outlives the job that made it
-///
-/// `suggest` takes the LARGEST bound of a command and puts every later claim
-/// above it, and only a larger bound replaces it. A bound that a wrong answer
-/// wrote thus changes every later run of that command, and no command of qex
-/// deletes one. The file `usage.json` in the state directory holds them, and a
-/// reader who suspects a wrong bound corrects that file.
-pub fn record_lower_bound(spec: &JobSpec, status: &JobStatus) {
-    if status.state != crate::job::JobState::Oom {
-        return;
-    }
-    // Take the LARGER of the claim and the measured peak.
-    //
-    // The kernel stopped the job at the claim, so the need is above the claim.
-    // The measurement can be larger when the job used memory that the limit
-    // does not count, and it can be zero when the kernel stopped the job before
-    // any child of the supervisor ended. The larger of the two is the value
-    // that does not repeat the failure.
-    add(
-        spec,
-        status,
-        Measurement::LowerBound,
-        status.usage.max_rss.max(status.mem),
-    );
-}
-
 /// Adds one measurement for a command.
 ///
 /// Two supervisors can stop at the same time, so this function holds a lock on
@@ -261,31 +247,6 @@ fn add(spec: &JobSpec, status: &JobStatus, kind: Measurement, bytes: u64) {
     let mut store = load();
     let entry = store.commands.entry(key(&spec.cwd, against)).or_default();
     entry.name = spec.name.clone();
-
-    // Keep ONE lower bound for a command.
-    //
-    // A ladder of attempts makes a bound at each step: one job of three
-    // attempts made three bounds and filled three of the five places. The
-    // measurements of the jobs that completed then went away, and the store
-    // held one job only. The largest bound holds every fact that the smaller
-    // bounds of the same ladder hold, so qex keeps that one.
-    if kind == Measurement::LowerBound {
-        if let Some(pos) = entry
-            .samples
-            .iter()
-            .position(|s| s.kind == Measurement::LowerBound)
-        {
-            if entry.samples[pos].max_rss >= bytes {
-                // An earlier bound is larger, so this one adds nothing. Move it
-                // to the end, so that it stays the newest measurement.
-                let earlier = entry.samples.remove(pos);
-                entry.samples.push(earlier);
-                write_store(&path, &store, &lock);
-                return;
-            }
-            entry.samples.remove(pos);
-        }
-    }
 
     entry.samples.push(Sample {
         kind,
@@ -333,45 +294,38 @@ pub fn suggest(
     //
     // A claim that is too small stops the job, and a claim that is a little too
     // large costs some capacity only. The two faults are not equal.
+    //
+    // A PEAK OF MORE THAN ZERO BYTES is the only measurement that gives a
+    // claim, and an entry that holds no such sample gives NO answer. Two
+    // shapes get past the reader and reach this point:
+    //
+    // - a `lower-bound`, which a file of an earlier qex holds for a command
+    //   whose jobs never completed. It says that a job stopped, and it names no
+    //   memory that the job used;
+    // - a peak of ZERO bytes, which is what a sample with no number reads as.
+    //   No job uses no memory, so the value measures nothing.
+    //
+    // Each one gives the smallest claim that qex permits, with `learned` in the
+    // record: the reader is told that 64MB came from the earlier jobs of a
+    // command that possibly needs 8GB. NO answer is the correct answer, because
+    // the reader then gets the default, which no measurement contradicts.
     let peak_mem = entry
         .samples
         .iter()
-        .filter(|s| s.kind == Measurement::Peak)
+        .filter(|s| s.kind == Measurement::Peak && s.max_rss > 0)
         .map(|s| s.max_rss)
-        .max()
-        .unwrap_or(0);
-    let mut mem = (peak_mem as f64 * margin) as u64;
-
-    // A lower bound comes from a job that the kernel stopped for memory. It is
-    // a claim that FAILED, so the next claim must be above it. An average with
-    // the peaks of the smaller runs would lose that lesson, and the next job
-    // would stop in the same way and cost a second whole run.
-    let bound = entry
-        .samples
-        .iter()
-        .filter(|s| s.kind == Measurement::LowerBound)
-        .map(|s| s.max_rss)
-        .max()
-        .unwrap_or(0);
-    if bound > 0 {
-        // The margin is the usual step above a measurement. A margin of exactly
-        // 1.0 is permitted in the config file, and it would give here the claim
-        // that the kernel already stopped, so the claim goes at least one tenth
-        // above the bound.
-        let above = ((bound as f64 * margin) as u64).max(bound + bound / 10 + 1);
-        mem = mem.max(above);
-    }
-
-    let mem = mem.max(MIN_MEMORY);
+        .max()?;
+    let mem = ((peak_mem as f64 * margin) as u64).max(MIN_MEMORY);
 
     // Calculate the cores from the CPU time and the time that the job operated.
     //
     // The CPU time of a job that used two cores for 10 seconds is 20 seconds.
     // The division thus gives the number of cores that the job used together.
     //
-    // Each sample counts here, and a lower bound also. The memory of a job that
-    // the kernel stopped is not the memory that the job needs, but the cores
-    // that it used in the time that it ran are a true measurement.
+    // EVERY sample counts here, and a sample of a kind that this version does
+    // not use as well. The memory of a job that did not finish says nothing
+    // about the memory that it needs, and the cores that it used in the time
+    // that it ran are a true measurement either way.
     let cores = entry
         .samples
         .iter()
@@ -570,60 +524,7 @@ mod tests {
         assert_eq!(s.mem, (400 << 20) * 3 / 2);
     }
 
-    /// A job that the kernel stopped for memory gives a LOWER BOUND, and the
-    /// next claim must be above it.
-    ///
-    /// This measurement costs a whole run to obtain. qex threw it away before,
-    /// so the same claim died in the same way on the next run.
-    #[test]
-    fn the_next_claim_is_above_a_lower_bound() {
-        let cmd: Vec<String> = vec!["train".into()];
-        let store = store_with(&["train"], vec![lower_bound(8 << 30)]);
-        let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
-        assert!(
-            s.mem > (8 << 30),
-            "the claim must be above a claim that failed, and it was {}",
-            crate::units::format_size(s.mem)
-        );
-        assert_eq!(s.mem, 12 << 30);
-
-        // A margin of exactly 1.0 is permitted in the config file. It must
-        // still give a claim ABOVE the value that the kernel stopped.
-        let s = suggest(&store, &dir(), &cmd, 1.0).unwrap();
-        assert!(
-            s.mem > (8 << 30),
-            "a margin of 1.0 gave the claim that already failed"
-        );
-    }
-
-    /// A small run that succeeds must not hide the lesson of a run that the
-    /// kernel stopped.
-    ///
-    /// The kill says that the command needs more than 8GB. Three later runs of
-    /// 1GB do not answer that: they had a smaller input. A claim from those
-    /// three would stop the next large run in the same way, and that costs a
-    /// whole run.
-    #[test]
-    fn a_lower_bound_is_not_averaged_away_by_the_smaller_runs() {
-        let cmd: Vec<String> = vec!["train".into()];
-        let store = store_with(
-            &["train"],
-            vec![
-                sample(1 << 30, 1.0, 10),
-                lower_bound(8 << 30),
-                sample(1 << 30, 1.0, 10),
-                sample(1 << 30, 1.0, 10),
-            ],
-        );
-        let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
-        assert!(
-            s.mem > (8 << 30),
-            "the lower bound went away, and the claim is {}",
-            crate::units::format_size(s.mem)
-        );
-    }
-
-    /// A peak that is larger than a lower bound must win. The bound says "more
+    /// A peak that is larger than an old bound must win. The bound says "more
     /// than 2GB", and a run that completed with 6GB says "6GB is sufficient".
     #[test]
     fn the_largest_evidence_wins_whatever_its_kind() {
@@ -639,7 +540,7 @@ mod tests {
     /// A file that qex wrote before this feature holds no `kind` field. Each of
     /// those samples is a peak, so an old file must give the claim that it gave
     /// before. Without this rule, every earlier measurement would become a
-    /// lower bound, and every claim would go up.
+    /// bound of an earlier qex, and every claim would go up.
     #[test]
     fn an_earlier_file_keeps_its_meaning() {
         let text = r#"{"commands":{"x":{"name":"t","samples":[
@@ -650,12 +551,236 @@ mod tests {
         assert_eq!(sample.max_rss, 1 << 30);
     }
 
-    /// The record of a job that the kernel stopped must hold the CLAIM when the
-    /// claim is the larger number. With a memory limit, the kernel stops the
-    /// job at the claim, so the need is above the claim and not at the peak
-    /// that qex measured.
+    /// A file that an earlier qex wrote must still give its peaks.
+    ///
+    /// An earlier qex wrote a sample of the kind `lower-bound` after the kernel
+    /// stopped a job for memory. qex writes no such sample now, and it uses
+    /// none — but the store LOADS as one value, so a kind that this version
+    /// cannot read gives an EMPTY store. The reader then loses every peak of
+    /// every command, with no message, and learns of the loss when a later
+    /// claim comes back too small.
+    ///
+    /// So the kind stays readable, and `suggest` passes over it.
     #[test]
-    fn a_kill_for_memory_records_the_claim_when_it_is_larger() {
+    fn a_file_with_a_bound_of_an_earlier_qex_still_gives_its_peaks() {
+        let text = r#"{"commands":{"x":{"name":"t","samples":[
+            {"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0},
+            {"kind":"lower-bound","max_rss":8589934592,"cpu_secs":1.0,"elapsed_secs":10,"at":1}]}}}"#;
+
+        let store: Store = serde_json::from_str(text).expect("a file of an earlier qex must load");
+        assert_eq!(
+            store.commands["x"].samples.len(),
+            2,
+            "each sample must load, so that no peak goes away"
+        );
+        let peaks: Vec<u64> = store.commands["x"]
+            .samples
+            .iter()
+            .filter(|s| s.kind == Measurement::Peak)
+            .map(|s| s.max_rss)
+            .collect();
+        assert_eq!(peaks, vec![1 << 30], "the peak of the old file must stay");
+    }
+
+    /// A file that this version cannot read in full must not lose the rest.
+    ///
+    /// The store loads as ONE value, so one word or one missing field that this
+    /// version does not know would give an EMPTY store: every peak of every
+    /// command, gone with no message, and the reader learns of it when a later
+    /// claim comes back too small.
+    ///
+    /// A later qex can write a kind and a field that this one has never seen,
+    /// so this test drives shapes that do not exist yet.
+    #[test]
+    fn a_file_that_this_version_cannot_read_in_full_keeps_its_peaks() {
+        let peak =
+            r#"{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}"#;
+        for (what, sample) in [
+            (
+                "a kind of a later qex",
+                r#"{"kind":"ceiling","max_rss":8589934592,"cpu_secs":1.0,"elapsed_secs":10,"at":1}"#,
+            ),
+            (
+                "a sample with no kind",
+                r#"{"max_rss":2,"cpu_secs":1.0,"elapsed_secs":10,"at":1}"#,
+            ),
+            (
+                "a sample that is missing a field",
+                r#"{"kind":"peak","max_rss":2}"#,
+            ),
+            ("a sample with no field at all", r#"{}"#),
+        ] {
+            let text =
+                format!(r#"{{"commands":{{"x":{{"name":"t","samples":[{peak},{sample}]}}}}}}"#);
+            let store: Store = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{what} must not empty the store: {e}"));
+            let peaks: Vec<u64> = store.commands["x"]
+                .samples
+                .iter()
+                .filter(|s| s.kind == Measurement::Peak)
+                .map(|s| s.max_rss)
+                .collect();
+            assert!(
+                peaks.contains(&(1 << 30)),
+                "{what} must leave the peak of the file: {peaks:?}"
+            );
+        }
+    }
+
+    /// An ENTRY that this version cannot read in full must not empty the store.
+    ///
+    /// The guard on `Sample` holds the level of one measurement. A later qex can
+    /// change the level ABOVE it, and the store still loads as one value, so an
+    /// entry that is missing a field would take the peaks of every OTHER command
+    /// with it.
+    ///
+    /// The command `good` holds the peak in each shape here, and the damage is
+    /// always in the command beside it.
+    #[test]
+    fn an_entry_that_this_version_cannot_read_in_full_keeps_the_other_commands() {
+        let good = r#"{"name":"t","samples":[{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}"#;
+        for (what, entry) in [
+            ("an entry with no name", r#"{"samples":[]}"#),
+            ("an entry where the samples went", r#"{"name":"t"}"#),
+            ("an entry with no field at all", r#"{}"#),
+            (
+                "an entry with a field of a later qex",
+                r#"{"name":"t","samples":[],"ceiling":42}"#,
+            ),
+        ] {
+            let text = format!(r#"{{"commands":{{"good":{good},"damaged":{entry}}}}}"#);
+            let store: Store = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{what} must not empty the store: {e}"));
+            let peaks: Vec<u64> = store.commands["good"]
+                .samples
+                .iter()
+                .filter(|s| s.kind == Measurement::Peak)
+                .map(|s| s.max_rss)
+                .collect();
+            assert_eq!(
+                peaks,
+                vec![1 << 30],
+                "{what} must leave the peak of the command beside it"
+            );
+        }
+    }
+
+    /// A STORE that this version cannot read in full must not lose its commands.
+    ///
+    /// This is the level above the entry. A later qex can add a field beside
+    /// `commands`, or write a file that has no `commands` field at all.
+    #[test]
+    fn a_store_with_a_field_of_a_later_qex_keeps_its_commands() {
+        let good = r#"{"name":"t","samples":[{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}"#;
+        let text = format!(r#"{{"commands":{{"good":{good}}},"written_by":"a later qex"}}"#);
+        let store: Store = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("a field of a later qex must not empty the store: {e}"));
+        assert_eq!(store.commands["good"].samples[0].max_rss, 1 << 30);
+
+        let empty: Store = serde_json::from_str(r#"{"written_by":"a later qex"}"#)
+            .expect("a file with no commands field must read as an empty store");
+        assert!(empty.commands.is_empty());
+    }
+
+    /// A command whose only history is a BOUND gives NO claim.
+    ///
+    /// An entry can hold samples and no peak: an earlier qex wrote a bound for
+    /// a command whose jobs never completed. A claim from such an entry would
+    /// be the smallest that qex permits, and the record would say `learned`, so
+    /// a reader would be told that 64MB came from the earlier jobs of a command
+    /// that needed more than 8GB. The reader must get the default instead.
+    #[test]
+    fn a_command_with_a_bound_and_no_peak_gives_no_claim() {
+        let cmd: Vec<String> = vec!["train".into()];
+        let store = store_with(&["train"], vec![lower_bound(8 << 30)]);
+        assert!(
+            suggest(&store, &dir(), &cmd, 1.5).is_none(),
+            "a bound is not a measurement, so it must give no claim at all"
+        );
+    }
+
+    /// A PEAK OF ZERO BYTES gives no claim.
+    ///
+    /// No job uses no memory, so a peak of zero measures nothing. A sample that
+    /// is missing its number reads as a peak of zero, because every field of a
+    /// sample takes a default: that is what keeps the peaks of a file that this
+    /// version cannot read in full. A claim from such a sample would be the
+    /// smallest that qex permits, and the record would say `learned`, so the
+    /// reader would get a number that no job supports.
+    #[test]
+    fn a_peak_of_zero_bytes_gives_no_claim() {
+        let cmd: Vec<String> = vec!["train".into()];
+        for (what, text) in [
+            (
+                "a sample with a kind and no number",
+                r#"{"commands":{"KEY":{"name":"t","samples":[{"kind":"peak"}]}}}"#,
+            ),
+            (
+                "a sample with no field at all",
+                r#"{"commands":{"KEY":{"name":"t","samples":[{}]}}}"#,
+            ),
+        ] {
+            let text = text.replace("KEY", &key(&dir(), &cmd));
+            let store: Store = serde_json::from_str(&text).unwrap();
+            assert!(
+                suggest(&store, &dir(), &cmd, 1.5).is_none(),
+                "{what} measures nothing, so it must give no claim at all"
+            );
+        }
+    }
+
+    /// A peak of zero bytes takes no peak of the same command with it.
+    ///
+    /// THIS TEST DOES NOT GUARD THE FILTER ON A PEAK OF ZERO. It passes with
+    /// that filter gone, because the largest of `0` and `1GB` is `1GB` either
+    /// way. `a_peak_of_zero_bytes_gives_no_claim` is the test that fails when
+    /// the filter goes.
+    ///
+    /// This test guards a DIFFERENT wrong answer: a version that refused the
+    /// whole entry because one sample in it holds a zero. The command keeps its
+    /// claim, and only the sample that measures nothing goes.
+    #[test]
+    fn a_peak_of_zero_bytes_leaves_the_claim_of_the_true_peaks() {
+        let cmd: Vec<String> = vec!["train".into()];
+        let store = store_with(
+            &["train"],
+            vec![sample(0, 1.0, 10), sample(1 << 30, 1.0, 10)],
+        );
+        let s = suggest(&store, &dir(), &cmd, 1.5).expect("the peak must give a claim");
+        assert_eq!(
+            s.mem,
+            (1 << 30) * 3 / 2,
+            "the claim must come from the peak that measures memory"
+        );
+    }
+
+    /// The claim of an old file comes from its PEAKS, and never from its bound.
+    ///
+    /// A bound is not a measurement. A version that read one as a peak would
+    /// put every later claim of that command above a number that no job used.
+    #[test]
+    fn a_bound_of_an_earlier_qex_gives_no_claim() {
+        let cmd: Vec<String> = vec!["train".into()];
+        let store = store_with(
+            &["train"],
+            vec![lower_bound(8 << 30), sample(1 << 30, 1.0, 10)],
+        );
+        let s = suggest(&store, &dir(), &cmd, 1.5).expect("the peaks must give a claim");
+        assert_eq!(
+            s.mem,
+            (1 << 30) * 3 / 2,
+            "the claim must come from the peak alone, and not from the bound"
+        );
+    }
+
+    /// qex learns from a job that COMPLETED, and from nothing else.
+    ///
+    /// A job that the kernel stopped for memory reached the memory that
+    /// something stopped it at, and that number is not the memory that the job
+    /// needs. A job that a person stopped says nothing at all. Neither one may
+    /// reach the store.
+    #[test]
+    fn a_job_that_did_not_complete_teaches_the_learner_nothing() {
         use crate::testutil::{env_lock, EnvVar};
         let _guard = env_lock();
         let dir = std::env::temp_dir().join(format!("qex-usage-oom-{}", std::process::id()));
@@ -691,80 +816,32 @@ mod tests {
             dedupe_window: 0,
         };
 
-        let mut status = crate::job::JobStatus::new(&spec);
-        status.state = crate::job::JobState::Oom;
-        status.usage.max_rss = 1 << 30;
-        record_lower_bound(&spec, &status);
+        for state in [
+            crate::job::JobState::Oom,
+            crate::job::JobState::Killed,
+            crate::job::JobState::Failed,
+        ] {
+            let mut status = crate::job::JobStatus::new(&spec);
+            status.state = state;
+            status.usage.max_rss = 3 << 30;
+            record(&spec, &status);
+            assert!(
+                !load().commands.contains_key(&key(&spec.cwd, &spec.command)),
+                "the state {state:?} must teach the learner nothing"
+            );
+        }
 
-        // `record` keeps the peak of a job that COMPLETED. A job that the
-        // kernel stopped needs the caller to hold the evidence of that job, so
-        // it has a function of its own and this one must do nothing.
-        record(&spec, &status);
-
+        // A job that COMPLETED gives its peak.
+        spec.command = vec!["good".into()];
+        let mut done = crate::job::JobStatus::new(&spec);
+        done.state = crate::job::JobState::Completed;
+        done.usage.max_rss = 2 << 30;
+        record(&spec, &done);
         let store = load();
         let entry = &store.commands[&key(&spec.cwd, &spec.command)];
         assert_eq!(entry.samples.len(), 1);
-        assert_eq!(entry.samples[0].kind, Measurement::LowerBound);
-        assert_eq!(
-            entry.samples[0].max_rss,
-            4 << 30,
-            "the claim is the larger evidence"
-        );
-
-        // A LADDER OF ATTEMPTS MUST LEAVE ONE BOUND, and it must not push the
-        // measurements of the jobs that completed out of the store.
-        //
-        // qex keeps five samples for a command. One job of three attempts
-        // writes a bound at each raise, so three of the five places went to one
-        // job and the peaks of the jobs that behave went away. The largest
-        // bound holds every fact that the smaller bounds of the same ladder
-        // hold, so the store keeps that one only.
-        spec.command = vec!["ladder".into()];
-        let ladder = key(&spec.cwd, &spec.command);
-        let mut peak = crate::job::JobStatus::new(&spec);
-        peak.state = crate::job::JobState::Completed;
-        peak.usage.max_rss = 2 << 30;
-        record(&spec, &peak);
-        for claim in [1u64 << 30, 2 << 30, 4 << 30] {
-            let mut oom = crate::job::JobStatus::new(&spec);
-            oom.state = crate::job::JobState::Oom;
-            oom.mem = claim;
-            oom.usage.max_rss = claim;
-            record_lower_bound(&spec, &oom);
-        }
-        let entry = &load().commands[&ladder];
-        let bounds: Vec<&Sample> = entry
-            .samples
-            .iter()
-            .filter(|s| s.kind == Measurement::LowerBound)
-            .collect();
-        assert_eq!(
-            bounds.len(),
-            1,
-            "a ladder of three attempts must leave one bound: {:?}",
-            entry.samples
-        );
-        assert_eq!(bounds[0].max_rss, 4 << 30, "the largest bound must win");
-        assert!(
-            entry
-                .samples
-                .iter()
-                .any(|s| s.kind == Measurement::Peak && s.max_rss == (2 << 30)),
-            "the measurement of the job that completed must stay: {:?}",
-            entry.samples
-        );
-
-        // A job that somebody stopped teaches nothing. The memory that it
-        // reached says nothing about the memory that it needs.
-        spec.command = vec!["other".into()];
-        let mut killed = crate::job::JobStatus::new(&spec);
-        killed.state = crate::job::JobState::Killed;
-        killed.usage.max_rss = 3 << 30;
-        record(&spec, &killed);
-        assert!(
-            !load().commands.contains_key(&key(&spec.cwd, &spec.command)),
-            "a job that a command stopped must teach the learner nothing"
-        );
+        assert_eq!(entry.samples[0].kind, Measurement::Peak);
+        assert_eq!(entry.samples[0].max_rss, 2 << 30);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -52,7 +52,7 @@ Every command that reads data accepts `--json`.
 | 97 to 127 | **qex.** The code describes the queue or the wait, never the job. |
 | 97 | The job gave a code from 97 to 255. Read the record for it. |
 | 98 | **A signal ended the job** — one that qex did not send, and that was not TERM or KILL. Read the number in the record before you act: a fault inside the job, such as SIGSEGV, means the work must change; a signal from outside, such as `kill -INT`, means the same command can run again. A kill, a cancel or a time limit gives 125, and an **external** `kill -9` gives 125 as well: qex cannot know who sent it. |
-| 99 | **The kernel stopped the job for memory.** qex reports this with no configuration. Give a larger `--mem` and submit again: qex starts no new attempt. With no `[enforce] mode` a claim is a promise, so the kill comes from the memory of the **machine** and not from your claim. A machine that keeps no cgroup counter, such as macOS, gives 125 for the same kill. |
+| 99 | **The kernel stopped the job for memory.** qex REPORTS this and acts on it in no way: no new attempt, no changed claim. qex reads a kill count that covers every program of your user, so it cannot say your job was the victim and cannot say the claim was too small — the machine can be full while your claim is correct. Compare the `usage` field with the claim. macOS keeps no such count and gives 125 for the same kill, so never wait for 99 there. |
 | 100 | The job has not stopped, so there is no result. Only `qex status --quiet` with no wait gives it. |
 | 121 | qex could not do what you asked. No job ran. |
 | 122 | Your wait stopped, and the job did not. Attach to it again. |
@@ -349,6 +349,28 @@ because an empty stream and a stream with no events look the same.
 Give `--cpu` and `--mem`. qex uses these claims to decide how many jobs operate
 together.
 
+**qex limits no job.** A claim decides what STARTS and when. Nothing holds a job
+to its claim after the job starts, so a job that claims 2GB and uses 20GB still
+fills the machine.
+
+### What qex may assume about the machine
+
+`[enforce] mode` says who else uses this machine. NEITHER VALUE LIMITS A JOB.
+
+| Value | qex assumes | The budget | The reserve | The peers |
+| ----- | ----------- | ---------- | ----------- | --------- |
+| `cooperative` (default) | others share this machine | 75% | 2GB | qex looks for them |
+| `single-user` | qex decides what runs here | 90% | 512MB | qex looks for none |
+
+Each value that `single-user` changes follows from the same assumption: the room
+that `cooperative` leaves is room for work that qex does not control, and there
+is no such work here. **A value that you write always wins**, in either mode, so
+`[budget] mem` or `[system] reserve_mem` in the file takes the number you gave.
+
+The section is named `[enforce]` because a way to hold a job to its claim would
+attach to `single-user`, and a file that already names the mode would then need
+no new key. qex holds a job to nothing today.
+
 If you do not know the size of a task, use a word in place of a number:
 
 | Word | Meaning |
@@ -374,137 +396,71 @@ the name, because `cargo build` and `cargo test` need different sizes. qex uses
 the **largest** measurement it holds plus a margin, because a claim that is too
 small stops the job while a claim that is a little large costs only capacity.
 
-qex records two kinds of measurement, and it keeps them apart:
+qex records ONE kind of measurement: the memory that a job which COMPLETED
+used. A job that something stopped shows the memory that it reached, and not the
+memory that it needs, so it teaches the learner nothing. That covers a job that
+you stopped, a job that reached its time limit, and a job that the kernel
+stopped for memory.
 
-| The job | What the sample says |
-| ------- | -------------------- |
-| completed | The memory that the job needs. |
-| the kernel stopped it at its own limit | A **lower bound**. The need is above this value. |
+The learned claim never goes above `[budget] mem`: qex makes that number itself,
+and it must not make a number that it then refuses.
 
-qex keeps one lower bound for a command, because a ladder of attempts makes one
-at each step and they would fill the store. The learned claim also never goes
-above `[budget] mem`: qex makes that number itself, and it must not make a
-number that it then refuses.
+A file that an EARLIER qex wrote can hold a sample of a kind that this version
+does not use, and a file that a LATER qex wrote can hold a kind or a field that
+this version has never seen. qex reads such a file and keeps every peak in it.
+It gives no claim from a sample that is not a peak, so a command whose only
+history is such a sample gets the default claim, and the record says so.
 
-A lower bound costs a whole run to obtain, so qex never averages it away. The
-next claim is above it, and a smaller run that succeeds later does not remove
-it. A job that you stopped, or that reached its time limit, is never recorded:
-it shows the memory it reached, not the memory it needs.
-
-**qex records no lower bound in this build.** The code that writes one runs
-after the same gate as the correction below, and issue
-[#88](https://github.com/stephenc/qex/issues/88) stops both. A job that the
-kernel stops for memory thus teaches the learner nothing, and you give the next
-claim yourself.
+A file that qex cannot read AT ALL is a different case. An incomplete file gives
+an empty store, and qex learns each command again from the jobs that follow.
+Each claim is the default until the measurements come back.
 
 Turn it off with `[learn] enabled = false`.
 
 ### A job that the kernel stops for memory
 
-The kernel stops a job for memory, and the job gets the state `oom`.
+The kernel stops a job for memory, and the job gets the state `oom` and the exit
+code 99.
 
-**What a job gets today.** qex reports the state `oom`, writes in the record
-what you can do, and starts **no** new attempt. Give a larger `--mem` value and
+**qex reports it, and qex acts on it in no way.** No new attempt starts, no
+claim changes, and the learner keeps nothing. Give a larger `--mem` value and
 submit the work again:
 
 ```sh
 qex submit --wait --mem 16GB -- uv run train.py
 ```
 
-**What `[enforce] mode` is for.** With no limit, a claim is a promise, so qex
-cannot separate a kill at your claim from a kill that the machine made under
-pressure. `[enforce] mode` puts each job in a cgroup of its own and applies the
-claim as the limit. The kernel then counts a kill at that limit separately, and
-that count is the proof that the claim was too small. With the proof, qex is
-designed to multiply the claim, start the job again with the same id and the
-same record, and keep a lower bound for the next job of the same command.
+#### What qex can prove, and what it cannot
 
-**That correction does not run in this build.** The supervisor joins the cgroup
-of the job, and it then stops every process in that cgroup. The supervisor stops
-itself, so nothing reaches the code that raises the claim. Issue
-[#88](https://github.com/stephenc/qex/issues/88) holds the fault. While it is
-open, `[enforce] mode` gives you a real memory limit and the state `oom`, and no
-job runs a second time.
+qex finds a kill for memory with the count `oom_kill` in `memory.events`, which
+Linux keeps for each cgroup. That count holds the processes that **any**
+out-of-memory killer stopped, below the cgroup that qex reads.
 
-The rules below describe the correction that issue #88 blocks.
+**qex reads the cgroup of its own process.** It makes no cgroup for a job, so
+that count covers every program of your user below it. A rise in it says that
+the kernel stopped something for memory while your attempt ran. It does not say
+that your job was the victim.
 
-| Rule | Value |
-| ---- | ----- |
-| How many raises | `[retry] on_oom`, 2 by default. |
-| The multiplier | `[retry] growth`, 2.0 by default. |
-| The limit | The claim never goes above `[budget] mem`. |
-| The count | Separate from `--retries`, which stays for your own faults. |
+So a kill for memory is **not** proof that the claim was too small:
 
-Each attempt costs the full time of the job, which is why the ladder has a
-limit. A job that stops for memory at the limit keeps the state `oom`, and the
-record tells you to give a larger `--mem` value or to use a larger machine.
+* a machine that is short of memory is also the machine on which a person uses
+  `kill -9`, and the two arrive together;
+* `[politeness] oom_score_adj` raises the score of a qex job on purpose, so a
+  qex job is the job that the killer of the machine takes first.
 
-The job goes through the **queue** again. Its claim is now larger, and the queue
-never admitted that claim, so qex tests it against the budget in the same way as
-a new job. A raised job thus waits while other jobs hold the budget, and the sum
-of the claims stays inside the budget.
+Your claim can be correct, and a larger claim is then the wrong answer. Read the
+`usage` field of the record and compare it with the claim:
 
-#### One job, and not two
-
-A new attempt is the SAME job. It keeps its id, its record and its log file, and
-these rules follow from that. They hold when the correction runs, and issue #88
-stops it today.
-
-| Question | Answer |
-| -------- | ------ |
-| `--max-queue-time` | It expires no new attempt. That value limits the WAIT of a job, and qex expires no job that already ran. The rule is the rule that holds a job between two attempts of `--retries`. |
-| A paused queue | A new attempt waits in the queue in the usual way. A pause starts no job, and it credits the wait that it added. |
-| `--dedupe-key` | The key names this job, and the job keeps its id, so a new attempt takes no key and meets no key. |
-| `[hooks] on_stop` | The hook runs ONE TIME, for the state that the job STOPS in. An attempt that the kernel stopped is not a stop of the job, so it gives no hook. |
-| `qex events` | A reader sees the states of one id: `running`, then `queued` again, then `running`, then the final state. Each line names the state before it, so a new attempt is a change of state and never a new job. |
-| `--each-line` | Every line of one fan-out measures against its template, and a lower bound goes to that same record. |
-| The log | A new attempt ADDS to the log file. The line `--- attempt 2 ---` separates the attempts, and the output that `[logs] max_bytes` removed is the sum of the attempts. |
-| `QEX_MEM`, `GOMEMLIMIT` and the other claim values | A new attempt hears the RAISED claim. qex replaces the values that qex wrote, and it keeps every value that you chose. |
-| `qex status` | The line `attempts:` gives the number, and the line `note:` gives the reason for each raise. `claim_source` is then `raised`. |
-
-#### When qex acts, and when it only reports
-
-qex finds a kill for memory with the counts in `memory.events`, which Linux
-keeps for each cgroup. That file holds TWO counts, and they answer two different
-questions:
-
-* `oom_kill` counts the processes of this cgroup that **any** out-of-memory
-  killer stopped. The killer of the whole machine raises it as well.
-* `oom` counts the times that this cgroup reached **its own** limit and the
-  kernel could not free memory. The limit of this cgroup alone raises it.
-
-So the cgroup that qex reads, and the count that rises in it, together decide
-what qex may do:
-
-| What qex reads | Which count rises | What qex does |
-| -------------- | ----------------- | ------------- |
-| The cgroup that qex made for this job (`[enforce] mode` is `soft` or `hard`) | `oom` and `oom_kill` | Reports `oom`. The limit of this job stopped it, so the claim was too small. This is the row in which qex raises the claim, runs the job again and teaches the learner, and issue #88 stops that today. |
-| The cgroup that qex made for this job | `oom_kill` only | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
-| The cgroup of your login session (`[enforce] mode` is `off`, the default) | `oom_kill` | Reports `oom` and says what you can do. It starts no new attempt and teaches the learner nothing. |
-
-**A kill is not proof that the claim was too small.** A rise in `oom_kill` with
-no rise in `oom` says that the memory of the machine, or a limit of a parent
-cgroup, stopped this job. The claim of the job can be correct, and a larger
-claim cannot move a limit that belongs to a parent. `[politeness] oom_score_adj`
-raises the score of a qex job on purpose, so a qex job is the job that the
-killer of the machine takes first.
-
-With no limit from qex, the count also rises when the kernel stops a
-**different program of the same user**. A machine that is short of memory is
-also the machine on which a person uses `kill -9`, so the two events arrive
-together. qex then cannot name the job that the kernel stopped.
-
-`[enforce] mode` gives qex a count for this job alone, so it can separate a kill
-at your claim from a kill that the machine made. That is what the correction
-needs, and issue #88 stops the correction itself.
+```sh
+qex status $ID --json      # the usage field gives max_rss and cpu_secs
+```
 
 `qex kill` writes a mark before it sends the signal, and that mark always wins.
-A job that you stopped never runs again with a larger claim, and it teaches the
-learner nothing.
+A job that you stopped reports `killed`, and never `oom`.
 
-On a machine with no cgroup, such as macOS, qex has no count. A `SIGKILL` that
-no qex command sent then gives the state `killed`, which starts no new attempt,
-and the record says that qex could not tell the cause.
+**macOS keeps no such count.** A `SIGKILL` that no qex command sent gives the
+state `killed` and the code 125 there, and the record says that qex could not
+tell the cause. Do not wait for the code 99 on a Mac.
 
 Do not run a small test job to measure a task. Give `guess` and start the real
 task. qex measures each job, and you can read the true use later:
@@ -1365,12 +1321,15 @@ The config file is `~/.config/qex.toml`. Every field is optional. Run
 
 ```toml
 [budget]
-cpu = "75%"           # cores that qex can use
-mem = "75%"           # memory that qex can use
+cpu = "75%"           # cores that qex can use; 90% under single-user
+mem = "75%"           # memory that qex can use; 90% under single-user
 
 [system]
-reserve_mem  = "2GB"  # memory to keep free for other programs
+reserve_mem  = "2GB"  # memory to keep free; 512MB under single-user
 max_pressure = 20     # maximum PSI memory pressure (Linux only)
+
+[enforce]
+mode = "cooperative"  # cooperative, or single-user
 
 [queue]
 oversized = "run-when-idle"   # run-when-idle, reject or queue
@@ -1378,10 +1337,6 @@ max_bypass = 2                # jobs that may start before the job at the front
 
 [logs]
 max_bytes = "32MB"    # the output that qex keeps for each stream of each job
-
-[retry]
-on_oom = 2            # times to raise the claim after a kill for memory
-growth = 2.0          # the multiplier for the claim at each raise
 
 [defaults]
 cpu = 1               # the default is 1 core
@@ -1483,8 +1438,8 @@ exec, and it never sets them again. Measured: a job at `nice 10` that operated
 stayed at 10 when the file changed to `nice 0`, and a job submitted immediately
 after a change to `nice 17` ran at 17.
 
-The supervisor of a job reads the file for itself, as it does for `[enforce]`,
-so a new `[politeness]` reaches the NEXT job and does not wait for the
+The supervisor of a job reads the file for itself, so a new `[politeness]`
+reaches the NEXT job and does not wait for the
 coordinator to read the file again.
 
 `io = "idle"` gives the disk to everything else first, which matters when a
@@ -1885,12 +1840,11 @@ go: NumCPU=16 GOMAXPROCS=2
 | Variable | For |
 | --- | --- |
 | `QEX_CPU`, `QEX_MEM`, `QEX_MEM_MB` | your own script: `make -j"$QEX_CPU"` |
-| `GOMAXPROCS`, `GOMEMLIMIT` | Go |
+| `GOMAXPROCS` | Go |
 | `OMP_NUM_THREADS` | OpenMP: C, C++, Fortran |
 | `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS` | numpy, pandas and the libraries below them |
 | `RAYON_NUM_THREADS`, `CARGO_BUILD_JOBS` | Rust |
 | `JULIA_NUM_THREADS`, `DOTNET_PROCESSOR_COUNT`, `POLARS_MAX_THREADS` | Julia, .NET, Polars |
-| `NODE_OPTIONS=--max-old-space-size` | node, at three quarters of the claim |
 
 **Give both `--cpu` and `--mem`.** qex writes these variables only when the
 whole claim came from you: a job that gives one of the two takes the other from
@@ -2068,8 +2022,7 @@ qex gives these guarantees:
 **A hook is not a job, and it receives nothing that belongs to one.** It does
 not take the `[politeness]` values, because those make WORK give way to a
 person and a notification is FOR the person: the hook runs at the priority of
-the qex process that starts it. It does not join the cgroup of the job, so
-`[enforce]` never applies the memory limit of the job to it. It does not receive
+the qex process that starts it. It does not receive
 `QEX_CPU`, `GOMAXPROCS` or any other variable of [`[claims]`](#the-claim-reaches-the-job),
 because it makes no claim on the budget. Its output limit is the fixed 1MB
 above, and NOT [`[logs] max_bytes`](#the-limit-on-the-output-of-a-job), which is

@@ -772,7 +772,9 @@ fn cmd_config(args: cli::ConfigArgs) -> Result<i32> {
             let cfg = config::Config::load()?;
             cfg.validate()?;
             if json || json_flag {
-                println!("{}", serde_json::to_string_pretty(&cfg)?);
+                // The RESOLVED values. An agent reads this form, so it must
+                // never show an empty sentinel in place of the value in force.
+                println!("{}", serde_json::to_string_pretty(&cfg.resolved())?);
             } else {
                 print_config_summary(&cfg)?;
             }
@@ -857,15 +859,15 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
         "politeness:   nice {}; io {}, oom_score_adj {} (Linux only)",
         cfg.politeness.nice, cfg.politeness.io, cfg.politeness.oom_score_adj
     );
-    match enforce::startup_warning(cfg) {
-        Some(warning) => {
-            println!("enforcement:  {:?} — NOT ACTIVE", cfg.enforce.mode);
-            println!("              {warning}");
+    // Say what the mode CHANGES, and never that qex enforces something. qex
+    // does not limit a job in either mode.
+    match cfg.enforce.mode {
+        crate::config::EnforceMode::Cooperative => {
+            println!("mode:         cooperative; qex leaves room for work that it does not control")
         }
-        None if cfg.enforce.mode.is_on() => {
-            println!("enforcement:  {:?}, active", cfg.enforce.mode)
-        }
-        None => println!("enforcement:  off; the claims control the queue only"),
+        crate::config::EnforceMode::SingleUser => println!(
+            "mode:         single-user; qex uses more of the machine and looks for no peer"
+        ),
     }
     // Report the true state of the shared accounting. A message that says "on"
     // for a directory that qex cannot use is the fault that this program must

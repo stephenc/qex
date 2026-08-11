@@ -6,7 +6,7 @@ name = "qex"
 # CONTRIBUTING.md and `src/version.rs`.
 version = "0.0.0-dev"
 edition = "2021"
-description = "Queued EXecutor — a resource-aware local job queue for long-running tasks"
+description = "Queued EXecutor — shared admission control for independent local agents"
 license = "Apache-2.0"
 repository = "https://github.com/stephenc/qex"
 homepage = "https://stephenc.github.io/qex"

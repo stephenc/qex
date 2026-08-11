@@ -284,18 +284,14 @@ pub const STATUS: &str = r##"{
     "started_at": { "type": ["integer", "null"], "description": "The start time, in seconds after the Unix epoch." },
     "finished_at": { "type": ["integer", "null"], "description": "The stop time, in seconds after the Unix epoch." },
     "cpu": { "type": "integer", "description": "The number of cores that the job claimed." },
-    "mem": { "type": "integer", "description": "The memory in bytes that the job claims NOW. The value starts as the claim in the submission, and qex raises it when the kernel stops the job for memory." },
+    "mem": { "type": "integer", "description": "The memory in bytes that the job claims." },
     "claim_source": {
       "type": "string",
-      "enum": ["explicit", "learned", "default", "raised"],
-      "description": "Where the claim came from. `raised` means that the kernel stopped an earlier attempt for memory and qex made the claim larger."
+      "enum": ["explicit", "learned", "default", "fan-out"],
+      "description": "Where the claim came from. `learned` is a claim from the earlier jobs of THIS command. `fan-out` is a claim from the earlier jobs of the fan-out, which qex measures against the template and not against the command of one line."
     },
     "attempts": { "type": "integer", "description": "The number of times that qex started this job." },
     "retries_left": { "type": "integer", "description": "The number of times that qex may still start this job again after a failure. See --retries." },
-    "oom_raises": {
-      "type": "integer",
-      "description": "The number of times that qex raised the memory claim of this job, because the kernel stopped an attempt at the memory limit that qex applied. This count is separate from retries_left. qex raises the claim only when it applied the limit itself, with [enforce] mode; with no limit it reports the state oom and starts no new attempt. See [retry] on_oom in the config file."
-    },
     "locks": {
       "type": "array",
       "items": { "type": "string" },
@@ -362,7 +358,7 @@ pub const STATUS: &str = r##"{
     },
     "error": {
       "type": ["string", "null"],
-      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause. A job that the kernel stopped for memory holds here the claim that failed, the new claim and the attempt, and that text stays in the record when a later attempt succeeds."
+      "description": "The reason that the job failed, when qex gives the reason. A command that does not exist is the usual cause. qex also writes here for a job that it could not start, a job that reached the limit of its wait in the queue, a job that it skipped because a job that it needed did not succeed, and an attempt that failed while qex has an attempt to give. This field gives the REASON; read `state` for what became of the job."
     },
     "needs": {
       "type": "array",

@@ -189,12 +189,8 @@ pub fn pool_check(cfg: &Config, spec: &JobSpec) -> Result<(), String> {
 ///
 /// # Which claim the queue uses
 ///
-/// The caller gives the claim IN FORCE, and not the claim in the specification.
-/// The two are the same until the kernel stops the job for memory: qex then
-/// raises the claim in the record and gives the job back to the queue. The
-/// queue must use the raised claim, because that is the claim that the job
-/// holds and that the memory limit applies. A test against the first claim
-/// would admit a job of 1GB into the space that qex kept for 600MB.
+/// The caller gives the claim of the RECORD, which is the claim in force. qex
+/// changes no claim, so it is the claim of the specification as well.
 pub fn size_check(cfg: &Config, cpu: u64, mem: u64) -> Size {
     let cpu_budget = cfg.budget_cpu().unwrap_or(1);
     let mem_budget = cfg.budget_mem().unwrap_or(0);
@@ -1639,8 +1635,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
         };
 
         // The claim in force lives in the record, and not in the
-        // specification. qex raises it after the kernel stops the job for
-        // memory, and the queue must then use the raised claim.
+        // specification.
         let (claim_cpu, claim_mem) = (job.status.cpu, job.status.mem);
         // The SAFE name. This sentence goes to a reader, through
         // `blocked_reason` and through `qex info`. See `job::safe_name`.
@@ -1902,7 +1897,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
         // one-writer rule.
         let pools = state.cfg.pools().unwrap_or_default();
         let held = state.claimed();
-        let peers = if state.cfg.peers.enabled {
+        let peers = if state.cfg.peers_enabled() {
             crate::peers::claims(&state.cfg)
         } else {
             crate::peers::Claims::default()
@@ -3131,14 +3126,14 @@ mod tests {
         }
     }
 
-    /// The queue must test the claim IN FORCE, and not the claim of the
-    /// submission.
+    /// The queue tests the claim that the RECORD holds.
     ///
-    /// qex raises the claim in the record after the kernel stops a job for
-    /// memory, and it gives the job back to the queue. A test against the first
-    /// claim would admit a job of 1GB into the space that qex kept for 600MB,
-    /// and the sum of the claims would go above the budget. Stopping that is
-    /// the work of this module.
+    /// The record is the one authority for a claim: the scheduler adds the
+    /// claim of each job that operates from the record, and it must test a new
+    /// job against that same number. A test against a different number would
+    /// admit a job of 1GB into the space that qex keeps for 600MB, and the sum
+    /// of the claims would go above the budget. Stopping that is the work of
+    /// this module.
     #[test]
     fn the_queue_tests_the_claim_that_the_job_holds_now() {
         let cfg = cfg_with("4", "1GB");
@@ -3150,14 +3145,14 @@ mod tests {
             Admit::Yes
         ));
 
-        // The raised claim of 1GB does not fit beside it, and it must wait.
+        // A claim of 1GB does not fit beside it, and it must wait.
         let reason = wait_reason(
             admit_plain(&cfg, 1, 1 << 30, 1, 400 << 20, &m),
-            "a raised claim must wait for capacity",
+            "a claim that does not fit must wait for capacity",
         );
         assert!(reason.contains("memory"), "got: {reason}");
 
-        // The raised claim alone still fits the budget, so the job is not an
+        // The claim alone still fits the budget, so the job is not an
         // oversized job and it starts when the other job stops.
         assert_eq!(size_check(&cfg, 1, 1 << 30), Size::Fits);
         assert!(matches!(
@@ -3368,12 +3363,13 @@ mod tests {
         assert!(!held.contains("time(s)"), "got: {held}");
     }
 
-    /// The claim IN FORCE decides the class, and not the claim of the spec.
+    /// The SIZE of the claim decides the class of a wait.
     ///
-    /// #21 raises the claim of a job that the kernel stopped for memory. A
-    /// scheduler that read the spec here would give the raised job the class of
-    /// its FIRST claim, and a job that no longer fits the budget would keep
-    /// capacity as a `Sibling` in place of waiting for a quiet machine.
+    /// A job whose claim fits the budget waits for its siblings. A job whose
+    /// claim is above the budget waits for a quiet machine, because no set of
+    /// siblings can release sufficient capacity for it. A scheduler that gave
+    /// the second job the class of the first would let it hold capacity as a
+    /// `Sibling` and wait for a moment that does not come.
     #[test]
     fn the_class_of_a_wait_uses_the_claim_in_force() {
         let cfg = cfg_with("4", "256MB");
@@ -3386,7 +3382,7 @@ mod tests {
         };
         assert_eq!(blocker, Blocker::Sibling);
 
-        // The raised claim is larger than the budget, so the same job now waits
+        // The claim is larger than the budget, so the same job now waits
         // for a quiet machine.
         let Verdict::Wait { blocker, .. } =
             verdict_plain(&cfg, 4, 512 << 20, 2, 0, &machine, false)

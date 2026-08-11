@@ -41,7 +41,7 @@ pub struct JobFile {
     /// Do not tell the job how large its claim is.
     ///
     /// qex writes the claim into the environment of the job (`GOMAXPROCS`,
-    /// `OMP_NUM_THREADS`, `GOMEMLIMIT` and more), so a runtime sizes its thread
+    /// `OMP_NUM_THREADS` and more), so a runtime sizes its thread
     /// pool to the claim and not to the machine. Give `true` here for a job
     /// that must see the machine as it is.
     ///
@@ -563,11 +563,10 @@ impl JobSpec {
         // A learned claim never goes above the budget.
         //
         // qex makes this number itself, and it must not make a number that it
-        // then refuses. A job that the kernel stopped for memory at the budget
-        // leaves a lower bound AT the budget, and the margin above that bound
-        // gave a claim of 1.5 budgets. `[queue] oversized = "reject"` then
-        // refused the submission with "Decrease the claim", and the user had
-        // given no claim to decrease.
+        // then refuses. A job that uses the full budget leaves a peak AT the
+        // budget, and the margin above that peak gives a claim of 1.5 budgets.
+        // `[queue] oversized = "reject"` then refuses the submission with
+        // "Decrease the claim", and the user gave no claim to decrease.
         //
         // The claim stops at the budget instead. The job then starts, and if it
         // still needs more memory, the record says that qex has no larger claim
@@ -643,13 +642,6 @@ impl JobSpec {
         // Without this test, `qex submit -- cargo test` on a machine of sixteen
         // cores writes GOMAXPROCS=1 and CARGO_BUILD_JOBS=1, and the job becomes
         // sixteen times slower with no error and no warning.
-        //
-        // A node job meets something worse: it receives a SMALLER heap than it
-        // receives with no qex at all. Measured on this machine, the default
-        // claim is 1805MB, which gives node a heap of 1353MB, and node 12 takes
-        // 2096MB by itself. A job that goes above the heap stops. Measured with
-        // a heap of 32MB: `FATAL ERROR: CALL_AND_RETRY_LAST Allocation failed -
-        // JavaScript heap out of memory`, exit code 134.
         //
         // A learned claim is not a decision either, and it makes the fault
         // permanent: qex measures the job that it made single-threaded, learns
@@ -949,7 +941,10 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
     }
 }
 
-/// The smallest heap that qex gives to a runtime, in megabytes.
+/// The smallest heap that a runtime hint carries, in megabytes.
+///
+/// This value reaches a job only through `[claims] also = ["java"]`, which a
+/// reader asks for. No default hint of qex carries a heap.
 ///
 /// # Why there is a floor and not a test against zero
 ///
@@ -960,15 +955,12 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 ///     -Xmx1m                  java 11   exit 1, initialization of VM failed
 ///     -Xmx2m                  java 11   exit 1, initialization of VM failed
 ///     -Xmx3m                  java 11   exit 0
-///     --max-old-space-size=1  node 12   exit 134
-///     --max-old-space-size=2  node 12   exit 134
-///     --max-old-space-size=3  node 12   exit 0
 ///
-/// Both runtimes stop at one and at two megabytes, and both operate at three.
+/// The runtime stops at one and at two megabytes, and it operates at three.
 /// THE FLOOR IS FOUR, which is one megabyte above three. Three is the LOWEST
 /// value that worked, so it is the exact edge on these two versions, and a
 /// value at an edge is not a value to choose: another runtime, or another
-/// version of these two, can need more. Four buys that margin and costs
+/// version of it, can need more. Four buys that margin and costs
 /// nothing, because a claim that small gets no heap either way.
 ///
 /// The heap is three quarters of the claim, and each step rounds down, so a
@@ -976,65 +968,6 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
 /// value, and the job then receives the default heap of its runtime, which is
 /// the behaviour that it has with no qex at all.
 const HEAP_FLOOR_MB: u64 = 4;
-
-/// Writes a RAISED claim into the environment of a job that runs again.
-///
-/// # Why
-///
-/// qex writes the claim into the environment at the submission, and that
-/// environment is in the specification. The specification does not change. When
-/// the kernel stops a job for memory, qex raises the claim in the RECORD and
-/// starts the job again, and the environment of the new attempt would still
-/// hold the claim that already failed: `GOMEMLIMIT` would keep a Go job at
-/// 128MB while the queue held 256MB for it. The kernel would then stop the same
-/// job in the same place, and the ladder of attempts would give no correction
-/// at all.
-///
-/// # The rule about a value that somebody chose
-///
-/// This function REPLACES a value only when that value is the value that qex
-/// itself wrote for the earlier claim. A value from the shell of the user, from
-/// the job file or from `--env` is a decision, it is not equal to the value
-/// that qex would have written, and it stays. A claim that qex never wrote —
-/// `[claims] export_env = false`, `--no-limit-env-hints`, `--env-capture none`,
-/// or a claim that the user did not choose — puts no key in the environment, so
-/// nothing here matches and this function adds nothing.
-pub fn reexport_claim(
-    env: &mut std::collections::BTreeMap<String, String>,
-    cpu: u64,
-    old_mem: u64,
-    new_mem: u64,
-    also: &[ClaimHint],
-) {
-    // A RAISE ONLY. qex calls this function when it made the claim LARGER, and
-    // a smaller claim would need a different rule: `export_claim` writes no
-    // `GOMEMLIMIT` for a claim of zero, and no `NODE_OPTIONS` below its floor,
-    // so a decrease could have to TAKE AWAY a value. Nothing decreases a claim
-    // today, and a branch that no caller reaches is a branch that no test
-    // proves.
-    if new_mem <= old_mem {
-        return;
-    }
-
-    // What qex wrote for the earlier claim, and what it would write now. Both
-    // come from `export_claim`, so this function can never go out of step with
-    // the list of variables that qex owns. The larger claim writes every key
-    // that the smaller claim wrote, so each key here has a new value.
-    let mut old = std::collections::BTreeMap::new();
-    export_claim(&mut old, cpu, old_mem, also);
-    let mut new = std::collections::BTreeMap::new();
-    export_claim(&mut new, cpu, new_mem, also);
-
-    for (key, was) in old {
-        if env.get(&key) != Some(&was) {
-            // Somebody else owns this value. Leave it.
-            continue;
-        }
-        if let Some(now) = new.get(&key) {
-            env.insert(key, now.clone());
-        }
-    }
-}
 
 /// Writes the size of the claim into the environment of a job.
 ///
@@ -1061,11 +994,9 @@ pub fn reexport_claim(
 /// # What was measured
 ///
 /// One machine of 16 cores and 28GB. A claim of 2 cores and 2GB, for which qex
-/// writes `GOMAXPROCS=2` and `--max-old-space-size=1536`. Each runtime was
-/// asked for its own value:
+/// writes `GOMAXPROCS=2`. Each runtime was asked for its own value:
 ///
 ///     go 1.22.2   GOMAXPROCS=2                gives runtime.GOMAXPROCS(0) == 2
-///     node 12     --max-old-space-size=1536   gives a heap limit of 1584MB
 ///     java 11     -XX:ActiveProcessorCount=2 -Xmx1536m
 ///                                             gives availableProcessors() == 2
 ///                                             and maxMemory() == 1536MB
@@ -1077,10 +1008,10 @@ pub fn reexport_claim(
 /// option at all gave a maximum heap of 7224MB on this 28GB machine, and
 /// `-XX:MaxRAMPercentage=25` gave the same 7224MB. A limit needs `-Xmx`.
 ///
-/// qex writes no core count for node. Measured on node 12:
-/// `os.cpus().length` is 16, the number of the MACHINE, and node reads no
-/// variable that changes it. (`os.availableParallelism` arrived in node 19 and
-/// was not measured here.)
+/// qex writes no core count for node, and no memory value for any runtime.
+/// Measured on node 12: `os.cpus().length` is 16, the number of the MACHINE,
+/// and node reads no variable that changes it. (`os.availableParallelism`
+/// arrived in node 19 and was not measured here.)
 fn export_claim(
     env: &mut std::collections::BTreeMap<String, String>,
     cpu: u64,
@@ -1117,23 +1048,32 @@ fn export_claim(
         set(key, &cores);
     }
 
-    // Memory. `GOMEMLIMIT` is a soft limit: Go collects more frequently as the
-    // job comes near it, and it does not stop the job.
+    // NO HINT CARRIES MEMORY.
     //
-    // ZERO IS A LIMIT OF ZERO, and not "no limit". qex accepts `--mem 0`, and
-    // Go then collects for ever. Measured on go 1.22.2, with a program that
-    // allocates 32MB: 7 collections with no GOMEMLIMIT, 6 with
-    // GOMEMLIMIT=2147483648, and 248 with GOMEMLIMIT=0.
-    if mem > 0 {
-        set("GOMEMLIMIT", &mem.to_string());
-    }
-
-    // A heap needs room for the rest of the process, so node receives three
-    // quarters of the claim.
+    // qex does not limit the memory of a job. A hint that names a memory value
+    // makes the claim behave like a limit for the few runtimes that read it,
+    // and like a promise for every other program: a Go job and a node job would
+    // be held to the number and a C job would not, and no page could state one
+    // rule.
+    //
+    // Such a hint also changes whether a job SUCCEEDS. A collector that runs
+    // harder near the number makes a job with a small claim slow instead of
+    // failing, and a heap limit makes a runtime stop. A claim is a promise that
+    // the submitter makes to the QUEUE, and it must not become an instruction
+    // to the program.
+    //
+    // A CORE hint is a different thing. It stops a program from starting 64
+    // threads when the queue gave it 4, which is how a program cooperates with
+    // the other work on the machine. It changes how the work is divided, and
+    // not whether the work fits.
+    //
+    // `QEX_MEM` and `QEX_MEM_MB` above NAME the claim for a script that reads
+    // them. No runtime acts on them by itself.
+    //
+    // `[claims] also = ["java"]` is the ONE place where a memory value still
+    // reaches a job, and a reader asks for it deliberately. A heap needs room
+    // for the rest of the process, so it takes three quarters of the claim.
     let heap_mb = (mem / (1 << 20)) * 3 / 4;
-    if heap_mb >= HEAP_FLOOR_MB {
-        set("NODE_OPTIONS", &format!("--max-old-space-size={heap_mb}"));
-    }
 
     // The two that qex writes only when the configuration asks for them.
     //
@@ -1220,10 +1160,11 @@ mod tests {
         ] {
             assert_eq!(env.get(key).map(String::as_str), Some("2"), "{key}");
         }
-        assert_eq!(env["GOMEMLIMIT"], (2u64 << 30).to_string());
-
-        // node takes three quarters of the claim for its heap.
-        assert_eq!(env["NODE_OPTIONS"], "--max-old-space-size=1536");
+        // NO HINT CARRIES MEMORY. qex does not limit the memory of a job, so
+        // a hint that named a memory value would hold a Go job and a node job
+        // to the claim and leave every other program free.
+        assert!(!env.contains_key("GOMEMLIMIT"), "{env:?}");
+        assert!(!env.contains_key("NODE_OPTIONS"), "{env:?}");
 
         // The two that need a request. Each has a cost, so neither is a
         // default.
@@ -1240,9 +1181,9 @@ mod tests {
     /// A claim too small for a usable heap must give NO heap.
     ///
     /// A SMALL HEAP IS WORSE THAN NO HEAP: java 11 exits 1 with `-Xmx1m` and
-    /// `-Xmx2m`, and node 12 exits 134 with `--max-old-space-size` of 1 or 2.
-    /// A runtime that receives no heap uses its own default and operates. The
-    /// count of the cores still arrives, because that number is correct.
+    /// `-Xmx2m`. A runtime that receives no heap uses its own default and
+    /// operates. The count of the cores still arrives, because that number is
+    /// correct. The heap reaches a job only through `[claims] also`.
     #[test]
     fn a_claim_too_small_for_a_heap_gives_no_heap() {
         use std::collections::BTreeMap;
@@ -1264,11 +1205,11 @@ mod tests {
             assert_eq!(env["GOMAXPROCS"], "2");
         }
 
-        // 6MB is the first claim that reaches the floor: it gives a heap of
-        // exactly 4MB, and that heap arrives.
+        // 6MB is the first claim that reaches the floor, and the JVM hint that
+        // a reader ASKED for then carries a heap. No default hint does.
         let mut env = BTreeMap::new();
         export_claim(&mut env, 2, 6 << 20, &[ClaimHint::Java]);
-        assert_eq!(env["NODE_OPTIONS"], "--max-old-space-size=4");
+        assert!(!env.contains_key("NODE_OPTIONS"), "{env:?}");
         assert_eq!(
             env["JAVA_TOOL_OPTIONS"],
             "-XX:ActiveProcessorCount=2 -Xmx4m"
@@ -1277,19 +1218,11 @@ mod tests {
         let mut env = BTreeMap::new();
         export_claim(&mut env, 2, 100 * 1024, &[ClaimHint::Java]);
         assert_eq!(env["QEX_MEM_MB"], "0");
-        // 100KB is above zero, so `GOMEMLIMIT` still holds the true claim.
-        assert_eq!(env["GOMEMLIMIT"], (100u64 * 1024).to_string());
+        assert!(!env.contains_key("GOMEMLIMIT"), "{env:?}");
 
-        // A CLAIM OF ZERO GETS NO GOMEMLIMIT AT ALL, and `qex submit --mem 0`
-        // gives exactly that. `GOMEMLIMIT=0` is a limit of zero and not "no
-        // limit": measured on go 1.22.2, a program that allocates 32MB
-        // collected 248 times with it, and 7 times without it.
         let mut env = BTreeMap::new();
         export_claim(&mut env, 2, 0, &[ClaimHint::Java]);
-        assert!(
-            !env.contains_key("GOMEMLIMIT"),
-            "a claim of zero must give no memory limit: {env:?}"
-        );
+        assert!(!env.contains_key("GOMEMLIMIT"), "{env:?}");
         assert!(!env.contains_key("NODE_OPTIONS"), "{env:?}");
         assert_eq!(env["JAVA_TOOL_OPTIONS"], "-XX:ActiveProcessorCount=2");
         // The claim itself still arrives, because zero IS what the user asked
@@ -1409,51 +1342,41 @@ mod tests {
         assert_eq!(env["OMP_NUM_THREADS"], "2");
     }
 
-    /// A raised claim replaces the value that QEX wrote, and nothing else.
+    /// A value that somebody chose must survive, and qex must add no memory.
     ///
-    /// The e2e test `a_raised_claim_reaches_the_environment_of_the_job` drives
-    /// this through the command. This test covers the rule that the e2e test
-    /// cannot reach: a value that somebody chose must survive the raise.
+    /// `export_claim` FILLS and never replaces, so a value from the shell of
+    /// the user, from a job file or from `--env` stays. And no default hint
+    /// carries memory: qex limits no job, so it tells no runtime to limit
+    /// itself.
     #[test]
-    fn a_raised_claim_replaces_the_value_of_qex_and_keeps_the_value_of_a_user() {
+    fn the_claim_fills_the_environment_and_carries_no_memory() {
         use std::collections::BTreeMap;
 
-        let first = 128u64 << 20;
-        let raised = 256u64 << 20;
-
+        let claim = 128u64 << 20;
         let mut env = BTreeMap::new();
-        // The user chose this one, before qex wrote anything.
+        // The user chose these, before qex wrote anything.
         env.insert("GOMEMLIMIT".to_string(), "77".to_string());
-        export_claim(&mut env, 2, first, &[]);
-        assert_eq!(env["QEX_MEM"], first.to_string());
-        assert_eq!(
-            env["GOMEMLIMIT"], "77",
-            "the value of the user must be here"
-        );
+        env.insert("GOMAXPROCS".to_string(), "9".to_string());
+        export_claim(&mut env, 2, claim, &[]);
 
-        reexport_claim(&mut env, 2, first, raised, &[]);
-
-        assert_eq!(
-            env["QEX_MEM"],
-            raised.to_string(),
-            "the job must hear the raised claim"
-        );
-        assert_eq!(env["QEX_MEM_MB"], "256");
-        assert_eq!(
-            env["GOMEMLIMIT"], "77",
-            "a value that somebody chose must survive the raise"
-        );
-        // The core count did not move, so nothing about it moves here.
+        assert_eq!(env["QEX_MEM"], claim.to_string());
+        assert_eq!(env["QEX_MEM_MB"], "128");
         assert_eq!(env["QEX_CPU"], "2");
-
-        // A claim that qex never wrote gives nothing. `export_env = false` and
-        // `--env-capture none` make such an environment.
-        let mut bare = BTreeMap::new();
-        reexport_claim(&mut bare, 2, first, raised, &[]);
-        assert!(
-            bare.is_empty(),
-            "a raise must add no variable that the submission did not write: {bare:?}"
+        assert_eq!(
+            env["GOMEMLIMIT"], "77",
+            "a value that somebody chose must stay, whatever qex does"
         );
+        assert_eq!(
+            env["GOMAXPROCS"], "9",
+            "a core value that somebody chose must stay as well"
+        );
+
+        // qex ADDS no memory value of its own.
+        let mut bare = BTreeMap::new();
+        export_claim(&mut bare, 2, claim, &[]);
+        assert!(!bare.contains_key("GOMEMLIMIT"), "{bare:?}");
+        assert!(!bare.contains_key("NODE_OPTIONS"), "{bare:?}");
+        assert_eq!(bare["GOMAXPROCS"], "2");
     }
 
     use super::*;
@@ -1515,7 +1438,8 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let command: Vec<String> = vec!["train-at-the-budget".into()];
 
-        // The evidence of a job that the kernel stopped AT the budget.
+        // The measurement of a job that used the whole budget. The margin then
+        // puts the claim above the budget, and it must stop there.
         let budget = 1u64 << 30;
         let mut store = crate::usage::Store::default();
         store.commands.insert(
@@ -1523,7 +1447,7 @@ mod tests {
             crate::usage::Entry {
                 name: "train".into(),
                 samples: vec![crate::usage::Sample {
-                    kind: crate::usage::Measurement::LowerBound,
+                    kind: crate::usage::Measurement::Peak,
                     max_rss: budget,
                     cpu_secs: 1.0,
                     elapsed_secs: 10,

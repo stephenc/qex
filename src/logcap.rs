@@ -21,11 +21,12 @@
 //!
 //! # The tail stays on the disk, and not in the memory
 //!
-//! The supervisor puts itself in the cgroup of the job, so memory that the
-//! supervisor holds counts against the memory claim of the job. A tail of 24MB
-//! in the memory of the supervisor would thus stop a job that operates at its
-//! claim, and `qex status` would show an out-of-memory event that the job did
-//! not cause. qex keeps the tail in a circular file: the file has a fixed size,
+//! A supervisor runs for every job that operates, and the memory that a
+//! supervisor holds is memory that the QUEUE NEVER ADMITTED: a claim covers the
+//! work, and qex adds the supervisor beside it. A tail of 24MB in the memory of
+//! each supervisor would thus put tens of megabytes for each job on a machine
+//! whose budget accounted for none of it, and the machine would meet a load
+//! that the budget exists to prevent. qex keeps the tail in a circular file: the file has a fixed size,
 //! the writer returns to the start of it when it reaches the end, and this
 //! module holds one buffer of 64KB in the memory.
 

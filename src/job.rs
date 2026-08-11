@@ -40,10 +40,10 @@ pub enum JobState {
     Expired,
     /// The out-of-memory killer or the cgroup limit stopped the job.
     ///
-    /// This state is different from `failed`. The correction is also different:
-    /// the memory claim is too small, or the machine is too small. qex makes
-    /// the first correction itself: it raises the claim and starts the job
-    /// again. See `oom_raises`.
+    /// This state is different from `failed`, and so is the correction: the
+    /// claim can be too small, or the machine can be too small. qex REPORTS
+    /// this state and acts on it in no way, because the count that it reads
+    /// covers every program of this user and cannot name the victim.
     Oom,
     /// qex removed the job from the queue before the job started.
     Cancelled,
@@ -379,19 +379,12 @@ pub struct JobStatus {
     pub started_at: Option<u64>,
     pub finished_at: Option<u64>,
     pub cpu: u64,
-    /// The memory claim in force, in bytes.
-    ///
-    /// This value starts as the claim in `spec.json`, and it can become larger:
-    /// qex raises it after the kernel stops the job for memory. The
-    /// specification keeps the value that the user asked for, and this field
-    /// gives the value that the queue and the memory limit use now.
+    /// The memory claim of the job, in bytes.
     pub mem: u64,
-    /// Where the claim came from: `explicit`, `learned`, `default` or `raised`.
+    /// Where the claim came from: `explicit`, `learned` or `default`.
     ///
-    /// A reader can then see that a claim came from a measurement, and it does
-    /// not look like a value that the agent chose. The value `raised` says that
-    /// the kernel stopped an earlier attempt for memory, and that qex made the
-    /// claim larger.
+    /// A reader can then see that a claim came from a measurement, and that it
+    /// is not a value that the agent chose.
     #[serde(default)]
     pub claim_source: String,
     /// The pipeline that this job belongs to.
@@ -497,15 +490,6 @@ pub struct JobStatus {
     /// The number of times that qex may still start this job again.
     #[serde(default)]
     pub retries_left: u32,
-    /// The number of times that qex raised the memory claim of this job.
-    ///
-    /// The kernel stops a job that uses more memory than its claim. That kill
-    /// says that the claim was too small, so qex multiplies the claim and
-    /// starts the job again. This count is separate from `retries_left`,
-    /// because the user gave that number for a different kind of fault. See
-    /// `[retry] on_oom` in the config file.
-    #[serde(default)]
-    pub oom_raises: u32,
     /// The job that caused this job to stop, for a job in the state `skipped`.
     ///
     /// This value names the first job that failed, and not the job before this
@@ -567,7 +551,6 @@ impl JobStatus {
             assigned: Default::default(),
             attempts: 0,
             retries_left: spec.retries,
-            oom_raises: 0,
             caused_by: None,
             logs_dropped: None,
             tags: spec.tags.clone(),

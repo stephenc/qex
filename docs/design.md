@@ -74,14 +74,9 @@ not available to a user on a usual Linux system, and macOS has no equivalent.
 The queue controls the number of cores instead: qex does not start more work
 than the budget permits.
 
-**qex does not limit the memory of a job by default.** A claim controls the
-queue only. This behaviour is the same on Linux and on macOS.
-
-Linux can apply a memory limit with cgroup v2. Set `[enforce] mode` to `soft` or
-`hard` to use it. The coordinator needs a cgroup that it owns, and a coordinator
-that starts from a login shell does not have one. `qex config show` reports
-`NOT ACTIVE` with the reason when this occurs. qex never reports a limit that it
-did not apply.
+**qex does not limit the memory of a job.** A claim controls the queue only, and
+the behaviour is the same on Linux and on macOS. Nothing holds a job to its
+claim after the job starts.
 
 **A claim is a promise, and not a measurement.** A job that claims 2GB and uses
 20GB can still fill the machine. qex tests the free memory of the machine before
@@ -222,24 +217,10 @@ This is deliberate, and the reason is the job that climbs for hours: a claim
 that is too small stops the job, and a claim that is a little large costs
 capacity only.
 
-qex records a job that COMPLETED, and a job that the KERNEL STOPPED AT THE LIMIT
-THAT QEX APPLIED. The second kind is a lower bound and not a peak: the job did
-not finish, so the true need is above the value. qex records that bound when it
-made the cgroup of the job and read the counter of that cgroup; the counter of
-the login session also counts a kill in a different program of the same user,
-and the machine can be full while the claim of the job is correct. qex keeps the
-two kinds apart in `usage.json`, and the next claim goes above the largest of
-both. A lower bound costs a whole run to obtain, and an average with the smaller
-runs would lose it.
-
-The second kind does not reach `usage.json` in this build. The supervisor stops
-every process in the cgroup of the job, so it stops itself before it writes the
-bound. Issue [#88](https://github.com/stephenc/qex/issues/88) holds the fault,
-and qex learns from a job that COMPLETED only.
-
-qex records nothing else. A job that somebody stopped, or that reached its time
-limit, shows the memory that it reached and not the memory that it needs, and
-that number would teach qex the wrong size.
+qex records a job that COMPLETED, and nothing else. A job that somebody stopped,
+that reached its time limit, or that the kernel stopped for memory shows the
+memory that it REACHED and not the memory that it needs, and that number would
+teach qex the wrong size.
 
 ### Is there fairness between agents?
 
