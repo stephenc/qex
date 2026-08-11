@@ -3770,6 +3770,69 @@ fn clean_keeps_every_record_of_a_pipeline_that_operates() {
     h.ok(&["kill", &c]);
 }
 
+/// The message names the work that HOLDS a record, and no other work.
+///
+/// A queue holds jobs that have no relation to each other. A message that
+/// lists every job which has not stopped says that each one needs the records
+/// that stayed, and that relation does not exist. A reader acts on the output
+/// of qex as fact, so a message may state only the relation that qex computed.
+#[test]
+fn the_message_names_the_work_that_holds_a_record() {
+    let h = Harness::with_default_config("cleanwho");
+
+    let dep = h.submit(&["submit", "--name", "m-dep", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &dep, "--timeout", "30s"]);
+    let holder = h.submit(&[
+        "submit", "--name", "m-holder", "--mem", "64MB", "--needs", &dep, "--", "sleep", "45",
+    ]);
+    // Two jobs that hold nothing. They wait for no record and no pipeline
+    // carries them.
+    let lone_one = h.submit(&[
+        "submit",
+        "--name",
+        "m-lone-one",
+        "--mem",
+        "64MB",
+        "--",
+        "sleep",
+        "45",
+    ]);
+    let lone_two = h.submit(&[
+        "submit",
+        "--name",
+        "m-lone-two",
+        "--mem",
+        "64MB",
+        "--",
+        "sleep",
+        "45",
+    ]);
+    for id in [&holder, &lone_one, &lone_two] {
+        h.until("each job operates", Duration::from_secs(45), || {
+            h.state_of(id) == "running"
+        });
+    }
+
+    let out = h.ok(&["clean", "--state", "done"]);
+
+    assert!(
+        out.contains(&holder[..8]),
+        "the message must name the job that holds the record: {out}"
+    );
+    assert!(
+        !out.contains(&lone_one[..8]),
+        "the message must not name a job that holds nothing: {out}"
+    );
+    assert!(
+        !out.contains(&lone_two[..8]),
+        "the message must not name a job that holds nothing: {out}"
+    );
+
+    for id in [&holder, &lone_one, &lone_two] {
+        h.ok(&["kill", id]);
+    }
+}
+
 /// `qex gc` counts a record as held only when the age selected it.
 ///
 /// `gc` deletes a record when it is old enough. A record that is too young is
@@ -5689,7 +5752,7 @@ fn a_dependency_of_a_queued_job_is_not_finished() {
     let out = h.ok(&["clean", "--all"]);
     assert!(out.contains("deleted 0 records"), "nothing must go: {out}");
     assert!(
-        out.contains("stayed, because"),
+        out.contains("record stayed") && out.contains("needs a record"),
         "the message must give the reason: {out}"
     );
     assert!(

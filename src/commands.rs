@@ -2761,7 +2761,10 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     // A job that a job in the queue still needs is not finished for the purpose
     // of a deletion, whatever its own state says.
     let held = held_by_unfinished(&jobs);
-    let mut held_back = 0usize;
+    // The records that this command chose and then kept. The reason for each
+    // one comes from the same rule that kept it, so the message states the
+    // relation that qex COMPUTED and never one that it assumed.
+    let mut stayed: Vec<uuid::Uuid> = Vec::new();
     let mut targets: Vec<uuid::Uuid> = Vec::new();
     let mut word_filters: Vec<StateFilter> = Vec::new();
 
@@ -2839,7 +2842,7 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
         // says what this command did, and a record that no option selected is
         // not a record that qex kept back.
         if held.contains(&j.id) {
-            held_back += 1;
+            stayed.push(j.id);
             continue;
         }
 
@@ -2864,36 +2867,61 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     }
 
     println!("qex deleted {}", count_of(deleted, "record"));
-    if held_back > 0 {
-        // Name the work that holds the records. A count with no name gives the
-        // reader nothing to wait for, and a list of every job makes a page, so
-        // this message names the jobs that have not stopped. They are the
-        // queue, and a queue holds tens of jobs.
-        let unfinished: Vec<String> = jobs
-            .iter()
-            .filter(|j| !j.state.is_terminal())
-            .map(|j| format!("{} ({})", short_id(&j.id), j.display_name()))
-            .collect();
-        let one = held_back == 1;
-        println!(
-            "{} stayed, because {} that {} not stopped {} {}: {}. \
-             {} when that work stops.",
-            count_of(held_back, "record"),
-            if unfinished.len() == 1 {
-                "a job"
-            } else {
-                "the jobs"
-            },
-            if unfinished.len() == 1 { "has" } else { "have" },
-            if unfinished.len() == 1 {
-                "needs"
-            } else {
-                "need"
-            },
-            if one { "it" } else { "them" },
-            unfinished.join(", "),
-            if one { "It goes" } else { "They go" },
-        );
+    if !stayed.is_empty() {
+        // Name the work that HOLDS these records, and no other work.
+        //
+        // The reason comes from the same rule that kept each record, so this
+        // message states a relation that qex computed. A list of every job
+        // that has not stopped is a different thing, and most of those jobs
+        // hold nothing.
+        let nodes = dep_nodes(&jobs);
+        let mut needed_by: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+        let mut in_pipeline: std::collections::BTreeSet<uuid::Uuid> = Default::default();
+        for id in &stayed {
+            match crate::deps::hold_reason(&nodes, *id) {
+                Some(crate::deps::Hold::Needed(holders)) => needed_by.extend(holders),
+                Some(crate::deps::Hold::Pipeline(holders)) => in_pipeline.extend(holders),
+                None => {}
+            }
+        }
+
+        let name = |id: &uuid::Uuid| -> Option<String> {
+            jobs.iter()
+                .find(|j| j.id == *id)
+                .map(|j| format!("{} ({})", short_id(&j.id), j.display_name()))
+        };
+
+        println!("{} stayed.", count_of(stayed.len(), "record"));
+
+        // The two rules are different relations, so each one gets its own
+        // sentence. One sentence for both would say something false about
+        // half of the records.
+        let needs_list: Vec<String> = needed_by.iter().filter_map(name).collect();
+        if !needs_list.is_empty() {
+            println!(
+                "  {} that {} not stopped {} a record: {}",
+                if needs_list.len() == 1 {
+                    "1 job"
+                } else {
+                    "These jobs"
+                },
+                if needs_list.len() == 1 { "has" } else { "have" },
+                if needs_list.len() == 1 {
+                    "needs"
+                } else {
+                    "need"
+                },
+                needs_list.join(", ")
+            );
+        }
+        let pipeline_list: Vec<String> = in_pipeline.iter().filter_map(name).collect();
+        if !pipeline_list.is_empty() {
+            println!(
+                "  A pipeline has work left, so the record of each stage stays: {}",
+                pipeline_list.join(", ")
+            );
+        }
+        println!("  Each record goes when the work that holds it stops.");
     }
 
     Ok(worst)
@@ -5601,15 +5629,17 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
             plural_directories(orphans.len()),
             format_size(bytes)
         );
-        if held_back == 1 {
+        if held_back > 0 {
+            // "holds" and not "needs": a record can stay because a job waits
+            // for it, and it can stay because its pipeline has work left. The
+            // second is not a job that needs the record. Use `qex clean <id>`
+            // for one record to read which rule kept it.
             println!(
-                "1 record stayed, because a job that has not stopped needs it. \
-                 It goes at the next run, after that job stops."
-            );
-        } else if held_back > 1 {
-            println!(
-                "{held_back} records stayed, because a job that has not stopped needs them. \
-                 They go at the next run, after that job stops."
+                "{} stayed, because work that has not stopped holds {}. \
+                 {} at the next run, after that work stops.",
+                count_of(held_back, "record"),
+                if held_back == 1 { "it" } else { "them" },
+                if held_back == 1 { "It goes" } else { "They go" },
             );
         }
         if deleted < targets.len() {
@@ -5640,8 +5670,12 @@ fn directory_size(path: &std::path::Path) -> u64 {
 /// one answer. See [`crate::deps::held_by_unfinished`] for the two rules and
 /// the reason for each.
 fn held_by_unfinished(jobs: &[JobStatus]) -> std::collections::BTreeSet<uuid::Uuid> {
-    let nodes: Vec<crate::deps::Node> = jobs
-        .iter()
+    crate::deps::held_by_unfinished(&dep_nodes(jobs))
+}
+
+/// Gives the records in the form that the rule of `crate::deps` reads.
+fn dep_nodes(jobs: &[JobStatus]) -> Vec<crate::deps::Node<'_>> {
+    jobs.iter()
         .map(|j| crate::deps::Node {
             id: j.id,
             group: j.group,
@@ -5649,8 +5683,7 @@ fn held_by_unfinished(jobs: &[JobStatus]) -> std::collections::BTreeSet<uuid::Uu
             needs: &j.needs,
             after: &j.after,
         })
-        .collect();
-    crate::deps::held_by_unfinished(&nodes)
+        .collect()
 }
 
 /// Shows how much disk space qex holds.
