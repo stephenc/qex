@@ -322,9 +322,23 @@ pub fn check(
 /// What one stage of a pipeline asks of the coordinator.
 ///
 /// The name is the name in the file, because that is what the reader edits.
+#[derive(Debug)]
 pub struct StageNeeds {
     pub stage: String,
     pub needs: Vec<&'static str>,
+}
+
+/// What asks for one capability, so that the message names the right place.
+///
+/// A reader corrects the thing that asked. A stage names a line of the file, the
+/// file itself names the shape of a pipeline, and the configuration names a file
+/// that the pipeline file never mentions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Every pipeline asks for it, whatever the file holds.
+    EveryPipeline,
+    /// The configuration of qex fills the field, and no stage names it.
+    Configuration,
 }
 
 /// Tests a WHOLE pipeline file against a coordinator.
@@ -332,8 +346,8 @@ pub struct StageNeeds {
 /// A pipeline submits many jobs, and each stage carries its own options. A test
 /// of one stage therefore speaks for that stage alone: the coordinator takes a
 /// later stage, ignores the option, and gives an id. The user asked for a stage
-/// that gives way, or that holds a lock, and the stage does that. That silence
-/// is the fault that this module exists to remove.
+/// that gives way, or that holds a lock, and the stage does NEITHER. That
+/// silence is the fault that this module exists to remove.
 ///
 /// This function tests every stage, and it names the stage beside the option,
 /// because the reader corrects a LINE of a file.
@@ -342,29 +356,37 @@ pub struct StageNeeds {
 /// stages gives one refusal that names the three, and not three refusals: the
 /// reader corrects every line in one pass, and a command that writes three
 /// refusals for one file teaches a reader to read none of them.
+///
+/// A message names ONLY the source that the caller computed. A capability that
+/// a default of the configuration fills belongs to that file, and a reader who
+/// is sent to a line that does not exist looks for a fault that is not there.
 pub fn check_pipeline(
     have: &[String],
     coordinator_version: &str,
     coordinator_pid: i32,
-    always: &[&'static str],
+    elsewhere: &[(&'static str, Source)],
     stages: &[StageNeeds],
 ) -> Result<(), String> {
     let absent = |need: &'static str| !have.iter().any(|h| h == need);
 
-    // The option, and what asks for it. A `None` says that every pipeline asks
-    // for it, and no stage of this file is more responsible than another.
-    let mut missing: std::collections::BTreeMap<&'static str, Option<Vec<String>>> =
+    // The option, and what asks for it. A `Source` says that no line of the
+    // file asks for it, so no stage is more responsible than another.
+    let mut missing: std::collections::BTreeMap<&'static str, Result<Vec<String>, Source>> =
         Default::default();
 
-    for need in always.iter().copied().filter(|n| absent(n)) {
-        missing.entry(need).or_insert(None);
+    for (need, source) in elsewhere.iter().filter(|(n, _)| absent(n)) {
+        missing.entry(need).or_insert(Err(*source));
     }
     for stage in stages {
         for need in stage.needs.iter().copied().filter(|n| absent(n)) {
-            // A `None` says that every pipeline asks for this one, so the name
-            // of a stage adds nothing to it.
-            if let Some(names) = missing.entry(need).or_insert_with(|| Some(Vec::new())) {
-                names.push(stage.stage.clone());
+            match missing.entry(need).or_insert_with(|| Ok(Vec::new())) {
+                Ok(names) => names.push(stage.stage.clone()),
+                // Every pipeline asks for this one whatever the file holds, so
+                // the name of a stage adds nothing.
+                Err(Source::EveryPipeline) => {}
+                // A stage that names the option is the better answer, because
+                // the reader corrects a line of the file.
+                slot @ Err(Source::Configuration) => *slot = Ok(vec![stage.stage.clone()]),
             }
         }
     }
@@ -384,9 +406,12 @@ pub fn check_pipeline(
     for (need, who) in &missing {
         let option = option_for(need);
         let reason = match who {
-            None => String::from("every pipeline asks for it"),
-            Some(names) if names.len() == 1 => format!("the stage `{}`", names[0]),
-            Some(names) => format!(
+            Err(Source::EveryPipeline) => String::from("every pipeline asks for it"),
+            Err(Source::Configuration) => {
+                String::from("a default of the configuration, and no stage of this file")
+            }
+            Ok(names) if names.len() == 1 => format!("the stage `{}`", names[0]),
+            Ok(names) => format!(
                 "the stages {}",
                 names
                     .iter()
@@ -993,7 +1018,10 @@ mod tests {
             &without("politeness"),
             "0.6.0",
             4321,
-            &["dependencies", "groups"],
+            &[
+                ("dependencies", Source::EveryPipeline),
+                ("groups", Source::EveryPipeline),
+            ],
             &stages,
         )
         .unwrap_err();
@@ -1073,7 +1101,14 @@ mod tests {
     #[test]
     fn a_capability_of_every_pipeline_names_no_stage() {
         let stages = [stage("only", &[])];
-        let err = check_pipeline(&without("groups"), "0.6.0", 1, &["groups"], &stages).unwrap_err();
+        let err = check_pipeline(
+            &without("groups"),
+            "0.6.0",
+            1,
+            &[("groups", Source::EveryPipeline)],
+            &stages,
+        )
+        .unwrap_err();
         assert!(
             err.contains("every pipeline asks for it"),
             "the message must say that the file itself asks for it: {err}"

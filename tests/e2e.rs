@@ -10924,6 +10924,9 @@ fn a_pipeline_with_an_option_on_a_later_stage_is_refused() {
     use std::sync::{Arc, Mutex};
 
     let root = std::env::temp_dir().join(format!("qxpipecap{}", std::process::id()));
+    // A run that a signal stopped leaves this directory and its socket, and the
+    // next run with the same number then cannot bind. Take it first.
+    std::fs::remove_dir_all(&root).ok();
     let run = root.join("state/qex/run");
     std::fs::create_dir_all(&run).unwrap();
     std::fs::create_dir_all(root.join("cfg")).unwrap();
