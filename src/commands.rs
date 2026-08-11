@@ -1738,9 +1738,10 @@ fn read_status_on_disk(raw_id: &str) -> Result<Option<JobStatus>> {
 /// is necessary because the supervisor continues after the coordinator stops.
 ///
 /// A coordinator that STOPS in the middle of the wait does not end the wait.
-/// qex replaces a coordinator on every update of the program, so that event is
-/// the normal upgrade path and not an exotic case. The job continues, and its
-/// result must reach the caller (issue #45).
+/// A coordinator stops for a new program only when NO job is active, so a wait
+/// meets this loss when something stops the coordinator abnormally: a signal,
+/// an out-of-memory kill, or a failure of the machine. The job continues, and
+/// its result must reach the caller (issue #45).
 fn wait_one(
     raw_id: &str,
     deadline: Option<Instant>,
@@ -4805,6 +4806,22 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     spec.after = resolve_dependencies(&mut client, &deps.after, "--after")?;
     require_capabilities(&mut client, &spec)?;
 
+    // Ask BEFORE the job exists, so this answer is about a decision that the
+    // reader can still make.
+    //
+    // This message names no id, because the job has none yet. It gives the way
+    // to find one instead.
+    let owns_jobs = coordinator_owns_jobs(&mut client);
+    if !owns_jobs {
+        eprintln!(
+            "qex: this coordinator keeps a job that waits, when this command stops without \
+             notice.\n\
+             qex: Ctrl-C and SIGTERM still stop the job. After a stop that this command cannot \
+             catch, remove the job with `qex cancel <id>`.\n\
+             qex: `qex list` gives the id."
+        );
+    }
+
     let (id, deduplicated) = match client.call(&Request::Submit {
         spec: Box::new(spec),
     })? {
@@ -4834,6 +4851,18 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     // like the command that it replaces.
     catch_run_signals();
 
+    // Give the job to this connection, so the coordinator cancels it when this
+    // command stops without notice.
+    //
+    // The handler above covers Ctrl-C and SIGTERM, and it cannot cover every
+    // way that a command stops. SIGKILL runs no code here, and a signal that
+    // arrives in the moment between the submit and the handler meets the
+    // default behaviour of the system. The connection covers each of those,
+    // because the kernel closes it when this process stops.
+    if owns_jobs && !deduplicated {
+        own_the_job(&mut client, id);
+    }
+
     // Say now what Ctrl-C will do, because a dedupe key changed it.
     //
     // This command started no job, so it is not the owner of this job, and a
@@ -4854,6 +4883,87 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
     let dir = paths::job_dir(&id)?;
     // `qex run` sets no limit on its own wait. `--timeout` limits the JOB.
     stream_until_done(&mut client, id, &dir, !deduplicated, None)
+}
+
+/// Asks the coordinator to cancel this job if this command stops.
+///
+/// The job of `qex run` has one reader, and it is this command. A job that
+/// keeps a place in the queue for a reader that went away holds every job
+/// behind it, and it later takes a claim for output that nobody reads.
+///
+/// Each answer here names ONLY what it proves, and each one gives the reader a
+/// step. A coordinator that does not know this request is a different thing
+/// from a coordinator that did not answer.
+///
+/// The id is in every message, because the step needs it. A reader who lost
+/// this command has `qex cancel {id}`, and `qex list` finds the id again.
+fn own_the_job(client: &mut Client, id: uuid::Uuid) {
+    let answer = match client.call(&Request::OwnJob { id }) {
+        Ok(Response::Ok) => OwnershipAnswer::Taken,
+        Ok(Response::Error { message, .. }) => OwnershipAnswer::Refused(message),
+        Ok(_) => OwnershipAnswer::Unexpected,
+        Err(e) => OwnershipAnswer::NoAnswer(e.to_string()),
+    };
+    if let Some(text) = ownership_message(id, &answer) {
+        eprintln!("{text}");
+    }
+}
+
+/// What the coordinator said about the ownership of a job.
+enum OwnershipAnswer {
+    Taken,
+    Refused(String),
+    /// The coordinator answered, and the answer was neither a success nor an
+    /// error. qex read the answer correctly; it says nothing about the job.
+    ///
+    /// A coordinator that does not KNOW this request does not reach this
+    /// variant. Such a coordinator gives an error, and `Refused` carries it.
+    Unexpected,
+    NoAnswer(String),
+}
+
+/// Gives the words for an answer, or nothing when the coordinator took the job.
+///
+/// Each answer names ONLY what it proves, and each one ends with the step that
+/// the reader takes. A message with no step costs the reader a second command.
+fn ownership_message(id: uuid::Uuid, answer: &OwnershipAnswer) -> Option<String> {
+    let remedy = format!(
+        "qex: Ctrl-C and SIGTERM still stop it. After a stop that this command cannot catch, \
+         run `qex cancel {id}`."
+    );
+    let first = match answer {
+        OwnershipAnswer::Taken => return None,
+        OwnershipAnswer::Refused(message) => {
+            format!("qex: the coordinator keeps the job {id} after this command stops: {message}")
+        }
+        // Say only what this answer proves. It proves that qex has no promise
+        // about the job, and it does not prove why.
+        OwnershipAnswer::Unexpected => format!(
+            "qex: the coordinator gave an answer that does not say if it took the job {id}, so \
+             qex treats that job as one that the coordinator keeps after this command stops."
+        ),
+        OwnershipAnswer::NoAnswer(e) => format!(
+            "qex: the coordinator did not answer, so it keeps the job {id} after this command \
+             stops: {e}"
+        ),
+    };
+    Some(format!("{first}\n{remedy}"))
+}
+
+/// True when the coordinator cancels the job of a command that stopped.
+///
+/// This question comes BEFORE the submit, so the answer is honest: a message
+/// after the submit describes a job that is already in the queue, and it can
+/// never become a refusal.
+///
+/// qex warns and continues here. The rule that a coordinator must REFUSE an
+/// option covers an option that the reader typed and relies on. This reader
+/// typed `qex run` and asked for a job, so a refusal would take the work away
+/// to protect the cleanup of the work. Ctrl-C and SIGTERM still stop the job,
+/// and only a stop that this command cannot catch loses the rule.
+fn coordinator_owns_jobs(client: &mut Client) -> bool {
+    let (have, _, _) = coordinator_capabilities(client);
+    have.iter().any(|n| n == "own-job")
 }
 
 /// Stops the job of this `qex run`, after Ctrl-C or after a SIGTERM.
@@ -4991,14 +5101,18 @@ fn stream_until_done(
 
         // A coordinator that stops must not end this command.
         //
-        // qex replaces the coordinator at every update of the program, so this
-        // is the normal upgrade path. The job continues, because its supervisor
+        // A coordinator stops for a new program only when no job is active, so
+        // a command that waits for a job meets this loss when something stops
+        // the coordinator abnormally: a signal, an out-of-memory kill, or a
+        // failure of the machine. The job continues, because its supervisor
         // continues, and the supervisor writes the record. Read that record, or
         // attach to the coordinator that replaced this one.
         let status = match client.call(&Request::Status { id }) {
             Ok(Response::Status { status }) => status,
             Ok(other) => return report_for_a_job(other),
-            Err(_) => status_without_the_coordinator(client, id, dir, &mut announced_loss)?,
+            Err(_) => {
+                status_without_the_coordinator(client, id, dir, owns_job, &mut announced_loss)?
+            }
         };
 
         // Say why nothing happens yet. A user of `qex run` sees no output while
@@ -5045,6 +5159,7 @@ fn status_without_the_coordinator(
     client: &mut Client,
     id: uuid::Uuid,
     dir: &std::path::Path,
+    started_here: bool,
     announced: &mut bool,
 ) -> Result<Box<JobStatus>> {
     if !*announced {
@@ -5059,6 +5174,26 @@ fn status_without_the_coordinator(
     // go the fast way again.
     if let Some(fresh) = Client::connect_existing() {
         *client = fresh;
+        // A CONNECTION carries the ownership of a job, so a new connection
+        // holds none. Ask the new coordinator again, or this command keeps a
+        // job that no cleanup can reach. Something stopped the earlier
+        // coordinator abnormally to reach this line, and such a stop leaves
+        // the job of this command in the queue with nothing to remove it.
+        //
+        // Ask THIS coordinator what it can do. It is a different process, and
+        // the answer of the coordinator that stopped says nothing about it: a
+        // new one can take the ownership that an earlier one refused.
+        if started_here {
+            if coordinator_owns_jobs(client) {
+                own_the_job(client, id);
+            } else {
+                eprintln!(
+                    "qex: this coordinator keeps the job {id} after this command stops.\n\
+                     qex: Ctrl-C and SIGTERM still stop it. After a stop that this command \
+                     cannot catch, run `qex cancel {id}`."
+                );
+            }
+        }
         if let Ok(Response::Status { status }) = client.call(&Request::Status { id }) {
             return Ok(status);
         }
@@ -5610,6 +5745,61 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::job::Usage;
+
+    /// Every answer about the ownership of a job must end with a step.
+    ///
+    /// A message that names a fault and no remedy costs the reader a second
+    /// command, and an agent cannot ask a colleague what to do next.
+    #[test]
+    fn each_answer_about_the_ownership_of_a_job_gives_the_reader_a_step() {
+        let id = uuid::Uuid::new_v4();
+
+        assert!(
+            ownership_message(id, &OwnershipAnswer::Taken).is_none(),
+            "a coordinator that took the job says nothing"
+        );
+
+        let refused = ownership_message(
+            id,
+            &OwnershipAnswer::Refused(String::from("there is no job with that id")),
+        )
+        .expect("a refusal must speak");
+        assert!(
+            refused.contains("there is no job with that id"),
+            "a refusal carries the words of the coordinator: {refused}"
+        );
+
+        // qex READ this answer correctly, so the message must not say that it
+        // could not. It must say only that the answer proves nothing.
+        let unexpected = ownership_message(id, &OwnershipAnswer::Unexpected)
+            .expect("an answer that says nothing about the job must speak");
+        assert!(
+            !unexpected.contains("unknown variant")
+                && !unexpected.contains("could not read")
+                && !unexpected.contains("cannot read"),
+            "the words of the protocol must not reach a reader, and qex read this answer: \
+             {unexpected}"
+        );
+        assert!(
+            unexpected.contains("does not say if it took the job"),
+            "the message says only what the answer proves: {unexpected}"
+        );
+
+        let silent = ownership_message(id, &OwnershipAnswer::NoAnswer(String::from("broken pipe")))
+            .expect("a coordinator that said nothing must speak");
+        assert!(
+            silent.contains("broken pipe"),
+            "the cause reaches the reader: {silent}"
+        );
+
+        // Every answer that speaks names the job and the step.
+        for text in [&refused, &unexpected, &silent] {
+            assert!(
+                text.contains(&format!("qex cancel {id}")),
+                "each answer gives the step that removes the job: {text}"
+            );
+        }
+    }
 
     fn status_with(state: JobState, code: Option<i32>) -> JobStatus {
         JobStatus {

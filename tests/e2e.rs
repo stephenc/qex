@@ -1523,8 +1523,9 @@ fn a_coordinator_that_stops_while_the_wait_opens_gives_no_answer_about_the_job()
 ///
 /// Issue #45: the wait died with the code 1, which is the code of a job that
 /// failed, and a pipeline of two hours that had entirely succeeded reported a
-/// failure. qex replaces the coordinator at every update of the program, so
-/// this is the normal upgrade path and not an exotic case.
+/// failure. A coordinator stops for a new program only when no job is active,
+/// so a wait meets this loss when something stops the coordinator abnormally:
+/// a signal, an out-of-memory kill, or a failure of the machine.
 #[test]
 fn a_wait_survives_a_coordinator_that_stops() {
     let h = Harness::with_default_config("waitcrash");
@@ -14028,4 +14029,211 @@ fn a_message_names_what_a_command_wrote() {
         !text.contains("line-30\n"),
         "a line above the last 20 must not appear: {text}"
     );
+}
+
+/// A signal that this command cannot catch must not leave a job in the queue.
+///
+/// The job of `qex run` has one reader, and it is that command. A job that
+/// keeps a place in the queue for a reader that went away holds every job
+/// behind it, and it later takes a claim for output that nobody reads.
+///
+/// The test uses SIGKILL, because the client runs NO code for it. The signal
+/// handler of `qex run` cannot cover this case, and neither can any other code
+/// in the command. Only the coordinator can, and it reads the connection that
+/// the kernel closes.
+#[test]
+fn a_kill_of_qex_run_cancels_a_job_that_never_started() {
+    let h = Harness::new("runkill", "[budget]\ncpu = \"1\"\n");
+
+    // The BUDGET holds the queue, and not the memory of the machine.
+    //
+    // This test sets a budget of one core, and the blocker takes that core, so
+    // the job under test waits on every machine. Each job gives a small memory
+    // claim for the same reason: admission for memory asks the MACHINE how much
+    // is free, so a job with the default claim waits on a small machine and
+    // starts on a large one, and the result of the test would follow the
+    // machine and not the code.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "30"]);
+    h.until("the blocker operates", Duration::from_secs(30), || {
+        h.state_of(&blocker) == "running"
+    });
+
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--mem", "64MB", "--", "sleep", "5"]);
+    h.until("the job of qex run waits", Duration::from_secs(30), || {
+        h.state_of(&id) == "queued"
+    });
+
+    // SIGKILL. The command runs no code after this point.
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    h.until(
+        "the coordinator cancels the job of a command that stopped",
+        Duration::from_secs(30),
+        || h.state_of(&id) == "cancelled",
+    );
+
+    // The reason must separate this from a cancel that a person typed.
+    let status = h.status_json(&id);
+    let error = status["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("the command that started this job stopped"),
+        "the record must say why qex cancelled the job: {status}"
+    );
+
+    h.ok(&["kill", &blocker]);
+}
+
+/// A job that OPERATES must survive the loss of the command that started it.
+///
+/// The job holds a claim and does work, and its output stays in the log file
+/// for a reader that attaches again. A coordinator that stopped such a job
+/// would destroy work that a reader can still use.
+///
+/// This test holds the boundary of the rule above it. Both tests must pass
+/// together: one says that qex cancels a job that never started, and this one
+/// says that qex stops there.
+#[test]
+fn a_kill_of_qex_run_leaves_a_job_that_operates() {
+    let h = Harness::new("runkillrun", "");
+
+    // A small memory claim, so this job starts on a machine of any size.
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--mem", "64MB", "--", "sleep", "12"]);
+    h.until("the job operates", Duration::from_secs(30), || {
+        h.state_of(&id) == "running"
+    });
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    // Give the coordinator more time than it needs to make a wrong decision.
+    std::thread::sleep(Duration::from_secs(3));
+    let state = h.state_of(&id);
+    assert!(
+        state == "running" || state == "completed",
+        "a job that operates must continue when its reader stops, and it is `{state}`"
+    );
+
+    h.ok(&["kill", &id]);
+}
+
+/// A command that does not own its job must leave that job in the queue.
+///
+/// `qex submit --wait` puts the job in the queue to live on its own. A reader
+/// that stops the wait has not asked qex to throw the work away, so the job
+/// waits for a reader that attaches again.
+///
+/// This test holds the boundary from the other side. Nothing else fails when
+/// the ownership reaches this path, because a job that goes away looks like a
+/// job that a person cancelled.
+#[test]
+fn a_kill_of_submit_with_a_wait_leaves_the_job_in_the_queue() {
+    let h = Harness::new("subwaitkill", "[budget]\ncpu = \"1\"\n");
+
+    // The budget holds the queue. Each job gives a small memory claim, so the
+    // memory of the machine never decides what this test measures.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "30"]);
+    h.until("the blocker operates", Duration::from_secs(30), || {
+        h.state_of(&blocker) == "running"
+    });
+
+    let id_file = h.root.join("subwait.id");
+    let id_path = id_file.to_str().unwrap().to_string();
+    let mut child = h.spawn(&[
+        "submit",
+        "--wait",
+        "--id-file",
+        &id_path,
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--",
+        "sleep",
+        "5",
+    ]);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let id = loop {
+        if let Ok(text) = std::fs::read_to_string(&id_file) {
+            let id = text.trim().to_string();
+            if id.parse::<uuid::Uuid>().is_ok() {
+                break id;
+            }
+        }
+        assert!(Instant::now() < deadline, "submit --wait wrote no id");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    h.until("the job waits", Duration::from_secs(30), || {
+        h.state_of(&id) == "queued"
+    });
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    // Give the coordinator more time than it needs to make a wrong decision.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        h.state_of(&id),
+        "queued",
+        "a job of `qex submit --wait` must wait for a reader that attaches again"
+    );
+
+    h.ok(&["cancel", &id]);
+    h.ok(&["kill", &blocker]);
+}
+
+/// The ownership of a job must survive a new coordinator.
+///
+/// A CONNECTION carries the ownership, so a new connection holds none. A
+/// command that asks once and never again loses the rule in silence, and it
+/// loses it exactly when the rule is most needed: something stopped the
+/// coordinator abnormally, and the job of that command waits in the queue.
+#[test]
+fn the_ownership_of_a_job_survives_a_new_coordinator() {
+    let h = Harness::new("ownagain", "[budget]\ncpu = \"1\"\n");
+
+    // The budget holds the queue. Each job gives a small memory claim, so the
+    // memory of the machine never decides what this test measures.
+    let blocker = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "60"]);
+    h.until("the blocker operates", Duration::from_secs(30), || {
+        h.state_of(&blocker) == "running"
+    });
+
+    let (mut child, id) = h.run_bg(&["--cpu", "1", "--mem", "64MB", "--", "sleep", "5"]);
+    h.until("the job of qex run waits", Duration::from_secs(30), || {
+        h.state_of(&id) == "queued"
+    });
+
+    // Stop the coordinator. The supervisor of the blocker continues, and a
+    // later command starts a new coordinator that reads the same records.
+    let info: serde_json::Value =
+        serde_json::from_str(&h.ok(&["info", "--no-start", "--json"])).unwrap();
+    let pid = info["pid"].as_i64().unwrap() as i32;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+
+    // `qex run` meets the loss, finds the new coordinator, and asks it again.
+    h.until("a new coordinator answers", Duration::from_secs(40), || {
+        h.state_of(&id) == "queued" && {
+            let fresh: serde_json::Value =
+                serde_json::from_str(&h.ok(&["info", "--json"])).unwrap();
+            fresh["pid"].as_i64().unwrap() as i32 != pid
+        }
+    });
+
+    // `qex run` must MEET the loss and ask the new coordinator before this test
+    // takes the command away. The command reads the state every 80ms, so this
+    // wait is far longer than it needs.
+    std::thread::sleep(Duration::from_secs(3));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    child.wait().unwrap();
+
+    h.until(
+        "the new coordinator cancels the job of a command that stopped",
+        Duration::from_secs(40),
+        || h.state_of(&id) == "cancelled",
+    );
+
+    h.ok(&["kill", &blocker]);
 }

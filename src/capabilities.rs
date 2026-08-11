@@ -189,6 +189,7 @@ pub const ALL: &[&str] = &[
     "learn",
     "locks",
     "max-queue-time",
+    "own-job",
     "pause",
     "politeness",
     "pools",

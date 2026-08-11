@@ -35,6 +35,12 @@ pub enum Command {
     /// This command writes the output of the job as it arrives, and it exits
     /// with the exit code of the job. Put `qex run` before any command to give
     /// that command a place in the queue.
+    ///
+    /// This command OWNS the job until the job starts. When this command stops,
+    /// and the job still waits, the coordinator cancels that job. A job that
+    /// already operates continues, and `qex status <id> --follow` reads its
+    /// output again. Use `qex submit` for work that must live longer than the
+    /// command that starts it.
     Run(RunArgs),
 
     /// Submit several stages from one file, as a pipeline.
@@ -312,6 +318,10 @@ pub struct SubmitArgs {
     ///
     /// `qex run` is the short form of this option, and the two behave in the
     /// same way. Ctrl-C stops the job.
+    ///
+    /// This option OWNS the job until the job starts. When this command stops,
+    /// and the job still waits, the coordinator cancels that job. `--wait`
+    /// never cancels a job: it leaves the job in the queue to live on its own.
     #[arg(long, conflicts_with = "wait")]
     pub follow: bool,
 
