@@ -36,6 +36,14 @@ struct Previous {
     at: Instant,
 }
 
+/// How to draw one page.
+struct PageHow<'a> {
+    update_cpu: bool,
+    unreachable: bool,
+    live: Option<&'a mut View>,
+    size: Option<(usize, usize)>,
+}
+
 /// The live state of the page that a person watches.
 struct View {
     selected: Option<uuid::Uuid>,
@@ -160,10 +168,12 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             hidden,
             info.as_ref(),
             &mut previous,
-            true,
-            !reached,
-            Some(&mut view),
-            sys::terminal_size(),
+            PageHow {
+                update_cpu: true,
+                unreachable: !reached,
+                live: Some(&mut view),
+                size: sys::terminal_size(),
+            },
         );
 
         show_page(&page);
@@ -186,10 +196,12 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
                     hidden,
                     info.as_ref(),
                     &mut previous,
-                    false,
-                    !reached,
-                    Some(&mut view),
-                    sys::terminal_size(),
+                    PageHow {
+                        update_cpu: false,
+                        unreachable: !reached,
+                        live: Some(&mut view),
+                        size: sys::terminal_size(),
+                    },
                 );
                 show_page(&page);
             }
@@ -210,10 +222,12 @@ fn render(
         hidden,
         info,
         previous,
-        true,
-        unreachable,
-        None,
-        None,
+        PageHow {
+            update_cpu: true,
+            unreachable,
+            live: None,
+            size: None,
+        },
     )
 }
 
@@ -222,11 +236,14 @@ fn paint(
     hidden: usize,
     info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
-    update_cpu: bool,
-    unreachable: bool,
-    mut live: Option<&mut View>,
-    size: Option<(usize, usize)>,
+    how: PageHow<'_>,
 ) -> String {
+    let PageHow {
+        update_cpu,
+        unreachable,
+        live,
+        size,
+    } = how;
     let header = header_lines(ordered, info, unreachable);
     let heading = crate::style::heading(&format!(
         "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}",
@@ -246,13 +263,12 @@ fn paint(
         lines.push((job.id, job_line(job, previous, update_cpu)));
     }
 
-    if live.is_none() {
+    let Some(view) = live else {
         return paint_once(&header, &heading, &lines, hidden);
-    }
+    };
 
     let (rows, cols) = size.unwrap_or((24, 80));
     let width = cols.max(40);
-    let view = live.as_deref_mut().expect("live is Some");
     let ids: Vec<uuid::Uuid> = lines.iter().map(|l| l.0).collect();
     // The selection may still be empty on the first page. The info pane then
     // takes the first job, so reserve that height before the list is clipped.
@@ -940,7 +956,7 @@ fn last_file_lines(path: &std::path::Path, n: usize) -> Vec<String> {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<String> = text.lines().map(|l| crate::job::printable(l)).collect();
+    let mut lines: Vec<String> = text.lines().map(crate::job::printable).collect();
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
@@ -1086,7 +1102,7 @@ fn sync_view(view: &mut View, ids: &[uuid::Uuid], height: usize) {
         }
         return;
     }
-    if view.selected.is_none_or(|id| !ids.iter().any(|x| *x == id)) {
+    if view.selected.is_none_or(|id| !ids.contains(&id)) {
         let fallback = view.scroll.min(ids.len() - 1);
         view.selected = Some(ids[fallback]);
     }
@@ -1719,10 +1735,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((20, 72)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((20, 72)),
+            },
         );
         assert_eq!(
             page.lines().count(),
@@ -1766,10 +1784,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((20, 72)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((20, 72)),
+            },
         );
         assert_eq!(
             page.lines().count(),
@@ -1842,14 +1862,14 @@ mod tests {
         let running = job(JobState::Running, 1, 1 << 20);
         let mut view = View::new();
         view.selected = Some(running.id);
-        handle_key(&mut view, Key::Char(b'x'), &[running.clone()]);
+        handle_key(&mut view, Key::Char(b'x'), std::slice::from_ref(&running));
         assert!(matches!(view.prompt, Some(Prompt::Stop(id)) if id == running.id));
 
         let mut queued = job(JobState::Queued, 1, 1 << 20);
         queued.started_at = None;
         view.prompt = None;
         view.selected = Some(queued.id);
-        handle_key(&mut view, Key::Char(b'x'), &[queued.clone()]);
+        handle_key(&mut view, Key::Char(b'x'), std::slice::from_ref(&queued));
         assert!(view.prompt.is_none());
         assert!(
             view.message.as_deref().is_some_and(|m| m.contains("queue")),
@@ -1892,7 +1912,7 @@ mod tests {
         let done = job(JobState::Completed, 1, 1 << 20);
         let mut view = View::new();
         view.selected = Some(done.id);
-        handle_key(&mut view, Key::Char(b'C'), &[done.clone()]);
+        handle_key(&mut view, Key::Char(b'C'), std::slice::from_ref(&done));
         assert!(matches!(view.prompt, Some(Prompt::Clean(id)) if id == done.id));
 
         let running = job(JobState::Running, 1, 1 << 20);
@@ -1925,10 +1945,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((20, 72)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((20, 72)),
+            },
         );
         assert!(page.contains("y yes"), "the bar must offer y: {page}");
         assert!(page.contains("n no"), "the bar must offer n: {page}");
@@ -1963,10 +1985,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((24, 80)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((24, 80)),
+            },
         );
         assert!(
             page.contains("command  uv run train.py --epochs 50"),
@@ -2049,10 +2073,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((20, 72)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((20, 72)),
+            },
         );
         assert!(page.contains("tail"), "the tail pane is missing: {page}");
         assert_eq!(page.lines().count(), 20, "got: {page}");
@@ -2088,10 +2114,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((24, 80)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((24, 80)),
+            },
         );
         assert!(
             page.lines().count() <= 24,
@@ -2115,10 +2143,12 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
-            true,
-            false,
-            Some(&mut view),
-            Some((20, 80)),
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((20, 80)),
+            },
         );
         assert!(page.contains("y yes"), "y was clipped: {page}");
         assert!(page.contains("n no"), "n was clipped: {page}");
