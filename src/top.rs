@@ -285,14 +285,24 @@ fn paint(
     }
     out.push_str(&pane_bar('├', '┤', &jobs_title, &jobs_extra, width));
     out.push_str(&pane_row(&heading, width, false));
+    let mut drawn = 0;
     if lines.is_empty() {
         out.push_str(&pane_row("no jobs", width, false));
+        drawn = 1;
     } else {
         let end = (view.scroll + view.body_rows).min(lines.len());
         for (id, styled) in &lines[view.scroll..end] {
             let marked = highlight(Some(*id) == selected, styled);
             out.push_str(&pane_row(&marked, width, Some(*id) == selected));
+            drawn += 1;
         }
+    }
+    // The jobs pane takes the leftover rows, so the info pane and the keys
+    // sit on the last lines of the terminal. A short list used to leave a
+    // hole under the table.
+    while drawn < view.body_rows {
+        out.push_str(&pane_row("", width, false));
+        drawn += 1;
     }
     if view.show_info {
         out.push_str(&pane_bar('├', '┤', "info", "", width));
@@ -1387,10 +1397,10 @@ mod tests {
             Some(&mut view),
             Some((20, 72)),
         );
-        assert!(
-            page.lines().count() <= 20,
-            "the page has {} lines: {page}",
-            page.lines().count()
+        assert_eq!(
+            page.lines().count(),
+            20,
+            "the page must fill the screen: {page}"
         );
         for line in page.lines() {
             assert!(
@@ -1407,6 +1417,39 @@ mod tests {
         assert!(page.contains("jobs"), "the jobs pane is missing: {page}");
         assert!(page.contains("info"), "the info pane is missing: {page}");
         assert!(page.contains("j/k move"), "the keys are missing: {page}");
+    }
+
+    /// A short list must still fill the terminal. The jobs pane grows, so the
+    /// info pane and the keys stay on the last rows.
+    #[test]
+    fn a_short_list_still_fills_the_screen() {
+        let jobs = many_jobs(2);
+        let (ordered, hidden) = arrange(&jobs);
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            false,
+            Some(&mut view),
+            Some((20, 72)),
+        );
+        assert_eq!(
+            page.lines().count(),
+            20,
+            "the jobs pane must grow to fill the screen: {page}"
+        );
+        let text: Vec<&str> = page.lines().collect();
+        assert!(
+            text[text.len() - 1].contains("j/k move"),
+            "the keys must sit on the last row: {page}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("info")),
+            "the info pane must stay after the jobs: {page}"
+        );
     }
 
     /// The query form writes every job that the page names. A script that
