@@ -720,7 +720,7 @@ fn detail_lines(
     inner: usize,
 ) -> Vec<String> {
     if view.show_info {
-        return wrap_all(&info_lines(job), inner);
+        return info_lines(job, inner);
     }
     if view.show_tail {
         let want = (rows / 2).max(1);
@@ -736,26 +736,10 @@ fn detail_lines(
     Vec::new()
 }
 
-fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in lines {
-        out.extend(wrap_plain(line, width));
-    }
-    out
-}
+/// Width of an info label plus the spaces that follow it: `note     `.
+const INFO_LABEL: usize = 9;
 
-fn wrap_plain(s: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let chars: Vec<char> = s.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
-    chars.chunks(width).map(|c| c.iter().collect()).collect()
-}
-
-fn info_lines(job: Option<&JobStatus>) -> Vec<String> {
+fn info_lines(job: Option<&JobStatus>, width: usize) -> Vec<String> {
     let Some(job) = job else {
         return vec!["no job is selected".into()];
     };
@@ -770,32 +754,90 @@ fn info_lines(job: Option<&JobStatus>) -> Vec<String> {
         .collect::<Vec<_>>()
         .join(" ");
     let cwd = crate::job::printable(&job.cwd);
-    let mut lines = vec![
-        format!("command  {command}"),
-        format!("cwd      {cwd}"),
-        format!("id       {}", job.id),
-        format!(
-            "queue    {}",
-            format_duration(Duration::from_secs(queued_secs(job)))
-        ),
-        format!("run      {}", run_text(job)),
-        format!("note     {}", crate::job::printable(&note_for(job))),
-    ];
+    let mut lines = Vec::new();
+    lines.extend(wrap_field("command", &command, width));
+    lines.extend(wrap_field("cwd", &cwd, width));
+    lines.extend(wrap_field("id", &job.id.to_string(), width));
+    lines.extend(wrap_field(
+        "queue",
+        &format_duration(Duration::from_secs(queued_secs(job))),
+        width,
+    ));
+    lines.extend(wrap_field("run", &run_text(job), width));
+    lines.extend(wrap_field(
+        "note",
+        &crate::job::printable(&note_for(job)),
+        width,
+    ));
     if !job.locks.is_empty() {
-        lines.push(format!(
-            "locks    {}",
-            job.locks
-                .iter()
-                .map(|n| crate::job::safe_name(n))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        let locks = job
+            .locks
+            .iter()
+            .map(|n| crate::job::safe_name(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.extend(wrap_field("locks", &locks, width));
     }
     if let Some(err) = &job.error {
         let err = crate::job::printable(err);
         if !err.is_empty() && !note_for(job).contains(&err) {
-            lines.push(format!("error    {err}"));
+            lines.extend(wrap_field("error", &err, width));
         }
+    }
+    lines
+}
+
+fn wrap_field(label: &str, text: &str, width: usize) -> Vec<String> {
+    let pad = format!("{label:<INFO_LABEL$}");
+    let indent = " ".repeat(INFO_LABEL);
+    let body_w = width.saturating_sub(INFO_LABEL).max(1);
+    let wrapped = wrap_words(text, body_w);
+    if wrapped.is_empty() {
+        return vec![pad];
+    }
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                format!("{pad}{line}")
+            } else {
+                format!("{indent}{line}")
+            }
+        })
+        .collect()
+}
+
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let wlen = word.chars().count();
+        if wlen > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = word.chars().collect();
+            for chunk in chars.chunks(width) {
+                lines.push(chunk.iter().collect());
+            }
+            continue;
+        }
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.chars().count() + 1 + wlen <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
     }
     lines
 }
@@ -1896,6 +1938,34 @@ mod tests {
         assert!(
             page.contains("note     "),
             "the info must give the full note: {page}"
+        );
+    }
+
+    /// A long note must break on a word, and the next line must line up with
+    /// the text, not with the label.
+    #[test]
+    fn a_long_note_wraps_on_a_word_and_indents() {
+        let text = "waits for cores: this job needs 1 core, and the jobs of this queue \
+                    hold 9 of the 9 cores in the budget.";
+        let lines = wrap_field("note", text, 50);
+        assert!(lines.len() >= 2, "the note must wrap: {lines:?}");
+        assert!(
+            lines[0].starts_with("note     "),
+            "the first line keeps the label: {lines:?}"
+        );
+        assert!(
+            lines[1].starts_with("         "),
+            "a wrapped line is indented: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("bu\n") || l.ends_with("bu")),
+            "a wrap must not split budget: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("budget")),
+            "budget must stay one word: {lines:?}"
         );
     }
 
