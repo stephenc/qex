@@ -77,6 +77,10 @@ pub enum Command {
     Du(DuArgs),
 
     /// Watch the queue. Shows the claim and the true use of each job.
+    ///
+    /// The page that a person watches fits the screen. Arrow keys or j/k
+    /// move the selection. x stops the selected job, c takes it out of the
+    /// queue, i shows more, q leaves.
     Top(TopArgs),
 
     /// Write one line for each change of state, as it happens.
@@ -654,8 +658,9 @@ pub struct TopArgs {
     ///
     /// This form is a QUERY, and it gives 124 when the coordinator did not
     /// answer inside its limit. The page that a person watches keeps drawing
-    /// and gives 0, because a display that drew did its work. Both forms write
-    /// the same page.
+    /// and gives 0, because a display that drew did its work. `--once` writes
+    /// every job that the page names, so a script does not lose a job that
+    /// did not fit the screen.
     #[arg(long)]
     pub once: bool,
 

@@ -5,10 +5,16 @@
 //! a claim is much larger than the need.
 //!
 //! The command uses simple terminal codes and no library. It clears the screen
-//! and writes the page again for each refresh.
+//! and writes the page again for each refresh. The page that a person watches
+//! fits the screen: the list scrolls, and a selection names the job that a
+//! key will act on.
+//!
+//! `--once` is a query. It writes every job that this page names, and it does
+//! not wait for a key.
 
 use crate::client::Client;
 use crate::job::{JobState, JobStatus};
+use crate::keys::Key;
 use crate::proto::{Request, Response};
 use crate::sys;
 use crate::units::{format_duration, format_size};
@@ -19,10 +25,48 @@ use std::time::{Duration, Instant};
 /// Moves the cursor to the corner and clears the screen.
 const CLEAR: &str = "\x1b[2J\x1b[H";
 
+/// The first signal that `x` sends, and the wait before KILL. The same values
+/// as `qex kill` with no options.
+const STOP_SIGNAL: i32 = 15;
+const STOP_GRACE_SECS: u64 = 10;
+
 /// One measurement of a job, to calculate the CPU use between two refreshes.
 struct Previous {
     cpu_secs: f64,
     at: Instant,
+}
+
+/// The live state of the page that a person watches.
+struct View {
+    selected: Option<uuid::Uuid>,
+    scroll: usize,
+    /// How many job lines the last page could hold.
+    body_rows: usize,
+    show_info: bool,
+    prompt: Option<Prompt>,
+    message: Option<String>,
+    dirty: bool,
+    need_refresh: bool,
+}
+
+enum Prompt {
+    Stop(uuid::Uuid),
+    LeaveQueue(uuid::Uuid),
+}
+
+impl View {
+    fn new() -> Self {
+        Self {
+            selected: None,
+            scroll: 0,
+            body_rows: 12,
+            show_info: false,
+            prompt: None,
+            message: None,
+            dirty: false,
+            need_refresh: false,
+        }
+    }
 }
 
 pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
@@ -35,16 +79,18 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
     // each refresh would push the page off the screen of the reader.
     let mut said_the_cause = false;
 
-    // Read the keys, so `q` stops the command. This step also puts the terminal
-    // back when a signal stops the process.
+    // Read the keys, so the person can move and act. This step also puts the
+    // terminal back when a signal stops the process.
     let keys = if args.once {
         false
     } else {
-        crate::keys::watch_for_quit()
+        crate::keys::watch()
     };
+    let mut view = View::new();
+    let mut ordered: Vec<JobStatus> = Vec::new();
 
     loop {
-        if keys && crate::keys::quit_requested() {
+        if keys && apply_keys(&mut view, &ordered) {
             crate::keys::restore();
             return Ok(0);
         }
@@ -87,15 +133,17 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             render(&jobs, info.as_ref(), &mut previous, !reached);
             std::thread::sleep(Duration::from_millis(400));
             print!("{}", render(&jobs, info.as_ref(), &mut previous, !reached));
-            // THE TWO FORMS MAKE TWO PROMISES, AND THE PAGE IS THE SAME.
+            // THE TWO FORMS MAKE TWO PROMISES, AND THEY ARE NOT THE SAME PAGE.
             //
             // The form that a person watches is a DISPLAY: its promise is to
             // keep drawing in every state, and a display that drew succeeded.
-            // `--once` is a QUERY, and an agent scripts it. The code 0 from a
-            // query says that qex answered the question, so a page that qex
-            // could not fill must not carry it: an agent then reads an empty
-            // page as the state of the machine and acts on it, and a false
-            // success is worse than a wait, because nobody sees it.
+            // It fits the screen and it holds a selection. `--once` is a
+            // QUERY, and an agent scripts it. It writes every job that this
+            // page names, so a script does not lose a job that did not fit.
+            // The code 0 from a query says that qex answered the question, so
+            // a page that qex could not fill must not carry it: an agent then
+            // reads an empty page as the state of the machine and acts on it,
+            // and a false success is worse than a wait, because nobody sees it.
             return Ok(if reached {
                 0
             } else {
@@ -103,19 +151,48 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             });
         }
 
-        let page = render(&jobs, info.as_ref(), &mut previous, !reached);
+        let hidden;
+        (ordered, hidden) = arrange(&jobs);
+        let rows = sys::terminal_rows();
+        let page = paint(
+            &ordered,
+            hidden,
+            info.as_ref(),
+            &mut previous,
+            !reached,
+            Some(&mut view),
+            rows,
+        );
 
         print!("{CLEAR}{page}");
         use std::io::Write;
         std::io::stdout().flush().ok();
 
-        // Sleep in short steps, so the `q` key stops the command at once and
-        // not after the whole time between two refreshes.
+        // Sleep in short steps, so a key moves the selection at once and not
+        // after the whole time between two refreshes.
         let until = Instant::now() + interval;
         while Instant::now() < until {
-            if keys && crate::keys::quit_requested() {
+            if keys && apply_keys(&mut view, &ordered) {
                 crate::keys::restore();
                 return Ok(0);
+            }
+            if view.need_refresh {
+                view.need_refresh = false;
+                break;
+            }
+            if view.dirty {
+                view.dirty = false;
+                let page = paint(
+                    &ordered,
+                    hidden,
+                    info.as_ref(),
+                    &mut previous,
+                    !reached,
+                    Some(&mut view),
+                    sys::terminal_rows(),
+                );
+                print!("{CLEAR}{page}");
+                std::io::stdout().flush().ok();
             }
             std::thread::sleep(Duration::from_millis(50).min(interval));
         }
@@ -127,6 +204,19 @@ fn render(
     info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
     unreachable: bool,
+) -> String {
+    let (ordered, hidden) = arrange(jobs);
+    paint(&ordered, hidden, info, previous, unreachable, None, None)
+}
+
+fn paint(
+    ordered: &[JobStatus],
+    hidden: usize,
+    info: Option<&Response>,
+    previous: &mut HashMap<uuid::Uuid, Previous>,
+    unreachable: bool,
+    mut live: Option<&mut View>,
+    rows: Option<usize>,
 ) -> String {
     let mut out = String::new();
 
@@ -223,8 +313,11 @@ fn render(
         // No coordinator. Give the budget from the config file, and count the
         // jobs from their records.
         let cfg = crate::config::Config::load().unwrap_or_default();
-        let active: Vec<&JobStatus> = jobs.iter().filter(|j| j.state.is_active()).collect();
-        let queued = jobs.iter().filter(|j| j.state == JobState::Queued).count();
+        let active: Vec<&JobStatus> = ordered.iter().filter(|j| j.state.is_active()).collect();
+        let queued = ordered
+            .iter()
+            .filter(|j| j.state == JobState::Queued)
+            .count();
         let cpu: u64 = active.iter().map(|j| j.cpu).sum();
         let mem: u64 = active.iter().map(|j| j.mem).sum();
 
@@ -265,8 +358,6 @@ fn render(
         sys::clock_text(sys::now_secs()),
     ));
 
-    let (ordered, hidden) = arrange(jobs);
-
     out.push_str(&crate::style::heading(&format!(
         "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}",
         "ID",
@@ -281,111 +372,206 @@ fn render(
     )));
     out.push('\n');
 
-    if ordered.is_empty() {
+    let mut lines: Vec<(uuid::Uuid, String)> = Vec::with_capacity(ordered.len());
+    for job in ordered {
+        lines.push((job.id, job_line(job, previous)));
+    }
+
+    if let (Some(view), Some(rows)) = (live.as_deref_mut(), rows) {
+        // Reserve the footer before we know the exact window counts. The
+        // footer is a few short lines, and one extra reserved line is better
+        // than a page that writes past the last row.
+        let header_n = out.lines().count();
+        let reserved = reserved_footer_lines(view, hidden);
+        view.body_rows = rows.saturating_sub(header_n + reserved).max(1);
+        let ids: Vec<uuid::Uuid> = lines.iter().map(|l| l.0).collect();
+        sync_view(view, &ids, view.body_rows);
+    }
+
+    let selected = live.as_ref().and_then(|v| v.selected);
+    let selected_job = selected.and_then(|id| ordered.iter().find(|j| j.id == id));
+    let footer = footer_text(
+        hidden,
+        live.as_deref(),
+        selected_job,
+        ordered.len(),
+        sys::stdin_is_terminal(),
+    );
+
+    if lines.is_empty() {
         out.push_str("\nno jobs\n");
+        out.push_str(&footer);
         return out;
     }
 
-    for job in &ordered {
-        // Measure the job now, for a job that operates.
-        let (cpu_now, mem_now) = match (job.state.is_active(), job.pid) {
-            (true, Some(pid)) => {
-                let usage = sys::group_usage(pid);
-                let now = Instant::now();
-                // The CPU use is the change in the CPU time, divided by the
-                // time between the two measurements. The result is a number of
-                // cores, so 2.0 means two cores in full use.
-                let cores = previous.get(&job.id).map(|p| {
-                    let seconds = now.duration_since(p.at).as_secs_f64();
-                    if seconds > 0.0 {
-                        ((usage.cpu_secs - p.cpu_secs) / seconds).max(0.0)
-                    } else {
-                        0.0
-                    }
-                });
-                previous.insert(
-                    job.id,
-                    Previous {
-                        cpu_secs: usage.cpu_secs,
-                        at: now,
-                    },
-                );
-                (cores, Some(usage.rss))
-            }
-            _ => {
-                previous.remove(&job.id);
-                (None, None)
-            }
+    let shown = if let Some(view) = live.as_deref() {
+        let end = (view.scroll + view.body_rows).min(lines.len());
+        &lines[view.scroll..end]
+    } else {
+        lines.as_slice()
+    };
+
+    let mark = live.is_some();
+    for (id, styled) in shown {
+        let line = if mark {
+            highlight(Some(*id) == selected, styled)
+        } else {
+            styled.clone()
         };
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str(&footer);
+    out
+}
 
-        let cpu_text = match cpu_now {
-            // The first refresh has no earlier measurement to compare with.
-            None if job.state.is_active() => "...".to_string(),
-            None => "-".to_string(),
-            Some(c) => format!("{c:.1}"),
-        };
+fn reserved_footer_lines(view: &View, hidden: usize) -> usize {
+    // CPU NOW legend, the keys, and a blank line before them.
+    let mut n = 3;
+    if hidden > 0 {
+        n += 2;
+    }
+    if view.show_info {
+        n += 3;
+    }
+    if view.prompt.is_some() || view.message.is_some() {
+        n += 1;
+    }
+    n
+}
 
-        let mem_text = match mem_now {
-            Some(rss) => format!("{} / {}", format_size(job.mem), format_size(rss)),
-            None if job.usage.max_rss > 0 => {
-                format!(
-                    "{} / {}",
-                    format_size(job.mem),
-                    format_size(job.usage.max_rss)
-                )
-            }
-            None => format!("{} / -", format_size(job.mem)),
-        };
+fn job_line(job: &JobStatus, previous: &mut HashMap<uuid::Uuid, Previous>) -> String {
+    // Measure the job now, for a job that operates.
+    let (cpu_now, mem_now) = match (job.state.is_active(), job.pid) {
+        (true, Some(pid)) => {
+            let usage = sys::group_usage(pid);
+            let now = Instant::now();
+            // The CPU use is the change in the CPU time, divided by the
+            // time between the two measurements. The result is a number of
+            // cores, so 2.0 means two cores in full use.
+            let cores = previous.get(&job.id).map(|p| {
+                let seconds = now.duration_since(p.at).as_secs_f64();
+                if seconds > 0.0 {
+                    ((usage.cpu_secs - p.cpu_secs) / seconds).max(0.0)
+                } else {
+                    0.0
+                }
+            });
+            previous.insert(
+                job.id,
+                Previous {
+                    cpu_secs: usage.cpu_secs,
+                    at: now,
+                },
+            );
+            (cores, Some(usage.rss))
+        }
+        _ => {
+            previous.remove(&job.id);
+            (None, None)
+        }
+    };
 
-        let elapsed = job
-            .elapsed()
-            .map(format_duration)
-            .unwrap_or_else(|| "-".to_string());
+    let cpu_text = match cpu_now {
+        // The first refresh has no earlier measurement to compare with.
+        None if job.state.is_active() => "...".to_string(),
+        None => "-".to_string(),
+        Some(c) => format!("{c:.1}"),
+    };
 
-        let note = note_for(job);
+    let mem_text = match mem_now {
+        Some(rss) => format!("{} / {}", format_size(job.mem), format_size(rss)),
+        None if job.usage.max_rss > 0 => {
+            format!(
+                "{} / {}",
+                format_size(job.mem),
+                format_size(job.usage.max_rss)
+            )
+        }
+        None => format!("{} / -", format_size(job.mem)),
+    };
 
-        // Write the state in its colour, and make a line of a job that
-        // succeeded faint. That job needs no attention, and the eye must go to
-        // the jobs that operate and to the failures.
-        let line = format!(
-            "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}",
-            &job.id.to_string()[..8],
-            job.state.as_str(),
-            // The SAFE name. A name that holds an ESC byte would move the
-            // cursor of the terminal and write over this page.
-            job.display_name(),
-            job.cpu,
-            cpu_text,
-            mem_text,
-            elapsed,
-            since_text(job),
-            note
-        );
+    let elapsed = job
+        .elapsed()
+        .map(format_duration)
+        .unwrap_or_else(|| "-".to_string());
 
-        let styled = match job.state {
-            JobState::Completed | JobState::Cancelled => crate::style::faint(&line),
-            JobState::Running | JobState::Starting => {
-                // Colour the state word only, so the numbers stay easy to read.
-                line.replacen(
-                    job.state.as_str(),
-                    &crate::style::state(job.state.as_str(), job.state.as_str()),
-                    1,
-                )
-            }
-            _ => line.replacen(
+    let note = note_for(job);
+
+    // Write the state in its colour, and make a line of a job that
+    // succeeded faint. That job needs no attention, and the eye must go to
+    // the jobs that operate and to the failures.
+    let line = format!(
+        "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}",
+        &job.id.to_string()[..8],
+        job.state.as_str(),
+        // The SAFE name. A name that holds an ESC byte would move the
+        // cursor of the terminal and write over this page.
+        job.display_name(),
+        job.cpu,
+        cpu_text,
+        mem_text,
+        elapsed,
+        since_text(job),
+        note
+    );
+
+    match job.state {
+        JobState::Completed | JobState::Cancelled => crate::style::faint(&line),
+        JobState::Running | JobState::Starting => {
+            // Colour the state word only, so the numbers stay easy to read.
+            line.replacen(
                 job.state.as_str(),
                 &crate::style::state(job.state.as_str(), job.state.as_str()),
                 1,
-            ),
-        };
-        out.push_str(&styled);
-        out.push('\n');
+            )
+        }
+        _ => line.replacen(
+            job.state.as_str(),
+            &crate::style::state(job.state.as_str(), job.state.as_str()),
+            1,
+        ),
     }
+}
 
+fn highlight(selected: bool, line: &str) -> String {
+    let mark = if selected { '>' } else { ' ' };
+    let marked = format!("{mark}{line}");
+    if selected {
+        crate::style::inverse(&marked)
+    } else {
+        marked
+    }
+}
+
+fn footer_text(
+    hidden: usize,
+    view: Option<&View>,
+    selected: Option<&JobStatus>,
+    total: usize,
+    tty: bool,
+) -> String {
+    let mut out = String::new();
     if hidden > 0 {
         out.push_str(&format!(
             "\n{hidden} more job(s) that stopped are not shown. Use `qex list`.\n"
         ));
+    }
+
+    if let (Some(view), Some(job)) = (view, selected) {
+        if view.show_info {
+            out.push_str(&info_text(job));
+        }
+    }
+
+    if let Some(view) = view {
+        if let Some(text) = prompt_text(view, selected) {
+            out.push_str(&crate::style::warning(&text));
+            out.push('\n');
+        } else if let Some(message) = &view.message {
+            out.push_str(message);
+            out.push('\n');
+        }
     }
 
     out.push_str(&crate::style::faint(
@@ -393,16 +579,267 @@ fn render(
          started or stopped.",
     ));
     out.push('\n');
-    if sys::stdin_is_terminal() {
+
+    if let Some(view) = view {
+        let above = view.scroll;
+        let below = total.saturating_sub(view.scroll + view.body_rows);
+        let window = match (above, below) {
+            (0, 0) => String::new(),
+            (a, b) => format!("{a} above, {b} below.  "),
+        };
+        out.push_str(&format!(
+            "{window}j/k move   x stop   c cancel   i info   q quit\n"
+        ));
+    } else if tty {
         out.push_str("Press q to stop.\n");
     }
     out
 }
 
+fn info_text(job: &JobStatus) -> String {
+    let command = job
+        .command
+        .iter()
+        .map(|a| crate::job::safe_name(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cwd = crate::job::safe_name(&job.cwd);
+    let locks = if job.locks.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  locks {}",
+            job.locks
+                .iter()
+                .map(|n| crate::job::safe_name(n))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    format!("\n{}  {}\n{}{}\n", job.id, command, cwd, locks)
+}
+
+fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
+    let prompt = view.prompt.as_ref()?;
+    let id = match prompt {
+        Prompt::Stop(id) | Prompt::LeaveQueue(id) => *id,
+    };
+    let name = selected
+        .filter(|j| j.id == id)
+        .map(|j| j.display_name())
+        .unwrap_or_else(|| id.to_string()[..8].to_string());
+    let short = &id.to_string()[..8];
+    Some(match prompt {
+        Prompt::Stop(_) => {
+            format!("Stop the job {short} {name}? Press y to stop, or n to keep it.")
+        }
+        Prompt::LeaveQueue(_) => {
+            format!("Take {short} {name} out of the queue? Press y to cancel, or n to keep it.")
+        }
+    })
+}
+
+/// Applies every key that arrived. Gives `true` when the person asked to leave.
+fn apply_keys(view: &mut View, jobs: &[JobStatus]) -> bool {
+    for key in crate::keys::take() {
+        if handle_key(view, key, jobs) {
+            return true;
+        }
+    }
+    false
+}
+
+fn handle_key(view: &mut View, key: Key, jobs: &[JobStatus]) -> bool {
+    if let Some(id) = view.prompt.as_ref().map(|p| match p {
+        Prompt::Stop(id) | Prompt::LeaveQueue(id) => *id,
+    }) {
+        let stop = matches!(view.prompt, Some(Prompt::Stop(_)));
+        match key {
+            Key::Char(b'y') | Key::Char(b'Y') => {
+                view.prompt = None;
+                view.message = Some(if stop { act_stop(id) } else { act_cancel(id) });
+                view.need_refresh = true;
+                view.dirty = true;
+            }
+            Key::Char(b'n') | Key::Char(b'N') | Key::Esc => {
+                view.prompt = None;
+                view.dirty = true;
+            }
+            Key::Char(b'q') | Key::Char(b'Q') => return true,
+            _ => {}
+        }
+        return false;
+    }
+
+    match key {
+        Key::Char(b'q') | Key::Char(b'Q') => return true,
+        Key::Char(b'j') | Key::Down => move_sel(view, jobs, 1),
+        Key::Char(b'k') | Key::Up => move_sel(view, jobs, -1),
+        Key::PageDown => move_sel(view, jobs, view.body_rows as isize),
+        Key::PageUp => move_sel(view, jobs, -(view.body_rows as isize)),
+        Key::Char(b'g') | Key::Home => jump(view, jobs, 0),
+        Key::Char(b'G') | Key::End => {
+            if !jobs.is_empty() {
+                jump(view, jobs, jobs.len() - 1);
+            }
+        }
+        Key::Char(b'i') | Key::Enter => {
+            view.show_info = !view.show_info;
+            view.dirty = true;
+        }
+        Key::Char(b'x') | Key::Char(b'K') => ask_stop(view, jobs),
+        Key::Char(b'c') => ask_cancel(view, jobs),
+        _ => {}
+    }
+    false
+}
+
+fn ids_of(jobs: &[JobStatus]) -> Vec<uuid::Uuid> {
+    jobs.iter().map(|j| j.id).collect()
+}
+
+fn selected_index(view: &View, jobs: &[JobStatus]) -> Option<usize> {
+    view.selected
+        .and_then(|id| jobs.iter().position(|j| j.id == id))
+}
+
+fn sync_view(view: &mut View, ids: &[uuid::Uuid], height: usize) {
+    if ids.is_empty() {
+        view.selected = None;
+        view.scroll = 0;
+        if view.prompt.is_some() {
+            view.prompt = None;
+            view.message = Some("that job is no longer on the page".into());
+        }
+        return;
+    }
+    if view.selected.is_none_or(|id| !ids.iter().any(|x| *x == id)) {
+        let fallback = view.scroll.min(ids.len() - 1);
+        view.selected = Some(ids[fallback]);
+    }
+    let idx = view
+        .selected
+        .and_then(|id| ids.iter().position(|x| *x == id))
+        .unwrap_or(0);
+    if height == 0 {
+        return;
+    }
+    if idx < view.scroll {
+        view.scroll = idx;
+    } else if idx >= view.scroll + height {
+        view.scroll = idx + 1 - height;
+    }
+    let max_scroll = ids.len().saturating_sub(height);
+    if view.scroll > max_scroll {
+        view.scroll = max_scroll;
+    }
+}
+
+fn move_sel(view: &mut View, jobs: &[JobStatus], delta: isize) {
+    if jobs.is_empty() {
+        return;
+    }
+    let idx = selected_index(view, jobs).unwrap_or(0);
+    let next = if delta < 0 {
+        idx.saturating_sub(delta.unsigned_abs())
+    } else {
+        idx.saturating_add(delta as usize).min(jobs.len() - 1)
+    };
+    view.selected = Some(jobs[next].id);
+    view.message = None;
+    view.dirty = true;
+    sync_view(view, &ids_of(jobs), view.body_rows.max(1));
+}
+
+fn jump(view: &mut View, jobs: &[JobStatus], index: usize) {
+    if jobs.is_empty() {
+        return;
+    }
+    view.selected = Some(jobs[index.min(jobs.len() - 1)].id);
+    view.message = None;
+    view.dirty = true;
+    sync_view(view, &ids_of(jobs), view.body_rows.max(1));
+}
+
+fn ask_stop(view: &mut View, jobs: &[JobStatus]) {
+    let Some(job) = view
+        .selected
+        .and_then(|id| jobs.iter().find(|j| j.id == id))
+    else {
+        view.message = Some("no job is selected".into());
+        view.dirty = true;
+        return;
+    };
+    if job.state.is_active() {
+        view.prompt = Some(Prompt::Stop(job.id));
+        view.message = None;
+    } else if job.state == JobState::Queued {
+        view.message = Some("this job waits in the queue. Press c to take it out.".into());
+    } else {
+        view.message = Some("this job already stopped".into());
+    }
+    view.dirty = true;
+}
+
+fn ask_cancel(view: &mut View, jobs: &[JobStatus]) {
+    let Some(job) = view
+        .selected
+        .and_then(|id| jobs.iter().find(|j| j.id == id))
+    else {
+        view.message = Some("no job is selected".into());
+        view.dirty = true;
+        return;
+    };
+    if job.state == JobState::Queued {
+        view.prompt = Some(Prompt::LeaveQueue(job.id));
+        view.message = None;
+    } else if job.state.is_active() {
+        view.message = Some("this job operates. Press x to stop it.".into());
+    } else {
+        view.message = Some("cancel takes a job out of the queue".into());
+    }
+    view.dirty = true;
+}
+
+fn act_stop(id: uuid::Uuid) -> String {
+    let short = &id.to_string()[..8];
+    match Client::connect_existing_result() {
+        Ok(None) => "no coordinator operates. qex cannot stop the job from this page.".into(),
+        Err(e) => format!("{e:#}"),
+        Ok(Some(mut client)) => {
+            match client.call(&Request::Kill {
+                id,
+                signal: STOP_SIGNAL,
+                grace_secs: STOP_GRACE_SECS,
+            }) {
+                Ok(Response::Ok) => format!("{short} received the signal"),
+                Ok(Response::Error { message, .. }) => message,
+                Ok(_) => "the coordinator refused the request".into(),
+                Err(e) => format!("{e:#}"),
+            }
+        }
+    }
+}
+
+fn act_cancel(id: uuid::Uuid) -> String {
+    let short = &id.to_string()[..8];
+    match Client::connect_existing_result() {
+        Ok(None) => "no coordinator operates. qex cannot cancel the job from this page.".into(),
+        Err(e) => format!("{e:#}"),
+        Ok(Some(mut client)) => match client.call(&Request::Cancel { id }) {
+            Ok(Response::Ok) => format!("{short} left the queue"),
+            Ok(Response::Error { message, .. }) => message,
+            Ok(_) => "the coordinator refused the request".into(),
+            Err(e) => format!("{e:#}"),
+        },
+    }
+}
+
 /// The number of jobs that stopped to show on the page.
 ///
 /// A page must fit a screen. The jobs that operate and the jobs in the queue
-/// always appear, because they are the state of the machine now.
+/// always appear, because they are the state of the machine now. The live
+/// page then scrolls that list so that it fits the rows of the terminal.
 const RECENT_DONE: usize = 12;
 
 /// Puts the jobs in the order for the page, and gives the number that it hides.
@@ -848,5 +1285,141 @@ mod tests {
         let mut previous = HashMap::new();
         let page = render(&[j], Some(&info()), &mut previous, false);
         assert!(page.contains("waits for cores"), "got: {page}");
+    }
+
+    fn many_jobs(n: usize) -> Vec<JobStatus> {
+        (0..n)
+            .map(|i| {
+                let mut j = job(JobState::Queued, 1, 1 << 20);
+                j.name = format!("job-{i}");
+                j.started_at = None;
+                j.submitted_at = i as u64;
+                j.sequence = i as u64;
+                j
+            })
+            .collect()
+    }
+
+    /// A page that a person watches must fit the screen. A list that is longer
+    /// than the screen used to write past the last row, and the header left
+    /// the display.
+    #[test]
+    fn a_live_page_fits_the_screen() {
+        let jobs = many_jobs(40);
+        let (ordered, hidden) = arrange(&jobs);
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            false,
+            Some(&mut view),
+            Some(20),
+        );
+        assert!(
+            page.lines().count() <= 20,
+            "the page has {} lines: {page}",
+            page.lines().count()
+        );
+        assert!(
+            page.contains("below"),
+            "the page must say that more jobs exist: {page}"
+        );
+        assert!(page.contains("j/k move"), "the keys are missing: {page}");
+    }
+
+    /// The query form writes every job that the page names. A script that
+    /// counts lines must not lose a job that did not fit a screen.
+    #[test]
+    fn once_writes_every_job_on_the_page() {
+        let jobs = many_jobs(40);
+        let mut previous = HashMap::new();
+        let page = render(&jobs, Some(&info()), &mut previous, false);
+        for i in 0..40 {
+            assert!(
+                page.contains(&format!("job-{i}")),
+                "the query lost job-{i}: {page}"
+            );
+        }
+        assert!(
+            !page.contains("j/k move"),
+            "the query must not wait for a key: {page}"
+        );
+    }
+
+    /// Moving past the last visible row must bring that job onto the page.
+    #[test]
+    fn the_selection_brings_a_job_onto_the_page() {
+        let jobs = many_jobs(20);
+        let ids: Vec<uuid::Uuid> = jobs.iter().map(|j| j.id).collect();
+        let mut view = View::new();
+        view.body_rows = 5;
+        sync_view(&mut view, &ids, 5);
+        assert_eq!(view.scroll, 0);
+        assert_eq!(view.selected, Some(ids[0]));
+
+        move_sel(&mut view, &jobs, 6);
+        assert_eq!(view.selected, Some(ids[6]));
+        assert_eq!(view.scroll, 2, "the window must follow the selection");
+    }
+
+    /// A job that leaves the page must not leave the selection pointing at it.
+    #[test]
+    fn a_job_that_leaves_gives_the_selection_to_another() {
+        let jobs = many_jobs(3);
+        let mut view = View::new();
+        view.selected = Some(jobs[1].id);
+        let remaining: Vec<uuid::Uuid> = vec![jobs[0].id, jobs[2].id];
+        sync_view(&mut view, &remaining, 5);
+        assert_eq!(view.selected, Some(jobs[0].id));
+    }
+
+    #[test]
+    fn x_asks_to_stop_a_job_that_operates() {
+        let running = job(JobState::Running, 1, 1 << 20);
+        let mut view = View::new();
+        view.selected = Some(running.id);
+        handle_key(&mut view, Key::Char(b'x'), &[running.clone()]);
+        assert!(matches!(view.prompt, Some(Prompt::Stop(id)) if id == running.id));
+
+        let mut queued = job(JobState::Queued, 1, 1 << 20);
+        queued.started_at = None;
+        view.prompt = None;
+        view.selected = Some(queued.id);
+        handle_key(&mut view, Key::Char(b'x'), &[queued.clone()]);
+        assert!(view.prompt.is_none());
+        assert!(
+            view.message.as_deref().is_some_and(|m| m.contains("queue")),
+            "got {:?}",
+            view.message
+        );
+
+        handle_key(&mut view, Key::Char(b'c'), &[queued]);
+        assert!(matches!(view.prompt, Some(Prompt::LeaveQueue(_))));
+    }
+
+    #[test]
+    fn i_shows_the_command_of_the_selected_job() {
+        let mut j = job(JobState::Running, 1, 1 << 20);
+        j.command = vec!["uv".into(), "run".into(), "train.py".into()];
+        j.cwd = "workdir".into();
+        let (ordered, hidden) = arrange(std::slice::from_ref(&j));
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        view.selected = Some(j.id);
+        view.show_info = true;
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            false,
+            Some(&mut view),
+            Some(24),
+        );
+        assert!(page.contains("uv run train.py"), "got: {page}");
+        assert!(page.contains("workdir"), "got: {page}");
     }
 }
