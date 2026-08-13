@@ -61,6 +61,24 @@ pub struct Claims {
     pub count: usize,
 }
 
+/// The name of the variable that moves the peer directory.
+///
+/// A test sets this so a suite run cannot write into `/tmp/qex`. The variable
+/// is not `TMPDIR`: two users of one machine have different values of `TMPDIR`
+/// on macOS, and they must still share one directory.
+pub const DIR_VARIABLE: &str = "QEX_PEERS_DIR";
+
+/// Gives the peer directory that this process will use.
+///
+/// `QEX_PEERS_DIR` wins when it is set, so a test can isolate itself. The
+/// config value is the directory of the live queue.
+fn peers_location(cfg: &Config) -> PathBuf {
+    match std::env::var_os(DIR_VARIABLE) {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(&cfg.peers.dir),
+    }
+}
+
 /// Gives the directory for the peer files, if the directory is safe.
 ///
 /// The directory is writable by every user, so this function makes these tests:
@@ -74,7 +92,7 @@ pub struct Claims {
 /// only. It does not give an error, because a shared directory is not necessary
 /// for a correct queue.
 fn peer_dir(cfg: &Config) -> Option<PathBuf> {
-    let dir = PathBuf::from(&cfg.peers.dir);
+    let dir = peers_location(cfg);
 
     match std::fs::symlink_metadata(&dir) {
         Ok(meta) => {
@@ -576,5 +594,61 @@ mod tests {
         cfg.peers.enabled = Some(false);
         assert_eq!(claims(&cfg), Claims::default());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `TMPDIR` must not move the peer directory. Two users on macOS have
+    /// different values of `TMPDIR`, and they must still share one directory.
+    #[test]
+    fn tmpdir_does_not_move_the_peer_directory() {
+        let _lock = crate::testutil::env_lock();
+        let tmp = tmpdir("notvia-tmpdir");
+        let _t = crate::testutil::EnvVar::set("TMPDIR", tmp.to_str().unwrap());
+        let _q = crate::testutil::EnvVar::unset(DIR_VARIABLE);
+        let cfg = Config::default();
+        assert_eq!(
+            peers_location(&cfg),
+            PathBuf::from("/tmp/qex"),
+            "TMPDIR must not move the shared peer directory"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A test sets `QEX_PEERS_DIR` so it cannot reach `/tmp/qex`.
+    #[test]
+    fn the_peers_dir_variable_moves_the_peer_directory() {
+        let _lock = crate::testutil::env_lock();
+        let dir = tmpdir("via-var");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let _q = crate::testutil::EnvVar::set(DIR_VARIABLE, dir.to_str().unwrap());
+
+        // The config names the live directory. The variable must win, or a
+        // suite run writes into the queue of the person who runs the suite.
+        let mut cfg = Config::default();
+        cfg.peers.enabled = Some(true);
+        assert_eq!(peers_location(&cfg), dir);
+        publish(&cfg, 2, 1 << 30, Default::default(), Default::default());
+        let mine = dir.join(user_dir_name(current_uid()));
+        assert!(
+            mine.join(peer_file_name(std::process::id() as i32))
+                .exists(),
+            "the record must land in the directory that the variable names"
+        );
+        let live = PathBuf::from("/tmp/qex")
+            .join(user_dir_name(current_uid()))
+            .join(peer_file_name(std::process::id() as i32));
+        assert!(
+            !live.exists(),
+            "the variable must keep the record out of the live directory"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_peers_dir_variable_does_not_move_the_directory() {
+        let _lock = crate::testutil::env_lock();
+        let _q = crate::testutil::EnvVar::set(DIR_VARIABLE, "");
+        let cfg = Config::default();
+        assert_eq!(peers_location(&cfg), PathBuf::from("/tmp/qex"));
     }
 }
