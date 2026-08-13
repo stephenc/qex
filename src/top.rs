@@ -246,7 +246,7 @@ fn paint(
     // takes the first job, so reserve that height before the list is clipped.
     let preview = view.selected.or(ids.first().copied());
     let selected_job = preview.and_then(|id| ordered.iter().find(|j| j.id == id));
-    let extra = usize::from(view.prompt.is_some() || view.message.is_some());
+    let extra = usize::from(view.message.is_some() && view.prompt.is_none());
     let inner = width.saturating_sub(2).max(1);
     // Top bar, header, jobs bar, heading, optional extra, bottom bar.
     let chrome = 1 + header.len() + 1 + 1 + extra + 1;
@@ -312,12 +312,18 @@ fn paint(
             out.push_str(&pane_row(line, width, false));
         }
     }
-    if let Some(text) = prompt_text(view, selected_job) {
-        out.push_str(&pane_row(&crate::style::warning(&text), width, false));
-    } else if let Some(message) = &view.message {
-        out.push_str(&pane_row(message, width, false));
+    if view.prompt.is_none() {
+        if let Some(message) = &view.message {
+            out.push_str(&pane_row(message, width, false));
+        }
     }
-    out.push_str(&pane_bar('└', '┘', &action_keys(selected_job), "", width));
+    // A y/n prompt blocks every other action. Replace the command bar so
+    // the keys that do not operate are not on the screen.
+    let keys = match prompt_keys(view, selected_job) {
+        Some(text) => text,
+        None => action_keys(selected_job),
+    };
+    out.push_str(&pane_bar('└', '┘', &keys, "", width));
     // No newline after the last row. A page of N lines plus a newline on a
     // terminal of N rows scrolls the header off the screen.
     if out.ends_with('\n') {
@@ -860,7 +866,7 @@ fn action_keys(job: Option<&JobStatus>) -> String {
     keys.join("   ")
 }
 
-fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
+fn prompt_keys(view: &View, selected: Option<&JobStatus>) -> Option<String> {
     let prompt = view.prompt.as_ref()?;
     let id = match prompt {
         Prompt::Stop(id) | Prompt::LeaveQueue(id) | Prompt::Clean(id) => *id,
@@ -870,17 +876,12 @@ fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
         .map(|j| j.display_name())
         .unwrap_or_else(|| id.to_string()[..8].to_string());
     let short = &id.to_string()[..8];
-    Some(match prompt {
-        Prompt::Stop(_) => {
-            format!("Stop the job {short} {name}? Press y to stop, or n to keep it.")
-        }
-        Prompt::LeaveQueue(_) => {
-            format!("Take {short} {name} out of the queue? Press y to cancel, or n to keep it.")
-        }
-        Prompt::Clean(_) => {
-            format!("Delete the record of {short} {name}? Press y to clean, or n to keep it.")
-        }
-    })
+    let verb = match prompt {
+        Prompt::Stop(_) => "stop",
+        Prompt::LeaveQueue(_) => "cancel",
+        Prompt::Clean(_) => "clean",
+    };
+    Some(format!("{verb} {short} {name}?   y yes   n no   q quit"))
 }
 
 /// Applies every key that arrived. Gives `true` when the person asked to leave.
@@ -1786,6 +1787,38 @@ mod tests {
                 .is_some_and(|m| m.contains("stopped")),
             "got {:?}",
             view.message
+        );
+    }
+
+    /// A y/n prompt blocks the other keys. The bar must name only y, n and q,
+    /// or the reader presses a key that the page still shows and nothing
+    /// happens.
+    #[test]
+    fn a_confirm_replaces_the_command_bar() {
+        let running = job(JobState::Running, 1, 1 << 20);
+        let (ordered, hidden) = arrange(std::slice::from_ref(&running));
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        view.selected = Some(running.id);
+        handle_key(&mut view, Key::Char(b'x'), &ordered);
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            false,
+            Some(&mut view),
+            Some((20, 72)),
+        );
+        assert!(page.contains("y yes"), "the bar must offer y: {page}");
+        assert!(page.contains("n no"), "the bar must offer n: {page}");
+        assert!(
+            !page.contains("x stop"),
+            "a blocked key must leave the bar: {page}"
+        );
+        assert!(
+            !page.contains("j/k move"),
+            "move is blocked during confirm: {page}"
         );
     }
 
