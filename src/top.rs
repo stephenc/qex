@@ -853,6 +853,9 @@ fn action_keys(job: Option<&JobStatus>) -> String {
         Some(state) if state.is_terminal() => keys.push("C clean".into()),
         _ => {}
     }
+    // `t tail` is always valid. A job in the queue has no output yet, and
+    // the reader may still open the pane to watch the first lines when it
+    // starts. A key that appeared only after the start would be too late.
     keys.extend(["i info".into(), "t tail".into(), "q quit".into()]);
     keys.join("   ")
 }
@@ -1759,6 +1762,9 @@ mod tests {
         assert!(finished.contains("C clean"), "{finished}");
         assert!(!finished.contains("x stop"), "{finished}");
         assert!(!finished.contains("c cancel"), "{finished}");
+        for bar in [&run, &wait, &finished] {
+            assert!(bar.contains("t tail"), "tail must stay on the bar: {bar}");
+        }
     }
 
     #[test]
