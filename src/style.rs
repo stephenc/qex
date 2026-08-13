@@ -75,6 +75,18 @@ pub fn inverse(text: &str) -> String {
     wrap(INVERSE, text)
 }
 
+/// Inverse a short span inside already-styled text.
+///
+/// A full reset would drop the bold of the command bar. This turns inverse
+/// off and leaves the rest of the line as it was.
+pub fn inverse_span(text: &str) -> String {
+    if active() {
+        format!("{INVERSE}{text}\x1b[27m")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Writes text with the colour of a job state.
 ///
 /// The colour follows the meaning: green for work that operates, yellow for
@@ -127,6 +139,7 @@ mod tests {
         assert_eq!(heading("ID"), "ID");
         assert_eq!(faint("done"), "done");
         assert_eq!(inverse("sel"), "sel");
+        assert_eq!(inverse_span("x"), "x");
         assert_eq!(state("running", "running"), "running");
         assert!(!warning("careful").contains('\x1b'));
     }

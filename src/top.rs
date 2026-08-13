@@ -323,7 +323,7 @@ fn paint(
         Some(text) => text,
         None => action_keys(selected_job),
     };
-    out.push_str(&pane_bar('└', '┘', &keys, "", width));
+    out.push_str(&command_bar(&keys, width));
     // No newline after the last row. A page of N lines plus a newline on a
     // terminal of N rows scrolls the header off the screen.
     if out.ends_with('\n') {
@@ -520,6 +520,23 @@ fn pane_bar(left: char, right: char, title: &str, extra: &str, width: usize) -> 
     let pad = inner.saturating_sub(visible_len(&core));
     core.push_str(&"─".repeat(pad));
     format!("{}\n", crate::style::faint(&format!("{left}{core}{right}")))
+}
+
+/// The command bar is bold, and each key is inverse, so the reader sees
+/// which characters operate.
+fn command_bar(title: &str, width: usize) -> String {
+    let inner = width.saturating_sub(2).max(1);
+    let mut core = format!("─ {title} ");
+    let fill = inner.saturating_sub(visible_len(&core));
+    core.push_str(&"─".repeat(fill));
+    core = fit(&core, inner);
+    let pad = inner.saturating_sub(visible_len(&core));
+    core.push_str(&"─".repeat(pad));
+    format!("{}\n", crate::style::heading(&format!("└{core}┘")))
+}
+
+fn key_chip(key: &str) -> String {
+    crate::style::inverse_span(key)
 }
 
 fn pane_row(text: &str, width: usize, selected: bool) -> String {
@@ -852,18 +869,26 @@ fn last_file_lines(path: &std::path::Path, n: usize) -> Vec<String> {
 }
 
 fn action_keys(job: Option<&JobStatus>) -> String {
-    let mut keys = vec!["j/k move".to_string()];
+    let mut keys = vec![key_hint("j/k", "move")];
     match job.map(|j| j.state) {
-        Some(state) if state.is_active() => keys.push("x stop".into()),
-        Some(JobState::Queued) => keys.push("c cancel".into()),
-        Some(state) if state.is_terminal() => keys.push("C clean".into()),
+        Some(state) if state.is_active() => keys.push(key_hint("x", "stop")),
+        Some(JobState::Queued) => keys.push(key_hint("c", "cancel")),
+        Some(state) if state.is_terminal() => keys.push(key_hint("C", "clean")),
         _ => {}
     }
     // `t tail` is always valid. A job in the queue has no output yet, and
     // the reader may still open the pane to watch the first lines when it
     // starts. A key that appeared only after the start would be too late.
-    keys.extend(["i info".into(), "t tail".into(), "q quit".into()]);
+    keys.extend([
+        key_hint("i", "info"),
+        key_hint("t", "tail"),
+        key_hint("q", "quit"),
+    ]);
     keys.join("   ")
+}
+
+fn key_hint(key: &str, label: &str) -> String {
+    format!("{} {label}", key_chip(key))
 }
 
 fn prompt_keys(view: &View, selected: Option<&JobStatus>) -> Option<String> {
@@ -881,7 +906,12 @@ fn prompt_keys(view: &View, selected: Option<&JobStatus>) -> Option<String> {
         Prompt::LeaveQueue(_) => "cancel",
         Prompt::Clean(_) => "clean",
     };
-    Some(format!("{verb} {short} {name}?   y yes   n no   q quit"))
+    Some(format!(
+        "{verb} {short} {name}?   {}   {}   {}",
+        key_hint("y", "yes"),
+        key_hint("n", "no"),
+        key_hint("q", "quit"),
+    ))
 }
 
 /// Applies every key that arrived. Gives `true` when the person asked to leave.
