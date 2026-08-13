@@ -65,6 +65,15 @@ pub const JOB: &str = r##"{
       "enum": ["all", "minimal", "none"],
       "description": "The environment that the job receives. \"all\" copies your shell. \"minimal\" copies PATH, HOME, USER, LOGNAME, SHELL, LANG and TZ. \"none\" copies nothing. The default is \"all\"."
     },
+    "nice": {
+      "type": "integer",
+      "description": "How politely this job uses the processor, from -20 to 19. A larger number gives way to everything else. The default comes from [politeness] nice in the configuration.",
+      "examples": [10, 19]
+    },
+    "no_limit_env_hints": {
+      "type": "boolean",
+      "description": "Do not tell the job how large its claim is. qex writes the claim into the environment of the job, so a runtime sizes its thread pool to the claim. Give true for a job that must see the machine as it is. true from any source turns the claim off."
+    },
     "resources": {
       "type": "object",
       "additionalProperties": false,
@@ -132,6 +141,18 @@ pub const JOB: &str = r##"{
       "description": "The jobs that must stop before this job starts. Their result is not important. Use this field for a cleanup step that must run also when an earlier stage fails.",
       "examples": [["build"]]
     },
+    "locks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The locks that this job holds while it operates. Two jobs with one lock name never operate together. Use a lock for a build directory, a port or a database.",
+      "examples": [["target"]]
+    },
+    "retries": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The number of times to run this job again when it fails. One id, one record, every attempt in the log. A kill for memory starts no new attempt.",
+      "examples": [3]
+    },
     "dedupe_key": {
       "type": "string",
       "description": "Start no second job when a job with this key already exists. qex gives the id of that job and exits with the code 0. A key holds a job while that job waits or operates, and the key is free when the job stops. Use it in a script that can run a second time.",
@@ -191,6 +212,16 @@ pub const PIPELINE: &str = r##"{
             "description": "The stages of THIS file that must stop before this stage, whatever their result. Use it for a cleanup stage.",
             "examples": [["ship"]]
           },
+          "locks": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "The locks that this stage holds while it operates. Two jobs with one lock name never operate together."
+          },
+          "retries": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The number of times to run this stage again when it fails."
+          },
           "cwd": { "type": "string", "description": "The directory for this stage." },
           "timeout": { "type": "string", "description": "The time limit. Use s, m, h or d." },
           "max_queue_time": { "type": "string", "description": "The time that this stage may wait in the queue before it starts. Use s, m, h or d. The wait for an earlier stage counts, so give a value that covers the whole pipeline." },
@@ -199,6 +230,14 @@ pub const PIPELINE: &str = r##"{
           "env_capture": {
             "type": "string",
             "enum": ["all", "minimal", "none"]
+          },
+          "nice": {
+            "type": "integer",
+            "description": "How politely this stage uses the processor, from -20 to 19. A larger number gives way to everything else."
+          },
+          "no_limit_env_hints": {
+            "type": "boolean",
+            "description": "Do not tell this stage how large its claim is. Give true for a stage that must see the machine as it is."
           },
           "resources": {
             "type": "object",
@@ -473,39 +512,55 @@ pub const EVENT: &str = r##"{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    /// The names of the top-level fields that `T` serializes.
+    ///
+    /// `JobFile` and `Stage` serialize every field, so a default value is the
+    /// list that the compiler owns. A list typed into this file is the fault
+    /// that this test exists to prevent: the schema and the struct go apart,
+    /// and the test agrees with the wrong answer.
+    ///
+    /// Do not add `skip_serializing_if` to those types without changing this
+    /// helper. A default value would then hide the field, and the test would
+    /// go silent.
+    fn serialized_field_names<T: serde::Serialize>(value: T) -> BTreeSet<String> {
+        serde_json::to_value(value)
+            .expect("the value must serialize")
+            .as_object()
+            .expect("the value must be an object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn schema_property_names(schema: &str, path: &[&str]) -> BTreeSet<String> {
+        let mut value: serde_json::Value =
+            serde_json::from_str(schema).expect("the schema must be valid JSON");
+        for key in path {
+            value = value[key].take();
+        }
+        value
+            .as_object()
+            .unwrap_or_else(|| panic!("no object at {path:?}"))
+            .keys()
+            .cloned()
+            .collect()
+    }
 
     /// The pipeline schema must list every field that a stage accepts. A field
     /// that the schema does not name looks unsupported, and the parser refuses
     /// a field that the schema names but the code does not accept.
+    ///
+    /// The names come from `Stage`, and not from a list written here. A list
+    /// written here would pass while a field that a stage gained reached
+    /// neither the schema nor the test — which is the whole fault, one step
+    /// further back.
     #[test]
     fn the_pipeline_schema_lists_every_field_of_a_stage() {
-        let parsed: serde_json::Value = serde_json::from_str(PIPELINE).unwrap();
-        let props = parsed["properties"]["jobs"]["items"]["properties"]
-            .as_object()
-            .unwrap();
-        for field in [
-            "name",
-            "command",
-            "needs",
-            "after",
-            "cwd",
-            "timeout",
-            "max_queue_time",
-            "tags",
-            "priority",
-            "env_capture",
-            "resources",
-            "env",
-        ] {
-            assert!(
-                props.contains_key(field),
-                "the schema has no field `{field}`"
-            );
-        }
         assert_eq!(
-            props.len(),
-            12,
-            "the schema has a field that a stage does not accept"
+            serialized_field_names(crate::pipeline::Stage::default()),
+            schema_property_names(PIPELINE, &["properties", "jobs", "items", "properties"])
         );
     }
 
@@ -569,36 +624,16 @@ mod tests {
     }
 
     /// The job schema must list each field of the job file. A missing field
-    /// gives an error, because the parser refuses an unknown field.
+    /// looks unsupported to an agent that reads `qex schema`, and a field that
+    /// the schema names but the parser refuses is an error.
+    ///
+    /// The names come from `JobFile`, and not from a list written here. See
+    /// `the_pipeline_schema_lists_every_field_of_a_stage`.
     #[test]
     fn the_job_schema_lists_every_field_of_the_job_file() {
-        let parsed: serde_json::Value = serde_json::from_str(JOB).unwrap();
-        let props = parsed["properties"].as_object().unwrap();
-        for field in [
-            "command",
-            "name",
-            "cwd",
-            "timeout",
-            "max_queue_time",
-            "tags",
-            "priority",
-            "env_capture",
-            "resources",
-            "env",
-            "needs",
-            "after",
-            "dedupe_key",
-            "dedupe_window",
-        ] {
-            assert!(
-                props.contains_key(field),
-                "the schema has no field `{field}`"
-            );
-        }
         assert_eq!(
-            props.len(),
-            14,
-            "the schema has a field that the job file does not accept"
+            serialized_field_names(crate::spec::JobFile::default()),
+            schema_property_names(JOB, &["properties"])
         );
     }
 
