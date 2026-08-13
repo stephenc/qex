@@ -80,7 +80,7 @@ pub enum Command {
     ///
     /// The page that a person watches fits the screen. Arrow keys or j/k
     /// move the selection. x stops the selected job, c takes it out of the
-    /// queue, i shows more, q leaves.
+    /// queue, i shows more, t shows the log tail, q leaves.
     Top(TopArgs),
 
     /// Write one line for each change of state, as it happens.

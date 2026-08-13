@@ -43,6 +43,7 @@ struct View {
     /// How many job lines the last page could hold.
     body_rows: usize,
     show_info: bool,
+    show_tail: bool,
     prompt: Option<Prompt>,
     message: Option<String>,
     dirty: bool,
@@ -60,7 +61,8 @@ impl View {
             selected: None,
             scroll: 0,
             body_rows: 12,
-            show_info: true,
+            show_info: false,
+            show_tail: false,
             prompt: None,
             message: None,
             dirty: false,
@@ -243,15 +245,18 @@ fn paint(
     // takes the first job, so reserve that height before the list is clipped.
     let preview = view.selected.or(ids.first().copied());
     let selected_job = preview.and_then(|id| ordered.iter().find(|j| j.id == id));
-    let info_n = if view.show_info {
-        info_lines(selected_job).len() + 1
-    } else {
-        0
-    };
     let extra = usize::from(view.prompt.is_some() || view.message.is_some());
-    // Top bar, header rows, jobs bar, heading, info pane, bottom bar.
-    let reserved = 1 + header.len() + 1 + 1 + info_n + 1 + extra;
-    view.body_rows = rows.saturating_sub(reserved).max(1);
+    let inner = width.saturating_sub(2).max(1);
+    // Top bar, header, jobs bar, heading, optional extra, bottom bar.
+    let chrome = 1 + header.len() + 1 + 1 + extra + 1;
+    let remaining = rows.saturating_sub(chrome);
+    let detail = detail_lines(view, selected_job, rows, remaining, inner);
+    let detail_n = if detail.is_empty() {
+        0
+    } else {
+        1 + detail.len()
+    };
+    view.body_rows = rows.saturating_sub(chrome + detail_n).max(1);
     sync_view(view, &ids, view.body_rows);
 
     let selected = view.selected;
@@ -299,10 +304,11 @@ fn paint(
         out.push_str(&pane_row("", width, false));
         drawn += 1;
     }
-    if view.show_info {
-        out.push_str(&pane_bar('├', '┤', "info", "", width));
-        for line in info_lines(selected_job) {
-            out.push_str(&pane_row(&line, width, false));
+    if !detail.is_empty() {
+        let title = if view.show_tail { "tail" } else { "info" };
+        out.push_str(&pane_bar('├', '┤', title, "", width));
+        for line in &detail {
+            out.push_str(&pane_row(line, width, false));
         }
     }
     if let Some(text) = prompt_text(view, selected_job) {
@@ -313,7 +319,7 @@ fn paint(
     out.push_str(&pane_bar(
         '└',
         '┘',
-        "j/k move   x stop   c cancel   i info   q quit",
+        "j/k move   x stop   c cancel   i info   t tail   q quit",
         "",
         width,
     ));
@@ -517,13 +523,19 @@ fn pane_bar(left: char, right: char, title: &str, extra: &str, width: usize) -> 
 
 fn pane_row(text: &str, width: usize, selected: bool) -> String {
     let inner = width.saturating_sub(2).max(1);
-    let fitted = fit(text, inner);
-    let pad = inner.saturating_sub(visible_len(&fitted));
-    let body = format!("{fitted}{}", " ".repeat(pad));
     let body = if selected {
-        crate::style::inverse(&body)
+        // Inverse a full-width PLAIN line. A state colour carries a reset,
+        // and that reset used to end the inverse at the state word, or
+        // before the pad, so the highlight stopped short of the border.
+        let plain = strip_sgr(text);
+        let mut fitted: String = plain.chars().take(inner).collect();
+        let pad = inner.saturating_sub(fitted.chars().count());
+        fitted.push_str(&" ".repeat(pad));
+        crate::style::inverse(&fitted)
     } else {
-        body
+        let fitted = fit(text, inner);
+        let pad = inner.saturating_sub(visible_len(&fitted));
+        format!("{fitted}{}", " ".repeat(pad))
     };
     format!(
         "{}{body}{}\n",
@@ -682,6 +694,49 @@ fn highlight(selected: bool, line: &str) -> String {
     format!("{mark}{line}")
 }
 
+fn detail_lines(
+    view: &View,
+    job: Option<&JobStatus>,
+    rows: usize,
+    remaining: usize,
+    inner: usize,
+) -> Vec<String> {
+    if view.show_info {
+        return wrap_all(&info_lines(job), inner);
+    }
+    if view.show_tail {
+        let want = (rows / 2).max(1);
+        // Keep one row for the jobs list when the screen allows it.
+        let max_content = remaining.saturating_sub(1 /* tail bar */ + 1 /* one job */);
+        let n = if remaining >= 3 {
+            want.min(max_content).max(1)
+        } else {
+            1
+        };
+        return tail_lines(job, n);
+    }
+    Vec::new()
+}
+
+fn wrap_all(lines: &[String], width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in lines {
+        out.extend(wrap_plain(line, width));
+    }
+    out
+}
+
+fn wrap_plain(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
+}
+
 fn info_lines(job: Option<&JobStatus>) -> Vec<String> {
     let Some(job) = job else {
         return vec!["no job is selected".into()];
@@ -701,6 +756,12 @@ fn info_lines(job: Option<&JobStatus>) -> Vec<String> {
         format!("command  {command}"),
         format!("cwd      {cwd}"),
         format!("id       {}", job.id),
+        format!(
+            "queue    {}",
+            format_duration(Duration::from_secs(queued_secs(job)))
+        ),
+        format!("run      {}", run_text(job)),
+        format!("note     {}", crate::job::printable(&note_for(job))),
     ];
     if !job.locks.is_empty() {
         lines.push(format!(
@@ -712,7 +773,81 @@ fn info_lines(job: Option<&JobStatus>) -> Vec<String> {
                 .join(", ")
         ));
     }
+    if let Some(err) = &job.error {
+        let err = crate::job::printable(err);
+        if !err.is_empty() && !note_for(job).contains(&err) {
+            lines.push(format!("error    {err}"));
+        }
+    }
     lines
+}
+
+fn queued_secs(job: &JobStatus) -> u64 {
+    let end = job.started_at.unwrap_or_else(sys::now_secs);
+    end.saturating_sub(job.submitted_at)
+}
+
+fn run_text(job: &JobStatus) -> String {
+    job.elapsed()
+        .map(format_duration)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn tail_lines(job: Option<&JobStatus>, n: usize) -> Vec<String> {
+    let mut lines = match job {
+        None => vec!["no job is selected".into()],
+        Some(job) => read_log_tail(job, n),
+    };
+    if lines.is_empty() {
+        lines.push("no output yet".into());
+    }
+    while lines.len() < n {
+        lines.push(String::new());
+    }
+    lines.truncate(n);
+    lines
+}
+
+fn read_log_tail(job: &JobStatus, n: usize) -> Vec<String> {
+    let Ok(dir) = crate::paths::job_dir(&job.id) else {
+        return vec!["no log directory".into()];
+    };
+    let mut chunks = Vec::new();
+    for (label, name) in [("stderr", "stderr.log"), ("stdout", "stdout.log")] {
+        let got = last_file_lines(&dir.join(name), n);
+        if !got.is_empty() {
+            chunks.push(format!("{label}:"));
+            chunks.extend(got);
+        }
+    }
+    if chunks.len() > n {
+        chunks.split_off(chunks.len() - n)
+    } else {
+        chunks
+    }
+}
+
+fn last_file_lines(path: &std::path::Path, n: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(64 * 1024);
+    if start > 0 {
+        let _ = file.seek(SeekFrom::Start(start));
+    }
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf);
+    let mut lines: Vec<String> = buf.lines().map(|l| crate::job::printable(l)).collect();
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    if lines.len() > n {
+        lines.split_off(lines.len() - n)
+    } else {
+        lines
+    }
 }
 
 fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
@@ -781,6 +916,16 @@ fn handle_key(view: &mut View, key: Key, jobs: &[JobStatus]) -> bool {
         }
         Key::Char(b'i') | Key::Enter => {
             view.show_info = !view.show_info;
+            if view.show_info {
+                view.show_tail = false;
+            }
+            view.dirty = true;
+        }
+        Key::Char(b't') => {
+            view.show_tail = !view.show_tail;
+            if view.show_tail {
+                view.show_info = false;
+            }
             view.dirty = true;
         }
         Key::Char(b'x') | Key::Char(b'K') => ask_stop(view, jobs),
@@ -1436,7 +1581,10 @@ mod tests {
         );
         assert!(page.contains("┌"), "the header pane is missing: {page}");
         assert!(page.contains("jobs"), "the jobs pane is missing: {page}");
-        assert!(page.contains("info"), "the info pane is missing: {page}");
+        assert!(
+            !page.contains("─ info "),
+            "the info pane must be off until the reader asks: {page}"
+        );
         assert!(page.contains("j/k move"), "the keys are missing: {page}");
     }
 
@@ -1466,10 +1614,6 @@ mod tests {
         assert!(
             text[text.len() - 1].contains("j/k move"),
             "the keys must sit on the last row: {page}"
-        );
-        assert!(
-            text.iter().any(|l| l.contains("info")),
-            "the info pane must stay after the jobs: {page}"
         );
     }
 
@@ -1579,6 +1723,71 @@ mod tests {
         assert!(
             page.contains("cwd      /home/me/project"),
             "the info must give the working directory: {page}"
+        );
+        assert!(
+            page.contains("queue    "),
+            "the info must give the wait: {page}"
+        );
+        assert!(
+            page.contains("run      "),
+            "the info must give the run: {page}"
+        );
+        assert!(
+            page.contains("note     "),
+            "the info must give the full note: {page}"
+        );
+    }
+
+    /// A state colour carries a reset. Inverse around that line used to end
+    /// at the state word, or before the pad, so the highlight stopped short.
+    #[test]
+    fn the_selection_covers_the_whole_row() {
+        let mut previous = HashMap::new();
+        let killed = job_line(&job(JobState::Killed, 1, 1 << 20), &mut previous);
+        let completed = job_line(&job(JobState::Completed, 1, 1 << 20), &mut previous);
+        for line in [killed, completed] {
+            let row = pane_row(&highlight(true, &line), 80, true);
+            assert_eq!(
+                visible_len(&row),
+                80,
+                "the highlight must reach the border: {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn t_opens_a_tail_pane_on_the_lower_half() {
+        let jobs = many_jobs(8);
+        let (ordered, hidden) = arrange(&jobs);
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        handle_key(&mut view, Key::Char(b't'), &ordered);
+        assert!(view.show_tail);
+        assert!(!view.show_info);
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            false,
+            Some(&mut view),
+            Some((20, 72)),
+        );
+        assert!(page.contains("tail"), "the tail pane is missing: {page}");
+        assert_eq!(page.lines().count(), 20, "got: {page}");
+        let tail_rows = page
+            .lines()
+            .skip_while(|l| !l.contains("tail"))
+            .skip(1)
+            .take_while(|l| !l.contains("j/k move"))
+            .count();
+        assert!(
+            tail_rows >= 1,
+            "the tail pane must keep at least one line: {page}"
+        );
+        assert!(
+            tail_rows >= 8,
+            "the tail pane must take about half of a 20-row screen: {tail_rows} {page}"
         );
     }
 }
