@@ -496,12 +496,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            // A command that does not exist is a frequent error. Write a clear
-            // message, and put it in the record of the job.
-            let message = format!(
-                "qex could not start `{}`: {e}. Test the program name and the PATH value.",
-                spec.command[0]
-            );
+            // The usual message says PATH. A list the kernel refuses, a NUL
+            // in a value, and a name that is not a program have nothing to
+            // do with PATH.
+            let message = spawn_fault_message(&spec.command[0], &e);
             eprintln!("{message}");
             status.state = JobState::Failed;
             status.finished_at = Some(sys::now_secs());
@@ -824,6 +822,48 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
 
     Ok(code.unwrap_or(0))
+}
+
+/// The words that a reader needs after the supervisor could not start the job.
+///
+/// A missing program is the usual cause, and the PATH is the usual remedy.
+/// Other spawn faults have nothing to do with PATH: a list the kernel
+/// refuses, a NUL in a value, a name that is not a program. A PATH remedy
+/// for those sends the reader to test a name that is correct.
+fn spawn_fault_message(program: &str, err: &std::io::Error) -> String {
+    let head = format!("qex could not start `{program}`: {err}.");
+    let remedy = match err.raw_os_error() {
+        Some(e) if e == libc::E2BIG => {
+            " An argument or the environment is larger than the kernel accepts. Shorten the command or the environment, and submit the job again."
+        }
+        Some(e) if e == libc::EACCES => {
+            " The kernel refuses this program. This process does not have permission to start it, or to search a directory on its path. Give the permission, or give a different path, and submit the job again."
+        }
+        Some(e) if e == libc::EISDIR => {
+            " The program name is a directory. Give the name of a file that is a program, and submit the job again."
+        }
+        Some(e) if e == libc::ENOTDIR => {
+            " A name in the program path is not a directory. Give a correct path, and submit the job again."
+        }
+        Some(e) if e == libc::ENOENT => " Test the program name and the PATH value.",
+        _ if is_nul_in_spawn_value(err) => {
+            " A value that qex gave the program holds a NUL character. The kernel cannot start such a program. Remove the NUL from the command, the directory or the environment, and submit the job again."
+        }
+        _ => {
+            " The kernel refused to start the program. Correct the cause that the error names, and submit the job again."
+        }
+    };
+    format!("{head}{remedy}")
+}
+
+/// A NUL never reaches the kernel, so this fault has no errno.
+///
+/// An empty environment key has the same kind and also has no errno. The
+/// word `nul` keeps that fault out of this remedy.
+fn is_nul_in_spawn_value(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::InvalidInput
+        && err.raw_os_error().is_none()
+        && err.to_string().to_ascii_lowercase().contains("nul")
 }
 
 /// How long the supervisor waits for the output of the job to close.
@@ -1411,6 +1451,107 @@ mod tests {
             !note.contains("  "),
             "a message must hold one space between two words: {note:?}"
         );
+        for err in spawn_faults_for_message_tests() {
+            let text = spawn_fault_message("prog", &err);
+            assert!(
+                !text.contains("  "),
+                "a message must hold one space between two words: {text:?}"
+            );
+        }
+    }
+
+    /// A spawn fault must name the remedy that fits the cause.
+    ///
+    /// The usual message says PATH. That is true for a missing program, and
+    /// false for a list the kernel refuses, a NUL in a value, and a name that
+    /// is not a program. A reader who obeys the wrong remedy tests a name
+    /// that is correct and learns nothing.
+    #[test]
+    fn a_spawn_fault_names_the_remedy_that_fits() {
+        let too_long = spawn_fault_message("prog", &std::io::Error::from_raw_os_error(libc::E2BIG));
+        assert!(
+            too_long.contains("larger than the kernel accepts"),
+            "E2BIG must name the size: {too_long}"
+        );
+        assert!(
+            !too_long.contains("PATH"),
+            "E2BIG is not a PATH fault: {too_long}"
+        );
+
+        let nul = spawn_fault_message("true", &error_from_a_nul_argument());
+        assert!(nul.contains("NUL"), "a NUL must name itself: {nul}");
+        assert!(!nul.contains("PATH"), "a NUL is not a PATH fault: {nul}");
+
+        let denied = spawn_fault_message("prog", &std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(
+            denied.contains("permission"),
+            "EACCES must name the permission: {denied}"
+        );
+        assert!(
+            !denied.contains("PATH"),
+            "EACCES is not a PATH fault: {denied}"
+        );
+
+        let is_dir = spawn_fault_message("prog", &std::io::Error::from_raw_os_error(libc::EISDIR));
+        assert!(
+            is_dir.contains("directory"),
+            "EISDIR must name the directory: {is_dir}"
+        );
+        assert!(
+            !is_dir.contains("PATH"),
+            "EISDIR is not a PATH fault: {is_dir}"
+        );
+
+        let not_dir =
+            spawn_fault_message("prog", &std::io::Error::from_raw_os_error(libc::ENOTDIR));
+        assert!(
+            not_dir.contains("not a directory"),
+            "ENOTDIR must name the path: {not_dir}"
+        );
+        assert!(
+            !not_dir.contains("PATH"),
+            "ENOTDIR is not a PATH fault: {not_dir}"
+        );
+
+        let missing =
+            spawn_fault_message("no-such", &std::io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(
+            missing.contains("PATH"),
+            "a missing program still names PATH: {missing}"
+        );
+        assert!(
+            missing.contains("no-such"),
+            "the message must name the program: {missing}"
+        );
+
+        let other = spawn_fault_message("prog", &std::io::Error::from_raw_os_error(libc::EPERM));
+        assert!(
+            !other.contains("PATH"),
+            "a setpgid refusal is not a PATH fault: {other}"
+        );
+    }
+
+    fn spawn_faults_for_message_tests() -> Vec<std::io::Error> {
+        vec![
+            std::io::Error::from_raw_os_error(libc::E2BIG),
+            error_from_a_nul_argument(),
+            std::io::Error::from_raw_os_error(libc::EACCES),
+            std::io::Error::from_raw_os_error(libc::EISDIR),
+            std::io::Error::from_raw_os_error(libc::ENOTDIR),
+            std::io::Error::from_raw_os_error(libc::ENOENT),
+            std::io::Error::from_raw_os_error(libc::EPERM),
+        ]
+    }
+
+    /// The error that `Command::spawn` gives for a NUL, not a constructed string.
+    ///
+    /// A test that builds the Display text the detector searches for stays
+    /// green if std changes that text.
+    fn error_from_a_nul_argument() -> std::io::Error {
+        std::process::Command::new("true")
+            .arg("a\0b")
+            .spawn()
+            .expect_err("a NUL in an argument must stop spawn")
     }
 
     /// A second fault must not push the first one out of the record.
