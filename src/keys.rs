@@ -88,15 +88,7 @@ pub fn watch() -> bool {
     }
 
     std::thread::spawn(|| {
-        use std::io::Read;
-        let mut stdin = std::io::stdin();
-        let mut byte = [0u8; 1];
-        while stdin.read(&mut byte).unwrap_or(0) == 1 {
-            let key = if byte[0] == 0x1b {
-                read_escape(&mut stdin)
-            } else {
-                decode_plain(byte[0])
-            };
+        while let Some(key) = read_key() {
             push(key);
         }
     });
@@ -125,64 +117,71 @@ fn decode_plain(byte: u8) -> Key {
     }
 }
 
-/// Reads the rest of an escape sequence after the ESC byte.
+/// Reads one key from the terminal file descriptor.
 ///
-/// A lone ESC is a key of its own. An arrow key is ESC, then `[`, then a
-/// letter, and those three bytes must become one key. A wait that is too long
-/// makes the arrow feel late; a wait that is too short turns an arrow into
-/// Esc. 50 ms is enough for a local terminal.
-fn read_escape(stdin: &mut std::io::Stdin) -> Key {
-    use std::io::Read;
+/// Do not use `std::io::Stdin` here. That handle has a buffer. An arrow key
+/// is three bytes (`ESC [ A`). A buffered read of the ESC byte also takes
+/// `[` and `A` out of the kernel, `poll` then sees nothing, and the arrow
+/// becomes a lone Esc. The selection does not move. Read the descriptor
+/// itself, so `poll` and `read` see the same bytes.
+fn read_key() -> Option<Key> {
+    let first = read_fd()?;
+    if first != 0x1b {
+        return Some(decode_plain(first));
+    }
+    // A lone ESC is a key of its own. An arrow is ESC, then more bytes, in
+    // the same instant. 50 ms is enough for a local terminal.
     if !stdin_ready(50) {
-        return Key::Esc;
+        return Some(Key::Esc);
     }
-    let mut intro = [0u8; 1];
-    if stdin.read(&mut intro).unwrap_or(0) != 1 {
-        return Key::Esc;
-    }
-    if intro[0] != b'[' && intro[0] != b'O' {
-        return Key::Esc;
-    }
-    if !stdin_ready(50) {
-        return Key::Esc;
-    }
-    let mut next = [0u8; 1];
-    if stdin.read(&mut next).unwrap_or(0) != 1 {
-        return Key::Esc;
-    }
-    match (intro[0], next[0]) {
-        (b'[', b'A') | (b'O', b'A') => Key::Up,
-        (b'[', b'B') | (b'O', b'B') => Key::Down,
-        (b'[', b'H') | (b'[', b'1') => {
-            eat_tilde(stdin, next[0]);
-            Key::Home
+    let mut buf = vec![0x1b];
+    while buf.len() < 16 {
+        let Some(byte) = read_fd() else {
+            break;
+        };
+        buf.push(byte);
+        if sequence_done(&buf) {
+            break;
         }
-        (b'[', b'F') | (b'[', b'4') => {
-            eat_tilde(stdin, next[0]);
-            Key::End
+        if !stdin_ready(20) {
+            break;
         }
-        (b'[', b'5') => {
-            eat_tilde(stdin, next[0]);
-            Key::PageUp
-        }
-        (b'[', b'6') => {
-            eat_tilde(stdin, next[0]);
-            Key::PageDown
-        }
-        _ => Key::Esc,
+    }
+    Some(decode(&buf).map(|(key, _)| key).unwrap_or(Key::Esc))
+}
+
+fn sequence_done(buf: &[u8]) -> bool {
+    if buf.len() < 3 || buf[0] != 0x1b {
+        return false;
+    }
+    match buf[1] {
+        b'[' => (0x40..=0x7e).contains(buf.last().unwrap()),
+        b'O' => buf.len() >= 3,
+        _ => true,
     }
 }
 
-fn eat_tilde(stdin: &mut std::io::Stdin, already: u8) {
-    use std::io::Read;
-    if already == b'~' {
-        return;
+fn read_fd() -> Option<u8> {
+    let mut byte = [0u8; 1];
+    loop {
+        let n = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                byte.as_mut_ptr() as *mut libc::c_void,
+                1,
+            )
+        };
+        if n == 1 {
+            return Some(byte[0]);
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+        }
+        return None;
     }
-    if !stdin_ready(20) {
-        return;
-    }
-    let mut extra = [0u8; 1];
-    let _ = stdin.read(&mut extra);
 }
 
 fn stdin_ready(timeout_ms: i32) -> bool {
@@ -196,42 +195,46 @@ fn stdin_ready(timeout_ms: i32) -> bool {
 
 /// Reads one complete key from a known sequence of bytes.
 ///
-/// The reader thread cannot use this: it must wait for the rest of an escape
-/// sequence. The tests can, because they hold the whole sequence.
+/// The tests hold the whole sequence. The reader thread builds that
+/// sequence with `read_key` and then calls this function.
 pub fn decode(bytes: &[u8]) -> Option<(Key, usize)> {
     let first = *bytes.first()?;
     if first != 0x1b {
         return Some((decode_plain(first), 1));
     }
-    match bytes {
-        [0x1b, b'[', b'A', ..] | [0x1b, b'O', b'A', ..] => Some((Key::Up, 3)),
-        [0x1b, b'[', b'B', ..] | [0x1b, b'O', b'B', ..] => Some((Key::Down, 3)),
-        [0x1b, b'[', b'5', b'~', ..] => Some((Key::PageUp, 4)),
-        [0x1b, b'[', b'6', b'~', ..] => Some((Key::PageDown, 4)),
-        [0x1b, b'[', b'H', ..] | [0x1b, b'[', b'1', b'~', ..] => {
-            Some((Key::Home, bytes_for_home(bytes)))
+    if bytes.len() >= 3 && (bytes[1] == b'[' || bytes[1] == b'O') {
+        if let Some(key) = decode_csi(bytes) {
+            return Some((key, bytes.len()));
         }
-        [0x1b, b'[', b'F', ..] | [0x1b, b'[', b'4', b'~', ..] => {
-            Some((Key::End, bytes_for_end(bytes)))
-        }
-        _ => Some((Key::Esc, 1)),
+    }
+    Some((Key::Esc, 1))
+}
+
+fn decode_csi(bytes: &[u8]) -> Option<Key> {
+    match *bytes.last()? {
+        b'A' => Some(Key::Up),
+        b'B' => Some(Key::Down),
+        b'H' => Some(Key::Home),
+        b'F' => Some(Key::End),
+        b'~' => match csi_number(bytes) {
+            5 => Some(Key::PageUp),
+            6 => Some(Key::PageDown),
+            1 | 7 => Some(Key::Home),
+            4 | 8 => Some(Key::End),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
-fn bytes_for_home(bytes: &[u8]) -> usize {
-    if bytes.starts_with(&[0x1b, b'[', b'1', b'~']) {
-        4
-    } else {
-        3
-    }
-}
-
-fn bytes_for_end(bytes: &[u8]) -> usize {
-    if bytes.starts_with(&[0x1b, b'[', b'4', b'~']) {
-        4
-    } else {
-        3
-    }
+fn csi_number(bytes: &[u8]) -> u32 {
+    let mid = bytes.get(2..bytes.len().saturating_sub(1)).unwrap_or(&[]);
+    let digits: String = mid
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .map(|b| *b as char)
+        .collect();
+    digits.parse().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -256,6 +259,11 @@ mod tests {
         assert_eq!(decode(b"\x1b[B"), Some((Key::Down, 3)));
         assert_eq!(decode(b"\x1bOA"), Some((Key::Up, 3)));
         assert_eq!(decode(b"\x1bOB"), Some((Key::Down, 3)));
+        // A modifier (Shift, Ctrl) sits in the middle. The last letter is
+        // still the arrow. A decoder that only accepts ESC [ A turns that
+        // sequence into Esc, and the selection does not move.
+        assert_eq!(decode(b"\x1b[1;5A"), Some((Key::Up, 6)));
+        assert_eq!(decode(b"\x1b[1;2B"), Some((Key::Down, 6)));
     }
 
     #[test]
