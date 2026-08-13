@@ -432,7 +432,7 @@ fn reserved_footer_lines(view: &View, hidden: usize) -> usize {
         n += 2;
     }
     if view.show_info {
-        n += 3;
+        n += 5;
     }
     if view.prompt.is_some() || view.message.is_some() {
         n += 1;
@@ -597,26 +597,33 @@ fn footer_text(
 }
 
 fn info_text(job: &JobStatus) -> String {
+    // The command and the directory are not handles. `safe_name` would turn
+    // `/home/me/project` into `_home_me_project` and `--epochs` into `_epochs`,
+    // and the reader could not act on either. `printable` keeps the path and
+    // the flags, and it still removes the bytes that move the cursor.
     let command = job
         .command
         .iter()
-        .map(|a| crate::job::safe_name(a))
+        .map(|a| crate::job::printable(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let cwd = crate::job::safe_name(&job.cwd);
-    let locks = if job.locks.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "  locks {}",
-            job.locks
+    let cwd = crate::job::printable(&job.cwd);
+    let mut out = format!(
+        "\ncommand  {command}\ncwd      {cwd}\nid       {}\n",
+        job.id
+    );
+    if !job.locks.is_empty() {
+        out.push_str("locks    ");
+        out.push_str(
+            &job.locks
                 .iter()
                 .map(|n| crate::job::safe_name(n))
                 .collect::<Vec<_>>()
-                .join(",")
-        )
-    };
-    format!("\n{}  {}\n{}{}\n", job.id, command, cwd, locks)
+                .join(", "),
+        );
+        out.push('\n');
+    }
+    out
 }
 
 fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
@@ -1403,8 +1410,14 @@ mod tests {
     #[test]
     fn i_shows_the_command_of_the_selected_job() {
         let mut j = job(JobState::Running, 1, 1 << 20);
-        j.command = vec!["uv".into(), "run".into(), "train.py".into()];
-        j.cwd = "workdir".into();
+        j.command = vec![
+            "uv".into(),
+            "run".into(),
+            "train.py".into(),
+            "--epochs".into(),
+            "50".into(),
+        ];
+        j.cwd = "/home/me/project".into();
         let (ordered, hidden) = arrange(std::slice::from_ref(&j));
         let mut previous = HashMap::new();
         let mut view = View::new();
@@ -1419,7 +1432,13 @@ mod tests {
             Some(&mut view),
             Some(24),
         );
-        assert!(page.contains("uv run train.py"), "got: {page}");
-        assert!(page.contains("workdir"), "got: {page}");
+        assert!(
+            page.contains("command  uv run train.py --epochs 50"),
+            "the info must give the command line: {page}"
+        );
+        assert!(
+            page.contains("cwd      /home/me/project"),
+            "the info must give the working directory: {page}"
+        );
     }
 }
