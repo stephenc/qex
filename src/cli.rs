@@ -79,8 +79,9 @@ pub enum Command {
     /// Watch the queue. Shows the claim and the true use of each job.
     ///
     /// The page that a person watches fits the screen. Arrow keys or j/k
-    /// move the selection. x stops the selected job, c takes it out of the
-    /// queue, i shows more, t shows the log tail, q leaves.
+    /// move the selection. x stops a job that operates, c takes a queued job
+    /// out, C deletes a finished record, i shows more, t shows the log tail,
+    /// q leaves.
     Top(TopArgs),
 
     /// Write one line for each change of state, as it happens.

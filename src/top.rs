@@ -53,6 +53,7 @@ struct View {
 enum Prompt {
     Stop(uuid::Uuid),
     LeaveQueue(uuid::Uuid),
+    Clean(uuid::Uuid),
 }
 
 impl View {
@@ -316,13 +317,7 @@ fn paint(
     } else if let Some(message) = &view.message {
         out.push_str(&pane_row(message, width, false));
     }
-    out.push_str(&pane_bar(
-        '└',
-        '┘',
-        "j/k move   x stop   c cancel   i info   t tail   q quit",
-        "",
-        width,
-    ));
+    out.push_str(&pane_bar('└', '┘', &action_keys(selected_job), "", width));
     // No newline after the last row. A page of N lines plus a newline on a
     // terminal of N rows scrolls the header off the screen.
     if out.ends_with('\n') {
@@ -850,10 +845,22 @@ fn last_file_lines(path: &std::path::Path, n: usize) -> Vec<String> {
     }
 }
 
+fn action_keys(job: Option<&JobStatus>) -> String {
+    let mut keys = vec!["j/k move".to_string()];
+    match job.map(|j| j.state) {
+        Some(state) if state.is_active() => keys.push("x stop".into()),
+        Some(JobState::Queued) => keys.push("c cancel".into()),
+        Some(state) if state.is_terminal() => keys.push("C clean".into()),
+        _ => {}
+    }
+    keys.extend(["i info".into(), "t tail".into(), "q quit".into()]);
+    keys.join("   ")
+}
+
 fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
     let prompt = view.prompt.as_ref()?;
     let id = match prompt {
-        Prompt::Stop(id) | Prompt::LeaveQueue(id) => *id,
+        Prompt::Stop(id) | Prompt::LeaveQueue(id) | Prompt::Clean(id) => *id,
     };
     let name = selected
         .filter(|j| j.id == id)
@@ -866,6 +873,9 @@ fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
         }
         Prompt::LeaveQueue(_) => {
             format!("Take {short} {name} out of the queue? Press y to cancel, or n to keep it.")
+        }
+        Prompt::Clean(_) => {
+            format!("Delete the record of {short} {name}? Press y to clean, or n to keep it.")
         }
     })
 }
@@ -881,23 +891,27 @@ fn apply_keys(view: &mut View, jobs: &[JobStatus]) -> bool {
 }
 
 fn handle_key(view: &mut View, key: Key, jobs: &[JobStatus]) -> bool {
-    if let Some(id) = view.prompt.as_ref().map(|p| match p {
-        Prompt::Stop(id) | Prompt::LeaveQueue(id) => *id,
-    }) {
-        let stop = matches!(view.prompt, Some(Prompt::Stop(_)));
+    if let Some(prompt) = view.prompt.take() {
+        let id = match prompt {
+            Prompt::Stop(id) | Prompt::LeaveQueue(id) | Prompt::Clean(id) => id,
+        };
         match key {
             Key::Char(b'y') | Key::Char(b'Y') => {
-                view.prompt = None;
-                view.message = Some(if stop { act_stop(id) } else { act_cancel(id) });
+                view.message = Some(match prompt {
+                    Prompt::Stop(_) => act_stop(id),
+                    Prompt::LeaveQueue(_) => act_cancel(id),
+                    Prompt::Clean(_) => act_clean(id),
+                });
                 view.need_refresh = true;
                 view.dirty = true;
             }
             Key::Char(b'n') | Key::Char(b'N') | Key::Esc => {
-                view.prompt = None;
                 view.dirty = true;
             }
             Key::Char(b'q') | Key::Char(b'Q') => return true,
-            _ => {}
+            _ => {
+                view.prompt = Some(prompt);
+            }
         }
         return false;
     }
@@ -930,6 +944,7 @@ fn handle_key(view: &mut View, key: Key, jobs: &[JobStatus]) -> bool {
         }
         Key::Char(b'x') | Key::Char(b'K') => ask_stop(view, jobs),
         Key::Char(b'c') => ask_cancel(view, jobs),
+        Key::Char(b'C') => ask_clean(view, jobs),
         _ => {}
     }
     false
@@ -1042,6 +1057,24 @@ fn ask_cancel(view: &mut View, jobs: &[JobStatus]) {
     view.dirty = true;
 }
 
+fn ask_clean(view: &mut View, jobs: &[JobStatus]) {
+    let Some(job) = view
+        .selected
+        .and_then(|id| jobs.iter().find(|j| j.id == id))
+    else {
+        view.message = Some("no job is selected".into());
+        view.dirty = true;
+        return;
+    };
+    if job.state.is_terminal() {
+        view.prompt = Some(Prompt::Clean(job.id));
+        view.message = None;
+    } else {
+        view.message = Some("clean deletes the record of a job that has stopped".into());
+    }
+    view.dirty = true;
+}
+
 fn act_stop(id: uuid::Uuid) -> String {
     let short = &id.to_string()[..8];
     match Client::connect_existing_result() {
@@ -1059,6 +1092,20 @@ fn act_stop(id: uuid::Uuid) -> String {
                 Err(e) => format!("{e:#}"),
             }
         }
+    }
+}
+
+fn act_clean(id: uuid::Uuid) -> String {
+    let short = &id.to_string()[..8];
+    match Client::connect_existing_result() {
+        Ok(None) => "no coordinator operates. qex cannot clean the job from this page.".into(),
+        Err(e) => format!("{e:#}"),
+        Ok(Some(mut client)) => match client.call(&Request::Clean { id }) {
+            Ok(Response::Ok) => format!("{short} deleted"),
+            Ok(Response::Error { message, .. }) => message,
+            Ok(_) => "the coordinator refused the request".into(),
+            Err(e) => format!("{e:#}"),
+        },
     }
 }
 
@@ -1689,6 +1736,51 @@ mod tests {
 
         handle_key(&mut view, Key::Char(b'c'), &[queued]);
         assert!(matches!(view.prompt, Some(Prompt::LeaveQueue(_))));
+    }
+
+    #[test]
+    fn the_keys_follow_the_state_of_the_selected_job() {
+        let running = job(JobState::Running, 1, 1 << 20);
+        let queued = {
+            let mut j = job(JobState::Queued, 1, 1 << 20);
+            j.started_at = None;
+            j
+        };
+        let done = job(JobState::Completed, 1, 1 << 20);
+        let run = action_keys(Some(&running));
+        assert!(run.contains("x stop"), "{run}");
+        assert!(!run.contains("c cancel"), "{run}");
+        assert!(!run.contains("C clean"), "{run}");
+        let wait = action_keys(Some(&queued));
+        assert!(wait.contains("c cancel"), "{wait}");
+        assert!(!wait.contains("x stop"), "{wait}");
+        assert!(!wait.contains("C clean"), "{wait}");
+        let finished = action_keys(Some(&done));
+        assert!(finished.contains("C clean"), "{finished}");
+        assert!(!finished.contains("x stop"), "{finished}");
+        assert!(!finished.contains("c cancel"), "{finished}");
+    }
+
+    #[test]
+    fn shift_c_asks_to_clean_a_job_that_stopped() {
+        let done = job(JobState::Completed, 1, 1 << 20);
+        let mut view = View::new();
+        view.selected = Some(done.id);
+        handle_key(&mut view, Key::Char(b'C'), &[done.clone()]);
+        assert!(matches!(view.prompt, Some(Prompt::Clean(id)) if id == done.id));
+
+        let running = job(JobState::Running, 1, 1 << 20);
+        view.prompt = None;
+        view.selected = Some(running.id);
+        handle_key(&mut view, Key::Char(b'C'), &[running]);
+        assert!(view.prompt.is_none());
+        assert!(
+            view.message
+                .as_deref()
+                .is_some_and(|m| m.contains("stopped")),
+            "got {:?}",
+            view.message
+        );
     }
 
     #[test]
