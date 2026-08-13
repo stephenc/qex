@@ -60,7 +60,7 @@ impl View {
             selected: None,
             scroll: 0,
             body_rows: 12,
-            show_info: false,
+            show_info: true,
             prompt: None,
             message: None,
             dirty: false,
@@ -153,7 +153,6 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
 
         let hidden;
         (ordered, hidden) = arrange(&jobs);
-        let rows = sys::terminal_rows();
         let page = paint(
             &ordered,
             hidden,
@@ -161,7 +160,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             &mut previous,
             !reached,
             Some(&mut view),
-            rows,
+            sys::terminal_size(),
         );
 
         print!("{CLEAR}{page}");
@@ -189,7 +188,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
                     &mut previous,
                     !reached,
                     Some(&mut view),
-                    sys::terminal_rows(),
+                    sys::terminal_size(),
                 );
                 print!("{CLEAR}{page}");
                 std::io::stdout().flush().ok();
@@ -216,10 +215,148 @@ fn paint(
     previous: &mut HashMap<uuid::Uuid, Previous>,
     unreachable: bool,
     mut live: Option<&mut View>,
-    rows: Option<usize>,
+    size: Option<(usize, usize)>,
+) -> String {
+    let header = header_lines(ordered, info, unreachable);
+    let heading = crate::style::heading(&format!(
+        "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}",
+        "ID",
+        "STATE",
+        "NAME",
+        "CPU CLAIM",
+        "CPU NOW",
+        "MEMORY CLAIM/NOW",
+        "RUNTIME",
+        "SINCE",
+        "NOTE"
+    ));
+
+    let mut lines: Vec<(uuid::Uuid, String)> = Vec::with_capacity(ordered.len());
+    for job in ordered {
+        lines.push((job.id, job_line(job, previous)));
+    }
+
+    if live.is_none() {
+        return paint_once(&header, &heading, &lines, hidden);
+    }
+
+    let (rows, cols) = size.unwrap_or((24, 80));
+    let width = cols.max(40);
+    let view = live.as_deref_mut().expect("live is Some");
+    let ids: Vec<uuid::Uuid> = lines.iter().map(|l| l.0).collect();
+    // The selection may still be empty on the first page. The info pane then
+    // takes the first job, so reserve that height before the list is clipped.
+    let preview = view.selected.or(ids.first().copied());
+    let selected_job = preview.and_then(|id| ordered.iter().find(|j| j.id == id));
+    let info_n = if view.show_info {
+        info_lines(selected_job).len() + 1
+    } else {
+        0
+    };
+    let extra = usize::from(view.prompt.is_some() || view.message.is_some());
+    // Top bar, header rows, jobs bar, heading, info pane, bottom bar.
+    let reserved = 1 + header.len() + 1 + 1 + info_n + 1 + extra;
+    view.body_rows = rows.saturating_sub(reserved).max(1);
+    sync_view(view, &ids, view.body_rows);
+
+    let selected = view.selected;
+    let selected_job = selected.and_then(|id| ordered.iter().find(|j| j.id == id));
+    let above = view.scroll;
+    let below = lines.len().saturating_sub(view.scroll + view.body_rows);
+    let mut jobs_title = "jobs".to_string();
+    if hidden > 0 {
+        jobs_title = format!("jobs · {hidden} stopped not shown");
+    }
+    let jobs_extra = match (above, below) {
+        (0, 0) => String::new(),
+        (a, b) => format!("{a} above, {b} below"),
+    };
+
+    let mut out = String::new();
+    out.push_str(&pane_bar(
+        '┌',
+        '┐',
+        "qex",
+        &sys::clock_text(sys::now_secs()),
+        width,
+    ));
+    for line in &header {
+        out.push_str(&pane_row(line, width, false));
+    }
+    out.push_str(&pane_bar('├', '┤', &jobs_title, &jobs_extra, width));
+    out.push_str(&pane_row(&heading, width, false));
+    if lines.is_empty() {
+        out.push_str(&pane_row("no jobs", width, false));
+    } else {
+        let end = (view.scroll + view.body_rows).min(lines.len());
+        for (id, styled) in &lines[view.scroll..end] {
+            let marked = highlight(Some(*id) == selected, styled);
+            out.push_str(&pane_row(&marked, width, Some(*id) == selected));
+        }
+    }
+    if view.show_info {
+        out.push_str(&pane_bar('├', '┤', "info", "", width));
+        for line in info_lines(selected_job) {
+            out.push_str(&pane_row(&line, width, false));
+        }
+    }
+    if let Some(text) = prompt_text(view, selected_job) {
+        out.push_str(&pane_row(&crate::style::warning(&text), width, false));
+    } else if let Some(message) = &view.message {
+        out.push_str(&pane_row(message, width, false));
+    }
+    out.push_str(&pane_bar(
+        '└',
+        '┘',
+        "j/k move   x stop   c cancel   i info   q quit",
+        "",
+        width,
+    ));
+    out
+}
+
+fn paint_once(
+    header: &[String],
+    heading: &str,
+    lines: &[(uuid::Uuid, String)],
+    hidden: usize,
 ) -> String {
     let mut out = String::new();
+    for line in header {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&sys::clock_text(sys::now_secs()));
+    out.push('\n');
+    out.push('\n');
+    out.push_str(heading);
+    out.push('\n');
+    if lines.is_empty() {
+        out.push_str("\nno jobs\n");
+    } else {
+        for (_, line) in lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if hidden > 0 {
+        out.push_str(&format!(
+            "\n{hidden} more job(s) that stopped are not shown. Use `qex list`.\n"
+        ));
+    }
+    out.push_str(&crate::style::faint(
+        "\nCPU NOW gives cores in use. SINCE gives the time since the job was queued, \
+         started or stopped.",
+    ));
+    out.push('\n');
+    if sys::stdin_is_terminal() {
+        out.push_str("Press q to stop.\n");
+    }
+    out
+}
 
+fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: bool) -> Vec<String> {
+    let mut lines = Vec::new();
     if let Some(Response::Info {
         version,
         program_replaced,
@@ -238,32 +375,25 @@ fn paint(
         ..
     }) = info
     {
-        out.push_str(&format!(
-            "qex   budget {cpu_claimed}/{cpu_budget} cores, {}/{} memory   \
-             {jobs_running} running, {jobs_queued} queued\n",
+        lines.push(format!(
+            "budget {cpu_claimed}/{cpu_budget} cores, {}/{} memory   \
+             {jobs_running} running, {jobs_queued} queued",
             format_size(*mem_claimed),
             format_size(*mem_budget),
         ));
-        // Give both versions. A coordinator can hold the code of an earlier
-        // build, and that difference caused a fault that named no cause.
         let mine = crate::version::VERSION;
         if version != mine {
-            out.push_str(&crate::style::warning(&format!(
-                "      WARNING: the coordinator is version {version} and this command is {mine}"
+            lines.push(crate::style::warning(&format!(
+                "WARNING: the coordinator is version {version} and this command is {mine}"
             )));
-            out.push('\n');
         } else {
-            out.push_str(&crate::style::faint(&format!("      version {version}")));
-            out.push('\n');
+            lines.push(crate::style::faint(&format!("version {version}")));
         }
         if *program_replaced {
-            out.push_str(
-                "      the qex program changed; this coordinator stops when no job operates\n",
+            lines.push(
+                "the qex program changed; this coordinator stops when no job operates".into(),
             );
         }
-
-        // Say the pause on the page. A person who watches a queue that starts
-        // nothing must read the cause here, and not look for it.
         let now = sys::now_secs();
         let fault = queue_state.as_deref() == Some("paused-by-fault");
         if let (true, Some(at)) = (
@@ -275,43 +405,33 @@ fn paint(
         ) {
             let record = crate::pause::PauseRecord {
                 paused_at: *at,
-                // The pid of the PAUSER. This page gave 0 for every pause,
-                // which `pause::who` prints as "an unknown process" — the
-                // honest answer for a coordinator that does not report it, and
-                // the wrong answer for one that does.
                 by_pid: paused_by_pid.unwrap_or(0),
                 reason: paused_reason.clone(),
                 until: *paused_until,
                 fault,
             };
-            out.push_str(&crate::style::warning(&format!(
-                "      QUEUE PAUSED: qex starts no job. {}",
+            lines.push(crate::style::warning(&format!(
+                "QUEUE PAUSED: qex starts no job. {}",
                 crate::pause::queue_line(&record, now)
             )));
-            out.push('\n');
         }
         for lock in paused_locks.iter().flatten() {
-            out.push_str(&crate::style::warning(&format!(
-                "      {}",
-                crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
+            lines.push(crate::style::warning(&crate::pause::lock_line(
+                &lock.name,
+                &lock.record,
+                lock.held_by.as_deref(),
+                now,
             )));
-            out.push('\n');
         }
-
-        // The health of the queue, in the same words as `qex info`. A reader of
-        // a screen that does not change must be able to see WHY it does not
-        // change, and the reason of each job is not on this screen.
         if let Some(info) = info {
             let line = crate::commands::queue_line(info);
             if !line.is_empty() {
-                out.push_str(&format!("      {line}\n"));
+                lines.push(line);
             }
         }
     }
 
     if info.is_none() {
-        // No coordinator. Give the budget from the config file, and count the
-        // jobs from their records.
         let cfg = crate::config::Config::load().unwrap_or_default();
         let active: Vec<&JobStatus> = ordered.iter().filter(|j| j.state.is_active()).collect();
         let queued = ordered
@@ -320,124 +440,120 @@ fn paint(
             .count();
         let cpu: u64 = active.iter().map(|j| j.cpu).sum();
         let mem: u64 = active.iter().map(|j| j.mem).sum();
-
-        out.push_str(&format!(
-            "qex   budget {cpu}/{} cores, {}/{} memory   {} running, {queued} queued\n",
+        lines.push(format!(
+            "budget {cpu}/{} cores, {}/{} memory   {} running, {queued} queued",
             cfg.budget_cpu().unwrap_or(0),
             format_size(mem),
             format_size(cfg.budget_mem().unwrap_or(0)),
             active.len(),
         ));
-        out.push_str(if unreachable {
-            // A coordinator that did not answer is NOT a coordinator that is
-            // absent, and this page must not say that nothing operates. The
-            // screen clears at each refresh, so the cause on stderr is gone by
-            // the next page and only this line carries it.
-            // EVERY CAUSE THAT REACHES THIS LINE, and not one of them.
-            //
-            // A coordinator that did not answer reaches it, and so does one
-            // that answered with words this version cannot read. The page must
-            // not name a cause that it did not test: what is true for both is
-            // that qex holds no answer from a coordinator.
-            "      qex has no answer from a coordinator. These records come from the state \
-             directory,\n\
-             \x20     and a coordinator can hold jobs that this page does not name.\n"
+        if unreachable {
+            lines.push(
+                "qex has no answer from a coordinator. These records come from the state \
+                 directory, and a coordinator can hold jobs that this page does not name."
+                    .into(),
+            );
         } else {
-            "      no coordinator operates. These records come from the state directory.\n\
-             \x20     qex starts a coordinator when you submit a job.\n"
-        });
+            lines.push(
+                "no coordinator operates. These records come from the state directory.".into(),
+            );
+            lines.push("qex starts a coordinator when you submit a job.".into());
+        }
     }
 
-    out.push_str(&format!(
-        "machine  {} cores, {} free of {}     {}\n\n",
+    lines.push(format!(
+        "machine  {} cores, {} free of {}",
         sys::cpu_count(),
         format_size(sys::available_memory()),
         format_size(sys::total_memory()),
-        // The time of the page. A reader of a screen that stopped refreshing
-        // must be able to see that it is old.
-        sys::clock_text(sys::now_secs()),
     ));
+    lines
+}
 
-    out.push_str(&crate::style::heading(&format!(
-        "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {}",
-        "ID",
-        "STATE",
-        "NAME",
-        "CPU CLAIM",
-        "CPU NOW",
-        "MEMORY CLAIM/NOW",
-        "RUNTIME",
-        "SINCE",
-        "NOTE"
-    )));
-    out.push('\n');
-
-    let mut lines: Vec<(uuid::Uuid, String)> = Vec::with_capacity(ordered.len());
-    for job in ordered {
-        lines.push((job.id, job_line(job, previous)));
-    }
-
-    if let (Some(view), Some(rows)) = (live.as_deref_mut(), rows) {
-        // Reserve the footer before we know the exact window counts. The
-        // footer is a few short lines, and one extra reserved line is better
-        // than a page that writes past the last row.
-        let header_n = out.lines().count();
-        let reserved = reserved_footer_lines(view, hidden);
-        view.body_rows = rows.saturating_sub(header_n + reserved).max(1);
-        let ids: Vec<uuid::Uuid> = lines.iter().map(|l| l.0).collect();
-        sync_view(view, &ids, view.body_rows);
-    }
-
-    let selected = live.as_ref().and_then(|v| v.selected);
-    let selected_job = selected.and_then(|id| ordered.iter().find(|j| j.id == id));
-    let footer = footer_text(
-        hidden,
-        live.as_deref(),
-        selected_job,
-        ordered.len(),
-        sys::stdin_is_terminal(),
-    );
-
-    if lines.is_empty() {
-        out.push_str("\nno jobs\n");
-        out.push_str(&footer);
-        return out;
-    }
-
-    let shown = if let Some(view) = live.as_deref() {
-        let end = (view.scroll + view.body_rows).min(lines.len());
-        &lines[view.scroll..end]
+fn pane_bar(left: char, right: char, title: &str, extra: &str, width: usize) -> String {
+    let inner = width.saturating_sub(2).max(1);
+    let mut core = format!("─ {title} ");
+    if !extra.is_empty() {
+        let tail = format!(" {extra} ─");
+        let fill = inner.saturating_sub(visible_len(&core) + visible_len(&tail));
+        core.push_str(&"─".repeat(fill));
+        core.push_str(&tail);
     } else {
-        lines.as_slice()
-    };
-
-    let mark = live.is_some();
-    for (id, styled) in shown {
-        let line = if mark {
-            highlight(Some(*id) == selected, styled)
-        } else {
-            styled.clone()
-        };
-        out.push_str(&line);
-        out.push('\n');
+        let fill = inner.saturating_sub(visible_len(&core));
+        core.push_str(&"─".repeat(fill));
     }
-    out.push_str(&footer);
+    core = fit(&core, inner);
+    let pad = inner.saturating_sub(visible_len(&core));
+    core.push_str(&"─".repeat(pad));
+    format!("{}\n", crate::style::faint(&format!("{left}{core}{right}")))
+}
+
+fn pane_row(text: &str, width: usize, selected: bool) -> String {
+    let inner = width.saturating_sub(2).max(1);
+    let fitted = fit(text, inner);
+    let pad = inner.saturating_sub(visible_len(&fitted));
+    let body = format!("{fitted}{}", " ".repeat(pad));
+    let body = if selected {
+        crate::style::inverse(&body)
+    } else {
+        body
+    };
+    format!(
+        "{}{body}{}\n",
+        crate::style::faint("│"),
+        crate::style::faint("│")
+    )
+}
+
+fn visible_len(s: &str) -> usize {
+    strip_sgr(s).chars().count()
+}
+
+fn strip_sgr(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for x in chars.by_ref() {
+                if ('@'..='~').contains(&x) {
+                    break;
+                }
+            }
+        } else if c != '\n' && c != '\r' {
+            out.push(c);
+        }
+    }
     out
 }
 
-fn reserved_footer_lines(view: &View, hidden: usize) -> usize {
-    // CPU NOW legend, the keys, and a blank line before them.
-    let mut n = 3;
-    if hidden > 0 {
-        n += 2;
+fn fit(s: &str, width: usize) -> String {
+    if visible_len(s) <= width {
+        return s.to_string();
     }
-    if view.show_info {
-        n += 5;
-    }
-    if view.prompt.is_some() || view.message.is_some() {
+    let mut out = String::new();
+    let mut n = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            out.push(c);
+            out.push(chars.next().unwrap());
+            for x in chars.by_ref() {
+                out.push(x);
+                if ('@'..='~').contains(&x) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if n >= width {
+            break;
+        }
+        out.push(c);
         n += 1;
     }
-    n
+    out.push_str("\x1b[0m");
+    out
 }
 
 fn job_line(job: &JobStatus, previous: &mut HashMap<uuid::Uuid, Previous>) -> String {
@@ -536,67 +652,13 @@ fn job_line(job: &JobStatus, previous: &mut HashMap<uuid::Uuid, Previous>) -> St
 
 fn highlight(selected: bool, line: &str) -> String {
     let mark = if selected { '>' } else { ' ' };
-    let marked = format!("{mark}{line}");
-    if selected {
-        crate::style::inverse(&marked)
-    } else {
-        marked
-    }
+    format!("{mark}{line}")
 }
 
-fn footer_text(
-    hidden: usize,
-    view: Option<&View>,
-    selected: Option<&JobStatus>,
-    total: usize,
-    tty: bool,
-) -> String {
-    let mut out = String::new();
-    if hidden > 0 {
-        out.push_str(&format!(
-            "\n{hidden} more job(s) that stopped are not shown. Use `qex list`.\n"
-        ));
-    }
-
-    if let (Some(view), Some(job)) = (view, selected) {
-        if view.show_info {
-            out.push_str(&info_text(job));
-        }
-    }
-
-    if let Some(view) = view {
-        if let Some(text) = prompt_text(view, selected) {
-            out.push_str(&crate::style::warning(&text));
-            out.push('\n');
-        } else if let Some(message) = &view.message {
-            out.push_str(message);
-            out.push('\n');
-        }
-    }
-
-    out.push_str(&crate::style::faint(
-        "\nCPU NOW gives cores in use. SINCE gives the time since the job was queued, \
-         started or stopped.",
-    ));
-    out.push('\n');
-
-    if let Some(view) = view {
-        let above = view.scroll;
-        let below = total.saturating_sub(view.scroll + view.body_rows);
-        let window = match (above, below) {
-            (0, 0) => String::new(),
-            (a, b) => format!("{a} above, {b} below.  "),
-        };
-        out.push_str(&format!(
-            "{window}j/k move   x stop   c cancel   i info   q quit\n"
-        ));
-    } else if tty {
-        out.push_str("Press q to stop.\n");
-    }
-    out
-}
-
-fn info_text(job: &JobStatus) -> String {
+fn info_lines(job: Option<&JobStatus>) -> Vec<String> {
+    let Some(job) = job else {
+        return vec!["no job is selected".into()];
+    };
     // The command and the directory are not handles. `safe_name` would turn
     // `/home/me/project` into `_home_me_project` and `--epochs` into `_epochs`,
     // and the reader could not act on either. `printable` keeps the path and
@@ -608,22 +670,22 @@ fn info_text(job: &JobStatus) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let cwd = crate::job::printable(&job.cwd);
-    let mut out = format!(
-        "\ncommand  {command}\ncwd      {cwd}\nid       {}\n",
-        job.id
-    );
+    let mut lines = vec![
+        format!("command  {command}"),
+        format!("cwd      {cwd}"),
+        format!("id       {}", job.id),
+    ];
     if !job.locks.is_empty() {
-        out.push_str("locks    ");
-        out.push_str(
-            &job.locks
+        lines.push(format!(
+            "locks    {}",
+            job.locks
                 .iter()
                 .map(|n| crate::job::safe_name(n))
                 .collect::<Vec<_>>()
-                .join(", "),
-        );
-        out.push('\n');
+                .join(", ")
+        ));
     }
-    out
+    lines
 }
 
 fn prompt_text(view: &View, selected: Option<&JobStatus>) -> Option<String> {
@@ -1323,17 +1385,27 @@ mod tests {
             &mut previous,
             false,
             Some(&mut view),
-            Some(20),
+            Some((20, 72)),
         );
         assert!(
             page.lines().count() <= 20,
             "the page has {} lines: {page}",
             page.lines().count()
         );
+        for line in page.lines() {
+            assert!(
+                visible_len(line) <= 72,
+                "a line is wider than the screen ({}) : {line}",
+                visible_len(line)
+            );
+        }
         assert!(
             page.contains("below"),
             "the page must say that more jobs exist: {page}"
         );
+        assert!(page.contains("┌"), "the header pane is missing: {page}");
+        assert!(page.contains("jobs"), "the jobs pane is missing: {page}");
+        assert!(page.contains("info"), "the info pane is missing: {page}");
         assert!(page.contains("j/k move"), "the keys are missing: {page}");
     }
 
@@ -1353,6 +1425,10 @@ mod tests {
         assert!(
             !page.contains("j/k move"),
             "the query must not wait for a key: {page}"
+        );
+        assert!(
+            !page.contains('┌'),
+            "the query must stay a plain page: {page}"
         );
     }
 
@@ -1430,7 +1506,7 @@ mod tests {
             &mut previous,
             false,
             Some(&mut view),
-            Some(24),
+            Some((24, 80)),
         );
         assert!(
             page.contains("command  uv run train.py --epochs 50"),

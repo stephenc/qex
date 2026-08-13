@@ -378,15 +378,20 @@ pub fn stdin_is_terminal() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
-/// The number of rows of the terminal that this command writes to.
+/// The size of the terminal that this command writes to, as `(rows, columns)`.
 ///
 /// `None` when the output is not a terminal, or when the system does not
-/// give a size. A page that has no size writes every job.
-pub fn terminal_rows() -> Option<usize> {
+/// give a size. A page that has no size writes every job and draws no frame.
+pub fn terminal_size() -> Option<(usize, usize)> {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) };
     if ok == 0 && size.ws_row > 0 {
-        Some(size.ws_row as usize)
+        let cols = if size.ws_col > 0 {
+            size.ws_col as usize
+        } else {
+            80
+        };
+        Some((size.ws_row as usize, cols))
     } else {
         None
     }
