@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
+const INVERSE: &str = "\x1b[7m";
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
@@ -65,6 +66,27 @@ pub fn faint(text: &str) -> String {
     wrap(DIM, text)
 }
 
+/// Writes the selected line of `qex top`.
+///
+/// Inverse video is the usual mark of a selection on a terminal. When colour
+/// is off, the caller must mark the line in another way, because this
+/// function then gives the text unchanged.
+pub fn inverse(text: &str) -> String {
+    wrap(INVERSE, text)
+}
+
+/// Inverse a short span inside already-styled text.
+///
+/// A full reset would drop the bold of the command bar. This turns inverse
+/// off and leaves the rest of the line as it was.
+pub fn inverse_span(text: &str) -> String {
+    if active() {
+        format!("{INVERSE}{text}\x1b[27m")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Writes text with the colour of a job state.
 ///
 /// The colour follows the meaning: green for work that operates, yellow for
@@ -116,6 +138,8 @@ mod tests {
     fn a_command_with_no_terminal_writes_plain_text() {
         assert_eq!(heading("ID"), "ID");
         assert_eq!(faint("done"), "done");
+        assert_eq!(inverse("sel"), "sel");
+        assert_eq!(inverse_span("x"), "x");
         assert_eq!(state("running", "running"), "running");
         assert!(!warning("careful").contains('\x1b'));
     }

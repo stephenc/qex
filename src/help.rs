@@ -1624,6 +1624,16 @@ Watch the queue
     qex top --once     one page, for a script
     qex top -i 5       a refresh every 5 seconds
 
+The page that a person watches fits the screen. Use the arrow keys or j and k
+to move the selection. x stops the selected job. c takes it out of the queue.
+i shows the command, the directory, the wait, the run and the note. t shows
+the tail of the logs in the lower half of the screen. x stops a job that
+operates. c takes a job out of the queue. C deletes the record of a job that
+has stopped. q stops the command.
+
+`--once` writes every job that the page names, and it does not wait for a key.
+Use it in a script.
+
 The CPU column gives the cores in use. Compare it with the CPU CLAIM column to
 find a claim that is much larger than the need.
 
