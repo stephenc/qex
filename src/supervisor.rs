@@ -4,9 +4,9 @@
 //! stop, fail or restart, and the job must continue and must still record its
 //! result. The supervisor writes `status.json` when the job stops.
 //!
-//! The supervisor starts the job in a new session and a new process group. The
-//! command `qex kill` can then signal every process of the job with one call,
-//! and no process of the job can avoid the signal.
+//! The coordinator gives the supervisor a session. The supervisor gives the
+//! job a process group. The command `qex kill` can then signal every process
+//! of the job with one call, and no process of the job can avoid the signal.
 
 use crate::daemon::{log, Coordinator};
 use crate::job::{self, JobState, Usage};
@@ -47,8 +47,8 @@ pub fn spawn(id: uuid::Uuid) -> Result<i32> {
 
     unsafe {
         cmd.pre_exec(|| {
-            // A new session. The job then continues after the terminal closes,
-            // and the job has its own process group for `qex kill`.
+            // The coordinator gives the supervisor a session. The job stays
+            // in that session, so the job continues after the terminal closes.
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -471,8 +471,8 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 
     unsafe {
         cmd.pre_exec(move || {
-            // A new process group. `qex kill` then signals every process of the
-            // job with one call to `killpg`.
+            // The supervisor gives the job a process group. `qex kill` then
+            // signals every process of the job with one call to `killpg`.
             if libc::setpgid(0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
