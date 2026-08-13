@@ -423,9 +423,9 @@ cargo test -- --test-threads=2
 cargo build --release
 ```
 
-Each end-to-end test makes its own config and state directory, starts its own
-coordinator, and stops it at the end. The tests do not touch the coordinator of
-the user, and they turn the peer accounting off.
+Each end-to-end test makes its own config, state and peer directory, starts
+its own coordinator, and stops it at the end. The tests do not touch the
+coordinator of the user, and they do not write into `/tmp/qex`.
 
 Use two test threads. Each end-to-end test starts real processes and waits for
 them. With more threads, the machine becomes busy, a job starts late, and a test

@@ -1,8 +1,9 @@
 //! End-to-end tests for qex.
 //!
-//! Each test makes its own config directory, state directory and runtime
-//! directory in a temporary location. A test thus starts its own coordinator,
-//! and it does not touch the coordinator of the user.
+//! Each test makes its own config directory, state directory, runtime
+//! directory and peer directory in a temporary location. A test thus starts
+//! its own coordinator, and it does not touch the coordinator of the user or
+//! the shared peer directory of the machine.
 //!
 //! These tests start real processes. They are slower than the unit tests, but
 //! they are the only tests that measure the behaviour that matters: a job that
@@ -29,6 +30,54 @@ struct Harness {
     root: PathBuf,
     /// Variables that each command of this test gets in addition.
     extra_env: Vec<(String, String)>,
+    /// The peer directory of this test. Every command sets `QEX_PEERS_DIR` to
+    /// this path, so a suite run cannot write into `/tmp/qex`.
+    peers_dir: PathBuf,
+}
+
+/// The name of the variable that moves the peer directory. It must match
+/// `src/peers.rs`. An integration test cannot read that constant.
+const QEX_PEERS_DIR: &str = "QEX_PEERS_DIR";
+
+/// The live peer directory of this machine. A test that would write here
+/// writes into the queue of the person who runs the suite.
+const LIVE_PEERS_DIR: &str = "/tmp/qex";
+
+/// Gives the peer directory for one test.
+///
+/// A config that already names a directory that is not `/tmp/qex` keeps that
+/// directory, so two coordinators can still share a private one. Every other
+/// config gets `isolated`. `/tmp/qex` is never the answer: that path is the
+/// live queue.
+fn peers_dir_for_test(config: &str, isolated: &Path) -> PathBuf {
+    for line in config.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("dir") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = rest.trim().trim_matches('"');
+        if !value.is_empty() && value != LIVE_PEERS_DIR {
+            return PathBuf::from(value);
+        }
+    }
+    isolated.to_path_buf()
+}
+
+/// Puts the isolation of one test onto a command.
+///
+/// Threads and a copied program cannot call `Harness::command`. They must
+/// still set the same variables, or a coordinator they start writes into
+/// `/tmp/qex`.
+fn isolate(cmd: &mut Command, root: &Path, peers: &Path) {
+    cmd.env("XDG_CONFIG_HOME", root.join("cfg"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("QEX_IDLE_EXIT_SECS", "120")
+        .env(QEX_PEERS_DIR, peers);
 }
 
 /// Gives one stream of a command in a form for a failure message.
@@ -77,10 +126,22 @@ impl Harness {
         std::fs::create_dir_all(root.join("cfg")).unwrap();
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::create_dir_all(root.join("run")).unwrap();
+        let isolated = root.join("peers");
+        std::fs::create_dir_all(&isolated).unwrap();
+        // The product refuses a peer directory without the sticky bit.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&isolated, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let peers_dir = peers_dir_for_test(config, &isolated);
+        assert_ne!(
+            peers_dir,
+            Path::new(LIVE_PEERS_DIR),
+            "the suite must not write into the live peer directory {LIVE_PEERS_DIR}"
+        );
         std::fs::write(root.join("cfg/qex.toml"), config).unwrap();
         Self {
             root,
             extra_env: Vec::new(),
+            peers_dir,
         }
     }
 
@@ -100,13 +161,9 @@ impl Harness {
     /// reader must change both, and a miss is silent.
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
-        cmd.args(args)
-            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            // Keep the coordinator for the length of the test only.
-            .env("QEX_IDLE_EXIT_SECS", "120")
-            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        cmd.args(args);
+        isolate(&mut cmd, &self.root, &self.peers_dir);
+        cmd.envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         cmd
     }
 
@@ -363,12 +420,7 @@ impl Harness {
     /// for the command to stop.
     #[allow(clippy::zombie_processes)]
     fn spawn(&self, args: &[&str]) -> std::process::Child {
-        Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(args)
-            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
+        self.command(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -397,12 +449,8 @@ impl Harness {
         let mut all: Vec<&str> = vec!["run", "--id-file", &id_path];
         all.extend_from_slice(args);
 
-        let child = Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(&all)
-            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
+        let child = self
+            .command(&all)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -427,12 +475,8 @@ impl Harness {
     /// test must measure that path with real pipes.
     fn qex_stdin(&self, args: &[&str], input: &str) -> Output {
         use std::io::Write;
-        let mut child = Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(args)
-            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
+        let mut child = self
+            .command(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -478,19 +522,83 @@ impl Harness {
             Err(_) => Vec::new(),
         }
     }
+
+    /// Stops every process that still holds a file of this test.
+    ///
+    /// Do not ask the socket, and do not trust the pid file alone. A test can
+    /// hide the socket, delete the pid file, or force the short socket path.
+    /// The coordinator still holds `daemon.log` under this root. A number in
+    /// a file is not enough: the system gives that number to a new process.
+    fn stop_coordinator(&self) {
+        let pids = self.pids_holding_this_root();
+        for pid in &pids {
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for pid in pids {
+            while Instant::now() < deadline && unsafe { libc::kill(pid, 0) } == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn may_stop(pid: i32) -> bool {
+        pid > 1 && pid != std::process::id() as i32 && pid != unsafe { libc::getppid() }
+    }
+
+    /// Finds processes that still hold a file under this harness root.
+    fn pids_holding_this_root(&self) -> Vec<i32> {
+        let mut pids = std::collections::BTreeSet::new();
+        if let Ok(proc) = std::fs::read_dir("/proc") {
+            for entry in proc.flatten() {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                if !Self::may_stop(pid) {
+                    continue;
+                }
+                let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                    continue;
+                };
+                let holds = fds.flatten().any(|fd| {
+                    std::fs::read_link(fd.path()).is_ok_and(|target| target.starts_with(&self.root))
+                });
+                if holds {
+                    pids.insert(pid);
+                }
+            }
+            return pids.into_iter().collect();
+        }
+        if let Ok(out) = Command::new("lsof")
+            .args(["-t", "+D"])
+            .arg(&self.root)
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Ok(pid) = line.trim().parse::<i32>() {
+                    if Self::may_stop(pid) {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+        pids.into_iter().collect()
+    }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
         // Stop the coordinator of this test, then delete the directory.
-        let out = self.qex(&["info", "--json"]);
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-            if let Some(pid) = v["pid"].as_i64() {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-        }
+        //
+        // Do not ask the socket for the pid. A test can hide that socket or
+        // replace it, and the coordinator then stays after cargo test returns.
+        self.stop_coordinator();
         std::fs::remove_dir_all(&self.root).ok();
     }
 }
@@ -1629,17 +1737,11 @@ fn the_output_of_a_job_is_recorded() {
 #[test]
 fn many_submissions_at_once_start_one_coordinator_only() {
     let h = Harness::with_default_config("race");
-    let exe = env!("CARGO_BIN_EXE_qex");
 
     let mut children = Vec::new();
     for _ in 0..20 {
         children.push(
-            Command::new(exe)
-                .args(["submit", "--", "true"])
-                .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-                .env("XDG_STATE_HOME", h.root.join("state"))
-                .env("XDG_RUNTIME_DIR", h.root.join("run"))
-                .env("QEX_IDLE_EXIT_SECS", "120")
+            h.command(&["submit", "--", "true"])
                 .spawn()
                 .expect("qex did not start"),
         );
@@ -1735,17 +1837,11 @@ fn a_second_submission_with_one_key_gives_the_first_job_and_starts_no_job() {
 #[test]
 fn many_submissions_with_one_key_at_once_make_one_job() {
     let h = Harness::with_default_config("dedupe-race");
-    let exe = env!("CARGO_BIN_EXE_qex");
 
     let mut children = Vec::new();
     for _ in 0..20 {
         children.push(
-            Command::new(exe)
-                .args(["submit", "--dedupe-key", "one", "--", "sleep", "30"])
-                .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-                .env("XDG_STATE_HOME", h.root.join("state"))
-                .env("XDG_RUNTIME_DIR", h.root.join("run"))
-                .env("QEX_IDLE_EXIT_SECS", "120")
+            h.command(&["submit", "--dedupe-key", "one", "--", "sleep", "30"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -2108,12 +2204,8 @@ fn a_signal_to_a_deduplicated_run_stops_the_wait_and_not_the_job() {
 
     // The second agent runs the same script. The key gives it the first job.
     let err_path = h.root.join("run.err");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["run", "--dedupe-key", "shared", "--", "sleep", "30"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
+    let mut child = h
+        .command(&["run", "--dedupe-key", "shared", "--", "sleep", "30"])
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(&err_path).unwrap())
         .spawn()
@@ -2168,12 +2260,8 @@ fn a_signal_to_a_run_that_started_its_job_stops_the_job() {
     let h = Harness::with_default_config("run-signal");
 
     let out_path = h.root.join("run.out");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["run", "--", "sh", "-c", "echo ready; sleep 30"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
+    let mut child = h
+        .command(&["run", "--", "sh", "-c", "echo ready; sleep 30"])
         .stdout(std::fs::File::create(&out_path).unwrap())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -2626,12 +2714,8 @@ fn a_job_receives_the_environment_and_the_directory_of_the_shell() {
     let dir = h.root.join("workdir");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["submit", "--", "sh", "-c", "pwd; echo MARK=$QEX_TEST_MARK"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
+    let out = h
+        .command(&["submit", "--", "sh", "-c", "pwd; echo MARK=$QEX_TEST_MARK"])
         .env("QEX_TEST_MARK", "captured")
         .current_dir(&dir)
         .output()
@@ -2655,8 +2739,8 @@ fn a_job_receives_the_environment_and_the_directory_of_the_shell() {
 fn the_environment_mode_none_removes_the_variables_of_the_shell() {
     let h = Harness::with_default_config("envnone");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args([
+    let out = h
+        .command(&[
             "submit",
             "--no-env-capture",
             "--env",
@@ -2666,10 +2750,6 @@ fn the_environment_mode_none_removes_the_variables_of_the_shell() {
             "-c",
             "echo MARK=$QEX_TEST_MARK KEPT=$KEPT",
         ])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
         .env("QEX_TEST_MARK", "leaked")
         .output()
         .unwrap();
@@ -4914,13 +4994,10 @@ fn a_replacement_of_the_program_does_not_stop_the_jobs() {
     std::fs::copy(env!("CARGO_BIN_EXE_qex"), &copy).unwrap();
 
     let run = |args: &[&str], exe: &std::path::Path| -> Output {
-        Command::new(exe)
-            .args(args)
-            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-            .env("XDG_STATE_HOME", h.root.join("state"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
-            .output()
-            .expect("qex did not start")
+        let mut cmd = Command::new(exe);
+        cmd.args(args);
+        isolate(&mut cmd, &h.root, &h.peers_dir);
+        cmd.output().expect("qex did not start")
     };
 
     let first = run(&["submit", "--", "true"], &copy);
@@ -5771,11 +5848,8 @@ fn the_directory_filters_select_the_right_jobs() {
     }
 
     let run_in = |dir: &std::path::Path, name: &str| -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(["submit", "--name", name, "--", "true"])
-            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-            .env("XDG_STATE_HOME", h.root.join("state"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
+        let out = h
+            .command(&["submit", "--name", name, "--", "true"])
             .current_dir(dir)
             .output()
             .unwrap();
@@ -5790,14 +5864,7 @@ fn the_directory_filters_select_the_right_jobs() {
     }
 
     let names = |args: &[&str], dir: &std::path::Path| -> Vec<String> {
-        let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(args)
-            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-            .env("XDG_STATE_HOME", h.root.join("state"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
-            .current_dir(dir)
-            .output()
-            .unwrap();
+        let out = h.command(args).current_dir(dir).output().unwrap();
         let jobs: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
         jobs.iter()
             .map(|j| j["name"].as_str().unwrap().to_string())
@@ -5813,11 +5880,8 @@ fn the_directory_filters_select_the_right_jobs() {
     );
 
     // A deletion must respect the same limit.
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["clean", "--under"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
+    let out = h
+        .command(&["clean", "--under"])
         .current_dir(&project)
         .output()
         .unwrap();
@@ -5931,12 +5995,9 @@ fn a_long_runtime_directory_still_works() {
     let h = Harness::with_default_config("longpath");
     std::fs::create_dir_all(&long).unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["submit", "--", "echo", "long-path-ok"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
+    let out = h
+        .command(&["submit", "--", "echo", "long-path-ok"])
         .env("XDG_RUNTIME_DIR", &long)
-        .env("QEX_IDLE_EXIT_SECS", "120")
         .output()
         .unwrap();
 
@@ -5947,23 +6008,17 @@ fn a_long_runtime_directory_still_works() {
     );
 
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let wait = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["wait", &id, "--timeout", "30s"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
+    let wait = h
+        .command(&["wait", &id, "--timeout", "30s"])
         .env("XDG_RUNTIME_DIR", &long)
-        .env("QEX_IDLE_EXIT_SECS", "120")
         .output()
         .unwrap();
     assert_eq!(wait.status.code(), Some(0));
 
     // Stop the coordinator of this test.
-    let info = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["info", "--json"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
+    let info = h
+        .command(&["info", "--json"])
         .env("XDG_RUNTIME_DIR", &long)
-        .env("QEX_IDLE_EXIT_SECS", "120")
         .output()
         .unwrap();
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&info.stdout) {
@@ -8413,17 +8468,13 @@ fn a_write_that_is_not_finished_does_not_change_the_budget_under_load() {
     // THE LOAD. Each submission wakes the scheduler, so the turns become
     // short. Without this the guard cannot be measured at all.
     let load = {
-        let (root, stop) = (h.root.clone(), stop.clone());
+        let (root, peers, stop) = (h.root.clone(), h.peers_dir.clone(), stop.clone());
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                Command::new(env!("CARGO_BIN_EXE_qex"))
-                    .args(["submit", "--", "true"])
-                    .env("XDG_CONFIG_HOME", root.join("cfg"))
-                    .env("XDG_STATE_HOME", root.join("state"))
-                    .env("XDG_RUNTIME_DIR", root.join("run"))
-                    .env("QEX_IDLE_EXIT_SECS", "120")
-                    .output()
-                    .ok();
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+                cmd.args(["submit", "--", "true"]);
+                isolate(&mut cmd, &root, &peers);
+                cmd.output().ok();
             }
         })
     };
@@ -8505,12 +8556,8 @@ fn a_command_refuses_a_configuration_path_that_is_not_a_regular_file() {
     }
 
     for args in [vec!["config", "show"], vec!["submit", "--", "true"]] {
-        let child = Command::new(env!("CARGO_BIN_EXE_qex"))
-            .args(&args)
-            .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-            .env("XDG_STATE_HOME", h.root.join("state"))
-            .env("XDG_RUNTIME_DIR", h.root.join("run"))
-            .env("QEX_IDLE_EXIT_SECS", "120")
+        let child = h
+            .command(&args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -8580,12 +8627,8 @@ fn a_configuration_path_that_is_not_a_regular_file_does_not_stop_the_coordinator
     let made = Command::new("mkfifo").arg(&path).status();
     if made.map(|s| s.success()).unwrap_or(false) {
         for _ in 0..6 {
-            let child = Command::new(env!("CARGO_BIN_EXE_qex"))
-                .args(["info"])
-                .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-                .env("XDG_STATE_HOME", h.root.join("state"))
-                .env("XDG_RUNTIME_DIR", h.root.join("run"))
-                .env("QEX_IDLE_EXIT_SECS", "120")
+            let child = h
+                .command(&["info"])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -10384,16 +10427,13 @@ fn the_config_file_controls_the_claim_in_the_environment() {
 /// limit hangs for ever when the stream gives nothing, and a test that hangs is
 /// worse than a test that fails: it says nothing and it holds the machine.
 fn events_reader(h: &Harness, args: &[&str]) -> std::process::Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
-    cmd.arg("events")
-        .args(args)
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
+    let mut all = vec!["events"];
+    all.extend_from_slice(args);
+    h.command(&all)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    cmd.spawn().expect("qex events did not start")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("qex events did not start")
 }
 
 /// Reads the lines of a reader that stopped, as JSON.
@@ -10828,14 +10868,11 @@ fn the_stream_counts_the_events_that_it_dropped() {
 
     // Make the ring small. With the usual size this test needs more than five
     // hundred events, and a test that takes minutes is a test that nobody runs.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
-    cmd.args(["submit", "--name", "gap0", "--", "true"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
-        .env("QEX_EVENTS_RETAINED", "3");
-    let out = cmd.output().expect("qex did not start");
+    let out = h
+        .command(&["submit", "--name", "gap0", "--", "true"])
+        .env("QEX_EVENTS_RETAINED", "3")
+        .output()
+        .expect("qex did not start");
     assert!(out.status.success(), "the first submission failed");
     let first = String::from_utf8_lossy(&out.stdout).trim().to_string();
     h.ok(&["wait", &first]);
@@ -10880,15 +10917,13 @@ fn the_coordinator_retires_under_a_reader_and_says_goodbye() {
 
     // The reader is the FIRST command, so the coordinator that it starts holds
     // this short idle time.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
-    cmd.args(["events", "--json", "--timeout", "60s"])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
+    let reader = h
+        .command(&["events", "--json", "--timeout", "60s"])
         .env("QEX_IDLE_EXIT_SECS", "3")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let reader = cmd.spawn().expect("qex events did not start");
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("qex events did not start");
 
     let out = reader.wait_with_output().expect("the reader did not stop");
     assert_eq!(
@@ -10959,14 +10994,12 @@ fn a_coordinator_that_has_no_event_stream_refuses_the_command() {
         }
     });
 
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["events", "--json", "--timeout", "10s"])
-        .env("XDG_CONFIG_HOME", root.join("cfg"))
-        .env("XDG_STATE_HOME", root.join("state"))
-        .env("XDG_RUNTIME_DIR", root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
-        .output()
-        .expect("qex did not start");
+    let peers = root.join("peers");
+    std::fs::create_dir_all(&peers).ok();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+    cmd.args(["events", "--json", "--timeout", "10s"]);
+    isolate(&mut cmd, &root, &peers);
+    let out = cmd.output().expect("qex did not start");
 
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -11060,14 +11093,12 @@ fn a_pipeline_with_an_option_on_a_later_stage_is_refused() {
         }
     });
 
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["pipeline", file.to_str().unwrap()])
-        .env("XDG_CONFIG_HOME", root.join("cfg"))
-        .env("XDG_STATE_HOME", root.join("state"))
-        .env("XDG_RUNTIME_DIR", root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
-        .output()
-        .expect("qex did not start");
+    let peers = root.join("peers");
+    std::fs::create_dir_all(&peers).ok();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+    cmd.args(["pipeline", file.to_str().unwrap()]);
+    isolate(&mut cmd, &root, &peers);
+    let out = cmd.output().expect("qex did not start");
 
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -11182,12 +11213,8 @@ fn a_rerun_of_a_job_that_holds_a_lock_is_refused_by_an_earlier_coordinator() {
         }
     });
 
-    let out = Command::new(env!("CARGO_BIN_EXE_qex"))
-        .args(["rerun", &id])
-        .env("XDG_CONFIG_HOME", h.root.join("cfg"))
-        .env("XDG_STATE_HOME", h.root.join("state"))
-        .env("XDG_RUNTIME_DIR", h.root.join("run"))
-        .env("QEX_IDLE_EXIT_SECS", "120")
+    let out = h
+        .command(&["rerun", &id])
         .output()
         .expect("qex did not start");
 
@@ -15609,6 +15636,130 @@ fn an_answer_that_never_finishes_does_not_stop_a_command() {
         String::from_utf8_lossy(&out.stderr).contains("did not finish it"),
         "the message must say that the answer began and did not finish: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A test that hides the socket must still stop its coordinator.
+///
+/// The tests that put a proxy in front of a real coordinator used to leave
+/// that coordinator after `cargo test` returned. Drop asked `qex info`, which
+/// talks to the proxy or to nobody. Drop now stops any process that still
+/// holds a file under the harness, including `daemon.log`.
+#[test]
+fn the_harness_stops_a_coordinator_whose_socket_it_cannot_reach() {
+    let h = Harness::with_default_config("dropcoord");
+    let pid = h.coordinator_pid();
+    assert!(
+        unsafe { libc::kill(pid, 0) } == 0,
+        "the test needs a coordinator that operates"
+    );
+    let run = h.root.join("state/qex/run");
+    std::fs::rename(run.join("s"), run.join("real")).unwrap();
+    drop(h);
+    assert!(
+        unsafe { libc::kill(pid, 0) } != 0,
+        "the coordinator {pid} stayed after the test hid its socket"
+    );
+}
+
+/// A test that deletes the pid file must still stop its coordinator.
+///
+/// `a_socket_that_answers_stops_a_new_coordinator` unlinks that file. A later
+/// `qex daemon` then writes a new file with its own number and exits. Drop
+/// that trusted the file alone left the first coordinator.
+#[test]
+fn the_harness_stops_a_coordinator_whose_pid_file_is_gone() {
+    let h = Harness::with_default_config("dropnopid");
+    let pid = h.coordinator_pid();
+    std::fs::remove_file(h.root.join("state/qex/run/pid")).unwrap();
+    drop(h);
+    assert!(
+        unsafe { libc::kill(pid, 0) } != 0,
+        "the coordinator {pid} stayed after the test deleted its pid file"
+    );
+}
+
+/// A long state path must still stop its coordinator.
+///
+/// When `state/qex/run/s` is longer than 100 bytes, the pid file lives in a
+/// short directory under the temporary directory, not under the harness root.
+/// Drop that read only `state/qex/run/pid` left that coordinator.
+#[test]
+fn the_harness_stops_a_coordinator_on_a_long_socket_path() {
+    // `/tmp/qx1-<name>-0/state/qex/run/s` is 27 bytes plus the name. The name
+    // must pass 73 bytes so the path is longer than 100 when TMPDIR is `/tmp`
+    // and the pid and the nanos are one digit.
+    let h = Harness::with_default_config(
+        "dropcoord-long-name-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    );
+    let preferred = h.root.join("state/qex/run/s");
+    assert!(
+        preferred.as_os_str().len() > 100,
+        "this test needs a socket path that does not fit: {}",
+        preferred.display()
+    );
+    let pid = h.coordinator_pid();
+    assert!(
+        !h.root.join("state/qex/run/pid").exists(),
+        "the pid file must be in the short directory, not under the harness"
+    );
+    drop(h);
+    assert!(
+        unsafe { libc::kill(pid, 0) } != 0,
+        "the coordinator {pid} stayed after a long socket path"
+    );
+}
+
+/// A coordinator that a test starts must not write into `/tmp/qex`.
+///
+/// The default config enables the peer system and names that directory. A
+/// test that forgets `[peers] enabled = false` used to publish there, next
+/// to the record of the coordinator that a person is using.
+#[test]
+fn the_suite_does_not_write_into_the_live_peer_directory() {
+    let h = Harness::new("livepeers", "[budget]\ncpu = \"1\"\n");
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let pid = h.coordinator_pid();
+    h.ok(&["wait", &id]);
+    let uid = unsafe { libc::getuid() };
+    let private = h
+        .peers_dir
+        .join(format!("u{uid}"))
+        .join(format!("peer-{pid}.json"));
+    h.until(
+        "this test published its claims in the private directory",
+        Duration::from_secs(10),
+        || private.exists(),
+    );
+    let live = PathBuf::from(LIVE_PEERS_DIR)
+        .join(format!("u{uid}"))
+        .join(format!("peer-{pid}.json"));
+    assert!(
+        !live.exists(),
+        "the suite wrote the claims of this test into the live peer directory: {}",
+        live.display()
+    );
+}
+
+/// The suite refuses the live peer directory even when a config names it.
+#[test]
+fn a_config_that_names_the_live_peer_directory_gets_a_private_one() {
+    let isolated = PathBuf::from("/tmp/qx-isolated-peers");
+    assert_eq!(
+        peers_dir_for_test("[peers]\ndir = \"/tmp/qex\"\n", &isolated),
+        isolated
+    );
+    assert_eq!(
+        peers_dir_for_test("[peers]\nenabled = false\n", &isolated),
+        isolated
+    );
+    let shared = PathBuf::from("/tmp/qxpeers-shared");
+    assert_eq!(
+        peers_dir_for_test(
+            &format!("[peers]\nenabled = true\ndir = \"{}\"\n", shared.display()),
+            &isolated
+        ),
+        shared
     );
 }
 
