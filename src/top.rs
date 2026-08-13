@@ -449,9 +449,13 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
         paused_reason,
         paused_until,
         paused_locks,
+        config_error,
         ..
     }) = info
     {
+        if let Some(fault) = config_error {
+            lines.push(crate::style::warning(&coordinator_config_line(fault)));
+        }
         lines.push(format!(
             "budget {cpu_claimed}/{cpu_budget} cores, {}/{} memory   \
              {jobs_running} running, {jobs_queued} queued",
@@ -509,7 +513,10 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
     }
 
     if info.is_none() {
-        let cfg = crate::config::Config::load().unwrap_or_default();
+        let (cfg, fault) = config_for_header();
+        if let Some(fault) = fault {
+            lines.push(crate::style::warning(&fault));
+        }
         let active: Vec<&JobStatus> = ordered.iter().filter(|j| j.state.is_active()).collect();
         let queued = ordered
             .iter()
@@ -545,6 +552,41 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
         format_size(sys::total_memory()),
     ));
     lines
+}
+
+/// A load fault must come back as a string, so the header can name the file.
+/// The budget line otherwise looks like a number the user chose.
+fn config_for_header() -> (crate::config::Config, Option<String>) {
+    match crate::config::Config::load_short() {
+        Ok(cfg) => (cfg, None),
+        Err(_) => (
+            crate::config::Config::default(),
+            Some(format!(
+                "WARNING: {} unreadable; this page uses the default values",
+                config_file_label()
+            )),
+        ),
+    }
+}
+
+/// The file name, not the path. The live page clips a long path from the right.
+fn config_file_label() -> String {
+    crate::paths::config_file()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "qex.toml".to_string())
+}
+
+/// `config_error` is a wait as well as a fault. A wait must not read as
+/// "the file is unreadable", because the coordinator just accepted a save.
+fn coordinator_config_line(error: &str) -> String {
+    let file = config_file_label();
+    if error == crate::daemon::WAITING_FOR_A_WRITER {
+        format!("WARNING: {file}: waiting for a writer; keeping prior values")
+    } else {
+        format!("WARNING: {file} unreadable; coordinator keeps its values")
+    }
 }
 
 fn pane_bar(left: char, right: char, title: &str, extra: &str, width: usize) -> String {
@@ -1586,6 +1628,7 @@ mod tests {
     /// it must not start it either.
     #[test]
     fn the_page_holds_the_jobs_with_no_coordinator() {
+        let _lock = crate::testutil::env_lock();
         let mut j = job(JobState::Completed, 2, 1 << 30);
         j.usage.max_rss = 100 << 20;
         j.finished_at = Some(5);
@@ -1604,6 +1647,258 @@ mod tests {
         );
         // The budget still comes from the config file.
         assert!(page.contains("cores"), "the budget is missing: {page}");
+    }
+
+    /// Isolates `XDG_CONFIG_HOME` so a test of the header can write a file
+    /// without reading the config of the person who runs the suite.
+    fn isolated_config(
+        tag: &str,
+        text: Option<&str>,
+    ) -> (std::path::PathBuf, crate::testutil::EnvVar) {
+        let dir = std::env::temp_dir().join(format!(
+            "qex-top-cfg-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = text {
+            std::fs::write(dir.join("qex.toml"), text).unwrap();
+        }
+        let guard = crate::testutil::EnvVar::set("XDG_CONFIG_HOME", dir.to_str().unwrap());
+        (dir, guard)
+    }
+
+    fn paint_live(info: Option<&Response>, cols: usize) -> String {
+        let (ordered, hidden) = arrange(&[]);
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        paint(
+            &ordered,
+            hidden,
+            info,
+            &mut previous,
+            PageHow {
+                update_cpu: true,
+                unreachable: false,
+                live: Some(&mut view),
+                size: Some((24, cols)),
+            },
+        )
+    }
+
+    fn info_with_config_error(error: Option<String>) -> Response {
+        let Response::Info {
+            pid,
+            version,
+            started_at,
+            program_replaced,
+            jobs_running,
+            jobs_queued,
+            cpu_budget,
+            mem_budget,
+            cpu_claimed,
+            mem_claimed,
+            queue_state,
+            paused_at,
+            paused_by_pid,
+            paused_reason,
+            paused_until,
+            paused_locks,
+            health,
+            pools,
+            ..
+        } = info()
+        else {
+            panic!("expected an info response")
+        };
+        Response::Info {
+            pid,
+            version,
+            started_at,
+            program_replaced,
+            jobs_running,
+            jobs_queued,
+            cpu_budget,
+            mem_budget,
+            cpu_claimed,
+            mem_claimed,
+            config_error: error,
+            queue_state,
+            paused_at,
+            paused_by_pid,
+            paused_reason,
+            paused_until,
+            paused_locks,
+            health,
+            pools,
+        }
+    }
+
+    /// A file that qex cannot read must not become the default values in
+    /// silence. The page must keep working, and it must name the file.
+    #[test]
+    fn a_config_file_that_qex_cannot_read_is_named_on_the_page() {
+        let _lock = crate::testutil::env_lock();
+        let (_dir, _cfg) =
+            isolated_config("bad", Some("[budget]\ncpu = \"1\"\n\n[unknown]\nfoo = 1\n"));
+
+        let mut previous = HashMap::new();
+        let page = render(&[], None, &mut previous, false);
+
+        assert!(
+            page.contains("default values"),
+            "the page must say that the numbers are not the user's: {page}"
+        );
+        assert!(
+            page.contains("qex.toml"),
+            "the page must name the file: {page}"
+        );
+        assert!(
+            page.contains("WARNING"),
+            "a silent fallback is the fault: {page}"
+        );
+        assert!(page.contains("budget"), "the page must still work: {page}");
+        assert!(
+            page.contains("no coordinator"),
+            "the page must still say that no coordinator operates: {page}"
+        );
+    }
+
+    /// The live page clips from the right. The file name must still be on
+    /// an 80-column screen, which is the form a person watches.
+    #[test]
+    fn a_live_page_still_names_a_config_file_that_qex_cannot_read() {
+        let _lock = crate::testutil::env_lock();
+        let (_dir, _cfg) = isolated_config(
+            "badlive",
+            Some("[budget]\ncpu = \"1\"\n\n[unknown]\nfoo = 1\n"),
+        );
+
+        let page = paint_live(None, 80);
+        assert!(
+            page.contains("qex.toml"),
+            "an 80-column page must still name the file: {page}"
+        );
+        assert!(
+            page.contains("default values"),
+            "the page must say that the numbers are not the user's: {page}"
+        );
+        for line in page.lines() {
+            assert!(
+                visible_len(line) <= 80,
+                "a line is wider than the screen ({}) : {line}",
+                visible_len(line)
+            );
+        }
+    }
+
+    /// A file that is gone is not a fault. qex uses the default values and
+    /// says nothing: that is the usual start, not a file that qex refused.
+    #[test]
+    fn a_missing_config_file_is_not_a_fault_on_the_page() {
+        let _lock = crate::testutil::env_lock();
+        let (_dir, _cfg) = isolated_config("gone", None);
+
+        let mut previous = HashMap::new();
+        let page = render(&[], None, &mut previous, false);
+
+        assert!(
+            !page.contains("default values"),
+            "a missing file must not look like a file that qex refused: {page}"
+        );
+        assert!(
+            !page.contains("WARNING"),
+            "a missing file is the usual start: {page}"
+        );
+        assert!(page.contains("budget"), "the page must still work: {page}");
+    }
+
+    /// A number that the user wrote must reach the header. A change that
+    /// always used the defaults would pass the warning tests and still hide
+    /// the file.
+    #[test]
+    fn the_header_uses_the_budget_from_a_file_that_qex_can_read() {
+        let _lock = crate::testutil::env_lock();
+        let (_dir, _cfg) = isolated_config("ok", Some("[budget]\ncpu = \"7\"\n"));
+
+        let mut previous = HashMap::new();
+        let page = render(&[], None, &mut previous, false);
+
+        assert!(
+            page.contains("0/7 cores"),
+            "the page must use the budget from the file: {page}"
+        );
+        assert!(
+            !page.contains("default values"),
+            "a file that qex can read is not a fault: {page}"
+        );
+    }
+
+    /// A coordinator that cannot read the file already holds the last good
+    /// values. The page must say so, or a person who watches `qex top` while
+    /// they edit the file never learns that the numbers are old.
+    #[test]
+    fn a_coordinator_config_fault_is_named_on_the_page() {
+        let broken = info_with_config_error(Some(
+            "parsing config file /x/qex.toml: unknown field `foo`".into(),
+        ));
+        let page = paint_live(Some(&broken), 80);
+        assert!(
+            page.contains("WARNING"),
+            "the page must name the fault: {page}"
+        );
+        assert!(
+            page.contains("qex.toml"),
+            "the page must name the file: {page}"
+        );
+        assert!(
+            page.contains("coordinator keeps its values"),
+            "the page must say that the numbers are the ones the coordinator already had: {page}"
+        );
+        assert!(
+            !page.contains("default values"),
+            "the coordinator did not take the defaults: {page}"
+        );
+        assert!(
+            !page.contains("waiting for a writer"),
+            "a parse fault is not a wait: {page}"
+        );
+        assert!(
+            page.contains("2/12 cores"),
+            "the budget of the coordinator must stay: {page}"
+        );
+    }
+
+    /// A young file is a wait, not a fault. The page must not say that qex
+    /// cannot use a file it is only ageing.
+    #[test]
+    fn a_coordinator_wait_for_a_writer_is_not_an_unreadable_file() {
+        let waiting = info_with_config_error(Some(crate::daemon::WAITING_FOR_A_WRITER.to_string()));
+        let page = paint_live(Some(&waiting), 80);
+        assert!(
+            page.contains("waiting for a writer"),
+            "the page must say that qex is waiting: {page}"
+        );
+        assert!(
+            page.contains("qex.toml"),
+            "the page must name the file: {page}"
+        );
+        assert!(
+            !page.contains("unreadable"),
+            "a wait must not read as a broken file: {page}"
+        );
+        assert!(
+            !page.contains("cannot use"),
+            "a wait must not read as a broken file: {page}"
+        );
+        assert!(
+            page.contains("2/12 cores"),
+            "the budget of the coordinator must stay: {page}"
+        );
     }
 
     /// The page must give the jobs that operate first, then the queue, then the
