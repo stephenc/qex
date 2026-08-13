@@ -496,12 +496,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            // A command that does not exist is a frequent error. Write a clear
-            // message, and put it in the record of the job.
-            let message = format!(
-                "qex could not start `{}`: {e}. Test the program name and the PATH value.",
-                spec.command[0]
-            );
+            // A command that does not exist is a frequent error. Two other
+            // faults reach spawn as well: a list the kernel refuses, and a
+            // NUL in a value. Those have nothing to do with PATH.
+            let message = spawn_fault_message(&spec.command[0], &e);
             eprintln!("{message}");
             status.state = JobState::Failed;
             status.finished_at = Some(sys::now_secs());
@@ -824,6 +822,24 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     crate::hook::fire(crate::hook::Origin::Supervisor, &dir, &status);
 
     Ok(code.unwrap_or(0))
+}
+
+/// The words that a reader needs after the supervisor could not start the job.
+///
+/// A missing program is the usual cause, and the PATH is the usual remedy.
+/// `--each-line` can also give a line that is too long, or a line that holds
+/// a NUL. A PATH remedy for those sends the reader to test a name that is
+/// correct.
+fn spawn_fault_message(program: &str, err: &std::io::Error) -> String {
+    let head = format!("qex could not start `{program}`: {err}.");
+    let remedy = if err.raw_os_error() == Some(libc::E2BIG) {
+        " An argument or the environment is larger than the kernel accepts. Shorten the command or the environment, and submit the job again."
+    } else if err.to_string().contains("nul byte") {
+        " A value that qex gave the program holds a NUL character. The kernel cannot start such a program. Remove the NUL from the command, the directory or the environment, and submit the job again."
+    } else {
+        " Test the program name and the PATH value."
+    };
+    format!("{head}{remedy}")
 }
 
 /// How long the supervisor waits for the output of the job to close.
@@ -1410,6 +1426,60 @@ mod tests {
         assert!(
             !note.contains("  "),
             "a message must hold one space between two words: {note:?}"
+        );
+        for err in [
+            std::io::Error::from_raw_os_error(libc::E2BIG),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nul byte found in provided data",
+            ),
+            std::io::Error::from_raw_os_error(libc::ENOENT),
+        ] {
+            let text = spawn_fault_message("prog", &err);
+            assert!(
+                !text.contains("  "),
+                "a message must hold one space between two words: {text:?}"
+            );
+        }
+    }
+
+    /// A spawn fault must name the remedy that fits the cause.
+    ///
+    /// The usual message says PATH. That is true for a missing program, and
+    /// false for a list the kernel refuses and for a NUL in a value. A reader
+    /// who obeys the wrong remedy tests a name that is correct and learns
+    /// nothing.
+    #[test]
+    fn a_spawn_fault_names_the_remedy_that_fits() {
+        let too_long = spawn_fault_message("prog", &std::io::Error::from_raw_os_error(libc::E2BIG));
+        assert!(
+            too_long.contains("larger than the kernel accepts"),
+            "E2BIG must name the size: {too_long}"
+        );
+        assert!(
+            !too_long.contains("PATH"),
+            "E2BIG is not a PATH fault: {too_long}"
+        );
+
+        let nul = spawn_fault_message(
+            "prog",
+            &std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "nul byte found in provided data",
+            ),
+        );
+        assert!(nul.contains("NUL"), "a NUL must name itself: {nul}");
+        assert!(!nul.contains("PATH"), "a NUL is not a PATH fault: {nul}");
+
+        let missing =
+            spawn_fault_message("no-such", &std::io::Error::from_raw_os_error(libc::ENOENT));
+        assert!(
+            missing.contains("PATH"),
+            "a missing program still names PATH: {missing}"
+        );
+        assert!(
+            missing.contains("no-such"),
+            "the message must name the program: {missing}"
         );
     }
 
