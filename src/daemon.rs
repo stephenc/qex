@@ -251,7 +251,7 @@ fn config_fingerprint(read: &ConfigFile) -> u64 {
 ///
 /// It is a WAIT, and not a fault of the file: the values that the coordinator
 /// holds are still the values of the last complete file.
-const WAITING_FOR_A_WRITER: &str =
+pub(crate) const WAITING_FOR_A_WRITER: &str =
     "a writer changes the configuration file now, so qex waits for it. The coordinator keeps \
      the values that it had.";
 

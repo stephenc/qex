@@ -1038,8 +1038,9 @@ enum Detail {
 /// to miss. Test BOTH before you change this text.
 ///
 /// 1. Does the command read the config file? `grep -n 'Config::load' src/`. A
-///    call with `?` stops. `qex top` (`unwrap_or_default`) and the supervisor
-///    of a job (it takes the default values) continue.
+///    call with `?` stops. `qex top` (it takes the default values and names
+///    the file on the page) and the supervisor of a job (it takes the default
+///    values) continue.
 /// 2. Does the command need a COORDINATOR? `Client::connect` starts one when
 ///    none operates, and a coordinator cannot start from a file that qex
 ///    cannot read. `qex info`, `qex list`, `qex status`, `qex kill`, `qex
