@@ -9787,8 +9787,26 @@ fn check_the_bash_candidates(
 /// the job uses them, and a build inside its budget still makes an editor
 /// stutter. qex knows what the scheduler of the machine does not: this work sat
 /// in a queue, so nobody waits for the next second of it.
+///
+/// `--nice 0` needs a coordinator at nice 0. The kernel refuses a value below
+/// the value of the process that asks, and qex does not ask for privilege. A
+/// queue that starts this suite gives the coordinator the nice value of the
+/// job. The test then sees that value, expects 0, and fails as though the
+/// code is wrong. If this process is above nice 0, the test stops and says so.
 #[test]
 fn a_job_gives_way_to_the_work_of_a_person() {
+    // `getpriority` can return -1 as a value or as a fault. A value above 0
+    // is the only state that cannot hold `--nice 0`, so a fault looks like
+    // 0 and the test runs.
+    let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    if nice > 0 {
+        eprintln!(
+            "this test did not run: this process is at nice {nice}, and qex cannot \
+             lower a nice value, so this test needs a coordinator at nice 0"
+        );
+        return;
+    }
+
     let h = Harness::with_default_config("polite");
 
     // `ps` reports the nice value on Linux and on macOS alike.
@@ -9801,9 +9819,9 @@ fn a_job_gives_way_to_the_work_of_a_person() {
         "a job must be polite by default, and this one was not: {out}"
     );
 
-    // A job that asks not to give way says so. The coordinator of this test
-    // runs at nice 0, so qex does not have to LOWER the value here and 0
-    // reaches the job. A coordinator under `nice 5` could not do this.
+    // A job that asks not to give way says so. The skip above holds the
+    // condition: this process is at nice 0, so qex does not have to LOWER
+    // the value and 0 reaches the job.
     let id = h.submit(&["submit", "--nice", "0", "--", "sh", "-c", "ps -o ni= -p $$"]);
     h.ok(&["wait", &id, "--timeout", "45s"]);
     let out = h.ok(&["logs", &id, "--stdout"]);
