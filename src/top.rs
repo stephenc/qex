@@ -160,6 +160,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             hidden,
             info.as_ref(),
             &mut previous,
+            true,
             !reached,
             Some(&mut view),
             sys::terminal_size(),
@@ -185,6 +186,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
                     hidden,
                     info.as_ref(),
                     &mut previous,
+                    false,
                     !reached,
                     Some(&mut view),
                     sys::terminal_size(),
@@ -203,7 +205,16 @@ fn render(
     unreachable: bool,
 ) -> String {
     let (ordered, hidden) = arrange(jobs);
-    paint(&ordered, hidden, info, previous, unreachable, None, None)
+    paint(
+        &ordered,
+        hidden,
+        info,
+        previous,
+        true,
+        unreachable,
+        None,
+        None,
+    )
 }
 
 fn paint(
@@ -211,6 +222,7 @@ fn paint(
     hidden: usize,
     info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
+    update_cpu: bool,
     unreachable: bool,
     mut live: Option<&mut View>,
     size: Option<(usize, usize)>,
@@ -231,7 +243,7 @@ fn paint(
 
     let mut lines: Vec<(uuid::Uuid, String)> = Vec::with_capacity(ordered.len());
     for job in ordered {
-        lines.push((job.id, job_line(job, previous)));
+        lines.push((job.id, job_line(job, previous, update_cpu)));
     }
 
     if live.is_none() {
@@ -251,13 +263,21 @@ fn paint(
     // Top bar, header, jobs bar, heading, optional extra, bottom bar.
     let chrome = 1 + header.len() + 1 + 1 + extra + 1;
     let remaining = rows.saturating_sub(chrome);
-    let detail = detail_lines(view, selected_job, rows, remaining, inner);
+    let mut detail = detail_lines(view, selected_job, rows, remaining, inner);
+    // One job row and the detail bar must still fit. A long note that wraps
+    // past that budget would push the header off the screen.
+    let max_detail = remaining.saturating_sub(2);
+    if max_detail == 0 {
+        detail.clear();
+    } else if detail.len() > max_detail {
+        detail.truncate(max_detail);
+    }
     let detail_n = if detail.is_empty() {
         0
     } else {
         1 + detail.len()
     };
-    view.body_rows = rows.saturating_sub(chrome + detail_n).max(1);
+    view.body_rows = remaining.saturating_sub(detail_n);
     sync_view(view, &ids, view.body_rows);
 
     let selected = view.selected;
@@ -285,11 +305,13 @@ fn paint(
         out.push_str(&pane_row(line, width, false));
     }
     out.push_str(&pane_bar('├', '┤', &jobs_title, &jobs_extra, width));
-    out.push_str(&pane_row(&heading, width, false));
+    out.push_str(&pane_row(&format!(" {heading}"), width, false));
     let mut drawn = 0;
     if lines.is_empty() {
-        out.push_str(&pane_row("no jobs", width, false));
-        drawn = 1;
+        if view.body_rows > 0 {
+            out.push_str(&pane_row("no jobs", width, false));
+            drawn = 1;
+        }
     } else {
         let end = (view.scroll + view.body_rows).min(lines.len());
         for (id, styled) in &lines[view.scroll..end] {
@@ -298,9 +320,8 @@ fn paint(
             drawn += 1;
         }
     }
-    // The jobs pane takes the leftover rows, so the info pane and the keys
-    // sit on the last lines of the terminal. A short list used to leave a
-    // hole under the table.
+    // Empty job rows pin the detail pane and the command bar to the bottom
+    // of the screen.
     while drawn < view.body_rows {
         out.push_str(&pane_row("", width, false));
         drawn += 1;
@@ -329,7 +350,16 @@ fn paint(
     if out.ends_with('\n') {
         out.pop();
     }
-    out
+    clip_to_rows(&out, rows)
+}
+
+fn clip_to_rows(page: &str, rows: usize) -> String {
+    let mut lines: Vec<&str> = page.lines().collect();
+    if lines.len() <= rows {
+        return page.to_string();
+    }
+    lines.truncate(rows);
+    lines.join("\n")
 }
 
 fn leave() -> i32 {
@@ -383,9 +413,6 @@ fn paint_once(
          started or stopped.",
     ));
     out.push('\n');
-    if sys::stdin_is_terminal() {
-        out.push_str("Press q to stop.\n");
-    }
     out
 }
 
@@ -542,9 +569,7 @@ fn key_chip(key: &str) -> String {
 fn pane_row(text: &str, width: usize, selected: bool) -> String {
     let inner = width.saturating_sub(2).max(1);
     let body = if selected {
-        // Inverse a full-width PLAIN line. A state colour carries a reset,
-        // and that reset used to end the inverse at the state word, or
-        // before the pad, so the highlight stopped short of the border.
+        // A state colour's reset would end inverse, so invert the plain text.
         let plain = strip_sgr(text);
         let mut fitted: String = plain.chars().take(inner).collect();
         let pad = inner.saturating_sub(fitted.chars().count());
@@ -613,7 +638,11 @@ fn fit(s: &str, width: usize) -> String {
     out
 }
 
-fn job_line(job: &JobStatus, previous: &mut HashMap<uuid::Uuid, Previous>) -> String {
+fn job_line(
+    job: &JobStatus,
+    previous: &mut HashMap<uuid::Uuid, Previous>,
+    update_cpu: bool,
+) -> String {
     // Measure the job now, for a job that operates.
     let (cpu_now, mem_now) = match (job.state.is_active(), job.pid) {
         (true, Some(pid)) => {
@@ -630,17 +659,23 @@ fn job_line(job: &JobStatus, previous: &mut HashMap<uuid::Uuid, Previous>) -> St
                     0.0
                 }
             });
-            previous.insert(
-                job.id,
-                Previous {
-                    cpu_secs: usage.cpu_secs,
-                    at: now,
-                },
-            );
+            // A key redraw must not reseed this sample. j/k would then
+            // measure CPU over 50ms and the next page would spike.
+            if update_cpu {
+                previous.insert(
+                    job.id,
+                    Previous {
+                        cpu_secs: usage.cpu_secs,
+                        at: now,
+                    },
+                );
+            }
             (cores, Some(usage.rss))
         }
         _ => {
-            previous.remove(&job.id);
+            if update_cpu {
+                previous.remove(&job.id);
+            }
             (None, None)
         }
     };
@@ -719,19 +754,18 @@ fn detail_lines(
     remaining: usize,
     inner: usize,
 ) -> Vec<String> {
+    let max_content = remaining.saturating_sub(2);
+    if max_content == 0 {
+        return Vec::new();
+    }
     if view.show_info {
-        return info_lines(job, inner);
+        let mut lines = info_lines(job, inner);
+        lines.truncate(max_content);
+        return lines;
     }
     if view.show_tail {
         let want = (rows / 2).max(1);
-        // Keep one row for the jobs list when the screen allows it.
-        let max_content = remaining.saturating_sub(1 /* tail bar */ + 1 /* one job */);
-        let n = if remaining >= 3 {
-            want.min(max_content).max(1)
-        } else {
-            1
-        };
-        return tail_lines(job, n);
+        return tail_lines(job, want.min(max_content));
     }
     Vec::new()
 }
@@ -889,17 +923,24 @@ fn read_log_tail(job: &JobStatus, n: usize) -> Vec<String> {
 
 fn last_file_lines(path: &std::path::Path, n: usize) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: u64 = 64 * 1024;
     let Ok(mut file) = std::fs::File::open(path) else {
         return Vec::new();
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let start = len.saturating_sub(64 * 1024);
-    if start > 0 {
-        let _ = file.seek(SeekFrom::Start(start));
+    let start = len.saturating_sub(WINDOW);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
     }
-    let mut buf = String::new();
-    let _ = file.read_to_string(&mut buf);
-    let mut lines: Vec<String> = buf.lines().map(|l| crate::job::printable(l)).collect();
+    let mut buf = Vec::new();
+    if std::io::Read::take(&mut file, WINDOW)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines: Vec<String> = text.lines().map(|l| crate::job::printable(l)).collect();
     if start > 0 && !lines.is_empty() {
         lines.remove(0);
     }
@@ -949,7 +990,7 @@ fn prompt_keys(view: &View, selected: Option<&JobStatus>) -> Option<String> {
         Prompt::Clean(_) => "clean",
     };
     Some(format!(
-        "{verb} {short} {name}?   {}   {}   {}",
+        "{}   {}   {}   {verb} {short} {name}?",
         key_hint("y", "yes"),
         key_hint("n", "no"),
         key_hint("q", "quit"),
@@ -1678,6 +1719,7 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
+            true,
             false,
             Some(&mut view),
             Some((20, 72)),
@@ -1724,6 +1766,7 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
+            true,
             false,
             Some(&mut view),
             Some((20, 72)),
@@ -1760,6 +1803,10 @@ mod tests {
         assert!(
             !page.contains('┌'),
             "the query must stay a plain page: {page}"
+        );
+        assert!(
+            !page.contains("Press q"),
+            "the query must not name a key that does not operate: {page}"
         );
     }
 
@@ -1878,6 +1925,7 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
+            true,
             false,
             Some(&mut view),
             Some((20, 72)),
@@ -1915,6 +1963,7 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
+            true,
             false,
             Some(&mut view),
             Some((24, 80)),
@@ -1974,8 +2023,8 @@ mod tests {
     #[test]
     fn the_selection_covers_the_whole_row() {
         let mut previous = HashMap::new();
-        let killed = job_line(&job(JobState::Killed, 1, 1 << 20), &mut previous);
-        let completed = job_line(&job(JobState::Completed, 1, 1 << 20), &mut previous);
+        let killed = job_line(&job(JobState::Killed, 1, 1 << 20), &mut previous, true);
+        let completed = job_line(&job(JobState::Completed, 1, 1 << 20), &mut previous, true);
         for line in [killed, completed] {
             let row = pane_row(&highlight(true, &line), 80, true);
             assert_eq!(
@@ -2000,6 +2049,7 @@ mod tests {
             hidden,
             Some(&info()),
             &mut previous,
+            true,
             false,
             Some(&mut view),
             Some((20, 72)),
@@ -2019,6 +2069,91 @@ mod tests {
         assert!(
             tail_rows >= 8,
             "the tail pane must take about half of a 20-row screen: {tail_rows} {page}"
+        );
+    }
+
+    /// A long note must not make the page taller than the terminal.
+    #[test]
+    fn a_long_info_note_still_fits_the_screen() {
+        let mut j = job(JobState::Queued, 1, 1 << 20);
+        j.started_at = None;
+        j.blocked_reason = Some("word ".repeat(200).trim().into());
+        let (ordered, hidden) = arrange(std::slice::from_ref(&j));
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        view.selected = Some(j.id);
+        view.show_info = true;
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            true,
+            false,
+            Some(&mut view),
+            Some((24, 80)),
+        );
+        assert!(
+            page.lines().count() <= 24,
+            "info overflowed the screen ({} lines): {page}",
+            page.lines().count()
+        );
+    }
+
+    /// The confirm chips must stay visible when the job name is long.
+    #[test]
+    fn a_long_name_does_not_hide_the_confirm_keys() {
+        let mut j = job(JobState::Completed, 1, 1 << 20);
+        j.name = "n".repeat(128);
+        let (ordered, hidden) = arrange(std::slice::from_ref(&j));
+        let mut previous = HashMap::new();
+        let mut view = View::new();
+        view.selected = Some(j.id);
+        handle_key(&mut view, Key::Char(b'C'), &ordered);
+        let page = paint(
+            &ordered,
+            hidden,
+            Some(&info()),
+            &mut previous,
+            true,
+            false,
+            Some(&mut view),
+            Some((20, 80)),
+        );
+        assert!(page.contains("y yes"), "y was clipped: {page}");
+        assert!(page.contains("n no"), "n was clipped: {page}");
+        assert!(page.contains("q quit"), "q was clipped: {page}");
+    }
+
+    #[test]
+    fn a_sideways_arrow_does_not_cancel_a_confirm() {
+        let running = job(JobState::Running, 1, 1 << 20);
+        let mut view = View::new();
+        view.selected = Some(running.id);
+        handle_key(&mut view, Key::Char(b'x'), std::slice::from_ref(&running));
+        assert!(matches!(view.prompt, Some(Prompt::Stop(_))));
+        handle_key(&mut view, Key::Left, std::slice::from_ref(&running));
+        assert!(
+            matches!(view.prompt, Some(Prompt::Stop(_))),
+            "left must not act as Esc"
+        );
+        handle_key(&mut view, Key::Right, std::slice::from_ref(&running));
+        assert!(matches!(view.prompt, Some(Prompt::Stop(_))));
+    }
+
+    #[test]
+    fn last_file_lines_reads_a_window_and_survives_bad_utf8() {
+        let dir = std::env::temp_dir().join(format!("qex-top-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.log");
+        let mut data = vec![0xffu8; 80 * 1024];
+        data.extend_from_slice(b"\nTHE_END\n");
+        std::fs::write(&path, &data).unwrap();
+        let lines = last_file_lines(&path, 5);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            lines.iter().any(|l| l.contains("THE_END")),
+            "the window missed the end: {lines:?}"
         );
     }
 }

@@ -30,6 +30,8 @@ pub enum Key {
     PageDown,
     Home,
     End,
+    Left,
+    Right,
     Enter,
     Esc,
 }
@@ -236,6 +238,8 @@ fn decode_csi(bytes: &[u8]) -> Option<Key> {
     match *bytes.last()? {
         b'A' => Some(Key::Up),
         b'B' => Some(Key::Down),
+        b'C' => Some(Key::Right),
+        b'D' => Some(Key::Left),
         b'H' => Some(Key::Home),
         b'F' => Some(Key::End),
         b'~' => match csi_number(bytes) {
@@ -286,6 +290,10 @@ mod tests {
         // sequence into Esc, and the selection does not move.
         assert_eq!(decode(b"\x1b[1;5A"), Some((Key::Up, 6)));
         assert_eq!(decode(b"\x1b[1;2B"), Some((Key::Down, 6)));
+        // Left and right are not Esc. Esc cancels a confirm; a sideways
+        // arrow must not.
+        assert_eq!(decode(b"\x1b[C"), Some((Key::Right, 3)));
+        assert_eq!(decode(b"\x1b[D"), Some((Key::Left, 3)));
     }
 
     #[test]
