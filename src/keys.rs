@@ -11,6 +11,9 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
+const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
+
 /// The settings of the terminal before this module changed them.
 static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
 
@@ -33,6 +36,15 @@ pub enum Key {
 
 /// Puts the terminal back to its usual behaviour.
 pub fn restore() {
+    // `write` is safe in a signal handler. Show the cursor before the
+    // process stops, or a Ctrl-C leaves the terminal with no cursor.
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            SHOW_CURSOR.as_ptr() as *const libc::c_void,
+            SHOW_CURSOR.len(),
+        );
+    }
     if let Ok(mut guard) = SAVED.lock() {
         if let Some(settings) = guard.take() {
             unsafe {
@@ -74,6 +86,16 @@ pub fn watch() -> bool {
     raw.c_cc[libc::VTIME] = 0;
     if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
         return false;
+    }
+
+    // Hide the cursor for the life of the page. A cursor on the last row,
+    // after a newline, scrolls the header off the screen.
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            HIDE_CURSOR.as_ptr() as *const libc::c_void,
+            HIDE_CURSOR.len(),
+        );
     }
 
     // Put the terminal back when a signal stops this process. Without this, a

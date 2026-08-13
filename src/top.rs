@@ -91,8 +91,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
 
     loop {
         if keys && apply_keys(&mut view, &ordered) {
-            crate::keys::restore();
-            return Ok(0);
+            return Ok(leave());
         }
 
         // Read the queue from the coordinator when one operates, and from the
@@ -163,17 +162,14 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             sys::terminal_size(),
         );
 
-        print!("{CLEAR}{page}");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
+        show_page(&page);
 
         // Sleep in short steps, so a key moves the selection at once and not
         // after the whole time between two refreshes.
         let until = Instant::now() + interval;
         while Instant::now() < until {
             if keys && apply_keys(&mut view, &ordered) {
-                crate::keys::restore();
-                return Ok(0);
+                return Ok(leave());
             }
             if view.need_refresh {
                 view.need_refresh = false;
@@ -190,8 +186,7 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
                     Some(&mut view),
                     sys::terminal_size(),
                 );
-                print!("{CLEAR}{page}");
-                std::io::stdout().flush().ok();
+                show_page(&page);
             }
             std::thread::sleep(Duration::from_millis(50).min(interval));
         }
@@ -322,7 +317,29 @@ fn paint(
         "",
         width,
     ));
+    // No newline after the last row. A page of N lines plus a newline on a
+    // terminal of N rows scrolls the header off the screen.
+    if out.ends_with('\n') {
+        out.pop();
+    }
     out
+}
+
+fn leave() -> i32 {
+    crate::keys::restore();
+    println!();
+    0
+}
+
+/// Writes the live page and parks the cursor on the last row.
+///
+/// The cursor must not sit after a newline on the last row. That wrap is
+/// what pushes the top pane off the display.
+fn show_page(page: &str) {
+    use std::io::Write;
+    let rows = sys::terminal_size().map(|(r, _)| r).unwrap_or(24);
+    print!("{CLEAR}{page}\x1b[{rows};1H");
+    std::io::stdout().flush().ok();
 }
 
 fn paint_once(
@@ -1401,6 +1418,10 @@ mod tests {
             page.lines().count(),
             20,
             "the page must fill the screen: {page}"
+        );
+        assert!(
+            !page.ends_with('\n'),
+            "a newline after the last row scrolls the header off"
         );
         for line in page.lines() {
             assert!(
