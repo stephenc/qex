@@ -173,9 +173,11 @@ Your job is not a child of your shell, and it is not a child of your agent:
       │
       ▼
   Coordinator ── starts ──▶ Supervisor ── starts ──▶ your job
-   (the queue)              (one for each job)      (its own session
-                                                     and process group)
+   (the queue)              (one for each job;       (a process group
+                             a session of its own)    of its own)
 ```
+
+The job stays in the session of the supervisor.
 
 Stop the coordinator, close the terminal, or replace the qex program:
 

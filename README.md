@@ -171,7 +171,7 @@ qex wait $TEST      # the code of the test, or 126 if the build failed
 ## Your session can stop, and the work continues
 
 The job is not a child of your shell, and it is not a child of your agent. A
-supervisor holds it in its own session, and the record of the job is on the disk.
+supervisor holds it in the session of the supervisor, and the record of the job is on the disk.
 
 Somebody can therefore stop your agent, close the terminal, or replace the qex
 binary. The job continues and it still writes its result. Your wait is the only

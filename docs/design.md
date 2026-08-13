@@ -21,8 +21,9 @@ coordinator.
 capacity. It stops one hour after the last job and the last command, so it uses
 no memory between your tasks.
 
-**A supervisor** controls one job. It starts the job in a new session and a new
-process group, writes the two output files, and records the result.
+**A supervisor** controls one job. The coordinator gives the supervisor a
+session. The supervisor gives the job a process group. The supervisor writes
+the two output files and records the result.
 
 The supervisor is a separate process for one reason: the coordinator can stop,
 fail or restart, and the job must continue and must still record its result. A
@@ -85,8 +86,8 @@ each start, which limits the damage, but an accurate claim is better.
 ## The property that an agent needs most
 
 The job is not a child of your shell, and it is not a child of your agent. The
-supervisor holds the job in its own session, and the record of the job is on the
-disk.
+supervisor holds the job in the session of the supervisor, and the record of the
+job is on the disk.
 
 Somebody can therefore stop your agent at any moment. The job continues, it
 writes its result, and a later session attaches to the same job with the id:
