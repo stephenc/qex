@@ -1315,13 +1315,13 @@ fn expire(
     // A job that ALREADY RAN must never get this state either.
     //
     // This guard is defensive, and no test here reproduces the state that it
-    // refuses. The reading behind it: a job between two attempts of `--retries`
-    // is `queued` and holds the `started_at` of the attempt that failed, and a
-    // coordinator that starts again puts every `queued` record back in the
-    // queue. A job in that gap would otherwise be able to expire, and its
-    // record would then say `expired` and hold a start time and an exit code at
-    // the same time. The state alone cannot separate the two cases; the start
-    // time can.
+    // refuses. A current job between two attempts of `--retries` stays
+    // `running` and cannot expire. An older record in that gap can be `queued`
+    // and still hold the `started_at` of the attempt that failed. A coordinator
+    // that starts again puts every `queued` record back in the queue. A job in
+    // that gap would otherwise be able to expire, and its record would then
+    // say `expired` and hold a start time and an exit code at the same time.
+    // The state alone cannot separate the two cases; the start time can.
     if job.status.started_at.is_some() {
         return;
     }
@@ -3074,10 +3074,11 @@ mod tests {
 
     /// A JOB THAT ALREADY RAN MUST NEVER GET THE STATE `expired`.
     ///
-    /// This guard is defensive. A job between two attempts of `--retries` is
-    /// `queued` and holds the `started_at` of the attempt that failed, and a
-    /// coordinator that starts again puts every `queued` record back in the
-    /// queue. The state alone cannot separate that job from one that never ran.
+    /// This guard is defensive. A current job between two attempts of
+    /// `--retries` stays `running`. An older record in that gap can be `queued`
+    /// and still hold the `started_at` of the attempt that failed. A coordinator
+    /// that starts again puts every `queued` record back in the queue. The state
+    /// alone cannot separate that job from one that never ran.
     #[test]
     fn a_job_that_holds_a_start_time_never_expires() {
         let mut state = state_with(JobState::Queued, Some(1), 3600);

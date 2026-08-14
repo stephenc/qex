@@ -6208,12 +6208,20 @@ fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
                 let attempts = v["attempts"].as_u64().unwrap_or(0);
 
                 // The final attempt succeeds, so the only terminal state that
-                // this record may ever hold is `completed`.
+                // this record may ever hold is `completed`. The job also stays
+                // active: `queued` would release its slot.
                 assert_ne!(
                     state, "failed",
                     "the record must never hold the state of an attempt that starts \
                      again; it held `failed` at attempt {attempts}"
                 );
+                if attempts >= 1 {
+                    assert_ne!(
+                        state, "queued",
+                        "a job with retries left must keep its slot; it held \
+                         `queued` at attempt {attempts}"
+                    );
+                }
 
                 if state == "running" && attempts > 1 {
                     saw_a_later_attempt = true;
@@ -6244,6 +6252,105 @@ fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
     assert_eq!(status["state"], "completed", "got: {status}");
     assert_eq!(status["attempts"], 2, "got: {status}");
     assert_eq!(status["exit_code"], 0, "got: {status}");
+}
+
+/// A job with retries keeps its slot until it stops. Another job must wait.
+///
+/// # The fault that this test prevents
+///
+/// A retry used to write `queued` between attempts. `claimed()` counts only
+/// `starting` and `running`, so a coordinator that started again — or that
+/// took the write — treated the slot as free. A second job of one core then
+/// started while the first job's next attempt still ran, and the machine
+/// used more cores than the budget.
+///
+/// The job stays `running`. The waiter stays in the queue until the last
+/// attempt stops.
+#[test]
+fn a_job_with_retries_keeps_its_slot_until_it_stops() {
+    let h = Harness::new(
+        "retryslot",
+        "[peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [budget]\ncpu = \"1\"\nmem = \"1GB\"\n",
+    );
+
+    let counter = h.root.join("attempts");
+    let script = format!(
+        "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; \
+         if [ $n -lt 2 ]; then exit 3; fi; sleep 8",
+        c = counter.display()
+    );
+    let first = h.submit(&[
+        "submit",
+        "--name",
+        "retry",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--retries",
+        "1",
+        "--",
+        "sh",
+        "-c",
+        &script,
+    ]);
+    h.until(
+        "the first attempt operates",
+        Duration::from_secs(45),
+        || h.state_of(&first) == "running",
+    );
+
+    let waiter = h.submit(&[
+        "submit", "--name", "waiter", "--cpu", "1", "--mem", "64MB", "--", "true",
+    ]);
+
+    // Cover the gap between the two attempts, and the second attempt itself.
+    // Read the record FILE as well as the coordinator: `queued` on the disk
+    // is the write that would release the slot after a restart.
+    let record = h.job_dir(&first).join("status.json");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let first_state = h.state_of(&first);
+        if first_state == "completed" {
+            break;
+        }
+        assert_eq!(
+            first_state, "running",
+            "a job with retries left must stay active"
+        );
+        if let Ok(text) = std::fs::read_to_string(&record) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                let on_disk = v["state"].as_str().unwrap_or("");
+                if on_disk != "completed" {
+                    assert_ne!(
+                        on_disk, "queued",
+                        "the record must not release the slot between attempts"
+                    );
+                    assert_eq!(
+                        on_disk, "running",
+                        "the record must stay active between attempts: {on_disk}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            h.state_of(&waiter),
+            "queued",
+            "a job with retries left must keep its slot"
+        );
+        assert!(
+            !h.has_started(&waiter),
+            "the waiter started while the retrying job still held the core"
+        );
+        assert!(Instant::now() < deadline, "the retrying job did not finish");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    h.until("the waiter starts", Duration::from_secs(45), || {
+        h.has_started(&waiter)
+    });
 }
 
 /// The record of a job must hold the SHORT form of a config fault.
@@ -11926,21 +12033,18 @@ fn a_failed_dependency_is_still_skipped_while_the_queue_is_paused() {
     h.ok(&["resume"]);
 }
 
-/// A retry must not start a new attempt while the queue is paused.
+/// A retry continues while the queue is paused. The job already started.
 ///
 /// # The fault that this test prevents
 ///
-/// A retry starts the next attempt inside the supervisor process. That process
-/// never gives the job back to the scheduler, so the pause test of the
-/// scheduler does not see it. Two fresh processes started 4 and 10 seconds
-/// AFTER `qex pause queue` answered "paused". A pause that starts work is the
-/// one thing that this feature must never do.
+/// The supervisor used to read the pause file and hold the next attempt. A
+/// pause stops new work. This job already holds its slot, so a pause that
+/// delayed the retry treated an operating job as a new submission. New work
+/// still waits.
 #[test]
-fn a_retry_starts_no_new_attempt_while_the_queue_is_paused() {
+fn a_retry_continues_while_the_queue_is_paused() {
     let h = Harness::with_default_config("pauseretry");
 
-    // Each attempt fails after a short time, so the job wants a retry while the
-    // test operates.
     let id = h.submit(&[
         "submit",
         "--cpu",
@@ -11961,10 +12065,8 @@ fn a_retry_starts_no_new_attempt_while_the_queue_is_paused() {
     );
 
     h.ok(&["pause", "queue"]);
+    let waiter = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
 
-    // Count the attempts that the job wrote. The first attempt can still be
-    // between the pause and its own end, so read the count after that.
-    std::thread::sleep(Duration::from_secs(5));
     let log = h.job_dir(&id).join("stdout.log");
     let count = |path: &Path| {
         std::fs::read_to_string(path)
@@ -11972,37 +12074,32 @@ fn a_retry_starts_no_new_attempt_while_the_queue_is_paused() {
             .matches("attempt")
             .count()
     };
-    let after_the_pause = count(&log);
-
-    // Measure over a period. One look would pass while an attempt waits for
-    // the one second that the retry gives the machine.
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while Instant::now() < deadline {
-        assert_eq!(
-            count(&log),
-            after_the_pause,
-            "a paused queue must start no attempt of a job with --retries"
-        );
-        std::thread::sleep(Duration::from_millis(400));
-    }
-
-    h.ok(&["resume"]);
-    h.until("the next attempt starts", Duration::from_secs(45), || {
-        count(&log) > after_the_pause
-    });
+    let at_the_pause = count(&log);
+    h.until(
+        "the next attempt starts while the queue is paused",
+        Duration::from_secs(45),
+        || count(&log) > at_the_pause,
+    );
+    assert_eq!(
+        h.state_of(&waiter),
+        "queued",
+        "a pause must still hold work that has not started"
+    );
 
     h.ok(&["kill", &id, "--grace", "1s"]);
+    h.ok(&["resume"]);
 }
 
-/// A retry must not take a lock that a person holds.
+/// A retry keeps the lock of the job until the job itself stops.
 ///
 /// # The fault that this test prevents
 ///
-/// The attempts of one job share one id and one record, so a retry that took
-/// the lock again gave a truthful message and an untruthful machine: the person
-/// held `gpu0` and a job used it.
+/// The supervisor used to wait when a person asked for the lock, so the next
+/// attempt treated the lock as free. The person then held `gpu0` in the record
+/// while the same job used it again, or another job took it between attempts.
+/// The lock comes to the person only when the job stops.
 #[test]
-fn a_retry_does_not_take_a_lock_that_a_person_holds() {
+fn a_retry_keeps_its_lock_until_the_job_stops() {
     let h = Harness::with_default_config("pauseretrylock");
 
     let id = h.submit(&[
@@ -12027,8 +12124,10 @@ fn a_retry_does_not_take_a_lock_that_a_person_holds() {
     );
 
     h.ok(&["pause", "lock", "gpu0"]);
+    let waiter = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--lock", "gpu0", "--", "true",
+    ]);
 
-    std::thread::sleep(Duration::from_secs(5));
     let log = h.job_dir(&id).join("stdout.log");
     let count = |path: &Path| {
         std::fs::read_to_string(path)
@@ -12036,26 +12135,32 @@ fn a_retry_does_not_take_a_lock_that_a_person_holds() {
             .matches("attempt")
             .count()
     };
-    let after_the_pause = count(&log);
+    let at_the_pause = count(&log);
+    h.until(
+        "the next attempt starts while a person has asked for the lock",
+        Duration::from_secs(45),
+        || count(&log) > at_the_pause,
+    );
+    assert_eq!(
+        h.state_of(&waiter),
+        "queued",
+        "another job must wait for the lock that the retrying job still holds"
+    );
 
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while Instant::now() < deadline {
-        assert_eq!(
-            count(&log),
-            after_the_pause,
-            "a person holds the lock, so no attempt of that job may start"
-        );
-        std::thread::sleep(Duration::from_millis(400));
-    }
+    h.ok(&["kill", &id, "--grace", "1s"]);
+    h.until("the retrying job stops", Duration::from_secs(45), || {
+        h.state_of(&id) == "killed"
+    });
+    assert_eq!(
+        h.state_of(&waiter),
+        "queued",
+        "the lock goes to the person when the job stops, not to the next job"
+    );
 
     h.ok(&["resume", "lock", "gpu0"]);
-    h.until("the next attempt starts", Duration::from_secs(45), || {
-        count(&log) > after_the_pause
+    h.until("the waiter takes the lock", Duration::from_secs(45), || {
+        h.has_started(&waiter)
     });
-
-    // The attempt runs `sleep 2; exit 1`, so it can stop by itself before this
-    // command reaches it. `stop` allows that; `ok` would call it a failure.
-    h.stop(&id);
 }
 
 /// A pause record that qex cannot read must HOLD the queue, and say why.

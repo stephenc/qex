@@ -600,9 +600,10 @@ impl State {
     /// priority. The queue is thus stable.
     ///
     /// A job can enter the queue more than one time: at the submission, and
-    /// again for each attempt that `--retries` gives it after a failure. Each
-    /// entry must use the same rule as the first, or a job that starts again
-    /// would go in front of the jobs that waited for it.
+    /// again if an older supervisor left a `queued` record after a failure.
+    /// A current retry stays `running` and does not come back here. Each entry
+    /// must use the same rule as the first, or a job that starts again would
+    /// go in front of the jobs that waited for it.
     pub fn enqueue(&mut self, id: uuid::Uuid) {
         if self.queue.contains(&id) {
             return;

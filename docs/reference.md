@@ -666,8 +666,8 @@ qex resume queue                              # start the queue again
 ```
 
 A paused queue starts **nothing**. The jobs that operate now continue, because
-each one already holds its capacity and a stop would lose that work. Use
-`qex kill <id>` to stop one.
+each one already holds its capacity and a stop would lose that work. A job
+with `--retries` is still that job. Use `qex kill <id>` to stop one.
 
 A lock is the better half:
 
@@ -687,7 +687,8 @@ b0bb2614  queued  train  ...  waits for the lock `gpu0`, which a person holds
 
 The pause is a file beside the job records, so it survives a coordinator that
 stops. It covers your queue only; it does not pause another user of the
-machine. A job with `--retries` waits too: its supervisor reads the same file.
+machine. A job with `--retries` is still a job that operates: the next attempt
+starts, and the job keeps its locks, until the last attempt stops.
 
 If qex cannot read that file, it holds the queue and says so. A file that qex
 cannot read can hold a pause, and qex does not know. `qex resume queue` writes

@@ -16,10 +16,10 @@
 //! one writer of a job record until the supervisor starts. The commands ask the
 //! coordinator; they do not write the file.
 //!
-//! The supervisor READS it. A retry starts the next attempt inside the
-//! supervisor process, which never gives the job back to the scheduler, so that
-//! process must test the pause itself. A file is a state that every process can
-//! read, which is the second reason for the file.
+//! A retry does not read this file. That job already started, so it keeps its
+//! slot and its locks and the next attempt starts, the same as any job that
+//! still operates. The file is for the coordinator, including one that starts
+//! again.
 
 use crate::paths;
 use anyhow::{Context, Result};
