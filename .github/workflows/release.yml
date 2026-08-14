@@ -379,17 +379,39 @@ jobs:
   #
   # This job comes after the release, and a failure here does not remove the
   # release: the binaries are the primary way to get qex, and crates.io is the
-  # second way. The job is skipped while the secret CARGO_REGISTRY_TOKEN does
-  # not exist, so the workflow is complete before the token arrives.
+  # second way. The publish job is skipped while the secret CARGO_REGISTRY_TOKEN
+  # does not exist, so the workflow is complete before the token arrives.
   #
   # `environment` makes this publish a deployment, next to github-pages, so the
   # Deployments page of the repository holds both places that a release goes.
-  # The job is skipped when there is no token, because a skipped job makes no
-  # deployment, and a green job with no publish would.
+  # A job `if` cannot read `secrets`, so a gate job writes whether the token
+  # exists. The publish job is skipped when it does not, because a skipped job
+  # makes no deployment, and a green job with no publish would.
+  crate-gate:
+    name: Can this release reach crates.io
+    needs: [decide, publish]
+    if: needs.decide.outputs.create-release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+    steps:
+      - id: check
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -n "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+            echo "No CARGO_REGISTRY_TOKEN secret exists, so this release does not publish to crates.io." \
+              >>"$GITHUB_STEP_SUMMARY"
+          fi
+
   crate:
     name: Publish to crates.io
-    needs: [decide, publish]
-    if: needs.decide.outputs.create-release == 'true' && secrets.CARGO_REGISTRY_TOKEN != ''
+    needs: [decide, crate-gate]
+    if: needs.crate-gate.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment:
