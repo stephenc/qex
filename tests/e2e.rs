@@ -2812,6 +2812,93 @@ fn the_job_files_are_private() {
     );
 }
 
+/// `qex logs --follow` can make the log file of a job. It must make it with
+/// the same mode as the supervisor: 0600.
+///
+/// # The fault that this test prevents
+///
+/// The follower opens with `.create(true)` so it can start before the
+/// supervisor makes the file. Without `.mode(0o600)`, the file takes 0666
+/// and the umask. The supervisor then keeps that mode, because `.mode()`
+/// applies to a new file only. The output of a job holds a token as
+/// frequently as its environment.
+///
+/// A follower that starts AFTER the supervisor made the file does not
+/// exercise this path. This test starts the follower while the job waits
+/// in a paused queue, so the file is not there yet.
+#[test]
+fn a_follower_that_makes_the_log_file_makes_it_private() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    let h = Harness::with_default_config("followmode");
+    h.ok(&["pause", "queue"]);
+    let id = h.submit(&["submit", "--", "echo", "secret"]);
+    let stdout_log = h.job_dir(&id).join("stdout.log");
+    let stderr_log = h.job_dir(&id).join("stderr.log");
+    assert!(
+        !stdout_log.exists() && !stderr_log.exists(),
+        "the supervisor must not have made the files yet"
+    );
+
+    // A umask of 0077 would hide the fault: 0666 & !0077 is 0600. The issue
+    // was measured at 0002, which leaves 0664.
+    let mut child = {
+        let mut cmd = h.command(&["logs", &id, "--follow"]);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::umask(0o002);
+                Ok(())
+            });
+        }
+        cmd.spawn().expect("qex logs --follow did not start")
+    };
+
+    h.until(
+        "the follower makes the log files",
+        Duration::from_secs(15),
+        || stdout_log.exists() && stderr_log.exists(),
+    );
+
+    for path in [&stdout_log, &stderr_log] {
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must be private, and not take the umask",
+            path.file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    h.ok(&["resume", "queue"]);
+    h.ok(&["wait", &id, "--timeout", "30s"]);
+
+    for path in [&stdout_log, &stderr_log] {
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must stay private after the job writes",
+            path.file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    // The job stopped, so the follower must stop too.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().ok();
+                panic!("the follower did not stop after the job");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 /// qex must not use a command line to find a job. This test submits a job whose
 /// command holds the letters `qex daemon`, which is the pattern that a person
 /// writes for `pgrep -f`. Every command must still operate.
