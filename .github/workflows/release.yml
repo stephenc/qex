@@ -379,14 +379,25 @@ jobs:
   #
   # This job comes after the release, and a failure here does not remove the
   # release: the binaries are the primary way to get qex, and crates.io is the
-  # second way. The job does nothing while the secret CARGO_REGISTRY_TOKEN does
+  # second way. The job is skipped while the secret CARGO_REGISTRY_TOKEN does
   # not exist, so the workflow is complete before the token arrives.
+  #
+  # `environment` makes this publish a deployment, next to github-pages, so the
+  # Deployments page of the repository holds both places that a release goes.
+  # The job is skipped when there is no token, because a skipped job makes no
+  # deployment, and a green job with no publish would.
   crate:
     name: Publish to crates.io
     needs: [decide, publish]
-    if: needs.decide.outputs.create-release == 'true'
+    if: needs.decide.outputs.create-release == 'true' && secrets.CARGO_REGISTRY_TOKEN != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment:
+      name: crates.io
+      url: https://crates.io/crates/qex/${{ needs.decide.outputs.version }}
+    permissions:
+      contents: read
+      deployments: write
     steps:
       # The tagged commit holds the release number already, so `cargo publish`
       # reads the correct number from a working tree that nothing changed.
@@ -404,10 +415,4 @@ jobs:
         # line would appear in the process list of the machine.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
-            echo "No CARGO_REGISTRY_TOKEN secret exists, so this step does nothing." \
-              >>"$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          cargo publish --locked
+        run: cargo publish --locked
