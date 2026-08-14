@@ -889,6 +889,8 @@ fn a_usage_error_of_a_command_that_speaks_for_a_job_uses_the_band() {
         vec!["status"],
         vec!["wait"],
         vec!["submit", "--wait", "--cpu", "not-a-number", "--", "true"],
+        vec!["pipeline", "--no-such-option"],
+        vec!["rerun", "--no-such-option"],
     ] {
         let out = h.qex(&args);
         assert_eq!(
@@ -900,10 +902,34 @@ fn a_usage_error_of_a_command_that_speaks_for_a_job_uses_the_band() {
         );
     }
 
-    // A command that never speaks for a job keeps the conventional code 2. The
-    // band binds the commands that pass the code of a job through, and no more.
+    // A command that never starts a job and never gives a job result keeps the
+    // conventional code 2.
     let out = h.qex(&["list", "--no-such-option"]);
     assert_eq!(out.status.code(), Some(2));
+}
+
+/// `qex pipeline` and `qex rerun` start a job, so they speak in the same voice
+/// as `qex submit`. A refusal is 121. An id that does not exist is 127.
+#[test]
+fn pipeline_and_rerun_use_the_band_of_a_job() {
+    let h = Harness::with_default_config("pipeband");
+
+    let missing = h.root.join("no-such-pipeline.toml");
+    let out = h.qex(&["pipeline", missing.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(121),
+        "a pipeline file that qex cannot read is a refusal: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = h.qex(&["rerun", "00000000-0000-0000-0000-000000000000"]);
+    assert_eq!(
+        out.status.code(),
+        Some(127),
+        "a rerun of a job that does not exist is 127: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// `qex status --follow` is the way back to a job of `qex run`.
@@ -11497,10 +11523,10 @@ fn a_pipeline_with_an_option_on_a_later_stage_is_refused() {
     drop(server);
     std::fs::remove_dir_all(&root).ok();
 
-    assert_ne!(
+    assert_eq!(
         out.status.code(),
-        Some(0),
-        "the command must fail. stdout: {stdout} stderr: {err}"
+        Some(121),
+        "a refused pipeline must give 121, as `qex submit` does. stdout: {stdout} stderr: {err}"
     );
     assert!(
         err.contains("--nice"),
@@ -11614,10 +11640,10 @@ fn a_rerun_of_a_job_that_holds_a_lock_is_refused_by_an_earlier_coordinator() {
     let requests = seen.lock().unwrap().clone();
     drop(server);
 
-    assert_ne!(
+    assert_eq!(
         out.status.code(),
-        Some(0),
-        "the command must fail. stdout: {stdout} stderr: {err}"
+        Some(121),
+        "a refused rerun must give 121, as `qex submit` does. stdout: {stdout} stderr: {err}"
     );
     assert!(
         err.contains("--lock"),

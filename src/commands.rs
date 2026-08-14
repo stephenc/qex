@@ -4495,7 +4495,7 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
                     stage.name
                 );
                 let _ = id;
-                return report(other);
+                return report_for_a_job(other);
             }
         }
     }
@@ -5535,7 +5535,7 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
             println!("{new_id}");
             Ok(0)
         }
-        other => report(other),
+        other => report_for_a_job(other),
     }
 }
 

@@ -163,8 +163,10 @@ you act on the difference between \"the job failed\" and \"my wait stopped\".
 A code from 125 does NOT say that your work failed: another agent on this
 machine can stop your job, so read the line on stderr before you run it again.
 
-`qex list`, `qex logs` and the other commands never speak for a job, so they use
-0, 1, 2 and 127 in the usual way. Run `qex help exit-codes` for the band.
+`qex submit`, `qex pipeline` and `qex rerun` use the same band: a refusal is
+121, and never 1. `qex list`, `qex logs` and the other commands never speak for
+a job, so they use 0, 1, 2 and 127 in the usual way. Run `qex help exit-codes`
+for the band.
 
 If qex cannot start at all
 --------------------------
@@ -1993,7 +1995,8 @@ pub const EXIT_CODES: &str = "\
 qex exit codes
 ==============
 
-One table. Every command that gives you the result of a job obeys it.
+One table. Every command that starts a job or gives you the result of a job
+obeys it.
 
     0 to 96     THE JOB. qex gives the exit code of the job, unchanged.
     97 to 127   QEX. The code describes the queue or the wait, never the job.
@@ -2056,9 +2059,12 @@ THE CODE ANSWERS `PASS OR FAIL`. THE RECORD ANSWERS `WHY`. An agent that acts
 on the difference between \"the job failed\" and \"my wait stopped\" reads
 `qex status`. An agent that needs pass or fail reads the code.
 
-Every command that gives you the result of a job obeys it: `qex run`,
-`qex submit --wait`, `qex submit --follow`, `qex wait`, `qex status --wait`,
-`qex status --follow` and `qex status --quiet`.
+Every command that starts a job or gives you the result of a job obeys it:
+`qex submit`, `qex run`, `qex pipeline`, `qex rerun`, `qex wait`,
+`qex status --wait`, `qex status --follow` and `qex status --quiet`.
+`qex submit`, `qex pipeline` and `qex rerun` give 0 when they start the work;
+they do not wait, so 0 is not the result of the job. A fault of those commands
+is 121, and never 1.
 
 Every other command gives 0 for success, 1 for a failure, 2 for a command line
 that qex cannot read, and 127 for a job that does not exist. `qex list` never

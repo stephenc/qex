@@ -94,9 +94,12 @@ jobs that did not stop then have no watcher, so wait again for them.
 
 ## The exit codes
 
-**One table.** Every command that gives you the result of a job obeys it:
-`qex run`, `qex submit --wait`, `qex submit --follow`, `qex wait`,
+**One table.** Every command that starts a job or gives you the result of a
+job obeys it: `qex submit`, `qex run`, `qex pipeline`, `qex rerun`, `qex wait`,
 `qex status --wait`, `qex status --follow` and `qex status --quiet`.
+`qex submit`, `qex pipeline` and `qex rerun` give 0 when they start the work;
+they do not wait, so 0 is not the result of the job. A fault of those commands
+is 121, and never 1.
 
 | Code | Meaning |
 | --- | --- |
@@ -119,8 +122,8 @@ jobs that did not stop then have no watcher, so wait again for them.
 `qex status` when you act on the difference between "the job failed" and "my
 wait stopped". **125 does not say that your work failed** — another agent on
 this machine can stop your job, so read the line on stderr first. `qex list`,
-`qex logs` and the other commands never speak for a job, so they use 0, 1, 2 and
-127 in the usual way.
+`qex logs` and the other commands never speak for a job, so they use 0, 1, 2
+and 127 in the usual way.
 
 ### Why a band, and why a sentinel
 

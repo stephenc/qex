@@ -91,8 +91,11 @@ jobs that did not stop then have no watcher, so wait again for them.
 
 ## The exit codes
 
-**One table.** Every command that gives you a job result obeys it: `qex run`,
-`qex submit --wait/--follow`, `qex wait` and `qex status --wait/--follow/-q`.
+**One table.** Every command that starts a job or gives you a job result obeys
+it: `qex submit`, `qex run`, `qex pipeline`, `qex rerun`, `qex wait` and
+`qex status --wait/--follow/-q`. `qex submit`, `qex pipeline` and `qex rerun`
+give 0 when they start the work; they do not wait, so 0 is not the result of
+the job. A fault of those commands is 121, and never 1.
 
 | Code | Meaning |
 | --- | --- |
