@@ -9815,16 +9815,17 @@ fn a_real_bash_offers_the_jobs_and_runs_no_name() {
         h.state_of(&running) == "running"
     });
 
-    // The names that an attacker would choose.
+    // The names that an attacker would choose. A later qex refuses them at
+    // submission. Plant them in records that an earlier qex could have written.
     let bait = h.root.join("BAIT");
-    h.submit(&[
-        "submit",
-        "--name",
-        &format!("bait$(touch {})", bait.display()),
-        "--",
-        "true",
-    ]);
-    h.submit(&["submit", "--name", "two words", "--", "true"]);
+    let bait_id = h.submit(&["submit", "--name", "bait-plant", "--", "true"]);
+    let two_id = h.submit(&["submit", "--name", "two-plant", "--", "true"]);
+    h.until("the planted jobs stop", Duration::from_secs(45), || {
+        h.state_of(&bait_id) == "completed" && h.state_of(&two_id) == "completed"
+    });
+    h.stop_coordinator();
+    h.plant_stored_name(&bait_id, &format!("bait$(touch {})", bait.display()));
+    h.plant_stored_name(&two_id, "two words");
 
     let script = h.root.join("qex.bash");
     std::fs::write(&script, h.ok(&["completions", "bash"])).unwrap();
