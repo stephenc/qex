@@ -2429,6 +2429,7 @@ fn select_log(
 /// needs `--line-buffered`. This code writes each line as it reads it.
 fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
 
     let streams = chosen_streams(select);
     // Say what the limit removed before the first line. A reader who follows a
@@ -2452,6 +2453,10 @@ fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i3
     for (name, file) in &streams {
         let path = dir.join(file);
         // The supervisor can make this file after the command starts.
+        // `.mode` applies only when this command makes the file. Without it
+        // the file takes 0666 and the umask, the supervisor keeps that mode
+        // (it cannot change an existing file), and every user of the machine
+        // can read the output.
         let mut f = std::fs::OpenOptions::new()
             .read(true)
             .create(true)
@@ -2459,6 +2464,7 @@ fn follow(dir: &std::path::Path, select: &crate::logsel::LogSelect) -> Result<i3
             // job, and it must never remove it.
             .truncate(false)
             .write(true)
+            .mode(0o600)
             .open(&path)?;
 
         // Read what the job already wrote, and show the last lines of it.
