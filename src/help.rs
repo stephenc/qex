@@ -335,8 +335,9 @@ Other options
     --timeout 4h       stop the JOB after this time. `--wait-timeout` stops
                        your wait instead, and the job continues.
     --retries 3        run the job again when it fails. One id, one record,
-                       every attempt in the log. A kill for memory starts no
-                       new attempt: give a larger `--mem` and submit again.
+                       every attempt in the log. The job keeps its claim until
+                       it stops. A kill for memory starts no new attempt: give
+                       a larger `--mem` and submit again.
     --lock NAME        two jobs with one lock name never operate together. Use
                        it for a build directory, a port or a database.
     --nice N           -20 to 19. A larger number gives way to a person. The
@@ -548,7 +549,9 @@ a job that costs nothing does not exist, and `paused` is one fact that you can
 act on.
 
 THE JOBS THAT OPERATE NOW CONTINUE. Each one already holds its capacity, and a
-stop would lose that work. To wait for a quiet machine:
+stop would lose that work. A job with `--retries` is still that job: the next
+attempt starts, and the job keeps its locks, until the last attempt stops. To
+wait for a quiet machine:
 
     qex pause queue --drain      # gives control back when no job operates
 
@@ -568,9 +571,6 @@ command that replaced them would change a pause of 30 minutes into a pause with
 no end. To replace an end, run `qex resume queue` first.
 
 `--for 0` is an error. To end a pause now, run `qex resume queue`.
-
-A job with `--retries` starts its next attempt inside its own supervisor, and
-that supervisor reads the pause as well. The next attempt waits.
 
 Pause a lock
 ------------

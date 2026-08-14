@@ -148,15 +148,12 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // line stops is one that a test cannot make happen".
                 crate::hook::fire_detached(&dir, &status);
             }
-            // The supervisor gave the job back to the queue.
-            //
-            // It does this for an attempt that failed while `--retries` gives
-            // the job one more. The capacity of the first attempt went back to
-            // the machine when that attempt stopped, so the coordinator must
-            // test the claim against the budget again, in the same way as for a
-            // new job. Without this branch the job would go to the state
-            // `failed` with "the supervisor stopped without a result", and the
-            // work would stop.
+            // The supervisor left a `queued` record. A current supervisor does
+            // not write that state for a retry: the job stays `running` and
+            // keeps its slot. An older supervisor wrote `queued` and then
+            // stopped. Put the job back in the queue so the work can start
+            // again when there is room. Without this branch the job would go
+            // to `failed` with "the supervisor stopped without a result".
             Ok(status) if status.state == JobState::Queued => {
                 job.status = status;
                 job.status.supervisor_pid = None;
@@ -769,18 +766,15 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // The decision comes BEFORE the write, and the record goes to the disk one
     // time.
     //
-    // An earlier version wrote `failed`, and then wrote `queued` a moment
-    // later. A reader between the two writes saw a state that the job never
-    // reached. The coordinator is such a reader: it reads the record of each
-    // job, it keeps the state that it reads, and it stops reading a job that
-    // stopped. It thus kept `failed` for a job that continued, and it kept it
-    // for ever. `qex list` then showed `failed` for a job that was running,
-    // `qex wait` gave the result of an attempt that was not the last one, and
-    // every rule that asks "did this job stop?" received the wrong answer.
+    // The job stays `running`. It is still on deck: this supervisor holds the
+    // slot until the last attempt stops. `queued` would drop the job from
+    // `claimed()` on a coordinator that starts again, and a different job
+    // would take the cores while this one continues. `failed` would do the
+    // same, and a reader between two writes would see a job that had stopped.
     let retrying = status.state == JobState::Failed && status.retries_left > 0;
     if retrying {
         status.retries_left -= 1;
-        status.state = JobState::Queued;
+        status.state = JobState::Running;
         status.error = Some(format!(
             "attempt {} failed with the exit code {}; qex starts the job again",
             status.attempts,
@@ -798,7 +792,8 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
         // Give the machine a moment. A task that fails at once, such as a
         // network that is not ready, needs the time more than the CPU.
         std::thread::sleep(Duration::from_secs(1));
-        wait_while_paused(&dir, &spec, &mut status);
+        // The job already started. A pause stops new work; it does not stop
+        // this one. The locks stay with this job until the last attempt ends.
         return main(id);
     }
 
@@ -939,68 +934,6 @@ fn drain_copies(
         }
     }
     false
-}
-
-/// Waits while a person holds the queue, or a lock of this job.
-///
-/// # The fault that this function prevents
-///
-/// A retry starts the next attempt IN THIS PROCESS. It does not give the job
-/// back to `sched::choose`, so the pause test of the scheduler never sees it.
-/// Without this wait, a job with `--retries` starts a new process minutes after
-/// `qex pause queue` answered "paused" and after `qex info` reported it. A job
-/// that fails quickly repeats that for the whole length of the pause.
-///
-/// This is also why the pause is a FILE. The supervisor is a separate process
-/// with no connection to the coordinator, and a file is a state that every
-/// process can read.
-///
-/// The lock has the same rule: a person who holds `gpu0` must not lose it to
-/// the second attempt of a job that held it before.
-fn wait_while_paused(
-    dir: &std::path::Path,
-    spec: &crate::spec::JobSpec,
-    status: &mut job::JobStatus,
-) {
-    let mut said = false;
-    loop {
-        let mut paused = crate::pause::Paused::read();
-        paused.expire(sys::now_secs());
-
-        let reason = match &paused.queue {
-            Some(record) => Some(crate::pause::queue_reason(record)),
-            None => spec
-                .locks
-                .iter()
-                .find(|name| {
-                    paused
-                        .locks
-                        .keys()
-                        .any(|k| crate::pause::lock_same(k, name))
-                })
-                .map(|name| crate::pause::lock_reason(name)),
-        };
-
-        let Some(reason) = reason else {
-            if said {
-                status.blocked_reason = None;
-                job::write_status(dir, status).ok();
-                log("the pause ended; the next attempt of this job starts");
-            }
-            return;
-        };
-
-        // Write the reason one time only. The text holds no number that
-        // changes, so a second write would give the same bytes and two more
-        // `fsync` calls, twice a second, for the whole length of the pause.
-        if !said {
-            said = true;
-            status.blocked_reason = Some(reason.clone());
-            job::write_status(dir, status).ok();
-            log(&format!("the next attempt of this job waits: {reason}"));
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
 }
 
 /// Makes a file that the other users of the machine cannot read.

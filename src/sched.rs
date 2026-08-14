@@ -1315,13 +1315,13 @@ fn expire(
     // A job that ALREADY RAN must never get this state either.
     //
     // This guard is defensive, and no test here reproduces the state that it
-    // refuses. The reading behind it: a job between two attempts of `--retries`
-    // is `queued` and holds the `started_at` of the attempt that failed, and a
-    // coordinator that starts again puts every `queued` record back in the
-    // queue. A job in that gap would otherwise be able to expire, and its
-    // record would then say `expired` and hold a start time and an exit code at
-    // the same time. The state alone cannot separate the two cases; the start
-    // time can.
+    // refuses. A current job between two attempts of `--retries` stays
+    // `running` and cannot expire. An older record in that gap can be `queued`
+    // and still hold the `started_at` of the attempt that failed. A coordinator
+    // that starts again puts every `queued` record back in the queue. A job in
+    // that gap would otherwise be able to expire, and its record would then
+    // say `expired` and hold a start time and an exit code at the same time.
+    // The state alone cannot separate the two cases; the start time can.
     if job.status.started_at.is_some() {
         return;
     }
@@ -3074,10 +3074,11 @@ mod tests {
 
     /// A JOB THAT ALREADY RAN MUST NEVER GET THE STATE `expired`.
     ///
-    /// This guard is defensive. A job between two attempts of `--retries` is
-    /// `queued` and holds the `started_at` of the attempt that failed, and a
-    /// coordinator that starts again puts every `queued` record back in the
-    /// queue. The state alone cannot separate that job from one that never ran.
+    /// This guard is defensive. A current job between two attempts of
+    /// `--retries` stays `running`. An older record in that gap can be `queued`
+    /// and still hold the `started_at` of the attempt that failed. A coordinator
+    /// that starts again puts every `queued` record back in the queue. The state
+    /// alone cannot separate that job from one that never ran.
     #[test]
     fn a_job_that_holds_a_start_time_never_expires() {
         let mut state = state_with(JobState::Queued, Some(1), 3600);
@@ -3202,7 +3203,7 @@ mod tests {
         mem: &str,
         peer_cpu: u64,
         peer_mem: u64,
-    ) -> (Config, std::path::PathBuf) {
+    ) -> (Config, std::path::PathBuf, std::process::Child) {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "qex-sched-peer-{}-{}",
@@ -3215,11 +3216,19 @@ mod tests {
         let uid = crate::peers::current_uid();
         let mine = dir.join(format!("u{uid}"));
         std::fs::create_dir_all(&mine).unwrap();
-        // Pid 1 always exists. `pid_alive` also accepts the answer "you may not
-        // signal this process", so the test needs no process of its own.
+        // The record must name a process that is alive and is not this test.
+        // `claims` skips (this user, this pid), and `pid_alive(1)` is false on
+        // some runners: `kill(1, 0)` gives ESRCH, the peer is dropped, and the
+        // test then measures an empty machine.
+        let live = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the test needs a live process for the peer record");
         let peer = serde_json::json!({
             "uid": uid,
-            "pid": 1,
+            "pid": live.id() as i32,
             "boot_id": sys::boot_id(),
             "cpu": peer_cpu,
             "mem": peer_mem,
@@ -3234,7 +3243,7 @@ mod tests {
             dir.display()
         ))
         .unwrap();
-        (cfg, dir)
+        (cfg, dir, live)
     }
 
     /// The measured fault: a job that another user holds back read a sentence
@@ -3244,7 +3253,7 @@ mod tests {
     /// queue starts the jobs behind this one.
     #[test]
     fn a_job_that_another_user_holds_back_says_so_and_never_keeps_capacity() {
-        let (cfg, dir) = cfg_with_peer("4", "256MB", 3, 0);
+        let (cfg, dir, mut live) = cfg_with_peer("4", "256MB", 3, 0);
         let machine = Machine::read(&cfg);
         assert_eq!(machine.peers.count, 1, "the test peer must count");
 
@@ -3276,6 +3285,8 @@ mod tests {
             Admit::Yes
         ));
 
+        live.kill().ok();
+        let _ = live.wait();
         std::fs::remove_dir_all(&dir).ok();
     }
 
