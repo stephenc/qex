@@ -191,12 +191,11 @@ fn say_that_a_newer_qex_exists() {
     }
 }
 
-/// True for a command that gives the exit code of a JOB.
+/// True for a command that starts a job or gives the exit code of a JOB.
 ///
-/// These commands, and only these, keep the rule of the band: a code below 97
-/// comes from the job. A fault of qex itself in one of them thus takes a code
-/// from the band, and a fault in every other command keeps the code 1 and the
-/// usage code 2 of the convention.
+/// These commands keep the rule of the band. A fault of qex itself takes a
+/// code from the band, so it cannot look like a job that failed. A fault in
+/// every other command keeps the code 1 and the usage code 2 of the convention.
 #[cfg(unix)]
 fn speaks_for_a_job(name: &str) -> bool {
     // A word that qex does not know takes the band as well. `qex staus $ID
@@ -211,7 +210,7 @@ fn speaks_for_a_job(name: &str) -> bool {
     !name.is_empty() && !SPEAKS_FOR_ITSELF.contains(&name)
 }
 
-/// The commands that never give the exit code of a job.
+/// The commands that never start a job and never give the exit code of a job.
 ///
 /// `qex list` and the others answer about qex, so a usage error there is the
 /// conventional 2 and nothing can read it as the code of a job.
@@ -222,7 +221,6 @@ const SPEAKS_FOR_ITSELF: &[&str] = &[
     "events",
     "kill",
     "cancel",
-    "rerun",
     "clean",
     "gc",
     "du",
@@ -236,7 +234,6 @@ const SPEAKS_FOR_ITSELF: &[&str] = &[
     "watchers",
     "completions",
     "top",
-    "pipeline",
     "daemon",
     "supervise",
     "__complete",

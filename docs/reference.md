@@ -42,9 +42,12 @@ Every command that reads data accepts `--json`.
 
 ### Exit codes
 
-**One table.** Every command that gives you the result of a job obeys it:
-`qex run`, `qex submit --wait`, `qex submit --follow`, `qex wait`,
+**One table.** Every command that starts a job or gives you the result of a
+job obeys it: `qex submit`, `qex run`, `qex pipeline`, `qex rerun`, `qex wait`,
 `qex status --wait`, `qex status --follow` and `qex status --quiet`.
+`qex submit`, `qex pipeline` and `qex rerun` give 0 when they start the work;
+they do not wait, so 0 is not the result of the job. A fault of those commands
+is 121, and never 1.
 
 | Code | Meaning |
 | ---- | ------- |
