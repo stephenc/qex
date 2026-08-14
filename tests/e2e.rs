@@ -12086,7 +12086,9 @@ fn a_retry_continues_while_the_queue_is_paused() {
         "a pause must still hold work that has not started"
     );
 
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    // Between attempts the record is `running` with no pid, so `qex kill` can
+    // refuse. The job stops by itself when the retries run out.
+    h.qex(&["kill", &id, "--grace", "1s"]);
     h.ok(&["resume"]);
 }
 
@@ -12111,7 +12113,7 @@ fn a_retry_keeps_its_lock_until_the_job_stops() {
         "--lock",
         "gpu0",
         "--retries",
-        "3",
+        "1",
         "--",
         "sh",
         "-c",
@@ -12147,9 +12149,10 @@ fn a_retry_keeps_its_lock_until_the_job_stops() {
         "another job must wait for the lock that the retrying job still holds"
     );
 
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    // Do not kill. Between attempts the record is `running` with no pid, and
+    // `qex kill` then says "starts now". The last attempt stops by itself.
     h.until("the retrying job stops", Duration::from_secs(45), || {
-        h.state_of(&id) == "killed"
+        h.state_of(&id) == "failed"
     });
     assert_eq!(
         h.state_of(&waiter),
