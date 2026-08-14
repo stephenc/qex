@@ -104,9 +104,36 @@ Or take the file for your machine from [the latest
 release](https://github.com/stephenc/qex/releases/latest):
 
 ```sh
-curl -fsSL "https://github.com/stephenc/qex/releases/latest/download/qex-$(uname -s)-$(uname -m).tar.gz" | tar xz
-install -m 755 qex ~/.local/bin/qex
+dir=$(mktemp -d) &&
+archive="qex-$(uname -s)-$(uname -m).tar.gz" &&
+curl -fsSL -o "$dir/$archive" \
+  "https://github.com/stephenc/qex/releases/latest/download/$archive" &&
+curl -fsSL -o "$dir/$archive.sha256" \
+  "https://github.com/stephenc/qex/releases/latest/download/$archive.sha256" &&
+if command -v sha256sum >/dev/null
+then (cd "$dir" && sha256sum -c "$archive.sha256")
+else (cd "$dir" && shasum -a 256 -c "$archive.sha256")
+fi &&
+tar -xzf "$dir/$archive" -C "$dir" qex &&
+mkdir -p ~/.local/bin &&
+install -m 755 "$dir/qex" ~/.local/bin/qex
+[ -n "$dir" ] && rm -rf "$dir"
+command -v qex
 ```
+
+These commands write into a temporary directory, and they do not write into
+the directory that you are in. The two `curl` lines take the archive and the
+`.sha256` file that the release holds beside it. The check compares the two.
+The `&&` after each write means a line that fails stops the writes that follow.
+The `rm` line still runs, and it removes the temporary directory.
+
+`mkdir` makes `~/.local/bin` when that directory is not there. `install` puts
+`qex` in that directory, and it REPLACES a `qex` that is already there.
+
+**`install` does not put `~/.local/bin` on your path.** `command -v qex` must
+show a file in `~/.local/bin`. If it shows nothing, add `~/.local/bin` to the
+path of this shell. If it shows a different file, that file is the one the
+shell will run.
 
 Or build it from the source:
 
