@@ -1644,18 +1644,28 @@ deploy prod$(id)   ->  deploy_prod_id_
 -version           ->  _version
 ```
 
-**The record on the disk keeps the name that you gave.** qex changes no record.
+**A name that you choose must already be in that set.** `--name` and the `name`
+field of a job file refuse a name that holds another character, a name that
+starts with `-`, and a name longer than 128 characters. After that refusal, the
+name that the record holds and the name that qex shows are the same.
+
+A submission with no `--name` takes the last part of the program path. A
+character outside the set in that path becomes `_`, and the job still starts:
+you did not choose that name.
+
+**The record on the disk keeps the name that an earlier qex stored.** qex
+changes no record. A record from before this rule can hold a name outside the
+set. qex shows the safe form of that name.
 
 **A safe name goes back into a command as it stands.** Take it from `qex list
 --json` or from `qex status`, which give the whole name. The NAME column of the
 table stops at 16 characters, as it did before this rule, so a long name in that
-column is not the whole name. The name that you gave still finds the job as
-well:
+column is not the whole name. The name that the record holds still finds the
+job as well:
 
 ```sh
 qex status deploy_prod_id_     # the name that qex shows
-qex status 'deploy prod$(id)'  # the name that you gave
-qex status -- -version         # a name that starts with `-`: put it after `--`
+qex status 'deploy prod$(id)'  # a name that an earlier qex stored
 ```
 
 Two names that give one safe form make that word name more than one job. qex
@@ -1667,9 +1677,11 @@ written to a terminal by `qex list`, moves the cursor and writes over the text
 around it; no shell and no TAB are needed for that. A name that holds a space or
 a `;` teaches a word that you cannot paste back.
 
-This rule covers the NAME of a job and the name of a group. A lock name, a tag,
-a value of `--show-env` and the name of the program still reach the terminal as
-they are. See issue #49.
+This rule covers the NAME of a job, the name of a group, a lock name and a
+tag. A value of `--show-env` and an argument of the program can hold any
+character. qex shows those values with a C-style escape for each control
+byte (`ESC` becomes `\x1b`), so a reader can see what the value is and the
+byte does not move the cursor.
 
 The rule holds for a record that qex wrote at any time, because the safe form
 comes from the name in the record. Nothing waits for `qex gc`.

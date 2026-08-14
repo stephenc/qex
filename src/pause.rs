@@ -291,6 +291,56 @@ fn shown_lock(name: &str) -> String {
     crate::job::safe_name(name)
 }
 
+/// True when a word names this stored lock.
+///
+/// qex shows the safe form, so a word that a reader copies from `qex status`
+/// must find the lock that the job holds.
+pub fn lock_matches(stored: &str, word: &str) -> bool {
+    stored == word || crate::job::safe_name(stored) == word
+}
+
+/// True when two lock words name the same lock.
+///
+/// A pause that a person took under the shown form must still hold a job
+/// that asked for the stored form.
+pub fn lock_same(a: &str, b: &str) -> bool {
+    a == b || crate::job::safe_name(a) == crate::job::safe_name(b)
+}
+
+/// Gives the stored lock name that a word names.
+///
+/// When no known lock matches, the word is a new lock that the person is
+/// taking. When two stored names give one safe form, qex cannot choose.
+pub fn resolve_lock_name<'a>(
+    word: &str,
+    known: impl IntoIterator<Item = &'a str>,
+) -> Result<String, String> {
+    let mut hits: Vec<String> = known
+        .into_iter()
+        .filter(|n| lock_matches(n, word))
+        .map(|s| s.to_string())
+        .collect();
+    hits.sort();
+    hits.dedup();
+    match hits.len() {
+        0 => Ok(word.to_string()),
+        1 => Ok(hits.pop().unwrap()),
+        n => {
+            let shown = crate::job::visible(word);
+            let list = hits
+                .iter()
+                .map(|name| format!("  {}", crate::job::visible(name)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "`{shown}` names {n} locks.\n\n\
+                 Two lock names give one safe form. qex cannot choose.\n\n\
+                 Use one of these names:\n{list}"
+            ))
+        }
+    }
+}
+
 /// Gives the reason that a job in the queue waits, while the queue is paused.
 ///
 /// # Why this text holds no elapsed time
@@ -416,6 +466,24 @@ pub fn lock_line(name: &str, record: &PauseRecord, held_by: Option<&str>, now: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_safe_lock_word_finds_the_stored_name() {
+        let known = ["deploy prod", "gpu0"];
+        assert_eq!(
+            resolve_lock_name("deploy_prod", known).unwrap(),
+            "deploy prod"
+        );
+        assert_eq!(
+            resolve_lock_name("deploy prod", known).unwrap(),
+            "deploy prod"
+        );
+        assert_eq!(resolve_lock_name("new", known).unwrap(), "new");
+        let err = resolve_lock_name("a_b", ["a b", "a_b"]).unwrap_err();
+        assert!(err.contains("2 locks"), "{err}");
+        assert!(lock_same("lk\u{1b}[2J", "lk_2J"));
+        assert!(!lock_same("gpu0", "gpu1"));
+    }
 
     fn record() -> PauseRecord {
         PauseRecord {

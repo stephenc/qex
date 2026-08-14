@@ -175,6 +175,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
         gpu: args.gpu,
         vram: args.vram,
         claims: args.claims,
+        allow_unsafe_name: false,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -504,6 +505,7 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
         // Every job of this fan-out measures against the template, so the whole
         // fan-out makes one record and the next run reads it.
         learn_key: Some(template.clone()),
+        allow_unsafe_name: false,
     };
 
     let (first, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -688,7 +690,11 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         jobs.retain(|j| f.matches(j.state));
     }
     if let Some(tag) = &args.tag {
-        jobs.retain(|j| j.tags.iter().any(|t| t == tag));
+        jobs.retain(|j| {
+            j.tags
+                .iter()
+                .any(|t| t == tag || crate::job::safe_name(t) == *tag)
+        });
     }
     let list_cwd = match &args.cwd {
         Some(p) => Some(resolve_directory(p, "--cwd")?),
@@ -974,9 +980,20 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
             let mut value = serde_json::to_value(&*status)?;
             if args.show_env {
                 // The environment can hold secrets, so qex adds it only when
-                // the user asks for it.
+                // the user asks for it. A value can hold any byte: show it
+                // in the form that a person can read. See `job::visible`.
                 if let Ok(spec) = crate::job::read_spec(&paths::job_dir(&id)?) {
-                    value["env"] = serde_json::to_value(&spec.env)?;
+                    let env: serde_json::Map<String, serde_json::Value> = spec
+                        .env
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                crate::job::visible(k),
+                                serde_json::Value::from(crate::job::visible(v)),
+                            )
+                        })
+                        .collect();
+                    value["env"] = serde_json::Value::Object(env);
                 }
             }
             if !excerpt.is_empty() {
@@ -1354,7 +1371,7 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
         let spec = crate::job::read_spec(&paths::job_dir(&s.id)?)?;
         println!("environment:");
         for (k, v) in &spec.env {
-            println!("  {k}={v}");
+            println!("  {}={}", crate::job::visible(k), crate::job::visible(v));
         }
     }
     Ok(())
@@ -3139,6 +3156,14 @@ fn for_display(mut s: JobStatus) -> JobStatus {
     // lock name is a NAME, so it takes `safe_name`, in the same way as the
     // name of the job.
     s.locks = s.locks.iter().map(|l| safe_name(l)).collect();
+    // A tag is a word, like a lock name. `qex list --tag` still finds the
+    // stored tag; this line is the form that a reader sees.
+    s.tags = s.tags.iter().map(|t| safe_name(t)).collect();
+    // The program and its arguments can hold any character. A reader needs
+    // to see what the value is, so a control byte becomes an escape and not
+    // a space. See `job::visible`.
+    s.command = s.command.iter().map(|a| crate::job::visible(a)).collect();
+    s.cwd = crate::job::visible(&s.cwd);
     // The two SENTENCES take the rule for a sentence, and not `safe_name`.
     //
     // qex wrote these two, but it wrote them AROUND text that the caller chose.
@@ -4249,7 +4274,10 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
             // to a terminal. Show the safe form of the name. See
             // `job::safe_name`.
             let shown = crate::job::safe_name(&name);
-            match locks.iter().find(|l| l.name == name) {
+            match locks
+                .iter()
+                .find(|l| crate::pause::lock_matches(&l.name, &name))
+            {
                 Some(lock) => match &lock.held_by {
                     Some(job) => println!(
                         "the job {job} holds the lock `{shown}` now. qex gives it to you when \
@@ -4340,7 +4368,7 @@ fn pause_report(json: bool) -> Result<i32> {
             held_by: jobs
                 .iter()
                 .find(|j| j.state.is_active() && j.locks.iter().any(|l| l == name))
-                .map(|j| format!("{} ({})", short_id(&j.id), j.name)),
+                .map(|j| format!("{} ({})", short_id(&j.id), j.display_name())),
         })
         .collect();
     print_pause_state(paused.queue.as_ref(), &locks, json)
@@ -4930,6 +4958,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
         gpu: args.submit.gpu,
         vram: args.submit.vram,
         claims: args.submit.claims,
+        allow_unsafe_name: false,
     };
 
     let (mut spec, deps) = JobSpec::resolve_with_deps(&opts, &cfg)?;
@@ -5253,7 +5282,7 @@ fn stream_until_done(
         // removes everywhere else.
         if !announced_wait && status.state == JobState::Queued {
             if let Some(reason) = &status.blocked_reason {
-                eprintln!("qex: {reason}");
+                eprintln!("qex: {}", crate::job::printable(reason));
                 announced_wait = true;
             }
         }
@@ -5465,6 +5494,10 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
     // would do the one thing that it exists to prevent: nothing.
     spec.dedupe_key = None;
     spec.dedupe_window = 0;
+
+    // A new job. An old record can hold a name outside the set. The user
+    // did not choose this name again, so rewrite it, as a derived name.
+    spec.name = crate::job::sanitize_name(&spec.name);
 
     // Test the specification that this command SUBMITS, and not the record that
     // it read.

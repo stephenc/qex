@@ -434,7 +434,12 @@ fn lock_conflict(state: &crate::daemon::State, pools: &[Pool], spec: &JobSpec) -
     // the time between. The reason must therefore name the person, whatever job
     // holds the lock at this moment.
     for name in &spec.locks {
-        if state.paused.locks.contains_key(name) {
+        if state
+            .paused
+            .locks
+            .keys()
+            .any(|k| crate::pause::lock_same(k, name))
+        {
             return Some(crate::pause::lock_reason(name));
         }
     }
@@ -461,7 +466,8 @@ fn lock_conflict(state: &crate::daemon::State, pools: &[Pool], spec: &JobSpec) -
             // record that an earlier version wrote.
             if job.spec.locks.contains(name) || job.spec.claims.contains_key(name) {
                 return Some(format!(
-                    "waits for the lock `{name}`, which the job {} ({}) holds",
+                    "waits for the lock `{}`, which the job {} ({}) holds",
+                    crate::job::safe_name(name),
                     &job.status.id.to_string()[..8],
                     // The SAFE name. This sentence goes to a reader, through
                     // `blocked_reason`. See `job::safe_name`.
@@ -1864,7 +1870,8 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             .find(|n| state.paused.locks.contains_key(*n))
         {
             log(&format!(
-                "job {id} does not start: a person holds the lock `{name}`"
+                "job {id} does not start: a person holds the lock `{}`",
+                crate::job::safe_name(name)
             ));
             return Ok(());
         }

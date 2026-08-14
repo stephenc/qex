@@ -972,7 +972,12 @@ fn wait_while_paused(
             None => spec
                 .locks
                 .iter()
-                .find(|name| paused.locks.contains_key(*name))
+                .find(|name| {
+                    paused
+                        .locks
+                        .keys()
+                        .any(|k| crate::pause::lock_same(k, name))
+                })
                 .map(|name| crate::pause::lock_reason(name)),
         };
 

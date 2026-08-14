@@ -567,7 +567,7 @@ impl State {
                 format!(
                     "{} ({})",
                     &j.status.id.to_string()[..8],
-                    j.status.name.clone()
+                    j.status.display_name()
                 )
             })
     }
@@ -1337,6 +1337,17 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
     }
 }
 
+/// Gives the stored lock name that a pause or a resume should use.
+fn resolve_paused_lock(state: &State, word: &str) -> Result<String, String> {
+    let known: Vec<&str> = state
+        .jobs
+        .values()
+        .flat_map(|j| j.spec.locks.iter().map(String::as_str))
+        .chain(state.paused.locks.keys().map(String::as_str))
+        .collect();
+    crate::pause::resolve_lock_name(word, known)
+}
+
 /// Records a pause of the queue or of one lock.
 ///
 /// A pause of a lock is never refused, whatever job holds that lock now. The
@@ -1360,6 +1371,10 @@ fn handle_pause(
             log("a person paused the queue; qex starts no job");
         }
         PauseTarget::Lock { name } => {
+            let name = match resolve_paused_lock(&state, &name) {
+                Ok(n) => n,
+                Err(msg) => return Response::error(ErrorKind::WrongState, msg),
+            };
             let record = keep_the_end(state.paused.locks.remove(&name), by_pid, reason, until);
             log(&format!(
                 "a person asked for the lock `{}`",
@@ -1427,6 +1442,10 @@ fn handle_resume(coord: &Arc<Coordinator>, target: crate::proto::PauseTarget) ->
             log("a person started the queue again");
         }
         PauseTarget::Lock { name } => {
+            let name = match resolve_paused_lock(&state, &name) {
+                Ok(n) => n,
+                Err(msg) => return Response::error(ErrorKind::WrongState, msg),
+            };
             log(&format!(
                 "a person gave the lock `{}` back",
                 crate::job::safe_name(&name)
@@ -1657,7 +1676,12 @@ fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
             );
         }
         for name in &spec.locks {
-            if state.paused.locks.contains_key(name) {
+            if state
+                .paused
+                .locks
+                .keys()
+                .any(|k| crate::pause::lock_same(k, name))
+            {
                 // The lock name is text that a person typed. Show the safe
                 // form of it in a sentence that a terminal prints.
                 let shown = crate::job::safe_name(name);
