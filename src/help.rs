@@ -330,7 +330,8 @@ that qex does not discard for you.
 Other options
 -------------
 
-    --name NAME        a name for `qex list`, and a handle in place of the id
+    --name NAME        letters, numbers, `-`, `_` and `.` only. Not a first
+                       `-`. 128 characters or fewer.
     --timeout 4h       stop the JOB after this time. `--wait-timeout` stops
                        your wait instead, and the job continues.
     --retries 3        run the job again when it fails. One id, one record,
@@ -426,7 +427,7 @@ A minimal file
 A full file
 -----------
 
-    name = \"train-model\"          # the name in `qex list`
+    name = \"train-model\"          # letters, numbers, `-`, `_` and `.` only
     cwd  = \"/home/me/project\"     # the default is your current directory
     command = [\"uv\", \"run\", \"train.py\", \"--epochs\", \"50\"]
     timeout = \"4h\"                # the default is no limit

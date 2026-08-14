@@ -186,6 +186,9 @@ pub struct SubmitArgs {
     pub claims: Vec<(String, crate::spec::PoolClaim)>,
 
     /// A name for the job, to show in `qex list`.
+    ///
+    /// Letters, numbers, `-`, `_` and `.` only. It must not start with `-`.
+    /// At most 128 characters.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 

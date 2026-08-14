@@ -220,6 +220,53 @@ pub fn safe_name(name: &str) -> String {
     out
 }
 
+/// True when `name` is already in the form that [`safe_name`] shows.
+///
+/// A name that a person or an agent chose must pass this test at submission.
+/// A derived name that fails it becomes [`safe_name`], and the job starts.
+pub fn name_is_safe(name: &str) -> bool {
+    !name.is_empty() && safe_name(name) == name
+}
+
+/// Gives a stored name that is already in the safe form.
+///
+/// A derived name, and a name that `qex rerun` copies from an old record,
+/// take this path: the user did not choose the name of this new job.
+pub fn sanitize_name(raw: &str) -> String {
+    let name = safe_name(raw);
+    if name.is_empty() || name.parse::<uuid::Uuid>().is_ok() {
+        "job".to_string()
+    } else {
+        name
+    }
+}
+
+/// Shows a value that can hold any character, so a reader can see what it is.
+///
+/// A name is a handle and takes [`safe_name`]. A value of the environment and
+/// an argument of a program are not handles: the reader needs the bytes that
+/// the job received. A control character becomes a C-style escape, so an ESC
+/// byte shows as `\x1b` and does not move the cursor.
+pub fn visible(value: &str) -> String {
+    let mut out = String::new();
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let mut buf = [0; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("\\x{b:02x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Replaces each control character with a space.
 ///
 /// THIS IS THE RULE FOR A SENTENCE, AND `safe_name` IS THE RULE FOR A NAME.
@@ -696,6 +743,31 @@ pub fn write_spec(dir: &Path, spec: &JobSpec) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_safe_name_keeps_the_allowed_set_and_nothing_else() {
+        assert_eq!(safe_name("deploy prod$(id)"), "deploy_prod_id_");
+        assert_eq!(safe_name("-version"), "_version");
+        assert_eq!(safe_name("plain-name_1.2"), "plain-name_1.2");
+        assert_eq!(safe_name("y".repeat(200).as_str()), "y".repeat(128));
+        assert!(name_is_safe("plain-name_1.2"));
+        assert!(!name_is_safe(""));
+        assert!(!name_is_safe("-version"));
+        assert!(!name_is_safe("deploy prod"));
+        assert!(!name_is_safe(&"y".repeat(129)));
+        assert_eq!(sanitize_name("deploy prod"), "deploy_prod");
+        assert_eq!(sanitize_name(""), "job");
+    }
+
+    /// A reader must see that an ESC byte was there. A space would hide it.
+    #[test]
+    fn visible_escapes_a_control_byte_and_keeps_the_rest() {
+        assert_eq!(visible("esc\u{1b}[2Jbad"), "esc\\x1b[2Jbad");
+        assert_eq!(visible("a\\b"), "a\\\\b");
+        assert_eq!(visible("one\ntwo"), "one\\ntwo");
+        assert_eq!(visible("/usr/bin/python3"), "/usr/bin/python3");
+        assert_eq!(visible("--epochs"), "--epochs");
+    }
 
     /// Gives the place of one state in [`JobState::ALL`].
     ///

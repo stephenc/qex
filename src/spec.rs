@@ -165,24 +165,33 @@ pub fn parse_claim_pair(s: &str) -> Result<(String, PoolClaim), String> {
     let help = "Use the form NAME=N, or NAME=N:SIZE for a quantity on each device. \
                 Example: --claim net=1";
     let Some((name, value)) = s.split_once('=') else {
-        return Err(format!("incorrect --claim value `{s}`. {help}"));
+        return Err(format!(
+            "incorrect --claim value `{}`. {help}",
+            crate::job::visible(s)
+        ));
     };
     let name = name.trim();
     if name.is_empty() {
-        return Err(format!("incorrect --claim value `{s}`. {help}"));
+        return Err(format!(
+            "incorrect --claim value `{}`. {help}",
+            crate::job::visible(s)
+        ));
     }
     let (count, size) = match value.split_once(':') {
         Some((c, sz)) => (c, Some(sz)),
         None => (value, None),
     };
-    let count: u64 = count
-        .trim()
-        .parse()
-        .map_err(|_| format!("incorrect --claim value `{s}`. {help}"))?;
+    let count: u64 = count.trim().parse().map_err(|_| {
+        format!(
+            "incorrect --claim value `{}`. {help}",
+            crate::job::visible(s)
+        )
+    })?;
     if count == 0 {
         return Err(format!(
-            "the claim `{s}` asks for 0 of `{name}`. A claim of zero holds nothing, so \
-             delete the option, or give 1 or more."
+            "the claim `{}` asks for 0 of `{name}`. A claim of zero holds nothing, so \
+             delete the option, or give 1 or more.",
+            crate::job::visible(s)
         ));
     }
     let size = match size {
@@ -280,6 +289,10 @@ pub struct SubmitOptions {
     pub vram: Option<String>,
     /// The claims on the other pools, from `--claim NAME=N`.
     pub claims: Vec<(String, PoolClaim)>,
+    /// When true, a chosen name outside the set is accepted.
+    ///
+    /// Pipeline stages use this. Their names are not this rule.
+    pub allow_unsafe_name: bool,
 }
 
 /// The dependencies of a job, as the user wrote them.
@@ -769,13 +782,19 @@ impl JobSpec {
             None => cfg.default_max_queue_time()?,
         };
 
-        let name = opts
-            .name
-            .clone()
-            .or(file.name)
+        let name = match opts.name.clone().or(file.name) {
+            Some(name) => {
+                if !opts.allow_unsafe_name {
+                    check_chosen_name(&name)?;
+                }
+                name
+            }
             // The program name is the default. `qex list` is then easy to read,
-            // and the user does not need to remember the `--name` option.
-            .unwrap_or_else(|| default_name(&command));
+            // and the user does not need to remember the `--name` option. The
+            // user did not select this name, so a character outside the set
+            // becomes the safe form and the job still starts.
+            None => derived_name(&command),
+        };
 
         // A name must not have the form of an id.
         //
@@ -902,11 +921,13 @@ impl JobSpec {
     }
 }
 
-/// Gives the last part of the program path.
+/// Gives the last part of the program path, in the form that qex accepts.
 ///
-/// For example, `/usr/bin/python3` gives `python3`.
-fn default_name(command: &[String]) -> String {
-    command
+/// For example, `/usr/bin/python3` gives `python3`. A path that holds a space
+/// or a character outside the name set becomes the safe form. The user did not
+/// choose this name, so qex does not stop the submission.
+fn derived_name(command: &[String]) -> String {
+    let raw = command
         .first()
         .map(|c| {
             Path::new(c)
@@ -915,7 +936,29 @@ fn default_name(command: &[String]) -> String {
                 .unwrap_or(c)
                 .to_string()
         })
-        .unwrap_or_else(|| "job".to_string())
+        .unwrap_or_else(|| "job".to_string());
+    crate::job::sanitize_name(&raw)
+}
+
+/// Refuses a name that a person or an agent chose, when it is not in the set.
+///
+/// The error names the name in its visible form, so an ESC byte in the value
+/// does not move the cursor of the terminal that prints the error.
+fn check_chosen_name(name: &str) -> Result<()> {
+    if crate::job::name_is_safe(name) {
+        return Ok(());
+    }
+    let shown = crate::job::visible(name);
+    bail!(
+        "the name `{shown}` is not a name that qex accepts.\n\n\
+         A job name holds the letters A to Z and a to z, the numbers 0 to 9, and \
+         the characters `-`, `_` and `.` only. It does not start with `-`. It is \
+         128 characters or fewer.\n\n\
+         qex shows this name in `qex list` and `qex top`, and other agents read \
+         it. A character outside the set can move the cursor of a terminal, or \
+         look like an option.\n\n\
+         Use a name such as `build` or `test`."
+    );
 }
 
 /// Makes the first environment for the selected mode.
@@ -935,8 +978,9 @@ pub fn parse_env_pair(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) if !k.is_empty() => Ok((k.to_string(), v.to_string())),
         _ => Err(format!(
-            "incorrect --env value `{s}`. Use the form KEY=VALUE. \
-             Example: --env RUST_LOG=debug"
+            "incorrect --env value `{}`. Use the form KEY=VALUE. \
+             Example: --env RUST_LOG=debug",
+            crate::job::visible(s)
         )),
     }
 }
@@ -1939,6 +1983,47 @@ mod tests {
         // A name that a person can read is accepted.
         o.name = Some("build".into());
         assert!(JobSpec::resolve(&o, &Config::default()).is_ok());
+    }
+
+    /// A name that a person chose must be in the set. A name that qex derived
+    /// from the program must become the safe form, and the job must start.
+    #[test]
+    fn a_chosen_name_outside_the_set_is_refused_and_a_derived_name_is_not() {
+        let _guard = env_lock();
+        let mut o = opts(&["true"]);
+        o.name = Some("deploy prod".into());
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a name that qex accepts"), "got: {err}");
+        assert!(err.contains("deploy prod"), "got: {err}");
+
+        o.name = Some("-version".into());
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a name that qex accepts"), "got: {err}");
+
+        o.name = Some("y".repeat(129));
+        let err = JobSpec::resolve(&o, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("128"), "got: {err}");
+
+        o.name = Some("plain-name_1.2".into());
+        assert!(JobSpec::resolve(&o, &Config::default()).is_ok());
+
+        // The user did not select this name. A space in the program becomes `_`.
+        let spec = JobSpec::resolve(&opts(&["./my build.sh"]), &Config::default()).unwrap();
+        assert_eq!(spec.name, "my_build.sh");
+
+        // A program whose last part has the form of an id must not stop the job.
+        let spec = JobSpec::resolve(
+            &opts(&["/tmp/550e8400-e29b-41d4-a716-446655440000"]),
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(spec.name, "job");
     }
 
     /// The key must reach the coordinator, from the command line and from the

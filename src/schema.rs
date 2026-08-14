@@ -35,7 +35,7 @@ pub const JOB: &str = r##"{
     },
     "name": {
       "type": "string",
-      "description": "The name in `qex list`. The default is the program name."
+      "description": "The name in `qex list`. Letters, numbers, `-`, `_` and `.` only. It must not start with `-`. At most 128 characters. The default is the program name."
     },
     "cwd": {
       "type": "string",
@@ -295,9 +295,9 @@ pub const STATUS: &str = r##"{
     "command": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "The program and its arguments, as qex ran them."
+      "description": "The program and its arguments, in the form that a person can read. A control byte is a C-style escape, so ESC is `\\x1b`. The record on the disk holds the bytes that the job received."
     },
-    "cwd": { "type": "string", "description": "The directory of the job." },
+    "cwd": { "type": "string", "description": "The directory of the job, in the same readable form as command." },
     "state": {
       "type": "string",
       "enum": ["queued", "starting", "running", "completed", "failed", "killed", "timeout", "expired", "oom", "cancelled", "skipped"],
@@ -334,7 +334,7 @@ pub const STATUS: &str = r##"{
     "locks": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "The locks that the job holds while it operates. Two jobs with one lock name never operate together."
+      "description": "The locks that the job holds, in the same SAFE form as name. The record on the disk keeps the word that the user gave."
     },
     "claims": {
       "type": "object",
@@ -437,7 +437,7 @@ pub const STATUS: &str = r##"{
     "tags": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "The tags of the job."
+      "description": "The tags of the job, in the same SAFE form as name. The record on the disk keeps the word that the user gave."
     }
   }
 }

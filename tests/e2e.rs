@@ -398,6 +398,22 @@ impl Harness {
         self.qex(&["kill", id, "--grace", "1s"]);
     }
 
+    /// Writes a stored name into an existing job record, as an earlier qex did.
+    ///
+    /// A later qex refuses such a name at submission. The record on the disk
+    /// can still hold one. Stop the coordinator first, so the next command
+    /// loads this name from the disk.
+    fn plant_stored_name(&self, id: &str, name: &str) {
+        for file in ["status.json", "spec.json"] {
+            let path = self.root.join("state/qex/jobs").join(id).join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("reading {} for a planted name: {e}", path.display()));
+            let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            value["name"] = serde_json::Value::String(name.to_string());
+            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        }
+    }
+
     /// Gives the process id of the coordinator.
     ///
     /// The value comes from the coordinator itself. A search of the process
@@ -7365,14 +7381,24 @@ fn a_line_never_puts_a_control_character_into_a_job_name() {
         "`qex list` holds a control character: {listing:?}"
     );
 
-    // The COMMAND still holds the line exactly. qex cleans the name, which goes
-    // to the terminal, and never the data that the job receives.
+    // The COMMAND that the job received still holds the line exactly. qex
+    // cleans the name, and it shows the command with an escape for a control
+    // byte. The record on the disk is the data that the job received.
     let id = jobs[0]["id"].as_str().unwrap();
-    let status = h.status_json(id);
+    let spec: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(h.root.join("state/qex/jobs").join(id).join("spec.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        status["command"][1].as_str().unwrap(),
+        spec["command"][1].as_str().unwrap(),
         line,
         "the job must receive the line as the file holds it"
+    );
+    let shown = h.status_json(id);
+    let arg = shown["command"][1].as_str().unwrap();
+    assert!(
+        arg.contains("\\x1b") && !arg.contains('\u{1b}'),
+        "the shown command must escape the control byte: {arg:?}"
     );
 }
 
@@ -8950,12 +8976,10 @@ fn the_completion_candidates_start_no_coordinator() {
     // them becomes ONE `_`, a first character of `-` becomes `_`, and the
     // result stops at 128 characters.
     //
-    // A record on the disk is not a promise about its content: qex wrote
-    // records before this rule, and one of them can hold a name with a space, a
-    // `$` or a `;`. The safe form comes from the name that the record holds, so
-    // the rule reaches every record at once and `qex gc` is not the thing that
-    // applies it.
-    let pairs = [
+    // A later qex refuses these names at submission. Plant them in a record
+    // that an earlier qex could have written. The safe form comes from the
+    // name that the record holds, so the rule reaches every record at once.
+    let pairs: Vec<(String, String)> = [
         ("deploy prod$(id)", "deploy_prod_id_"),
         ("cost $HOME", "cost_HOME"),
         ("a; touch", "a_touch"),
@@ -8968,26 +8992,43 @@ fn the_completion_candidates_start_no_coordinator() {
         ("-version", "_version"),
         ("caf\u{e9}", "caf_"),
         ("plain-name_1.2", "plain-name_1.2"),
-    ];
-    for (name, safe) in pairs {
-        let id = h.submit(&["submit", &format!("--name={name}"), "--", "true"]);
+    ]
+    .into_iter()
+    .map(|(n, s)| (n.to_string(), s.to_string()))
+    .chain(std::iter::once(("y".repeat(200), "y".repeat(128))))
+    .collect();
+    let mut planted = Vec::new();
+    for (i, (name, safe)) in pairs.iter().enumerate() {
+        let id = h.submit(&["submit", "--name", &format!("plant{i}"), "--", "true"]);
+        planted.push((id, name.clone(), safe.clone()));
+    }
+    h.until("the planted jobs stop", Duration::from_secs(45), || {
+        planted
+            .iter()
+            .all(|(id, _, _)| h.state_of(id) == "completed")
+    });
+    h.stop_coordinator();
+    for (id, name, _) in &planted {
+        h.plant_stored_name(id, name);
+    }
+    for (id, name, safe) in &planted {
         // qex shows the safe form. `every_output_shows_the_safe_name` holds
         // the other half: the record on the disk keeps the name that the user
         // gave.
         assert_eq!(
-            h.status_json(&id)["name"].as_str(),
-            Some(safe),
+            h.status_json(id)["name"].as_str(),
+            Some(safe.as_str()),
             "qex must show {safe:?} for the name {name:?}"
         );
         // The list holds the SAFE form, and never the name itself.
         let all = h.ok(&["__complete", "ids"]);
         assert!(
-            all.lines().any(|l| l == safe),
+            all.lines().any(|l| l == safe.as_str()),
             "the list must offer {safe:?} for the name {name:?}: {all}"
         );
         if safe != name {
             assert!(
-                !all.lines().any(|l| l == name),
+                !all.lines().any(|l| l == name.as_str()),
                 "the list must not offer the name {name:?} itself: {all}"
             );
         }
@@ -9012,14 +9053,7 @@ fn the_completion_candidates_start_no_coordinator() {
         );
     }
 
-    // A LONG NAME stops at 128 characters.
-    let long = "y".repeat(200);
-    h.submit(&["submit", &format!("--name={long}"), "--", "true"]);
     let all = h.ok(&["__complete", "ids"]);
-    assert!(
-        all.lines().any(|l| l == "y".repeat(128)),
-        "a long name must stop at 128 characters"
-    );
     assert!(
         all.lines().all(|l| l.chars().count() <= 128),
         "no candidate may be longer than 128 characters"
@@ -9030,8 +9064,13 @@ fn the_completion_candidates_start_no_coordinator() {
     //
     // `a b` and `a_b` both give `a_b`. `a-b` does NOT collide with them,
     // because `-` is inside the set and it is not replaced.
-    h.submit(&["submit", "--name=x y", "--", "true"]);
+    let spaced = h.submit(&["submit", "--name", "plant-space", "--", "true"]);
     h.submit(&["submit", "--name=x_y", "--", "true"]);
+    h.until("the collision jobs stop", Duration::from_secs(45), || {
+        h.state_of(&spaced) == "completed"
+    });
+    h.stop_coordinator();
+    h.plant_stored_name(&spaced, "x y");
     let out = h.qex(&["status", "x_y"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -9085,13 +9124,17 @@ fn every_output_shows_the_safe_name() {
 
     let stored = "deploy prod$(id)";
     let safe = "deploy_prod_id_";
-    let id = h.submit(&["submit", &format!("--name={stored}"), "--", "true"]);
+    let id = h.submit(&["submit", "--name", "deploy-plant", "--", "true"]);
     // A name that holds an ESC byte. This is the one that hurts a terminal.
+    // An earlier qex stored it. A later qex refuses it at submission.
     let esc = "esc\u{1b}[2Jbad";
-    let esc_id = h.submit(&["submit", &format!("--name={esc}"), "--", "true"]);
+    let esc_id = h.submit(&["submit", "--name", "esc-plant", "--", "true"]);
     h.until("both jobs stop", Duration::from_secs(45), || {
         h.state_of(&id) == "completed" && h.state_of(&esc_id) == "completed"
     });
+    h.stop_coordinator();
+    h.plant_stored_name(&id, stored);
+    h.plant_stored_name(&esc_id, esc);
 
     // 1. THE RECORD KEEPS THE STORED NAME. This change rewrites no history.
     let record = h.root.join("state/qex/jobs").join(&id).join("status.json");
@@ -9171,7 +9214,8 @@ fn every_output_shows_the_safe_name() {
     // way, so they hold the safe name too.
     let holder = h.submit(&[
         "submit",
-        &format!("--name={esc}"),
+        "--name",
+        "esc_2Jbad",
         "--cpu",
         "1",
         "--mem",
@@ -9194,7 +9238,8 @@ fn every_output_shows_the_safe_name() {
     // A job that FAILED, and a job that needed it.
     let broken = h.submit(&[
         "submit",
-        &format!("--name={esc}"),
+        "--name",
+        "esc_2Jbad-broken",
         "--",
         "sh",
         "-c",
@@ -9208,7 +9253,7 @@ fn every_output_shows_the_safe_name() {
     );
 
     // And a record that something deleted.
-    let gone = h.submit(&["submit", &format!("--name={esc}"), "--", "true"]);
+    let gone = h.submit(&["submit", "--name", "esc_2Jbad-gone", "--", "true"]);
     h.until("that job stops", Duration::from_secs(45), || {
         h.state_of(&gone) == "completed"
     });
@@ -9281,7 +9326,8 @@ fn every_output_shows_the_safe_name() {
     // while the record it needs is already deletable.
     let waiting_esc = h.submit(&[
         "submit",
-        &format!("--name={esc}"),
+        "--name",
+        "esc_2Jbad-wait",
         "--needs",
         &done,
         "--cpu",
@@ -9479,6 +9525,149 @@ fn every_output_shows_the_safe_name() {
         Some(id.as_str()),
         "the stored name must still find the job"
     );
+}
+
+/// A name that a person chose must be in the set. The error must name the
+/// cause and the remedy, and it must not write an ESC byte to the terminal.
+#[test]
+fn a_chosen_name_outside_the_set_is_refused() {
+    let h = Harness::with_default_config("refusename");
+    for name in ["deploy prod", "-version", &"y".repeat(129), "esc\u{1b}[2J"] {
+        // `--name=VALUE` so a name that starts with `-` is not an option.
+        let out = h.qex(&["submit", &format!("--name={name}"), "--", "true"]);
+        assert!(!out.status.success(), "qex accepted the name {name:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("not a name that qex accepts"),
+            "the error must say what happened: {err}"
+        );
+        assert!(
+            err.contains("build") || err.contains("test"),
+            "the error must say what to write: {err}"
+        );
+        assert!(
+            !out.stderr.windows(4).any(|w| w == b"\x1b[2J"),
+            "the error wrote an ESC byte for the name {name:?}"
+        );
+    }
+    // A name in the set starts a job.
+    let id = h.submit(&["submit", "--name", "build", "--", "true"]);
+    assert_eq!(h.status_json(&id)["name"].as_str(), Some("build"));
+}
+
+/// A name that qex takes from the program must become the safe form. The user
+/// did not select it, so the job still starts.
+#[test]
+fn a_derived_name_outside_the_set_becomes_the_safe_form() {
+    let h = Harness::with_default_config("derivedname");
+    let script = h.root.join("my build.sh");
+    std::fs::write(&script, "#!/bin/sh\ntrue\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&script).unwrap().permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&script, p).unwrap();
+    }
+    let id = h.submit(&["submit", "--", script.to_str().unwrap()]);
+    assert_eq!(
+        h.status_json(&id)["name"].as_str(),
+        Some("my_build.sh"),
+        "the derived name must be the safe form of the program"
+    );
+}
+
+/// A tag, a lock, the program and the environment reach a reader in a form
+/// that cannot move the cursor.
+#[test]
+fn a_tag_a_lock_a_command_and_the_environment_are_safe_on_the_page() {
+    let h = Harness::with_default_config("safevals");
+    let esc = "t\u{1b}[2Jag";
+    let lock = "lk\u{1b}[2J";
+    let id = h.submit(&[
+        "submit",
+        "--name",
+        "vals",
+        "--tag",
+        esc,
+        "--lock",
+        lock,
+        "--env",
+        "K=\u{1b}[2Jx",
+        "--env-capture",
+        "none",
+        "--",
+        "true",
+        "a\u{1b}[2Jb",
+    ]);
+    h.until("the job stops", Duration::from_secs(45), || {
+        h.state_of(&id) == "completed"
+    });
+
+    let status = h.ok(&["status", &id, "--show-env"]);
+    assert!(
+        !status.contains('\u{1b}'),
+        "`qex status` wrote an ESC byte: {status:?}"
+    );
+    assert!(
+        status.contains("t_2Jag") || status.contains("t_ag"),
+        "the tag must reach the reader in its safe form: {status}"
+    );
+    assert!(
+        status.contains("lk_2J") || status.contains("lk_"),
+        "the lock must reach the reader in its safe form: {status}"
+    );
+    assert!(
+        status.contains("\\x1b"),
+        "the environment must show the ESC byte as an escape: {status}"
+    );
+
+    let json = h.status_json(&id);
+    assert_eq!(json["tags"][0].as_str(), Some("t_2Jag"));
+    assert_eq!(json["locks"][0].as_str(), Some("lk_2J"));
+    let cmd = json["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        cmd.iter().any(|a| a.contains("\\x1b")),
+        "the command must show the ESC byte as an escape: {cmd:?}"
+    );
+
+    let listed = h.ok(&["list"]);
+    assert!(!listed.contains('\u{1b}'), "`qex list` wrote an ESC byte");
+}
+
+/// A lock word that `qex status` shows must find the lock that the job holds.
+#[test]
+fn a_safe_lock_word_pauses_and_resumes_the_stored_lock() {
+    let h = Harness::with_default_config("safelock");
+    let stored = "lk\u{1b}[2J";
+    let id = h.submit(&[
+        "submit", "--name", "holder", "--lock", stored, "--", "sleep", "30",
+    ]);
+    h.until("the holder runs", Duration::from_secs(45), || {
+        h.state_of(&id) == "running"
+    });
+    let shown = h.status_json(&id)["locks"][0].as_str().unwrap().to_string();
+    assert_eq!(shown, "lk_2J");
+
+    h.ok(&["pause", "lock", &shown]);
+    let waiter = h.submit(&["submit", "--name", "waiter", "--lock", stored, "--", "true"]);
+    h.until("the waiter sees the pause", Duration::from_secs(45), || {
+        h.status_json(&waiter)["blocked_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("person holds"))
+    });
+    h.ok(&["resume", "lock", &shown]);
+    h.until(
+        "the waiter starts after the resume",
+        Duration::from_secs(45),
+        || h.state_of(&waiter) == "completed",
+    );
+    h.stop(&id);
 }
 
 /// bash must keep a hostile candidate in ONE word, whatever the answer holds.
@@ -10519,13 +10708,20 @@ fn the_event_stream_reports_each_change_of_state_in_order() {
 #[test]
 fn the_stream_shows_the_safe_name() {
     let h = Harness::with_default_config("eventsname");
+    let esc = "esc\u{1b}[2Jbad";
+    let id = h.submit(&["submit", "--name", "esc-event", "--", "sleep", "30"]);
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.state_of(&id) == "running"
+    });
+    h.stop_coordinator();
+    h.plant_stored_name(&id, esc);
+
+    // Read AFTER the plant. The coordinator that starts now holds the stored
+    // name, so the stream and `qex status` show one safe form.
     let reader = events_reader(&h, &["--json", "--timeout", "20s"]);
     let plain = events_reader(&h, &["--timeout", "20s"]);
     std::thread::sleep(Duration::from_millis(500));
-
-    let esc = "esc\u{1b}[2Jbad";
-    let id = h.submit(&["submit", &format!("--name={esc}"), "--", "true"]);
-    h.ok(&["wait", &id]);
+    h.ok(&["kill", &id, "--grace", "1s"]);
 
     // The text form goes to a terminal, so test the BYTES.
     let text = plain.wait_with_output().expect("the reader did not stop");

@@ -762,7 +762,7 @@ fn job_line(
         .map(format_duration)
         .unwrap_or_else(|| "-".to_string());
 
-    let note = note_for(job);
+    let note = crate::job::printable(&note_for(job));
 
     // Write the state in its colour, and make a line of a job that
     // succeeded faint. That job needs no attention, and the eye must go to
@@ -837,15 +837,16 @@ fn info_lines(job: Option<&JobStatus>, width: usize) -> Vec<String> {
     };
     // The command and the directory are not handles. `safe_name` would turn
     // `/home/me/project` into `_home_me_project` and `--epochs` into `_epochs`,
-    // and the reader could not act on either. `printable` keeps the path and
-    // the flags, and it still removes the bytes that move the cursor.
+    // and the reader could not act on either. `visible` keeps the path and
+    // the flags, and it turns a control byte into an escape that a person
+    // can read.
     let command = job
         .command
         .iter()
-        .map(|a| crate::job::printable(a))
+        .map(|a| crate::job::visible(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let cwd = crate::job::printable(&job.cwd);
+    let cwd = crate::job::visible(&job.cwd);
     let mut lines = Vec::new();
     lines.extend(wrap_field("command", &command, width));
     lines.extend(wrap_field("cwd", &cwd, width));

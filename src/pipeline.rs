@@ -272,7 +272,10 @@ pub fn stage_spec(
         env: stage.env.clone(),
     };
 
-    let opts = SubmitOptions::default();
+    let opts = SubmitOptions {
+        allow_unsafe_name: true,
+        ..SubmitOptions::default()
+    };
     let (mut spec, _) = JobSpec::resolve_from_file(&opts, cfg, file)?;
     spec.group = Some(group);
     spec.group_name = Some(group_name.to_string());
