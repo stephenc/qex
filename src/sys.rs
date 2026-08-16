@@ -180,7 +180,7 @@ fn sysctl_boottime() -> Option<String> {
     let mut len = std::mem::size_of::<libc::timeval>();
     let rc = unsafe {
         libc::sysctlbyname(
-            b"kern.boottime\0".as_ptr() as *const libc::c_char,
+            c"kern.boottime".as_ptr(),
             &mut tv as *mut _ as *mut libc::c_void,
             &mut len,
             std::ptr::null_mut(),
