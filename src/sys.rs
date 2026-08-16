@@ -173,21 +173,43 @@ pub fn boot_id() -> String {
 
 #[cfg(target_os = "macos")]
 fn sysctl_boottime() -> Option<String> {
-    let mut tv = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut len = std::mem::size_of::<libc::timeval>();
-    let rc = unsafe {
-        libc::sysctlbyname(
-            c"kern.boottime".as_ptr(),
-            &mut tv as *mut _ as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    (rc == 0).then(|| format!("boot-{}", tv.tv_sec))
+    boot_time_secs().map(|secs| format!("boot-{secs}"))
+}
+
+/// Gives the moment when this machine started, in seconds after the Unix epoch.
+///
+/// A file that was written BEFORE this moment was written in an earlier start
+/// of the machine. Recovery uses this to date a record that has no `boot_id`:
+/// an old version of qex wrote no identifier, and the process tests alone
+/// cannot see a restart.
+pub fn boot_time_secs() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    if let Ok(text) = std::fs::read_to_string("/proc/stat") {
+        if let Some(line) = text.lines().find(|l| l.starts_with("btime ")) {
+            return line.split_whitespace().nth(1).and_then(|f| f.parse().ok());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tv = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut len = std::mem::size_of::<libc::timeval>();
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.boottime".as_ptr(),
+                &mut tv as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && tv.tv_sec > 0 {
+            return Some(tv.tv_sec as u64);
+        }
+    }
+    None
 }
 
 /// Tests if a process is alive.
@@ -224,6 +246,36 @@ pub fn job_pid_alive(pid: i32) -> bool {
         return false;
     }
     unsafe { libc::getpgid(pid) == pid }
+}
+
+/// Tests if a process of THIS USER is alive.
+///
+/// Unlike `pid_alive`, a refusal of permission does not count as alive. The
+/// supervisor of a job always runs as the user of the coordinator, so a pid
+/// that `kill(pid, 0)` refuses belongs to somebody else: the machine gave the
+/// number of the supervisor to a new process.
+pub fn own_pid_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Tests if the process that holds `pid` NOW is the process that a record
+/// named, by its start time.
+///
+/// `recorded` is the value that `process_start_token` gave when the record was
+/// written. `None` comes from a record of an earlier version of qex, which
+/// wrote no value; for such a record qex loses this test only and the answer
+/// is yes. A recorded value that the current process does not show — because
+/// the value differs, or because the current process will not show a start
+/// time although the record has one — is a no: qex must not act on a process
+/// that it cannot prove is the recorded one.
+pub fn same_process_start(pid: i32, recorded: Option<u64>) -> bool {
+    match recorded {
+        None => true,
+        Some(recorded) => process_start_token(pid) == Some(recorded),
+    }
 }
 
 /// Gives a value that identifies ONE START of a process.
@@ -348,6 +400,33 @@ mod tests {
         assert_eq!(token, process_start_token(me));
         assert!(process_start_token(-1).is_none());
         assert!(process_start_token(0).is_none());
+
+        // A record without a value loses the test only; a record with a value
+        // demands that exact value.
+        assert!(same_process_start(me, None));
+        assert!(same_process_start(me, token));
+        assert!(!same_process_start(me, token.map(|t| t + 1)));
+        // A process that shows no start time is not proven to be the recorded
+        // one. The pid -1 has none, and the answer for a recorded value must
+        // be no, not yes.
+        assert!(!same_process_start(-1, Some(42)));
+        assert!(same_process_start(-1, None));
+    }
+
+    #[test]
+    fn a_process_of_another_user_is_never_the_supervisor() {
+        let me = std::process::id() as i32;
+        assert!(own_pid_alive(me));
+        assert!(!own_pid_alive(-1));
+        assert!(!own_pid_alive(0));
+        // The init process belongs to root. `pid_alive` counts the permission
+        // refusal as alive, which is correct for a peer of another user;
+        // `own_pid_alive` must not, because the supervisor is always this
+        // user. (As root there is no refusal, so the test would test nothing.)
+        if unsafe { libc::getuid() } != 0 {
+            assert!(pid_alive(1));
+            assert!(!own_pid_alive(1));
+        }
     }
 }
 

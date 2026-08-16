@@ -42,7 +42,7 @@ pub fn parse_signal(s: &str) -> Result<i32, String> {
 /// qex sends the first signal, waits for the grace time, then sends `KILL`.
 /// A job that handles `SIGTERM` can thus write its files before it stops.
 pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u64) -> Response {
-    let pid = {
+    let (pid, pid_start) = {
         let mut state = coord.state.lock().unwrap();
         // Read the status file first. The supervisor writes the process id
         // there, and this command needs that value to signal the job.
@@ -72,7 +72,7 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
         }
 
         match job.status.pid {
-            Some(p) => p,
+            Some(p) => (p, job.status.pid_start_token),
             None => {
                 return Response::error(
                     ErrorKind::WrongState,
@@ -131,8 +131,9 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
             // job can stop in it and the machine can give its number to a new
             // process, and a job with `--retries` can start a new attempt
             // with a new pid. The KILL goes to the group of the recorded pid
-            // only while that pid is still the pid of this job, and only
-            // while that pid still leads its group.
+            // only while that pid is still the pid of this job, only while it
+            // still leads its group, and only while the process has the start
+            // time that the record gave at the first signal.
             let pid_now = {
                 let state = coord.state.lock().unwrap();
                 state
@@ -142,7 +143,10 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
                     .and_then(|j| j.status.pid)
             };
 
-            if pid_now == Some(pid) && crate::sys::job_pid_alive(pid) {
+            if pid_now == Some(pid)
+                && crate::sys::job_pid_alive(pid)
+                && crate::sys::same_process_start(pid, pid_start)
+            {
                 unsafe {
                     libc::killpg(pid, libc::SIGKILL);
                 }

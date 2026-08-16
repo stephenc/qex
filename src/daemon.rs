@@ -1019,6 +1019,7 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     }
 
     let current_boot = sys::boot_id();
+    let boot_time = sys::boot_time_secs();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -1048,41 +1049,57 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
             // — processes that have no connection with the job.
             //
             // A record from an EARLIER START OF THE MACHINE is dead, whatever
-            // its pids say. A record without the value comes from the moment
-            // between the fork and the first write of the supervisor, or from
-            // an earlier version of qex; for such a record qex keeps the
-            // tests of the processes.
+            // its pids say. The submission writes `boot_id`, so every record
+            // of this version has one from its birth. A record WITHOUT the
+            // value comes from an earlier version of qex; date it by the time
+            // of its file instead — a status that was written before this
+            // machine started belongs to an earlier start. Without that
+            // fallback, a reboot with old records on the disk would take a
+            // boot-time daemon that reuses a recorded pid for the job.
             let same_boot = match status.boot_id.as_deref() {
                 Some(recorded) => recorded == current_boot,
-                None => true,
+                None => written_this_boot(&path.join("status.json"), boot_time),
             };
-            // `job_pid_alive` demands that the pid leads its own process
-            // group, which the supervisor gave the job at its start. A new
-            // process with the same number is almost never that, and a
-            // process of another user (which `pid_alive` counts as alive) is
-            // never the job.
-            let job_alive = same_boot && status.pid.map(sys::job_pid_alive).unwrap_or(false);
+            // Two tests for the job pid, because neither alone is a name:
+            // the pid must lead its own process group, which the supervisor
+            // gave the job at its start, and the process must have the start
+            // time that the supervisor recorded beside the pid. A recycled
+            // number can lead a group of its own (a shell, a daemon); it
+            // cannot also have the recorded start time. A process of another
+            // user (which `pid_alive` counts as alive) is never the job.
+            let job_alive = same_boot
+                && status
+                    .pid
+                    .map(|pid| {
+                        sys::job_pid_alive(pid)
+                            && sys::same_process_start(pid, status.pid_start_token)
+                    })
+                    .unwrap_or(false);
             // The pid comes from the record, or from the file that the
             // coordinator wrote at the fork. The second one covers the moment
             // between the fork and the first write of the supervisor: without
             // it, a coordinator that starts again in that moment finds a job
-            // with no process and marks it failed, while the job runs.
-            let supervisor_pid = status
-                .supervisor_pid
-                .or_else(|| crate::supervisor::supervisor_pid_of(&path));
-            // The supervisor recorded its own start time. A process that
-            // holds the number now with a DIFFERENT start time is a stranger:
-            // the job must not stay `running` on the strength of it, and the
-            // watch that `reap` starts must not follow it.
+            // with no process and marks it failed, while the job runs. The
+            // file also carries the start time of the supervisor, so that
+            // moment has an identity too.
+            let (supervisor_pid, fork_start) = match status.supervisor_pid {
+                Some(pid) => (Some(pid), None),
+                None => match crate::supervisor::supervisor_record_of(&path) {
+                    Some((pid, start)) => (Some(pid), start),
+                    None => (None, None),
+                },
+            };
+            let supervisor_start = status.supervisor_start_token.or(fork_start);
+            // The supervisor runs as this user, so `own_pid_alive`: a pid
+            // that the kernel refuses to signal belongs to somebody else, and
+            // is not the supervisor whatever a permission error suggests. And
+            // the process must have the recorded start time: a stranger that
+            // holds the number must not keep the job `running`, and the watch
+            // that `reap` starts must not follow it.
             let supervisor_alive = same_boot
                 && supervisor_pid
                     .map(|pid| {
-                        sys::pid_alive(pid)
-                            && match (status.supervisor_start_token, sys::process_start_token(pid))
-                            {
-                                (Some(recorded), Some(current)) => recorded == current,
-                                _ => true,
-                            }
+                        sys::own_pid_alive(pid) && sys::same_process_start(pid, supervisor_start)
                     })
                     .unwrap_or(false);
 
@@ -1120,13 +1137,14 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                          continues; qex stops the job now",
                         status.id
                     ));
-                    crate::supervisor::stop_process_group(pid);
+                    crate::supervisor::stop_process_group(pid, status.pid_start_token);
                     note.push_str("; qex stopped the job process");
                 }
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
                 status.blocked_reason = None;
                 status.error = Some(note);
+                retire_the_pids(&mut status);
                 job::write_status(&path, &status).ok();
                 // This coordinator made the job terminal, so this coordinator
                 // tells the person. The supervisor is gone and cannot.
@@ -1146,6 +1164,7 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                      continued"
                         .to_string()
                 });
+                retire_the_pids(&mut status);
                 job::write_status(&path, &status).ok();
                 log(&format!(
                     "job {} was active but its processes are gone; the state is now failed",
@@ -1244,6 +1263,45 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         log(&format!("the coordinator read {recovered} job record(s)"));
     }
     Ok(())
+}
+
+/// Tests if a file was written in the current start of the machine.
+///
+/// Recovery uses this to date a record that has no `boot_id`, which an earlier
+/// version of qex wrote. Without a date, that record would take the process
+/// tests after a reboot, and a boot-time process that reuses a recorded pid
+/// could pass them.
+///
+/// When the machine gives no boot time, or the file gives no time, the answer
+/// is yes: qex then loses the restart test for that record only, which is the
+/// behavior it had before the test existed.
+fn written_this_boot(file: &std::path::Path, boot_time: Option<u64>) -> bool {
+    let Some(boot_time) = boot_time else {
+        return true;
+    };
+    let Some(written) = std::fs::metadata(file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    else {
+        return true;
+    };
+    written.as_secs() >= boot_time
+}
+
+/// Moves the pids of a job out of the active fields, for a terminal write.
+///
+/// The published rule is that a pid in a record exists only while the job
+/// operates, and that a reader can act on it. The recovery paths that make a
+/// job terminal know that these numbers now point at nothing — or at
+/// strangers — so they must not stay where a reader is told to trust them.
+/// This mirrors the stop write of the supervisor.
+fn retire_the_pids(status: &mut crate::job::JobStatus) {
+    if let Some(pid) = status.pid.take() {
+        status.last_pid = Some(pid);
+    }
+    status.pid_start_token = None;
+    status.supervisor_pid = None;
 }
 
 /// Holds the jobs that one connection owns, and gives them back when it ends.

@@ -74,21 +74,26 @@ pub fn spawn(id: uuid::Uuid) -> Result<i32> {
 /// and_gives_its_pid` holds.
 pub fn record_supervisor_pid(id: &uuid::Uuid, pid: i32) {
     let Ok(dir) = paths::job_dir(id) else { return };
-    crate::job::write_atomic(
-        &dir.join("supervisor.pid"),
-        pid.to_string().as_bytes(),
-        0o600,
-    )
-    .ok();
+    // The pid, and after it the start time of that process. The pid alone is
+    // not a name — the machine uses the number again — and this file is the
+    // ONLY identity of the supervisor in the window before its first write,
+    // so the identity must be here.
+    let text = match sys::process_start_token(pid) {
+        Some(token) => format!("{pid} {token}"),
+        None => pid.to_string(),
+    };
+    crate::job::write_atomic(&dir.join("supervisor.pid"), text.as_bytes(), 0o600).ok();
 }
 
-/// Reads that pid.
-pub fn supervisor_pid_of(dir: &std::path::Path) -> Option<i32> {
-    std::fs::read_to_string(dir.join("supervisor.pid"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+/// Reads that pid, and the start time beside it.
+///
+/// The start time is `None` for a file that an earlier version of qex wrote,
+/// which held the pid alone.
+pub fn supervisor_record_of(dir: &std::path::Path) -> Option<(i32, Option<u64>)> {
+    let text = std::fs::read_to_string(dir.join("supervisor.pid")).ok()?;
+    let mut fields = text.split_whitespace();
+    let pid = fields.next()?.parse().ok()?;
+    Some((pid, fields.next().and_then(|f| f.parse().ok())))
 }
 
 /// Waits for one supervisor and puts its result in the coordinator.
@@ -175,7 +180,13 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 // must stop it here. Without this step, the job continues, the
                 // budget shows the memory as free, and no qex command can stop
                 // the job, because its record says that it stopped.
-                let job_pid = other.ok().and_then(|s| s.pid).or(job.status.pid);
+                // The pid and its start time come from ONE record: the pair is
+                // the identity, and a pid of one write with the start time of
+                // another names nothing.
+                let (job_pid, job_start) = match other.ok().filter(|s| s.pid.is_some()) {
+                    Some(s) => (s.pid, s.pid_start_token),
+                    None => (job.status.pid, job.status.pid_start_token),
+                };
                 let mut note = "the supervisor stopped without a result".to_string();
 
                 // Give the words of the supervisor itself.
@@ -189,22 +200,31 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 }
 
                 if let Some(pid) = job_pid {
-                    // `job_pid_alive` and not `pid_alive`: the machine can give
-                    // this number to a new process, and the group signal below
-                    // must not reach a stranger. The job process is the leader
-                    // of its own group, and a stranger is almost never that.
-                    if sys::job_pid_alive(pid) {
+                    // `job_pid_alive` with the start time, and not `pid_alive`:
+                    // the machine can give this number to a new process, and
+                    // the group signal below must not reach a stranger. The
+                    // job process leads its own group and has the recorded
+                    // start time; a stranger fails one of the two.
+                    if sys::job_pid_alive(pid) && sys::same_process_start(pid, job_start) {
                         log(&format!(
                             "the supervisor of the job {id} stopped, and the job {pid} \
                              continues; qex stops the job now"
                         ));
-                        stop_process_group(pid);
+                        stop_process_group(pid, job_start);
                         note.push_str("; qex stopped the job process");
                     }
                 }
 
                 job.status.state = JobState::Failed;
                 job.status.finished_at = Some(sys::now_secs());
+                // A pid in a terminal record invites a signal to whoever holds
+                // the number later. Keep it as history only, as the supervisor
+                // does in its own stop write.
+                if let Some(p) = job.status.pid.take() {
+                    job.status.last_pid = Some(p);
+                }
+                job.status.pid_start_token = None;
+                job.status.supervisor_pid = None;
                 // A job that failed waits for nothing, so this text belongs in
                 // the error field.
                 job.status.error = Some(note);
@@ -248,14 +268,26 @@ fn watch_until_gone(pid: i32) {
 ///
 /// This function sends `SIGTERM`, waits a short time, then sends `SIGKILL`.
 /// A process cannot avoid the second signal.
-pub(crate) fn stop_process_group(pid: i32) {
+///
+/// `recorded_start` is the start time that the record gave for `pid`, from
+/// `sys::process_start_token`, or `None` when the record has no value. THE
+/// IDENTITY TEST RUNS BEFORE EACH SIGNAL, and not one time at the entry: the
+/// wait in the middle is long enough for the job to stop and for the machine
+/// to give its number — even the lead of a group — to a new process, and a
+/// signal to a group is exactly the operation that must never reach a
+/// stranger.
+pub(crate) fn stop_process_group(pid: i32, recorded_start: Option<u64>) {
+    let is_the_job = |pid| sys::job_pid_alive(pid) && sys::same_process_start(pid, recorded_start);
+    if !is_the_job(pid) {
+        return;
+    }
     unsafe {
         libc::killpg(pid, libc::SIGTERM);
     }
     // Give the job a short time to write its files and stop.
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
-        if !sys::pid_alive(pid) {
+        if !is_the_job(pid) {
             return;
         }
     }
@@ -565,6 +597,10 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let pid = child.id() as i32;
     status.state = JobState::Running;
     status.pid = Some(pid);
+    // Say which START of the process the number names. A pid alone is not a
+    // name: the machine uses the number again, and a coordinator that starts
+    // again must not take the new holder for the job.
+    status.pid_start_token = sys::process_start_token(pid);
     // Record this process as the supervisor.
     //
     // The coordinator also writes this value, but this process writes the file
@@ -746,6 +782,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // give that number to another process at any moment. Keep it as history
     // only, where no code can act on it.
     status.pid = None;
+    status.pid_start_token = None;
     status.last_pid = Some(pid);
 
     // Report a kill for memory. qex does not act on one.

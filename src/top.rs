@@ -1424,6 +1424,7 @@ mod tests {
             cwd: "/".into(),
             state,
             pid: Some(std::process::id() as i32),
+            pid_start_token: None,
             last_pid: None,
             supervisor_pid: None,
             boot_id: None,

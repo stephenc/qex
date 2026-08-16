@@ -397,6 +397,16 @@ pub struct JobStatus {
     /// is this job, now. A reader can act on it, because a value that exists
     /// means that the job operates.
     pub pid: Option<i32>,
+    /// The start time of the job process, as `sys::process_start_token` gives
+    /// it. THE UNIT DIFFERS BETWEEN SYSTEMS; compare for equality only.
+    ///
+    /// The supervisor writes this value beside `pid`, and clears it with
+    /// `pid`. A coordinator that starts again compares it with the start time
+    /// of the process that holds the number now: the machine uses each pid
+    /// again, and the new holder can even lead a group of its own, so neither
+    /// life nor group leadership alone proves that a pid is the job.
+    #[serde(default)]
+    pub pid_start_token: Option<u64>,
     /// The pid that the job HAD, kept after the job stops.
     ///
     /// This value is for a person who reads a log of the machine. NEVER SEND A
@@ -411,14 +421,17 @@ pub struct JobStatus {
     /// job that stopped.
     #[serde(default)]
     pub supervisor_pid: Option<i32>,
-    /// The identifier of the start of the machine when the supervisor wrote
-    /// this record. See `sys::boot_id`.
+    /// The identifier of the start of the machine that this record belongs
+    /// to. See `sys::boot_id`. The submission writes it, and the supervisor
+    /// writes it again, so every record has one from its birth.
     ///
     /// A coordinator that starts again compares this value with the current
     /// one. After a restart of the machine, every pid in an active record
     /// points at nothing, or at a process that has no connection with the job.
     /// A record from an earlier start of the machine is therefore dead,
-    /// whatever its pids say.
+    /// whatever its pids say. A record WITHOUT the value comes from an earlier
+    /// version of qex; recovery dates such a record by the time of its file
+    /// against `sys::boot_time_secs`.
     #[serde(default)]
     pub boot_id: Option<String>,
     /// The start time of the supervisor process, as `sys::process_start_token`
@@ -588,9 +601,14 @@ impl JobStatus {
             cwd: spec.cwd.to_string_lossy().into_owned(),
             state: JobState::Queued,
             pid: None,
+            pid_start_token: None,
             last_pid: None,
             supervisor_pid: None,
-            boot_id: None,
+            // From its birth, so no active record is ever without a
+            // generation: the window between the fork of the supervisor and
+            // its first write would otherwise leave a record whose boot
+            // recovery cannot know.
+            boot_id: Some(crate::sys::boot_id()),
             supervisor_start_token: None,
             exit_code: None,
             signal: None,

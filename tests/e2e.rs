@@ -3503,8 +3503,186 @@ fn a_record_from_an_earlier_start_of_the_machine_is_dead() {
     let v: serde_json::Value = serde_json::from_str(&info).unwrap();
     assert_eq!(v["cpu_claimed"].as_u64(), Some(0));
 
+    // The pids move to history. The published rule is that a non-null `pid`
+    // means the job operates and a reader can act on it; after this path the
+    // numbers belong to strangers, so they must not stay where a reader is
+    // told to trust them.
+    let s = h.status_json(&id);
+    assert!(
+        s["pid"].is_null(),
+        "a terminal record must hold no pid: {s}"
+    );
+    assert_eq!(s["last_pid"].as_i64(), Some(job_pid as i64));
+    assert!(
+        s["supervisor_pid"].is_null(),
+        "a terminal record must hold no supervisor pid: {s}"
+    );
+
     // The processes were stand-ins for strangers, so recovery must not have
     // signaled them; stop them here.
+    unsafe {
+        libc::kill(supervisor, libc::SIGKILL);
+        libc::killpg(job_pid, libc::SIGKILL);
+    }
+}
+
+/// A supervisor pid that a NEW process holds must not keep a job `running`.
+///
+/// The machine uses each pid again within one start of the machine. Recovery
+/// must compare the start time that the supervisor recorded with the start
+/// time of the process that holds the number now; a process that is merely
+/// alive with the right number is not the supervisor. Before this rule, a
+/// recycled supervisor pid attached the coordinator to a stranger: the job
+/// stayed `running` for ever and `watch_until_gone` followed that stranger.
+#[test]
+fn a_new_process_with_the_supervisor_pid_is_not_the_supervisor() {
+    let h = Harness::with_default_config("recoversupreuse");
+    let id = h.submit(&["submit", "--name", "reused", "--", "sleep", "300"]);
+
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.state_of(&id) == "running" && h.status_json(&id)["supervisor_pid"].as_i64().is_some()
+    });
+
+    let job_pid = h.status_json(&id)["pid"].as_i64().unwrap() as i32;
+    let supervisor = h.status_json(&id)["supervisor_pid"].as_i64().unwrap() as i32;
+    let coordinator = h.coordinator_pid();
+
+    // The coordinator goes first, then the supervisor; the job stays alive.
+    unsafe {
+        libc::kill(coordinator, libc::SIGKILL);
+        libc::kill(supervisor, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while unsafe { libc::kill(coordinator, 0) } == 0 || unsafe { libc::kill(supervisor, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator and the supervisor did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // A stand-in for the reuse of the pid: a live process of this user that
+    // is not the supervisor. The record keeps the start time of the TRUE
+    // supervisor, so the identity test must refuse this process.
+    #[allow(clippy::zombie_processes)]
+    let decoy = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("starting the stand-in process");
+    let decoy_pid = decoy.id() as i32;
+
+    let path = h.job_dir(&id).join("status.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        value["supervisor_start_token"].as_u64().is_some(),
+        "the record must hold the start time of the supervisor: {value}"
+    );
+    value["supervisor_pid"] = serde_json::json!(decoy_pid);
+    std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+    // The next coordinator must not attach to the stand-in. The supervisor is
+    // gone, the job continues, so recovery stops the job and marks it failed.
+    h.until("the job is failed", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+    let error = h.status_json(&id)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("the supervisor of this job did not continue"),
+        "the record must say that the supervisor is the cause: {error}"
+    );
+    h.until("the job process stops", Duration::from_secs(30), || {
+        let rc = unsafe { libc::kill(job_pid, 0) };
+        rc != 0
+    });
+
+    // The stand-in was never the supervisor, so no signal may reach it.
+    assert_eq!(
+        unsafe { libc::kill(decoy_pid, 0) },
+        0,
+        "the stand-in process must not receive a signal"
+    );
+    unsafe {
+        libc::kill(decoy_pid, libc::SIGKILL);
+    }
+}
+
+/// A record of an earlier version of qex, found after a restart of the
+/// machine, must not take live processes for the job.
+///
+/// Such a record holds no `boot_id` and no start times — only raw pids.
+/// Recovery dates it by the time of its file against the boot time of the
+/// machine: a status written before this start of the machine belongs to an
+/// earlier start, and its numbers name nobody. This test builds that exact
+/// record: the identity fields are removed, the file is dated before the
+/// boot, and the pids point at processes that are alive.
+#[test]
+fn an_old_record_from_before_the_boot_is_dead() {
+    let h = Harness::with_default_config("recoveroldboot");
+    let id = h.submit(&["submit", "--name", "old", "--", "sleep", "300"]);
+
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.state_of(&id) == "running" && h.status_json(&id)["supervisor_pid"].as_i64().is_some()
+    });
+
+    let job_pid = h.status_json(&id)["pid"].as_i64().unwrap() as i32;
+    let supervisor = h.status_json(&id)["supervisor_pid"].as_i64().unwrap() as i32;
+    let coordinator = h.coordinator_pid();
+
+    unsafe {
+        libc::kill(coordinator, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while unsafe { libc::kill(coordinator, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the coordinator did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Make the record one that an earlier version of qex wrote, in an earlier
+    // start of the machine: no identity fields, and a file time before the
+    // boot. The supervisor and the job stay alive as the live strangers that
+    // the recycled numbers would point at.
+    let path = h.job_dir(&id).join("status.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let fields = value.as_object_mut().unwrap();
+    fields.remove("boot_id");
+    fields.remove("supervisor_start_token");
+    fields.remove("pid_start_token");
+    std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+    let touched = std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(&path)
+        .status()
+        .expect("dating the record before the boot");
+    assert!(touched.success(), "touch refused the date");
+
+    // The next coordinator must call the job dead and send no signal.
+    h.until("the job is failed", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+    let error = h.status_json(&id)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("the machine restarted"),
+        "the record must name the restart of the machine: {error}"
+    );
+    assert_eq!(
+        unsafe { libc::kill(job_pid, 0) },
+        0,
+        "the job process stands in for a stranger and must not receive a signal"
+    );
+    assert_eq!(
+        unsafe { libc::kill(supervisor, 0) },
+        0,
+        "the supervisor process stands in for a stranger and must not receive a signal"
+    );
+
     unsafe {
         libc::kill(supervisor, libc::SIGKILL);
         libc::killpg(job_pid, libc::SIGKILL);
