@@ -342,16 +342,29 @@ pub fn claims(cfg: &Config) -> Claims {
     total
 }
 
+/// The largest peer record that qex reads. A record is small; a larger file is
+/// not a record.
+const MAX_PEER_LEN: u64 = 64 * 1024;
+
 /// Reads one peer file and tests its owner.
 ///
 /// The function opens the file without a symbolic link. A different user thus
 /// cannot point the file at a file of this user.
+///
+/// The function opens the file WITHOUT A WAIT. The directory is writable by
+/// every user, and an open of a FIFO waits until a writer arrives — for ever,
+/// when no writer comes. The callers of this function hold the state of the
+/// coordinator, so a wait here stops every command of every user of this
+/// queue. `O_NONBLOCK` makes the open return at once; for a regular file it
+/// changes nothing. The test that the file IS a regular file comes after the
+/// open, from the file itself, so no other user can change the answer between
+/// a test of the path and the open.
 fn read_peer(path: &Path, expected_uid: u32) -> Option<Peer> {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
 
@@ -363,12 +376,21 @@ fn read_peer(path: &Path, expected_uid: u32) -> Option<Peer> {
     if meta.uid() != expected_uid {
         return None;
     }
-    // A record is small. A large file is not a record.
-    if meta.len() > 64 * 1024 {
+    if meta.len() > MAX_PEER_LEN {
         return None;
     }
 
-    let text = std::io::read_to_string(file).ok()?;
+    // Cap the read itself. The file can grow between the test of its size and
+    // the read, and a reader with no cap would take the whole file into
+    // memory.
+    use std::io::Read;
+    let mut text = String::new();
+    file.take(MAX_PEER_LEN + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_PEER_LEN {
+        return None;
+    }
     let peer: Peer = serde_json::from_str(&text).ok()?;
     // The record must name the same user as its directory and its owner.
     if peer.uid != expected_uid {
@@ -503,6 +525,36 @@ mod tests {
         let cfg = cfg_for(&dir);
         // The reader must give an answer and must not stop.
         assert_eq!(claims(&cfg), Claims::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A FIFO in place of a record must not stop the reader.
+    ///
+    /// The peer directory is writable by every user, and an open of a FIFO
+    /// with no writer waits for ever. The callers of `read_peer` hold the
+    /// state of the coordinator, so that wait would stop every command of
+    /// every user of this queue. Without `O_NONBLOCK` in `read_peer`, this
+    /// test does not fail: it hangs.
+    #[test]
+    fn a_fifo_in_place_of_a_record_does_not_stop_the_reader() {
+        let dir = tmpdir("fifo");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let other = dir.join("u12345");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let fifo = other.join("peer-1.json");
+        let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(path.as_ptr(), 0o644) },
+            0,
+            "the test needs a FIFO"
+        );
+
+        // The reader must give an answer at once, and the answer is a refusal.
+        assert!(read_peer(&fifo, 12345).is_none());
+        // The full read must give an answer too, whatever entry finds the FIFO.
+        assert_eq!(claims(&cfg_for(&dir)), Claims::default());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
