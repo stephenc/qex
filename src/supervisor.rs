@@ -236,7 +236,7 @@ fn watch_until_gone(pid: i32) {
 ///
 /// This function sends `SIGTERM`, waits a short time, then sends `SIGKILL`.
 /// A process cannot avoid the second signal.
-fn stop_process_group(pid: i32) {
+pub(crate) fn stop_process_group(pid: i32) {
     unsafe {
         libc::killpg(pid, libc::SIGTERM);
     }
@@ -1140,7 +1140,7 @@ fn write_i32(value: i32, out: &mut [u8; OOM_TEXT]) -> usize {
 ///
 /// The result holds the last lines only, and it is one line of text, because it
 /// goes into a field that `qex status` shows.
-fn supervisor_log_tail(dir: &std::path::Path) -> Option<String> {
+pub(crate) fn supervisor_log_tail(dir: &std::path::Path) -> Option<String> {
     const KEEP: usize = 3;
     const LIMIT: usize = 400;
 

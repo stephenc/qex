@@ -1050,18 +1050,51 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                 .or_else(|| crate::supervisor::supervisor_pid_of(&path));
             let supervisor_alive = supervisor_pid.map(sys::pid_alive).unwrap_or(false);
 
-            if job_alive || supervisor_alive {
+            if supervisor_alive {
                 // The job continues. Keep its state, and let the supervisor
                 // write the result.
-                if supervisor_alive {
-                    if let Some(pid) = supervisor_pid {
-                        // Watch the supervisor again, so the coordinator learns
-                        // when the job stops.
-                        let coord2 = Arc::clone(coord);
-                        let id = status.id;
-                        std::thread::spawn(move || crate::supervisor::reap(coord2, id, pid));
-                    }
+                if let Some(pid) = supervisor_pid {
+                    // Watch the supervisor again, so the coordinator learns
+                    // when the job stops.
+                    let coord2 = Arc::clone(coord);
+                    let id = status.id;
+                    std::thread::spawn(move || crate::supervisor::reap(coord2, id, pid));
                 }
+            } else if job_alive {
+                // The supervisor is gone, and the job process continues. No
+                // process will ever write the result: the supervisor was the
+                // parent of the job, and the exit code of the job goes to that
+                // parent alone.
+                //
+                // Stop the job, exactly as `supervisor::reap` does when a
+                // supervisor stops under a live coordinator. Before this branch
+                // existed, the coordinator kept such a job as `running` and
+                // watched nothing: the record never changed, the job held its
+                // claim and its locks for ever, `qex wait` on it never
+                // returned, and the coordinator never became idle.
+                let mut note = String::from(
+                    "the coordinator stopped, and the supervisor of this job did not continue",
+                );
+                if let Some(text) = crate::supervisor::supervisor_log_tail(&path) {
+                    note.push_str(&format!(". The supervisor said: {text}"));
+                }
+                if let Some(pid) = status.pid {
+                    log(&format!(
+                        "job {} lost its supervisor, and the job process {pid} \
+                         continues; qex stops the job now",
+                        status.id
+                    ));
+                    crate::supervisor::stop_process_group(pid);
+                    note.push_str("; qex stopped the job process");
+                }
+                status.state = JobState::Failed;
+                status.finished_at = Some(sys::now_secs());
+                status.blocked_reason = None;
+                status.error = Some(note);
+                job::write_status(&path, &status).ok();
+                // This coordinator made the job terminal, so this coordinator
+                // tells the person. The supervisor is gone and cannot.
+                crate::hook::fire_detached(&path, &status);
             } else {
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
