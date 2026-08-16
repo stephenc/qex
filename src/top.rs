@@ -1376,9 +1376,12 @@ fn note_for(job: &JobStatus) -> String {
             None => "failed".to_string(),
         },
         JobState::Skipped => "a job that it needed did not succeed".to_string(),
-        // Name the cause, and not the symptom. This column holds one short
-        // line, and the reader must learn what to correct: the claim.
-        JobState::Oom => "the memory claim was too small".to_string(),
+        // Say what qex saw, and no more. An earlier note said "the memory
+        // claim was too small", and qex cannot say that: the kill count
+        // covers every program of the user, so the machine can be full while
+        // the claim is correct, and `docs/reference.md` promises that qex
+        // never makes that call.
+        JobState::Oom => "the kernel stopped it for memory".to_string(),
         JobState::Timeout => "reached its time limit".to_string(),
         JobState::Killed => "stopped by a command".to_string(),
         JobState::Cancelled => "left the queue".to_string(),

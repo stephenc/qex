@@ -50,6 +50,16 @@
 //! read would give an empty store and take every peak of every command with it.
 //! `suggest` passes over such a sample, and a command whose only history is one
 //! gives no claim at all.
+//!
+//! # A file that qex cannot read
+//!
+//! The store loads as one value, so a file that this version cannot read in
+//! full would give an empty store — and the next write would then DELETE every
+//! learned peak from the disk, in silence. So the reader salvages: it keeps
+//! every entry and every sample that it can read. The writer goes one step
+//! further, because the writer is the one that can destroy the file: it moves
+//! a damaged file aside, to `usage.json.corrupt-<time>`, before it writes, and
+//! it writes nothing at all over a file whose bytes it could not read.
 
 use crate::job::JobStatus;
 use crate::paths;
@@ -67,8 +77,7 @@ const SAMPLES: usize = 5;
 const MIN_MEMORY: u64 = 64 << 20;
 
 /// What one measurement says about the memory that a command needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Measurement {
     /// The job completed, and this value is the memory that it used.
     ///
@@ -87,15 +96,43 @@ pub enum Measurement {
     /// `suggest` passes over these samples. The value is not a measurement of
     /// the memory that a job used, so a claim must not come from it.
     LowerBound,
-    /// A kind that this version does not know.
+    /// A kind that this version does not know, with the word that the file
+    /// held.
     ///
     /// A LATER qex can write a kind that this one has never seen, and the store
     /// loads as ONE value: without this arm, that one word would give an empty
     /// store and the reader would lose every peak of every command with no
     /// message. `suggest` passes over these samples, because qex cannot say
     /// what they measure.
-    #[serde(other)]
-    Unknown,
+    ///
+    /// The arm HOLDS THE WORD, and the writer gives it back unchanged. An arm
+    /// with no word would write `unknown` over a kind such as `ceiling`, and
+    /// the first completed job after an upgrade-and-return would destroy the
+    /// label of every sample of the later qex, permanently and with no message.
+    Unknown(String),
+}
+
+// The kind reads and writes as one word, by hand and not by derive, so that a
+// word of a later qex comes back out of the file exactly as it went in.
+impl Serialize for Measurement {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Measurement::Peak => "peak",
+            Measurement::LowerBound => "lower-bound",
+            Measurement::Unknown(word) => word,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Measurement {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Ok(match word.as_str() {
+            "peak" => Measurement::Peak,
+            "lower-bound" => Measurement::LowerBound,
+            _ => Measurement::Unknown(word),
+        })
+    }
 }
 
 /// One measurement of one job.
@@ -150,7 +187,9 @@ pub struct Store {
 pub struct Suggestion {
     pub cpu: u64,
     pub mem: u64,
-    /// The number of measurements behind this claim.
+    /// The number of measurements behind this claim: the peaks, and no other
+    /// kind of sample. A sample that gives no claim does not count as evidence
+    /// for one.
     pub samples: usize,
 }
 
@@ -186,15 +225,95 @@ fn store_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(paths::state_dir()?.join("usage.json"))
 }
 
-/// Reads the store. A file that qex cannot read gives an empty store.
+/// What the reader found on the disk.
+///
+/// `Missing` and `Unreadable` are two different answers, and `add` acts on the
+/// difference: a store that is MISSING starts empty, and the first write makes
+/// the file; a store that qex could not READ must take no write at all, because
+/// a write over a file that qex has not seen destroys measurements that qex
+/// cannot count.
+enum OnDisk {
+    /// No file exists. The store starts empty, and that is correct.
+    Missing,
+    /// A file exists and qex could not read its bytes.
+    Unreadable,
+    /// The file loaded in full.
+    Whole(Store),
+    /// The file held text that this version could not read as a store. The
+    /// value holds every entry and every sample that qex COULD read.
+    Damaged(Store),
+}
+
+fn read_store(path: &std::path::Path) -> OnDisk {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return OnDisk::Missing,
+        Err(_) => return OnDisk::Unreadable,
+    };
+    match serde_json::from_str(&text) {
+        Ok(store) => OnDisk::Whole(store),
+        Err(_) => OnDisk::Damaged(salvage(&text)),
+    }
+}
+
+/// Keeps what a damaged file still says.
+///
+/// The store loads as ONE value, so one entry that this version cannot read
+/// would take every peak of every command with it. The defaults on `Sample` and
+/// `Entry` hold the shapes that a later qex is EXPECTED to write; they do not
+/// hold a truncated file, a field of the wrong type, or one damaged entry among
+/// many. This function reads the file one entry and one sample at a time, and
+/// keeps each one that this version can read.
+fn salvage(text: &str) -> Store {
+    let mut store = Store::default();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        // The text is not JSON at all, so no entry is readable. The caller
+        // quarantines the file, so the bytes stay for a person to read.
+        return store;
+    };
+    let Some(commands) = value.get("commands").and_then(|c| c.as_object()) else {
+        return store;
+    };
+    for (key, entry) in commands {
+        let name = entry
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let samples: Vec<Sample> = entry
+            .get("samples")
+            .and_then(|s| s.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|s| serde_json::from_value(s.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if samples.is_empty() {
+            // An entry with no readable sample gives no claim, so it says
+            // nothing worth a line in the file.
+            continue;
+        }
+        store.commands.insert(key.clone(), Entry { name, samples });
+    }
+    store
+}
+
+/// Reads the store, for a reader that gives claims.
+///
+/// A file that qex cannot read IN FULL gives the entries that qex could read,
+/// and a file that qex cannot read AT ALL gives an empty store: a claim is an
+/// estimate, so a reader loses accuracy only. The writer, `add`, does not use
+/// this function, because a writer that starts from a part of the file would
+/// then write that part OVER the file.
 pub fn load() -> Store {
     let Ok(path) = store_path() else {
         return Store::default();
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Store::default();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
+    match read_store(&path) {
+        OnDisk::Missing | OnDisk::Unreadable => Store::default(),
+        OnDisk::Whole(store) | OnDisk::Damaged(store) => store,
+    }
 }
 
 /// Records the peak of a job that completed.
@@ -244,7 +363,49 @@ fn add(spec: &JobSpec, status: &JobStatus, kind: Measurement, bytes: u64) {
     // reason in full.
     let against = spec.learn_key.as_deref().unwrap_or(&spec.command);
 
-    let mut store = load();
+    // Read the file under the lock, and read it with its damage visible. An
+    // earlier qex read with `unwrap_or_default()` here, so ONE byte that it
+    // could not read gave an empty store, and this write then DELETED every
+    // learned peak of every command from the disk, in silence. The first job
+    // that completed after the damage was the one that destroyed the file.
+    let mut store = match read_store(&path) {
+        OnDisk::Missing => Store::default(),
+        OnDisk::Whole(store) => store,
+        OnDisk::Unreadable => {
+            // The file exists and its bytes did not come. A write here would
+            // replace measurements that qex has not seen. One lost sample
+            // costs less than the whole store, so the write is skipped.
+            crate::daemon::log(&format!(
+                "qex could not read {} and did not record the measurement of \
+                 this job. The file stays as it is.",
+                path.display()
+            ));
+            release(&lock);
+            return;
+        }
+        OnDisk::Damaged(salvaged) => {
+            // Move the damaged file aside BEFORE any write, so that the write
+            // cannot destroy it and a person can read what it held. The store
+            // continues from the entries that qex could read.
+            let aside =
+                path.with_file_name(format!("usage.json.corrupt-{}", crate::sys::now_secs()));
+            if std::fs::rename(&path, &aside).is_err() {
+                // The file cannot move, so it also must not be written over.
+                release(&lock);
+                return;
+            }
+            crate::daemon::log(&format!(
+                "qex could not read every part of {}. The file moved to {}, so \
+                 that no write destroys it, and the store keeps the entries that \
+                 qex could read ({} of them). The claims of the other commands \
+                 come back as their jobs complete.",
+                path.display(),
+                aside.display(),
+                salvaged.commands.len()
+            ));
+            salvaged
+        }
+    };
     let entry = store.commands.entry(key(&spec.cwd, against)).or_default();
     entry.name = spec.name.clone();
 
@@ -266,11 +427,16 @@ fn add(spec: &JobSpec, status: &JobStatus, kind: Measurement, bytes: u64) {
 
 /// Writes the store and releases the lock.
 fn write_store(path: &std::path::Path, store: &Store, lock: &std::fs::File) {
-    use std::os::unix::io::AsRawFd;
     if let Ok(bytes) = serde_json::to_vec_pretty(store) {
         // Mode 0600: this file names the jobs of this user.
         crate::job::write_atomic(path, &bytes, 0o600).ok();
     }
+    release(lock);
+}
+
+/// Releases the lock on the store.
+fn release(lock: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
     unsafe {
         libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
     }
@@ -309,12 +475,13 @@ pub fn suggest(
     // record: the reader is told that 64MB came from the earlier jobs of a
     // command that possibly needs 8GB. NO answer is the correct answer, because
     // the reader then gets the default, which no measurement contradicts.
-    let peak_mem = entry
+    let peaks: Vec<u64> = entry
         .samples
         .iter()
         .filter(|s| s.kind == Measurement::Peak && s.max_rss > 0)
         .map(|s| s.max_rss)
-        .max()?;
+        .collect();
+    let peak_mem = peaks.iter().copied().max()?;
     let mem = ((peak_mem as f64 * margin) as u64).max(MIN_MEMORY);
 
     // Calculate the cores from the CPU time and the time that the job operated.
@@ -340,10 +507,13 @@ pub fn suggest(
 
     let cpu = (cores * margin).ceil().max(1.0) as u64;
 
+    // The count is the count of the PEAKS, and not of every sample. The claim
+    // rests on the peaks alone, so a count that took every sample would say
+    // that more evidence stands behind the claim than the claim rests on.
     Some(Suggestion {
         cpu,
         mem,
-        samples: entry.samples.len(),
+        samples: peaks.len(),
     })
 }
 
@@ -375,6 +545,38 @@ mod tests {
 
     fn dir() -> std::path::PathBuf {
         std::path::PathBuf::from("/project")
+    }
+
+    /// A specification for a job whose command is one word, for the tests that
+    /// drive `record` against a real file.
+    fn spec_for(command: &str) -> JobSpec {
+        JobSpec {
+            id: uuid::Uuid::new_v4(),
+            name: command.into(),
+            cwd: "/project".into(),
+            command: vec![command.into()],
+            env: Default::default(),
+            cpu: 1,
+            mem: 4 << 30,
+            timeout: None,
+            max_queue_time: None,
+            tags: vec![],
+            priority: 0,
+            env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
+            learn_key: None,
+            group: None,
+            group_name: None,
+            claims: Default::default(),
+            locks: vec![],
+            retries: 0,
+            nice: None,
+            needs: vec![],
+            after: vec![],
+            submitted_at: 0,
+            dedupe_key: None,
+            dedupe_window: 0,
+        }
     }
 
     fn store_with(command: &[&str], samples: Vec<Sample>) -> Store {
@@ -535,6 +737,209 @@ mod tests {
         );
         let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
         assert_eq!(s.mem, 9 << 30, "6GB and one half");
+        // The claim rests on ONE peak. A count of two would say that more
+        // evidence stands behind the claim than the claim rests on.
+        assert_eq!(s.samples, 1, "the bound is not evidence for the claim");
+    }
+
+    /// The count of the evidence counts the PEAKS, and no other sample.
+    ///
+    /// A reader that sees `samples: 3` takes the claim as three measurements
+    /// strong. A bound and a peak of zero give no claim, so a count that took
+    /// them would overstate the evidence.
+    #[test]
+    fn the_count_of_the_evidence_counts_the_peaks_alone() {
+        let cmd: Vec<String> = vec!["train".into()];
+        let store = store_with(
+            &["train"],
+            vec![
+                sample(1 << 30, 1.0, 10),
+                sample(2 << 30, 1.0, 10),
+                lower_bound(8 << 30),
+                sample(0, 1.0, 10),
+            ],
+        );
+        let s = suggest(&store, &dir(), &cmd, 1.5).unwrap();
+        assert_eq!(s.samples, 2, "two peaks stand behind this claim");
+    }
+
+    /// A kind of a later qex must come out of the file as it went in.
+    ///
+    /// An arm without the word would write `unknown` over a kind such as
+    /// `ceiling`, so the first completed job after a return to this version
+    /// would destroy the label of every sample of the later qex, permanently
+    /// and with no message. The peak would stay; the name of the measurement
+    /// would not.
+    #[test]
+    fn a_kind_of_a_later_qex_keeps_its_word() {
+        let text = r#"{"kind":"ceiling","max_rss":1,"cpu_secs":0.0,"elapsed_secs":0,"at":0}"#;
+        let s: Sample = serde_json::from_str(text).unwrap();
+        assert_eq!(s.kind, Measurement::Unknown("ceiling".into()));
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(
+            out.contains(r#""kind":"ceiling""#),
+            "the word must come back unchanged: {out}"
+        );
+    }
+
+    /// A file with ONE entry that this version cannot read at all must keep
+    /// the other entries.
+    ///
+    /// The defaults on `Sample` and `Entry` hold the shapes that a later qex
+    /// is EXPECTED to write. They do not hold a field of the wrong type: a
+    /// `kind` that is a number refuses the WHOLE file, and an earlier qex then
+    /// read the store as empty. The salvage reads one entry at a time, so the
+    /// damage stops at the entry that holds it.
+    #[test]
+    fn one_entry_of_the_wrong_shape_leaves_the_other_entries() {
+        let good = r#"{"name":"t","samples":[{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}"#;
+        let bad = r#"{"name":"t","samples":[{"kind":3,"max_rss":2,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}"#;
+        let text = format!(r#"{{"commands":{{"good":{good},"damaged":{bad}}}}}"#);
+
+        // The whole file refuses to load as one value; that is the fault that
+        // the salvage exists for.
+        assert!(serde_json::from_str::<Store>(&text).is_err());
+
+        let store = salvage(&text);
+        assert_eq!(
+            store.commands["good"].samples[0].max_rss,
+            1 << 30,
+            "the entry beside the damage must stay"
+        );
+        assert!(
+            !store.commands.contains_key("damaged"),
+            "an entry with no readable sample says nothing"
+        );
+    }
+
+    /// One damaged SAMPLE must not take the peaks of its own entry with it.
+    #[test]
+    fn one_sample_of_the_wrong_shape_leaves_the_peaks_beside_it() {
+        let text = r#"{"commands":{"x":{"name":"t","samples":[
+            {"kind":3,"max_rss":2,"cpu_secs":1.0,"elapsed_secs":10,"at":0},
+            {"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}]}}}"#;
+        let store = salvage(text);
+        let peaks: Vec<u64> = store.commands["x"]
+            .samples
+            .iter()
+            .filter(|s| s.kind == Measurement::Peak)
+            .map(|s| s.max_rss)
+            .collect();
+        assert_eq!(peaks, vec![1 << 30], "the peak beside the damage must stay");
+    }
+
+    /// A file that is not JSON at all salvages as an empty store. The caller
+    /// quarantines the file, so nothing is lost; qex simply cannot read it.
+    #[test]
+    fn a_file_that_is_not_json_salvages_nothing() {
+        assert!(salvage("").commands.is_empty());
+        assert!(salvage(r#"{"commands":{"x":"#).commands.is_empty());
+        assert!(salvage("not json").commands.is_empty());
+    }
+
+    /// A write over a damaged file must move the file aside first, and it must
+    /// keep the entries that qex could read.
+    ///
+    /// This is the fault of issue #101: `add` read a damaged file as an EMPTY
+    /// store, and then wrote that empty store back. The first job that
+    /// completed after the damage deleted every learned peak from the disk,
+    /// and qex gave no message.
+    #[test]
+    fn a_write_over_a_damaged_file_quarantines_it_and_keeps_what_it_can() {
+        use crate::testutil::{env_lock, EnvVar};
+        let _guard = env_lock();
+        let dir = std::env::temp_dir().join(format!("qex-usage-corrupt-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = EnvVar::set("XDG_STATE_HOME", dir.to_str().unwrap());
+
+        // A store with one readable entry and one that this version cannot
+        // read. The readable entry belongs to `earlier`, a different command
+        // from the one that completes below.
+        let earlier: Vec<String> = vec!["earlier".into()];
+        let good = format!(
+            r#""{}":{{"name":"earlier","samples":[{{"kind":"peak","max_rss":1073741824,"cpu_secs":1.0,"elapsed_secs":10,"at":0}}]}}"#,
+            key(&std::path::PathBuf::from("/project"), &earlier)
+        );
+        let bad = r#""damaged":{"name":"t","samples":[{"kind":3}]}"#;
+        let path = store_path().unwrap();
+        crate::paths::ensure_dir(path.parent().unwrap(), 0o700).unwrap();
+        std::fs::write(&path, format!(r#"{{"commands":{{{good},{bad}}}}}"#)).unwrap();
+
+        // A job completes, and its measurement goes into the store.
+        let spec = spec_for("train");
+        let mut done = crate::job::JobStatus::new(&spec);
+        done.state = crate::job::JobState::Completed;
+        done.usage.max_rss = 2 << 30;
+        record(&spec, &done);
+
+        // The damaged file moved aside, with its bytes as they were.
+        let aside: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("usage.json.corrupt-")
+            })
+            .collect();
+        assert_eq!(aside.len(), 1, "the damaged file must move aside");
+        let kept = std::fs::read_to_string(aside[0].path()).unwrap();
+        assert!(
+            kept.contains(r#""kind":3"#),
+            "the quarantine must hold the bytes that qex could not read"
+        );
+
+        // The new store holds the salvaged peak AND the new measurement.
+        let store = load();
+        let old = &store.commands[&key(&std::path::PathBuf::from("/project"), &earlier)];
+        assert_eq!(
+            old.samples[0].max_rss,
+            1 << 30,
+            "the entry that qex could read must survive the write"
+        );
+        let new = &store.commands[&key(&spec.cwd, &spec.command)];
+        assert_eq!(new.samples[0].max_rss, 2 << 30);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file whose bytes qex cannot read takes NO write.
+    ///
+    /// A write over a file that qex has not seen replaces measurements that
+    /// qex cannot count. One lost sample costs less than the whole store.
+    #[test]
+    fn a_file_that_qex_cannot_read_takes_no_write() {
+        use crate::testutil::{env_lock, EnvVar};
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root reads every file, so this test cannot make one unreadable.
+            return;
+        }
+        let _guard = env_lock();
+        let dir = std::env::temp_dir().join(format!("qex-usage-noread-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = EnvVar::set("XDG_STATE_HOME", dir.to_str().unwrap());
+
+        let path = store_path().unwrap();
+        crate::paths::ensure_dir(path.parent().unwrap(), 0o700).unwrap();
+        std::fs::write(&path, r#"{"commands":{}}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let spec = spec_for("train");
+        let mut done = crate::job::JobStatus::new(&spec);
+        done.state = crate::job::JobState::Completed;
+        done.usage.max_rss = 2 << 30;
+        record(&spec, &done);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            load().commands.is_empty(),
+            "no write may land on a file that qex could not read"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A file that qex wrote before this feature holds no `kind` field. Each of
@@ -788,33 +1193,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _env = EnvVar::set("XDG_STATE_HOME", dir.to_str().unwrap());
 
-        let mut spec = crate::spec::JobSpec {
-            id: uuid::Uuid::new_v4(),
-            name: "train".into(),
-            cwd: "/project".into(),
-            command: vec!["train".into()],
-            env: Default::default(),
-            cpu: 1,
-            mem: 4 << 30,
-            timeout: None,
-            max_queue_time: None,
-            tags: vec![],
-            priority: 0,
-            env_capture: crate::config::EnvCapture::None,
-            claim_source: "explicit".into(),
-            learn_key: None,
-            group: None,
-            group_name: None,
-            claims: Default::default(),
-            locks: vec![],
-            retries: 0,
-            nice: None,
-            needs: vec![],
-            after: vec![],
-            submitted_at: 0,
-            dedupe_key: None,
-            dedupe_window: 0,
-        };
+        let mut spec = spec_for("train");
 
         for state in [
             crate::job::JobState::Oom,

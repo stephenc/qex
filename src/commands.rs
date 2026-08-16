@@ -3080,17 +3080,20 @@ fn describe_result(s: &JobStatus) -> String {
             .error
             .clone()
             .unwrap_or_else(|| "the job waited more time than its queue limit".to_string()),
-        // Point the reader at the CLAIM, and not at the machine.
-        //
-        // The words "the machine ran out of memory" send the reader to the
-        // machine, and the step that the reader can take is to give the job a
-        // claim that fits its work. Use the text of the `error` field when qex
-        // wrote one, because that text names the cause more exactly than a
-        // sentence that this function builds from two numbers.
+        // Point the reader at the CLAIM, and not at the machine — but do not
+        // say that the claim WAS too small. qex reads a kill count that covers
+        // every program of the user, so it cannot say that this job was the
+        // victim, and `docs/reference.md` promises that it never says so. An
+        // earlier text here said "The claim of N was too small", which broke
+        // that promise. Use the text of the `error` field when qex wrote one,
+        // because that text names the cause more exactly than a sentence that
+        // this function builds from two numbers.
         JobState::Oom => s.error.clone().unwrap_or_else(|| {
             format!(
-                "the kernel stopped the job for memory. The claim of {} was too small, and the \
-                 job reached {}. Give a larger `--mem` value.",
+                "the kernel stopped the job for memory. The claim was {}, and the job reached \
+                 {}. qex cannot say that the claim was too small: the machine can be full \
+                 while the claim is correct. Compare the two values, and give a larger \
+                 `--mem` value if the usage was near the claim.",
                 format_size(s.mem),
                 format_size(s.usage.max_rss)
             )
@@ -6712,10 +6715,15 @@ mod tests {
         // The text must give the claim and the true use. An agent then corrects
         // its claim from this line.
         assert!(text.contains("1GB") && text.contains("2GB"), "got: {text}");
-        // It must also point the reader at the CLAIM. The words "the machine
-        // ran out of memory" send the reader to the machine, and the step that
-        // the reader can take is to give the job a claim that fits its work.
-        assert!(text.contains("too small"), "got: {text}");
+        // It must also point the reader at the CLAIM, and it must NOT say that
+        // the claim was too small. qex reads a kill count that covers every
+        // program of the user, so it cannot say that this job was the victim,
+        // and `docs/reference.md` promises that it never says so.
+        assert!(
+            text.contains("cannot say that the claim was too small"),
+            "got: {text}"
+        );
+        assert!(text.contains("`--mem`"), "got: {text}");
 
         // The `error` field wins when qex wrote one. That text comes from the
         // supervisor, which saw the event, so it names the cause more exactly
