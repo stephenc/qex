@@ -385,9 +385,7 @@ fn read_peer(path: &Path, expected_uid: u32) -> Option<Peer> {
     // memory.
     use std::io::Read;
     let mut text = String::new();
-    file.take(MAX_PEER_LEN + 1)
-        .read_to_string(&mut text)
-        .ok()?;
+    file.take(MAX_PEER_LEN + 1).read_to_string(&mut text).ok()?;
     if text.len() as u64 > MAX_PEER_LEN {
         return None;
     }
