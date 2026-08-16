@@ -3352,6 +3352,86 @@ fn a_dead_supervisor_does_not_leave_the_job_alive() {
     assert_eq!(v["cpu_claimed"].as_u64(), Some(0));
 }
 
+/// A recovered job whose supervisor is gone must not stay `running` for ever.
+///
+/// The test above covers a supervisor that stops under a live coordinator.
+/// This test stops the coordinator FIRST, so only recovery can see the job.
+/// Before this rule, the next coordinator kept such a job and watched nothing:
+/// the supervisor was the only process that could write the result, so the
+/// record never changed, the job held its claim and its locks for ever, and
+/// `qex wait` on it never returned.
+#[test]
+fn a_recovered_job_without_a_supervisor_does_not_stay_running() {
+    let h = Harness::with_default_config("recoverorphan");
+    let id = h.submit(&["submit", "--name", "orphan", "--", "sleep", "300"]);
+
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.state_of(&id) == "running" && h.status_json(&id)["supervisor_pid"].as_i64().is_some()
+    });
+
+    let job_pid = h.status_json(&id)["pid"].as_i64().unwrap() as i32;
+    let supervisor = h.status_json(&id)["supervisor_pid"].as_i64().unwrap() as i32;
+    let coordinator = h.coordinator_pid();
+
+    // The coordinator goes first. A supervisor that stops under a live
+    // coordinator is the case that `supervisor::reap` already covers, and this
+    // test must not measure that path.
+    unsafe {
+        libc::kill(coordinator, libc::SIGKILL);
+        libc::kill(supervisor, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while unsafe { libc::kill(coordinator, 0) } == 0 || unsafe { libc::kill(supervisor, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the coordinator and the supervisor did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The job process continues at this moment. Without this step, the test
+    // would pass for a job that stopped with its supervisor.
+    assert_eq!(
+        unsafe { libc::kill(job_pid, 0) },
+        0,
+        "the job process must still operate when recovery finds it"
+    );
+
+    // The next command starts the next coordinator, and that coordinator
+    // recovers the job. It must make the job terminal, not keep it.
+    h.until("the job is failed", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+
+    // The job process must stop. A record that says the job stopped, with the
+    // job still alive, leaves memory in use that no command can free.
+    h.until("the job process stops", Duration::from_secs(30), || {
+        let rc = unsafe { libc::kill(job_pid, 0) };
+        rc != 0
+    });
+
+    // The record must name the cause.
+    let error = h.status_json(&id)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("the supervisor of this job did not continue"),
+        "the record must say that the supervisor is the cause: {error}"
+    );
+
+    // The budget must show the capacity as free again, and a wait must return.
+    let info = h.ok(&["info", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(v["cpu_claimed"].as_u64(), Some(0));
+    let out = h.qex(&["wait", &id]);
+    assert_eq!(
+        out.status.code(),
+        Some(121),
+        "a wait for a failed job must return at once"
+    );
+}
+
 /// A job that stops at the same moment as its time limit must keep its true
 /// result. A job that succeeded must never get the state `timeout`.
 #[test]
@@ -9326,7 +9406,11 @@ fn the_completion_candidates_start_no_coordinator() {
         "one safe form gives one candidate: {all}"
     );
 
-    h.ok(&["kill", &running, "--grace", "1s"]);
+    // Each `stop_coordinator` above stopped the supervisor of the holder and
+    // left its job process. The next coordinator found the job without its
+    // supervisor, stopped the process, and made the job `failed`, so there is
+    // no job left to kill.
+    assert_eq!(h.state_of(&running), "failed");
 }
 
 /// qex must SHOW the safe form of a name, and only that, in every output.
@@ -10024,17 +10108,6 @@ fn bash_keeps_a_hostile_candidate_in_one_word() {
 fn a_real_bash_offers_the_jobs_and_runs_no_name() {
     let h = Harness::with_default_config("bashcomp");
 
-    let running = h.submit(&[
-        "submit", "--name", "holder", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--",
-        "sleep", "300",
-    ]);
-    let queued = h.submit(&[
-        "submit", "--name", "waiter", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--", "true",
-    ]);
-    h.until("the first job operates", Duration::from_secs(45), || {
-        h.state_of(&running) == "running"
-    });
-
     // The names that an attacker would choose. A later qex refuses them at
     // submission. Plant them in records that an earlier qex could have written.
     let bait = h.root.join("BAIT");
@@ -10046,6 +10119,21 @@ fn a_real_bash_offers_the_jobs_and_runs_no_name() {
     h.stop_coordinator();
     h.plant_stored_name(&bait_id, &format!("bait$(touch {})", bait.display()));
     h.plant_stored_name(&two_id, "two words");
+
+    // The pair for `kill` and `cancel` comes AFTER the stop above. A job that
+    // loses its supervisor in that stop is `failed` when the next coordinator
+    // recovers it, and the candidates below need a job that operates and a job
+    // that waits.
+    let running = h.submit(&[
+        "submit", "--name", "holder", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--",
+        "sleep", "300",
+    ]);
+    let queued = h.submit(&[
+        "submit", "--name", "waiter", "--cpu", "1", "--mem", "64MB", "--lock", "one", "--", "true",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&running) == "running"
+    });
 
     let script = h.root.join("qex.bash");
     std::fs::write(&script, h.ok(&["completions", "bash"])).unwrap();
@@ -10942,7 +11030,14 @@ fn the_stream_shows_the_safe_name() {
     let reader = events_reader(&h, &["--json", "--timeout", "20s"]);
     let plain = events_reader(&h, &["--timeout", "20s"]);
     std::thread::sleep(Duration::from_millis(500));
-    h.ok(&["kill", &id, "--grace", "1s"]);
+    // The readers started the next coordinator. That coordinator found the job
+    // without its supervisor, stopped it, and made it `failed` — with the name
+    // that the plant put in the record. That change is the job event that the
+    // readers must see, and `publish_changes` at the end of recovery puts it
+    // in the stream.
+    h.until("the job is failed", Duration::from_secs(30), || {
+        h.state_of(&id) == "failed"
+    });
 
     // The text form goes to a terminal, so test the BYTES.
     let text = plain.wait_with_output().expect("the reader did not stop");
