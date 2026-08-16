@@ -6115,6 +6115,8 @@ mod tests {
             pid: Some(1),
             last_pid: None,
             supervisor_pid: None,
+            boot_id: None,
+            supervisor_start_token: None,
             exit_code: code,
             signal: None,
             submitted_at: 0,

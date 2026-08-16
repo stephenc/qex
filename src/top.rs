@@ -1426,6 +1426,8 @@ mod tests {
             pid: Some(std::process::id() as i32),
             last_pid: None,
             supervisor_pid: None,
+            boot_id: None,
+            supervisor_start_token: None,
             exit_code: None,
             signal: None,
             submitted_at: 0,

@@ -3432,6 +3432,85 @@ fn a_recovered_job_without_a_supervisor_does_not_stay_running() {
     );
 }
 
+/// A record from an earlier start of the machine is dead, whatever its pids
+/// say.
+///
+/// The machine uses each pid again after a restart, so a recovered record can
+/// point at live processes that have no connection with the job. A coordinator
+/// that trusts such a pid keeps the job `running` for ever, or watches a
+/// stranger for days. This test makes that exact shape: the record names a
+/// different start of the machine, while both of its pids point at processes
+/// that are alive.
+#[test]
+fn a_record_from_an_earlier_start_of_the_machine_is_dead() {
+    let h = Harness::with_default_config("recoverboot");
+    let id = h.submit(&["submit", "--name", "stale", "--", "sleep", "300"]);
+
+    h.until("the job operates", Duration::from_secs(45), || {
+        h.state_of(&id) == "running" && h.status_json(&id)["supervisor_pid"].as_i64().is_some()
+    });
+
+    let job_pid = h.status_json(&id)["pid"].as_i64().unwrap() as i32;
+    let supervisor = h.status_json(&id)["supervisor_pid"].as_i64().unwrap() as i32;
+    let coordinator = h.coordinator_pid();
+
+    // Stop the coordinator ONLY. The supervisor and the job stay alive: after
+    // a true restart the numbers in the record can belong to live strangers,
+    // and this test uses the live processes of the job itself as those
+    // strangers.
+    unsafe {
+        libc::kill(coordinator, libc::SIGKILL);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while unsafe { libc::kill(coordinator, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the coordinator did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Say in the record that the machine started again after the supervisor
+    // wrote it.
+    let path = h.job_dir(&id).join("status.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["boot_id"] = serde_json::Value::String("an-earlier-start".to_string());
+    std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+
+    // The next coordinator must call the job dead, although both pids of the
+    // record point at processes that are alive.
+    h.until("the job is failed", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+    assert_eq!(
+        unsafe { libc::kill(job_pid, 0) },
+        0,
+        "the job process must still be alive; otherwise this test proves nothing"
+    );
+
+    // The record must name the true cause, and it must not blame the
+    // supervisor: the supervisor of a machine that restarted did nothing
+    // wrong.
+    let error = h.status_json(&id)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        error.contains("the machine restarted"),
+        "the record must name the restart of the machine: {error}"
+    );
+
+    // The budget must show the capacity as free again.
+    let info = h.ok(&["info", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&info).unwrap();
+    assert_eq!(v["cpu_claimed"].as_u64(), Some(0));
+
+    // The processes were stand-ins for strangers, so recovery must not have
+    // signaled them; stop them here.
+    unsafe {
+        libc::kill(supervisor, libc::SIGKILL);
+        libc::killpg(job_pid, libc::SIGKILL);
+    }
+}
+
 /// A job that stops at the same moment as its time limit must keep its true
 /// result. A job that succeeded must never get the state `timeout`.
 #[test]

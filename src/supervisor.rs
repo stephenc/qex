@@ -189,7 +189,11 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
                 }
 
                 if let Some(pid) = job_pid {
-                    if sys::pid_alive(pid) {
+                    // `job_pid_alive` and not `pid_alive`: the machine can give
+                    // this number to a new process, and the group signal below
+                    // must not reach a stranger. The job process is the leader
+                    // of its own group, and a stranger is almost never that.
+                    if sys::job_pid_alive(pid) {
                         log(&format!(
                             "the supervisor of the job {id} stopped, and the job {pid} \
                              continues; qex stops the job now"
@@ -227,7 +231,15 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
 /// A parent uses `waitpid`. This function is for the other case: a coordinator
 /// that starts again inherits no supervisor, so it tests the process instead.
 fn watch_until_gone(pid: i32) {
+    // Keep the start time of the process that the watch began with. The
+    // machine can give the number to a new process during the watch, and
+    // without this test the watch follows that stranger — for days, when the
+    // stranger is a service.
+    let token = sys::process_start_token(pid);
     while sys::pid_alive(pid) {
+        if token.is_some() && sys::process_start_token(pid) != token {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(500));
     }
 }
@@ -268,6 +280,12 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // writes it instead, before it does anything that can take time, so a
     // coordinator that starts again finds the supervisor of this job.
     status.supervisor_pid = Some(std::process::id() as i32);
+    // Record WHICH start of WHICH machine these pids belong to. A pid alone is
+    // not a name: the machine uses each number again, and after a restart every
+    // number in this record points at nothing or at a stranger. A coordinator
+    // that starts again reads these two values before it trusts a pid.
+    status.boot_id = Some(sys::boot_id());
+    status.supervisor_start_token = sys::process_start_token(std::process::id() as i32);
     job::write_status(&dir, &status).context("writing the job status")?;
 
     // Delete the marks of the attempt before this one.

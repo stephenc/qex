@@ -1018,6 +1018,8 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         ));
     }
 
+    let current_boot = sys::boot_id();
+
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -1039,7 +1041,27 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
         // alone would mark a live job as failed. That job then completes on the
         // disk while the coordinator reports a failure for ever.
         if status.state.is_active() {
-            let job_alive = status.pid.map(sys::pid_alive).unwrap_or(false);
+            // A pid is not a name, so test the identity of each pid before
+            // the life of it. The machine uses each number again; without
+            // these tests a recovered record can point at strangers, and the
+            // job then says `running` for ever while qex watches — or signals
+            // — processes that have no connection with the job.
+            //
+            // A record from an EARLIER START OF THE MACHINE is dead, whatever
+            // its pids say. A record without the value comes from the moment
+            // between the fork and the first write of the supervisor, or from
+            // an earlier version of qex; for such a record qex keeps the
+            // tests of the processes.
+            let same_boot = match status.boot_id.as_deref() {
+                Some(recorded) => recorded == current_boot,
+                None => true,
+            };
+            // `job_pid_alive` demands that the pid leads its own process
+            // group, which the supervisor gave the job at its start. A new
+            // process with the same number is almost never that, and a
+            // process of another user (which `pid_alive` counts as alive) is
+            // never the job.
+            let job_alive = same_boot && status.pid.map(sys::job_pid_alive).unwrap_or(false);
             // The pid comes from the record, or from the file that the
             // coordinator wrote at the fork. The second one covers the moment
             // between the fork and the first write of the supervisor: without
@@ -1048,7 +1070,21 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
             let supervisor_pid = status
                 .supervisor_pid
                 .or_else(|| crate::supervisor::supervisor_pid_of(&path));
-            let supervisor_alive = supervisor_pid.map(sys::pid_alive).unwrap_or(false);
+            // The supervisor recorded its own start time. A process that
+            // holds the number now with a DIFFERENT start time is a stranger:
+            // the job must not stay `running` on the strength of it, and the
+            // watch that `reap` starts must not follow it.
+            let supervisor_alive = same_boot
+                && supervisor_pid
+                    .map(|pid| {
+                        sys::pid_alive(pid)
+                            && match (status.supervisor_start_token, sys::process_start_token(pid))
+                            {
+                                (Some(recorded), Some(current)) => recorded == current,
+                                _ => true,
+                            }
+                    })
+                    .unwrap_or(false);
 
             if supervisor_alive {
                 // The job continues. Keep its state, and let the supervisor
@@ -1099,10 +1135,17 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
                 status.blocked_reason = None;
-                status.error = Some(
+                status.error = Some(if same_boot {
                     "the coordinator stopped, and neither the job nor its supervisor continued"
-                        .to_string(),
-                );
+                        .to_string()
+                } else {
+                    // Say the true cause. The pids of this record can point at
+                    // live processes of the new start of the machine, and a
+                    // reader who tests them would call the record a lie.
+                    "the machine restarted while the job was active; no process of the job \
+                     continued"
+                        .to_string()
+                });
                 job::write_status(&path, &status).ok();
                 log(&format!(
                     "job {} was active but its processes are gone; the state is now failed",

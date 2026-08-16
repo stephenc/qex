@@ -411,6 +411,25 @@ pub struct JobStatus {
     /// job that stopped.
     #[serde(default)]
     pub supervisor_pid: Option<i32>,
+    /// The identifier of the start of the machine when the supervisor wrote
+    /// this record. See `sys::boot_id`.
+    ///
+    /// A coordinator that starts again compares this value with the current
+    /// one. After a restart of the machine, every pid in an active record
+    /// points at nothing, or at a process that has no connection with the job.
+    /// A record from an earlier start of the machine is therefore dead,
+    /// whatever its pids say.
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// The start time of the supervisor process, as `sys::process_start_token`
+    /// gives it. THE UNIT DIFFERS BETWEEN SYSTEMS; compare for equality only.
+    ///
+    /// The machine uses each pid again within one start of the machine. A
+    /// coordinator that starts again compares this value with the start time
+    /// of the process that holds `supervisor_pid` now; a different value shows
+    /// a stranger that took the number.
+    #[serde(default)]
+    pub supervisor_start_token: Option<u64>,
     /// The exit code, if the job stopped without a signal.
     pub exit_code: Option<i32>,
     /// The signal that stopped the job, if a signal stopped it.
@@ -571,6 +590,8 @@ impl JobStatus {
             pid: None,
             last_pid: None,
             supervisor_pid: None,
+            boot_id: None,
+            supervisor_start_token: None,
             exit_code: None,
             signal: None,
             submitted_at: spec.submitted_at,

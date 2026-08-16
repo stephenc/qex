@@ -127,16 +127,22 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(grace_secs));
 
-            let still_active = {
+            // Read the pid again after the sleep. The grace time is long: the
+            // job can stop in it and the machine can give its number to a new
+            // process, and a job with `--retries` can start a new attempt
+            // with a new pid. The KILL goes to the group of the recorded pid
+            // only while that pid is still the pid of this job, and only
+            // while that pid still leads its group.
+            let pid_now = {
                 let state = coord.state.lock().unwrap();
                 state
                     .jobs
                     .get(&id)
-                    .map(|j| j.status.state.is_active())
-                    .unwrap_or(false)
+                    .filter(|j| j.status.state.is_active())
+                    .and_then(|j| j.status.pid)
             };
 
-            if still_active {
+            if pid_now == Some(pid) && crate::sys::job_pid_alive(pid) {
                 unsafe {
                     libc::killpg(pid, libc::SIGKILL);
                 }
