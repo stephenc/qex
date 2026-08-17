@@ -6547,7 +6547,9 @@ fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
     let counter = h.root.join("attempts");
     let script = format!(
         "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; \
-         if [ $n -lt 2 ]; then exit 3; fi; sleep 5",
+         if [ $n -lt 2 ]; then \
+             i=0; while [ $i -lt 1000000 ]; do i=$((i+1)); done; exit 3; \
+         fi; sleep 5",
         c = counter.display()
     );
     let id = h.submit(&["submit", "--retries", "4", "--", "sh", "-c", &script]);
@@ -6615,6 +6617,17 @@ fn a_job_that_starts_again_never_shows_the_attempt_that_failed() {
     assert_eq!(status["state"], "completed", "got: {status}");
     assert_eq!(status["attempts"], 2, "got: {status}");
     assert_eq!(status["exit_code"], 0, "got: {status}");
+    assert_eq!(
+        status["error"],
+        serde_json::Value::Null,
+        "a successful final attempt must not keep the error of the failed attempt: {status}"
+    );
+    let cpu_secs = status["usage"]["cpu_secs"].as_f64().unwrap();
+    assert!(
+        cpu_secs < 0.5,
+        "the final sleeping attempt must not include the CPU-heavy failed attempt; got \
+         {cpu_secs:.3}s: {status}"
+    );
 }
 
 /// A job with retries keeps its slot until it stops. Another job must wait.

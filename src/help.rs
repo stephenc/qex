@@ -1294,11 +1294,13 @@ these conditions are true:
 
     qex status <id> --json
 
-The `usage` field gives `max_rss` in bytes and `cpu_secs`. A task that always
-uses much less than its claim wastes capacity: put an exact claim in a job file,
-and more jobs then operate together. A task that the kernel stops for memory
-needs a larger claim, and you must give it: the correction that raises a claim
-by itself does not run in this build. Issue #88 holds the fault.
+The `usage` field gives `max_rss` in bytes and `cpu_secs`. For a job with
+retries, `max_rss` is the largest peak of any attempt, and `cpu_secs` belongs to
+the latest attempt. A task that always uses much less than its claim wastes
+capacity: put an exact claim in a job file, and more jobs then operate together.
+A task that the kernel stops for memory needs a larger claim, and you must give
+it: the correction that raises a claim by itself does not run in this build.
+Issue #88 holds the fault.
 
 For one task, this step is not necessary.
 
