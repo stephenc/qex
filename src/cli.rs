@@ -988,6 +988,19 @@ mod tests {
         assert!(Cli::try_parse_from(["qex", "submit", "--cpu", "lots", "--", "true"]).is_err());
     }
 
+    #[test]
+    fn zero_claims_are_refused_on_the_command_line() {
+        let cpu = Cli::try_parse_from(["qex", "submit", "--cpu", "0", "--", "true"])
+            .unwrap_err()
+            .to_string();
+        assert!(cpu.contains("1 core or more"), "got: {cpu}");
+
+        let mem = Cli::try_parse_from(["qex", "submit", "--mem", "0", "--", "true"])
+            .unwrap_err()
+            .to_string();
+        assert!(mem.contains("1 byte or more"), "got: {mem}");
+    }
+
     /// The job command can have options with the same names as the qex options.
     /// qex must give each of these options to the job.
     #[test]

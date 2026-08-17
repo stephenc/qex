@@ -203,7 +203,7 @@ where
                 de::Error::custom(format!(
                     "the number is {v}, and a count cannot be below zero. qex cannot \
                      calculate a size from it, and it stops. Write a whole number of \
-                     0 or more."
+                     1 or more."
                 ))
             })
         }
@@ -1463,8 +1463,11 @@ impl Config {
     /// Gives the default number of cores for a job.
     ///
     /// If the config file gives no value, the result is 1 core.
-    pub fn default_cpu(&self) -> u64 {
-        self.defaults.cpu.unwrap_or(1).max(1)
+    pub fn default_cpu(&self) -> Result<u64> {
+        let cpu = self.defaults.cpu.unwrap_or(1);
+        crate::claim::Claim::exact(cpu, false)
+            .map_err(|e| anyhow::anyhow!("config [defaults] cpu: {e}"))?;
+        Ok(cpu)
     }
 
     /// Gives the default quantity of memory for a job.
@@ -1475,7 +1478,11 @@ impl Config {
     pub fn default_mem(&self) -> Result<u64> {
         match &self.defaults.mem {
             Some(s) => {
-                units::parse_size(s).map_err(|e| anyhow::anyhow!("config [defaults] mem: {e}"))
+                let mem = units::parse_size(s)
+                    .map_err(|e| anyhow::anyhow!("config [defaults] mem: {e}"))?;
+                crate::claim::Claim::exact(mem, true)
+                    .map_err(|e| anyhow::anyhow!("config [defaults] mem: {e}"))?;
+                Ok(mem)
             }
             None => {
                 let cores = sys::cpu_count().max(1);
@@ -1754,6 +1761,7 @@ impl Config {
         self.peer_stale_after()?;
         self.history_keep()?;
         self.gc_keep()?;
+        self.default_cpu()?;
         self.default_mem()?;
         self.default_timeout()?;
         self.default_max_queue_time()?;
@@ -2122,7 +2130,7 @@ mod tests {
         assert_eq!(c.system.max_pressure, 9223372036854775808f64);
         // `[defaults] cpu` is a u64 field, so the value stays a number.
         let c: Config = toml::from_str("[defaults]\ncpu = 18446744073709551615\n").unwrap();
-        assert_eq!(c.default_cpu(), u64::MAX);
+        assert_eq!(c.default_cpu().unwrap(), u64::MAX);
     }
 
     /// The quotation marks must make no difference in EITHER direction.
@@ -2150,8 +2158,8 @@ mod tests {
         .unwrap();
         bare.validate().unwrap();
 
-        assert_eq!(quoted.default_cpu(), bare.default_cpu());
-        assert_eq!(quoted.default_cpu(), 3);
+        assert_eq!(quoted.default_cpu().unwrap(), bare.default_cpu().unwrap());
+        assert_eq!(quoted.default_cpu().unwrap(), 3);
         assert_eq!(quoted.system.max_pressure, bare.system.max_pressure);
         assert_eq!(quoted.system.max_pressure, 30.0);
         assert_eq!(quoted.learn.margin, bare.learn.margin);
@@ -2190,7 +2198,7 @@ mod tests {
         // Text that is not a number at all must also give a remedy.
         for (text, want) in [
             ("[defaults]\ncpu = \"many\"\n", "Write a whole number"),
-            ("[defaults]\ncpu = -1\n", "cannot be below zero"),
+            ("[defaults]\ncpu = -1\n", "1 or more"),
             ("[learn]\nmargin = \"one\"\n", "Write a number"),
         ] {
             let e = toml::from_str::<Config>(text).unwrap_err().to_string();
@@ -2200,7 +2208,7 @@ mod tests {
         // A space around the value is not a fault. A user who writes ` 2` in a
         // quoted field means 2.
         let c: Config = toml::from_str("[defaults]\ncpu = \" 2 \"\n").unwrap();
-        assert_eq!(c.default_cpu(), 2);
+        assert_eq!(c.default_cpu().unwrap(), 2);
         let c: Config = toml::from_str("[learn]\nmargin = \" 2.5 \"\n").unwrap();
         assert_eq!(c.learn.margin, 2.5);
     }
@@ -2464,7 +2472,7 @@ mod tests {
         assert_eq!(c.queue.oversized, OversizedPolicy::RunWhenIdle);
         assert_eq!(c.enforce.mode, EnforceMode::Cooperative);
         assert!(c.budget_cpu().unwrap() >= 1);
-        assert_eq!(c.default_cpu(), 1);
+        assert_eq!(c.default_cpu().unwrap(), 1);
         assert_eq!(c.default_timeout().unwrap(), None);
     }
 
@@ -2494,12 +2502,25 @@ mod tests {
         let c: Config =
             toml::from_str("[defaults]\ncpu = 4\nmem = \"6GB\"\ntimeout = \"30m\"\n").unwrap();
         c.validate().unwrap();
-        assert_eq!(c.default_cpu(), 4);
+        assert_eq!(c.default_cpu().unwrap(), 4);
         assert_eq!(c.default_mem().unwrap(), 6 << 30);
         assert_eq!(
             c.default_timeout().unwrap(),
             Some(std::time::Duration::from_secs(1800))
         );
+    }
+
+    #[test]
+    fn zero_job_defaults_are_refused_instead_of_becoming_claims() {
+        let cpu: Config = toml::from_str("[defaults]\ncpu = 0\n").unwrap();
+        let cpu_error = cpu.default_cpu().unwrap_err().to_string();
+        assert!(cpu_error.contains("1 core or more"), "got: {cpu_error}");
+        assert!(cpu.validate().is_err());
+
+        let mem: Config = toml::from_str("[defaults]\nmem = 0\n").unwrap();
+        let mem_error = mem.default_mem().unwrap_err().to_string();
+        assert!(mem_error.contains("1 byte or more"), "got: {mem_error}");
+        assert!(mem.validate().is_err());
     }
 
     #[test]

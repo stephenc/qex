@@ -18,6 +18,13 @@
 use crate::config::Config;
 use serde::{Deserialize, Deserializer, Serialize};
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawClaim {
+    Number(u64),
+    Text(String),
+}
+
 /// The size of a claim, before qex calculates the value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
@@ -40,7 +47,10 @@ impl Claim {
         match t.as_str() {
             "half" | "guess" | "auto" => Ok(Self::Half),
             "full" | "max" | "all" => Ok(Self::Full),
-            _ if is_size => crate::units::parse_size(&t).map(Self::Exact),
+            _ if is_size => {
+                let n = crate::units::parse_size(&t)?;
+                Self::exact(n, true)
+            }
             _ => {
                 let n = t.parse::<u64>().map_err(|_| {
                     format!(
@@ -49,23 +59,30 @@ impl Claim {
                          the full budget."
                     )
                 })?;
-                // Refuse zero. A claim of zero would let qex start an unlimited
-                // number of jobs together, which is the fault that qex prevents.
-                // qex must not change the number without a message either.
-                if n == 0 {
-                    return Err(
-                        "a job needs 1 core or more. Give 1, or the word `guess`.".to_string()
-                    );
-                }
-                Ok(Self::Exact(n))
+                Self::exact(n, false)
             }
         }
+    }
+
+    pub(crate) fn exact(n: u64, is_size: bool) -> Result<Self, String> {
+        // A zero claim lets qex start an unlimited number of jobs together,
+        // which is the fault that qex prevents. Do not silently raise it: the
+        // value is a decision made by the author of the command or job file.
+        if n == 0 {
+            let message = if is_size {
+                "a job needs 1 byte or more. Give a size such as `1MB`, or the word `guess`."
+            } else {
+                "a job needs 1 core or more. Give 1, or the word `guess`."
+            };
+            return Err(message.to_string());
+        }
+        Ok(Self::Exact(n))
     }
 
     /// Gives the number of cores for this claim.
     pub fn cores(&self, cfg: &Config) -> u64 {
         match self {
-            Self::Exact(n) => (*n).max(1),
+            Self::Exact(n) => *n,
             // Two jobs of this size operate together, and a third job waits.
             Self::Half => (cfg.budget_cpu().unwrap_or(2) / 2).max(1),
             // A job of this size operates alone. It fills the budget exactly,
@@ -103,21 +120,33 @@ impl<'de> Deserialize<'de> for Claim {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error;
 
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Number(u64),
-            Text(String),
-        }
-
-        match Raw::deserialize(d)? {
-            Raw::Number(n) => Ok(Claim::Exact(n)),
+        match RawClaim::deserialize(d)? {
+            RawClaim::Number(n) => Claim::exact(n, true).map_err(D::Error::custom),
             // A job file gives a memory value as text, so this path accepts a
-            // size. A core value of `"2"` also arrives here, and `parse_size`
-            // reads a number without a unit as a count of bytes, which is the
-            // same number.
-            Raw::Text(s) => Claim::parse(&s, true).map_err(D::Error::custom),
+            // size. CPU uses the dedicated deserializer below, because a size
+            // such as `"8GB"` is not a valid number of cores.
+            RawClaim::Text(s) => Claim::parse(&s, true).map_err(D::Error::custom),
         }
+    }
+}
+
+/// Reads the optional CPU claim in a job or pipeline file.
+pub fn deserialize_cpu_option<'de, D>(d: D) -> Result<Option<Claim>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    match Option::<RawClaim>::deserialize(d)? {
+        None => Ok(None),
+        Some(RawClaim::Number(n)) => Claim::exact(n, false).map(Some).map_err(D::Error::custom),
+        Some(RawClaim::Text(s)) => match Claim::parse(&s, false).map_err(D::Error::custom)? {
+            Claim::Exact(_) => Err(D::Error::custom(format!(
+                "incorrect job-file CPU claim `{s}`. Give an integer without quotation marks, \
+                 or one of these words: `half`, `guess`, `auto`, `full`, `max`, `all`."
+            ))),
+            word => Ok(Some(word)),
+        },
     }
 }
 
@@ -136,6 +165,18 @@ mod tests {
         assert_eq!(
             Claim::parse("512MB", true).unwrap(),
             Claim::Exact(512 << 20)
+        );
+    }
+
+    #[test]
+    fn zero_is_refused_for_core_and_memory_claims() {
+        assert_eq!(
+            Claim::parse("0", false).unwrap_err(),
+            "a job needs 1 core or more. Give 1, or the word `guess`."
+        );
+        assert_eq!(
+            Claim::parse("0", true).unwrap_err(),
+            "a job needs 1 byte or more. Give a size such as `1MB`, or the word `guess`."
         );
     }
 
@@ -204,7 +245,6 @@ mod tests {
         let small: Config = toml::from_str("[budget]\ncpu = \"1\"\nmem = \"1MB\"\n").unwrap();
         assert!(Claim::Half.cores(&small) >= 1);
         assert!(Claim::Half.bytes(&small) > 0);
-        assert!(Claim::Exact(0).cores(&small) >= 1);
     }
 
     #[test]
