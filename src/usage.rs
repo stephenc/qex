@@ -354,8 +354,13 @@ fn add(spec: &JobSpec, status: &JobStatus, kind: Measurement, bytes: u64) {
         return;
     };
     use std::os::unix::io::AsRawFd;
-    unsafe {
-        libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+    if let Err(e) = lock_exclusive(lock.as_raw_fd()) {
+        crate::daemon::log(&format!(
+            "qex could not lock {} and did not record this measurement: {}",
+            lock_path.display(),
+            e
+        ));
+        return;
     }
 
     // A job of a fan-out gives its template here, so one fan-out makes one
@@ -423,6 +428,20 @@ fn add(spec: &JobSpec, status: &JobStatus, kind: Measurement, bytes: u64) {
     entry.samples.drain(..extra);
 
     write_store(&path, &store, &lock);
+}
+
+/// Takes the usage-store lock. Kept separate so the failure path has a direct
+/// regression test; a failed lock must never be mistaken for an acquired one.
+fn lock_exclusive(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    loop {
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 /// Writes the store and releases the lock.
@@ -520,6 +539,11 @@ pub fn suggest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_usage_lock_is_not_an_acquired_lock() {
+        assert!(lock_exclusive(-1).is_err());
+    }
 
     fn sample(max_rss: u64, cpu_secs: f64, elapsed_secs: u64) -> Sample {
         Sample {

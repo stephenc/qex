@@ -9,13 +9,19 @@
 //! terminal back from a signal handler.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
 const HIDE_CURSOR: &[u8] = b"\x1b[?25l";
 const SHOW_CURSOR: &[u8] = b"\x1b[?25h";
 
 /// The settings of the terminal before this module changed them.
-static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
+///
+/// The pointer is written before the signal handlers are installed and lives
+/// until the process exits. It is deliberately not freed: a signal can arrive
+/// at any instruction, and reclaiming it would create a use-after-free window
+/// in the handler. One invocation of `top` leaks one small termios value.
+static SAVED: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Keys that the reader thread has not yet given to the command.
 static EVENTS: Mutex<VecDeque<Key>> = Mutex::new(VecDeque::new());
@@ -47,20 +53,30 @@ pub fn restore() {
             SHOW_CURSOR.len(),
         );
     }
-    if let Ok(mut guard) = SAVED.lock() {
-        if let Some(settings) = guard.take() {
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &settings);
-            }
+    let settings = SAVED.load(Ordering::Acquire);
+    if !settings.is_null() {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, settings);
         }
     }
 }
 
 extern "C" fn on_signal(_signal: libc::c_int) {
-    restore();
-    // Use `_exit`. A signal handler must call a few functions only, and the
-    // usual exit path runs code that is not safe here.
-    unsafe { libc::_exit(0) }
+    // Keep this handler to async-signal-safe system calls. In particular it
+    // must never take the mutex used by the key queue: the signal can interrupt
+    // the thread while that mutex is held.
+    unsafe {
+        libc::write(
+            libc::STDOUT_FILENO,
+            SHOW_CURSOR.as_ptr() as *const libc::c_void,
+            SHOW_CURSOR.len(),
+        );
+        let settings = SAVED.load(Ordering::Acquire);
+        if !settings.is_null() {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, settings);
+        }
+        libc::_exit(0)
+    }
 }
 
 /// Reads each key in its own thread.
@@ -76,8 +92,17 @@ pub fn watch() -> bool {
     if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut settings) } != 0 {
         return false;
     }
-    if let Ok(mut guard) = SAVED.lock() {
-        *guard = Some(settings);
+    SAVED.store(Box::into_raw(Box::new(settings)), Ordering::Release);
+
+    // Install the handlers before changing the terminal. A signal after the
+    // raw-mode write must always see our restoration path.
+    unsafe {
+        // Cast through a pointer. A direct cast of a function to an integer
+        // is not correct on every platform.
+        let handler = on_signal as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
     }
 
     let mut raw = settings;
@@ -98,17 +123,6 @@ pub fn watch() -> bool {
             HIDE_CURSOR.as_ptr() as *const libc::c_void,
             HIDE_CURSOR.len(),
         );
-    }
-
-    // Put the terminal back when a signal stops this process. Without this, a
-    // Ctrl-C would leave the terminal without an echo of the keys.
-    unsafe {
-        // Cast through a pointer. A direct cast of a function to an integer
-        // is not correct on every platform.
-        let handler = on_signal as *const () as libc::sighandler_t;
-        libc::signal(libc::SIGINT, handler);
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGHUP, handler);
     }
 
     std::thread::spawn(|| {

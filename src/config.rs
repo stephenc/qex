@@ -1284,6 +1284,14 @@ impl Config {
         Self::read(Detail::Full)
     }
 
+    /// Parses one look at the config file with the full terminal error text.
+    ///
+    /// The coordinator uses this at startup so the bytes it installs are also
+    /// the bytes whose fingerprint it records.
+    pub fn from_file(read: ConfigFile) -> Result<Self> {
+        Self::read_file(read, Detail::Full)
+    }
+
     /// Reads the config file where the message becomes DATA.
     ///
     /// Two callers need this form. The supervisor of a job puts the fault in
@@ -1314,8 +1322,12 @@ impl Config {
     }
 
     fn read(detail: Detail) -> Result<Self> {
+        Self::read_file(read_config_file(), detail)
+    }
+
+    fn read_file(read: ConfigFile, detail: Detail) -> Result<Self> {
         let path = paths::config_file()?;
-        match read_config_file() {
+        match read {
             ConfigFile::Text(bytes, _) => {
                 let text = String::from_utf8(bytes).map_err(|_| {
                     anyhow::anyhow!(

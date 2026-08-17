@@ -551,29 +551,27 @@ fn pool_wait(
         }
         let pool = pool_of(pools, name);
 
-        // Does another user hold ANY part of this pool?
-        //
-        // That question chooses the class, and the test is deliberately "any"
-        // and not "most". A wait that has a peer component has a part that qex
-        // cannot schedule, so its end is not one that qex can name, and a
-        // reservation would then hold the machine empty for an unknown time.
-        // `Peer` never reserves, so this is the direction that cannot park the
-        // queue. A wait that is entirely the work of this queue is `Sibling`.
+        // Another user is the blocker only when the claim would still be short
+        // after every job of this queue released the pool. A peer that holds a
+        // small part of a pool must not turn a shortage caused by our siblings
+        // into `Peer`: that class never reserves, so a stream of our smaller
+        // jobs could then starve this claim for ever.
         let peer_units = peers.pools.get(name).copied().unwrap_or(0);
-        let peer_devices = peers.devices.get(name).map(|d| d.len()).unwrap_or(0);
-        let by_peer = peer_units > 0 || peer_devices > 0;
 
         // `arithmetic` is the count and nothing else. Each class below gives it
         // a lead of its own, because the two leads are different statements:
         // the jobs of this queue release the pool, and another user may not.
-        let (short, arithmetic) = if pool.is_indexed() {
+        let (short, short_without_siblings, arithmetic) = if pool.is_indexed() {
             let free = free_devices(&pool, claim, held, peers).len() as u64;
+            let free_without_siblings =
+                free_devices(&pool, claim, &Held::default(), peers).len() as u64;
             let each = match claim.size {
                 Some(size) => format!(" with {} free each", format_size(size)),
                 None => " that is free in full".to_string(),
             };
             (
                 free < claim.count,
+                free_without_siblings < claim.count,
                 format!(
                     "this job needs {} device(s){each}, the pool has {}, and {free} can hold this \
                      job now.",
@@ -583,8 +581,10 @@ fn pool_wait(
         } else {
             let ours = held.pools.get(name).copied().unwrap_or(0);
             let free = pool.total.saturating_sub(ours).saturating_sub(peer_units);
+            let free_without_siblings = pool.total.saturating_sub(peer_units);
             (
                 claim.count > free,
+                claim.count > free_without_siblings,
                 format!(
                     "this job needs {}, the pool has {}, and the jobs of this queue hold {ours}.",
                     claim.count, pool.total
@@ -596,7 +596,7 @@ fn pool_wait(
             continue;
         }
 
-        return Some(if by_peer {
+        return Some(if short_without_siblings {
             PoolWait {
                 blocker: Blocker::Peer { count: peers.count },
                 reason: format!(
@@ -924,18 +924,28 @@ fn verdict(
             // This job can never fit. Start it alone when the machine is quiet,
             // so the agent gets a result and not an endless wait.
             if cfg.queue.oversized == OversizedPolicy::RunWhenIdle {
-                if quiet {
+                let peers_idle = machine.peers.cpu == 0
+                    && machine.peers.mem == 0
+                    && machine.peers.pools.values().all(|n| *n == 0)
+                    && machine.peers.devices.values().all(BTreeSet::is_empty);
+                let pressure_ok = machine
+                    .pressure
+                    .map(|p| p <= cfg.system.max_pressure)
+                    .unwrap_or(true);
+                if quiet && peers_idle && pressure_ok {
                     return Verdict::Start;
                 }
                 return Verdict::Wait {
                     blocker: Blocker::OversizedWaitsForIdle,
                     reason: format!(
-                        "{reason}; qex starts this job when no other job operates. qex starts the \
-                         jobs behind this one until then."
+                        "{reason}; qex starts this job when no other qex job operates on the \
+                         machine and memory pressure is within the configured limit. qex starts \
+                         the jobs behind this one until then."
                     ),
                     held_reason: Some(format!(
-                        "{reason}; qex starts this job when no other job operates. qex starts no \
-                         other job before this one, so the queue becomes empty."
+                        "{reason}; qex starts this job when no other qex job operates on the \
+                         machine and memory pressure is within the configured limit. qex starts \
+                         no other job before this one, so this queue becomes empty."
                     )),
                 };
             }
@@ -1167,10 +1177,20 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
     // `needs`: the job must succeed.
     for dep in &job.spec.needs {
         let Some(other) = state.jobs.get(dep) else {
-            // `qex clean` does not delete a job that a queued job needs, so
-            // this case is not usual. Continue, because a job that waits for a
-            // record that does not exist would wait with no end.
-            continue;
+            // `needs` promises success, and a missing record cannot prove it.
+            // A current submission cannot create this state, and `clean`
+            // cannot create it either; it remains possible in an old or
+            // manually damaged store. Refuse to run the dependent as though
+            // the missing job had succeeded. `after` stays lenient below,
+            // because it promises only that the earlier job is no longer
+            // operating, which a missing record does prove.
+            return Depends::Broken {
+                reason: format!(
+                    "the record of the job {} that this job needed is gone, so qex cannot prove that it succeeded",
+                    &dep.to_string()[..8]
+                ),
+                root: *dep,
+            };
         };
 
         if !other.status.state.is_terminal() {
@@ -2473,6 +2493,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_missing_needed_record_breaks_the_job_but_a_missing_after_record_does_not() {
+        let missing = uuid::Uuid::new_v4();
+
+        let mut needs = state_with(JobState::Queued, None, 0);
+        let needs_id = needs.queue[0];
+        needs.jobs.get_mut(&needs_id).unwrap().spec.needs = vec![missing];
+        let Depends::Broken { reason, root } = depends(&needs, needs_id) else {
+            panic!("a missing success record must not count as success");
+        };
+        assert_eq!(root, missing);
+        assert!(reason.contains("record") && reason.contains("gone"));
+
+        let mut after = state_with(JobState::Queued, None, 0);
+        let after_id = after.queue[0];
+        after.jobs.get_mut(&after_id).unwrap().spec.after = vec![missing];
+        assert!(matches!(depends(&after, after_id), Depends::Ready));
+    }
+
     /// Puts one job in a state, with a claim, a state and a queue limit.
     fn add_job(
         state: &mut crate::daemon::State,
@@ -3351,6 +3390,36 @@ mod tests {
         ));
     }
 
+    /// "Idle" covers the machine shared by every coordinator, and not this
+    /// queue only. Otherwise two users can each force an oversized job into
+    /// the same budget at once.
+    #[test]
+    fn an_oversized_job_does_not_bypass_peers_or_memory_pressure() {
+        let mut cfg = cfg_with("2", "256MB");
+        cfg.system.max_pressure = 50.0;
+
+        let mut peer_machine = Machine {
+            available: u64::MAX / 2,
+            pressure: None,
+            peers: crate::peers::Claims {
+                cpu: 1,
+                count: 1,
+                ..Default::default()
+            },
+        };
+        assert!(matches!(
+            verdict_plain(&cfg, 64, 64 << 20, 0, 0, &peer_machine, true),
+            Verdict::Wait { .. }
+        ));
+
+        peer_machine.peers = crate::peers::Claims::default();
+        peer_machine.pressure = Some(51.0);
+        assert!(matches!(
+            verdict_plain(&cfg, 64, 64 << 20, 0, 0, &peer_machine, true),
+            Verdict::Wait { .. }
+        ));
+    }
+
     /// The two texts of a sibling wait must give different instructions. The
     /// first says that a smaller job can pass; the second says that no job can.
     #[test]
@@ -3633,6 +3702,48 @@ mod tests {
             "a wait on another user must never keep capacity"
         );
         assert!(held_reason.is_none());
+    }
+
+    /// A peer can hold part of a pool without causing this shortage. When the
+    /// claim fits after our siblings release their units, the scheduler owns
+    /// the end of the wait and must reserve after the bypass limit.
+    #[test]
+    fn a_peer_does_not_hide_a_pool_shortage_caused_by_siblings() {
+        let cfg = cfg_with_pools();
+        let pools = cfg.pools().unwrap();
+        let claim = spec_claiming(&[("net", 2, None)]);
+        let mut held = Held::default();
+        held.pools.insert("net".into(), 2);
+        let mut peers = crate::peers::Claims {
+            count: 1,
+            ..Default::default()
+        };
+        peers.pools.insert("net".into(), 1);
+        let machine = Machine {
+            available: u64::MAX / 2,
+            pressure: None,
+            peers,
+        };
+
+        let Admit::No {
+            blocker,
+            held_reason,
+            ..
+        } = admit(
+            &cfg,
+            &pools,
+            &effective_claims(&claim),
+            claim.cpu,
+            claim.mem,
+            &held,
+            &machine,
+        )
+        else {
+            panic!("only one of the two requested units is free now");
+        };
+        assert_eq!(blocker, Blocker::Sibling);
+        assert!(blocker.may_reserve());
+        assert!(held_reason.is_some());
     }
 
     /// A name that the configuration does not declare is a lock of one unit.

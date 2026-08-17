@@ -9,7 +9,7 @@
 //! of the job with one call, and no process of the job can avoid the signal.
 
 use crate::daemon::{log, Coordinator};
-use crate::job::{self, JobState, Usage};
+use crate::job::{self, JobState, JobStatus, Usage};
 use crate::paths;
 use crate::sys;
 use anyhow::{Context, Result};
@@ -161,7 +161,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
             // to `failed` with "the supervisor stopped without a result".
             Ok(status) if status.state == JobState::Queued => {
                 job.status = status;
-                job.status.supervisor_pid = None;
+                persist_legacy_requeue(&dir, &mut job.status);
                 let claim = job.status.mem;
                 // Use the rule of the submission, so a job that starts again
                 // does not go in front of the jobs that waited for it.
@@ -244,6 +244,13 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
     drop(state);
 
     coord.notify();
+}
+
+/// Removes the dead supervisor from a legacy retry record and persists the
+/// requeue before the coordinator exposes it from memory.
+fn persist_legacy_requeue(dir: &std::path::Path, status: &mut JobStatus) {
+    status.supervisor_pid = None;
+    job::write_status(dir, status).ok();
 }
 
 /// Waits until a process stops, for a process that is not a child.
@@ -1428,6 +1435,22 @@ fn usage_between(before: &Usage, after: &Usage) -> Usage {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    #[test]
+    fn a_legacy_requeue_clears_the_supervisor_on_disk() {
+        let dir = std::env::temp_dir().join(format!("qex-legacy-requeue-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut status = JobStatus::new(&spec());
+        status.state = JobState::Queued;
+        status.supervisor_pid = Some(12345);
+
+        persist_legacy_requeue(&dir, &mut status);
+
+        let stored = job::read_status(&dir).unwrap();
+        assert_eq!(stored.state, JobState::Queued);
+        assert_eq!(stored.supervisor_pid, None);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     /// The answer must say what qex CANNOT prove.
     ///

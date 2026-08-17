@@ -684,7 +684,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    fn new(cfg: Config) -> Self {
+    fn new(cfg: Config, config_seen: u64) -> Self {
         Self {
             state: Mutex::new(State {
                 cfg,
@@ -699,7 +699,7 @@ impl Coordinator {
                 // stopped if it could not. Take that value as the one this
                 // coordinator holds, so the first turn of the scheduler makes
                 // no change.
-                config_seen: config_fingerprint(&crate::config::read_config_file()),
+                config_seen,
                 config_settling: None,
                 config_error: None,
                 events: crate::events::EventLog::new(),
@@ -719,10 +719,17 @@ impl Coordinator {
     }
 }
 
+/// Parses and fingerprints one read of the configuration at coordinator start.
+fn start_config(read: ConfigFile) -> Result<(Config, u64)> {
+    let seen = config_fingerprint(&read);
+    let cfg = Config::from_file(read)?;
+    Ok((cfg, seen))
+}
+
 /// Runs the coordinator. This function gives control back when the coordinator
 /// stops.
 pub fn run() -> Result<()> {
-    let cfg = Config::load()?;
+    let (cfg, config_seen) = start_config(crate::config::read_config_file())?;
     cfg.validate()?;
 
     let runtime = paths::runtime_dir()?;
@@ -848,7 +855,7 @@ pub fn run() -> Result<()> {
     // Delete the old lines of the job history. See `[history] keep`.
     crate::history::prune(&cfg);
 
-    let coord = Arc::new(Coordinator::new(cfg));
+    let coord = Arc::new(Coordinator::new(cfg, config_seen));
     recover(&coord)?;
 
     log(&format!(
@@ -1089,6 +1096,15 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                     None => (None, None),
                 },
             };
+            // Any supervisor identity proves that the coordinator reached the
+            // spawn path. A dead supervisor with no job pid is not proof that
+            // exec never happened: the supervisor writes the job pid only
+            // after spawn and after its log-copy threads start.
+            let supervisor_was_recorded = status.supervisor_pid.is_some()
+                || !matches!(
+                    std::fs::symlink_metadata(path.join("supervisor.pid")),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                );
             let supervisor_start = status.supervisor_start_token.or(fork_start);
             // The supervisor runs as this user, so `own_pid_alive`: a pid
             // that the kernel refuses to signal belongs to somebody else, and
@@ -1149,6 +1165,17 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
                 // This coordinator made the job terminal, so this coordinator
                 // tells the person. The supervisor is gone and cannot.
                 crate::hook::fire_detached(&path, &status);
+            } else if requeue_unstarted(&mut status, supervisor_was_recorded) {
+                // `starting` is written before the supervisor creates the job
+                // process. With neither process alive and no job pid ever
+                // recorded, no command ran and there is no result to lose.
+                // Put the work back where it was instead of inventing a
+                // failure for an attempt that never began.
+                job::write_status(&path, &status).ok();
+                log(&format!(
+                    "job {} lost its supervisor before its process started; it is in the queue again",
+                    status.id
+                ));
             } else {
                 status.state = JobState::Failed;
                 status.finished_at = Some(sys::now_secs());
@@ -1302,6 +1329,25 @@ fn retire_the_pids(status: &mut crate::job::JobStatus) {
     }
     status.pid_start_token = None;
     status.supervisor_pid = None;
+}
+
+/// Returns an active record to the queue only when it proves that no job
+/// process was ever created.
+fn requeue_unstarted(status: &mut crate::job::JobStatus, supervisor_was_recorded: bool) -> bool {
+    if status.state != JobState::Starting || status.pid.is_some() || supervisor_was_recorded {
+        return false;
+    }
+    status.state = JobState::Queued;
+    status.started_at = None;
+    status.finished_at = None;
+    status.error = None;
+    status.blocked_reason = None;
+    status.supervisor_start_token = None;
+    status.assigned.clear();
+    status.forced = false;
+    status.forced_reason = None;
+    retire_the_pids(status);
+    true
 }
 
 /// Holds the jobs that one connection owns, and gives them back when it ends.
@@ -2164,6 +2210,56 @@ mod tests {
     use super::*;
     use crate::spec::JobSpec;
 
+    #[test]
+    fn a_starting_record_with_no_job_process_returns_to_the_queue() {
+        let spec = spec_with_key("unstarted");
+        let mut status = JobStatus::new(&spec);
+        status.state = JobState::Starting;
+        status.started_at = Some(crate::sys::now_secs());
+        status.error = Some("stale".into());
+        status.assigned.insert(
+            "gpu".into(),
+            crate::job::Assignment {
+                units: 1,
+                devices: vec![0],
+                size: None,
+            },
+        );
+        status.forced = true;
+        status.forced_reason = Some("too large".into());
+
+        assert!(requeue_unstarted(&mut status, false));
+        assert_eq!(status.state, JobState::Queued);
+        assert_eq!(status.started_at, None);
+        assert_eq!(status.supervisor_pid, None);
+        assert_eq!(status.error, None);
+        assert!(status.assigned.is_empty());
+        assert!(!status.forced);
+        assert_eq!(status.forced_reason, None);
+
+        status.state = JobState::Running;
+        assert!(!requeue_unstarted(&mut status, false));
+        status.state = JobState::Starting;
+        status.pid = Some(12345);
+        assert!(!requeue_unstarted(&mut status, false));
+        status.pid = None;
+        assert!(
+            !requeue_unstarted(&mut status, true),
+            "a supervisor identity means that the spawn path began"
+        );
+    }
+
+    #[test]
+    fn startup_parses_and_fingerprints_the_same_config_value() {
+        let read = ConfigFile::Text(b"[budget]\ncpu = \"1\"\n".to_vec(), None);
+        let expected = config_fingerprint(&read);
+
+        let (cfg, seen) = start_config(read).unwrap();
+
+        assert_eq!(seen, expected);
+        assert_eq!(cfg.budget.cpu, "1");
+    }
+
     /// A cancel must leave no error text from an earlier attempt on the record.
     ///
     /// WHAT THIS TEST OBSERVES: the field, in the function that writes it. A
@@ -2178,7 +2274,7 @@ mod tests {
     /// this test makes the state instead of racing for it.
     #[test]
     fn a_cancel_leaves_no_error_text_from_an_earlier_attempt() {
-        let coord = Arc::new(Coordinator::new(Config::default()));
+        let coord = Arc::new(Coordinator::new(Config::default(), 0));
         let id = uuid::Uuid::new_v4();
 
         {

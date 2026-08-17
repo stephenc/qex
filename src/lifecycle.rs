@@ -164,130 +164,104 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
 ///
 /// This command does not stop a job. A job that operates keeps its record.
 pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
-    // Keep the name and the state of this job. The dependents need them after
-    // this job leaves the list.
-    let (cause_name, cause_state) = {
-        let state = coord.state.lock().unwrap();
-        match state.jobs.get(&id) {
-            // The SAFE name: this value goes into a sentence that a reader
-            // sees, through `status.error`. See `job::safe_name`.
-            Some(job) => (job.status.display_name(), job.status.state.to_string()),
-            None => (String::from("unknown"), String::from("unknown")),
-        }
+    // The dependency check and the removal from `state.jobs` are one critical
+    // section. `handle_submit` validates dependencies under this same mutex,
+    // so no submission can name this job in the window between the check and
+    // the removal.
+    let mut state = coord.state.lock().unwrap();
+    let (cause_name, cause_state) = match state.jobs.get(&id) {
+        // The SAFE name: this value goes into a sentence that a reader sees,
+        // through `status.error`. See `job::safe_name`.
+        Some(job) => (job.status.display_name(), job.status.state.to_string()),
+        None => (String::from("unknown"), String::from("unknown")),
     };
 
-    {
-        let state = coord.state.lock().unwrap();
-        match state.jobs.get(&id) {
-            None => {
-                return Response::error(
-                    ErrorKind::NoSuchJob,
-                    format!("there is no job with the id {id}"),
-                )
-            }
-            Some(job) if !job.status.state.is_terminal() => {
-                return Response::error(
-                    ErrorKind::WrongState,
-                    format!(
-                        "the job {id} is in the state `{}`. Stop it first with `qex kill {id}`.",
-                        job.status.state
-                    ),
-                )
-            }
-            Some(_) => {}
+    match state.jobs.get(&id) {
+        None => {
+            return Response::error(
+                ErrorKind::NoSuchJob,
+                format!("there is no job with the id {id}"),
+            )
         }
+        Some(job) if !job.status.state.is_terminal() => {
+            return Response::error(
+                ErrorKind::WrongState,
+                format!(
+                    "the job {id} is in the state `{}`. Stop it first with `qex kill {id}`.",
+                    job.status.state
+                ),
+            )
+        }
+        Some(_) => {}
+    }
 
-        // Keep a job that a job in the queue needs.
-        //
-        // Without this rule, the record of the cause disappears, and a job that
-        // waits for it cannot report why it did not run.
-        //
-        // This test is the LAST one, so every deletion meets it, whatever asked
-        // for the deletion. It uses the rule of `crate::deps`, which `qex clean`
-        // and `qex gc` use as well: one rule gives one answer, and a command
-        // cannot say that it kept a record while this code deletes it.
-        let nodes: Vec<crate::deps::Node> = state
-            .jobs
-            .values()
-            .map(|j| crate::deps::Node {
-                id: j.status.id,
-                group: j.status.group,
-                terminal: j.status.state.is_terminal(),
-                needs: &j.spec.needs,
-                after: &j.spec.after,
+    // Keep a job that a job in the queue needs.
+    //
+    // Without this rule, the record of the cause disappears, and a job that
+    // waits for it cannot report why it did not run.
+    //
+    // This test is the LAST one, so every deletion meets it, whatever asked
+    // for the deletion. It uses the rule of `crate::deps`, which `qex clean`
+    // and `qex gc` use as well: one rule gives one answer, and a command
+    // cannot say that it kept a record while this code deletes it.
+    let nodes: Vec<crate::deps::Node> = state
+        .jobs
+        .values()
+        .map(|j| crate::deps::Node {
+            id: j.status.id,
+            group: j.status.group,
+            terminal: j.status.state.is_terminal(),
+            needs: &j.spec.needs,
+            after: &j.spec.after,
+        })
+        .collect();
+
+    if let Some(hold) = crate::deps::hold_reason(&nodes, id) {
+        let name = |holder: &uuid::Uuid| -> Option<String> {
+            state.jobs.get(holder).map(|j| {
+                format!(
+                    "{} ({})",
+                    &j.status.id.to_string()[..8],
+                    j.status.display_name()
+                )
             })
-            .collect();
+        };
 
-        if let Some(hold) = crate::deps::hold_reason(&nodes, id) {
-            let name = |holder: &uuid::Uuid| -> Option<String> {
-                state.jobs.get(holder).map(|j| {
-                    format!(
-                        "{} ({})",
-                        &j.status.id.to_string()[..8],
-                        j.status.display_name()
-                    )
-                })
-            };
-
-            // Each rule is a DIFFERENT relation, so each gets its own words. A
-            // stage of a pipeline that no other stage waits for is not a job
-            // that another job needs, and a message that says so is false.
-            let text = match &hold {
-                crate::deps::Hold::Needed(holders) => {
-                    let waiting: Vec<String> = holders.iter().filter_map(name).collect();
-                    let one = waiting.len() == 1;
-                    format!(
-                        "the job {id} is needed by {}. Wait for {}, or cancel {}.",
-                        waiting.join(", "),
-                        if one { "that job" } else { "those jobs" },
-                        if one { "it" } else { "them" }
-                    )
-                }
-                crate::deps::Hold::Pipeline(holders) => {
-                    let working: Vec<String> = holders.iter().filter_map(name).collect();
-                    let one = working.len() == 1;
-                    format!(
-                        "the job {id} belongs to a pipeline that has work left: {}. \
+        // Each rule is a DIFFERENT relation, so each gets its own words. A
+        // stage of a pipeline that no other stage waits for is not a job
+        // that another job needs, and a message that says so is false.
+        let text = match &hold {
+            crate::deps::Hold::Needed(holders) => {
+                let waiting: Vec<String> = holders.iter().filter_map(name).collect();
+                let one = waiting.len() == 1;
+                format!(
+                    "the job {id} is needed by {}. Wait for {}, or cancel {}.",
+                    waiting.join(", "),
+                    if one { "that job" } else { "those jobs" },
+                    if one { "it" } else { "them" }
+                )
+            }
+            crate::deps::Hold::Pipeline(holders) => {
+                let working: Vec<String> = holders.iter().filter_map(name).collect();
+                let one = working.len() == 1;
+                format!(
+                    "the job {id} belongs to a pipeline that has work left: {}. \
                          The record of a stage stays while the pipeline operates, so that \
                          a reader can see the whole pipeline. Wait for {}, or cancel {}.",
-                        working.join(", "),
-                        if one { "that job" } else { "those jobs" },
-                        if one { "it" } else { "them" }
-                    )
-                }
-            };
+                    working.join(", "),
+                    if one { "that job" } else { "those jobs" },
+                    if one { "it" } else { "them" }
+                )
+            }
+        };
 
-            return Response::error(ErrorKind::WrongState, text);
-        }
+        return Response::error(ErrorKind::WrongState, text);
     }
 
-    // Record the removal before the deletion. A reader of `qex status` can then
-    // learn that this job existed and that its work happened.
-    {
-        let state = coord.state.lock().unwrap();
-        if let Some(job) = state.jobs.get(&id) {
-            let status = job.status.clone();
-            drop(state);
-            crate::history::record_removed(&status);
-        }
-    }
-
-    let dir = match paths::job_dir(&id) {
-        Ok(d) => d,
-        Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),
-    };
-
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Response::error(
-                ErrorKind::Internal,
-                format!("qex could not delete {}: {e}", dir.display()),
-            );
-        }
-    }
-
-    let mut state = coord.state.lock().unwrap();
-    state.jobs.remove(&id);
+    // Remove the job while the dependency check is still protected by the
+    // same lock. A submit can run as soon as this lock goes, and it must then
+    // see either the job throughout or no job throughout.
+    let removed = state.jobs.remove(&id).expect("the job was checked above");
     state.queue.retain(|q| *q != id);
 
     // Free the dedupe key of this job with its record.
@@ -313,6 +287,7 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
         .map(|j| j.status.id)
         .collect();
 
+    let mut dependent_statuses = Vec::new();
     for dep in dependents {
         if let Some(job) = state.jobs.get_mut(&dep) {
             job.status.error = Some(format!(
@@ -321,16 +296,39 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
                 cause_name, cause_state
             ));
             job.status.caused_by = None;
-            let status = job.status.clone();
-            if let Ok(dir) = paths::job_dir(&dep) {
-                job::write_status(&dir, &status).ok();
-            }
+            dependent_statuses.push((dep, job.status.clone()));
         }
     }
     state.publish_changes();
     drop(state);
-
     coord.notify();
+
+    // Disk work can be slow (especially deletion of large logs), so none of it
+    // holds the coordinator mutex. The in-memory removal above already closes
+    // the dependency race.
+    for (dep, status) in dependent_statuses {
+        if let Ok(dir) = paths::job_dir(&dep) {
+            job::write_status(&dir, &status).ok();
+        }
+    }
+
+    // Record the removal before deleting the directory. A reader of history
+    // can then learn that this job existed and that its work happened.
+    crate::history::record_removed(&removed.status);
+
+    let dir = match paths::job_dir(&id) {
+        Ok(d) => d,
+        Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),
+    };
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Response::error(
+                ErrorKind::Internal,
+                format!("qex could not delete {}: {e}", dir.display()),
+            );
+        }
+    }
+
     Response::Ok
 }
 
