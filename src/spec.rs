@@ -89,6 +89,7 @@ pub struct JobFile {
 #[serde(default, deny_unknown_fields)]
 pub struct Resources {
     /// The number of cores. Give an integer, or `half`, `guess`, `full`, `max`.
+    #[serde(default, deserialize_with = "crate::claim::deserialize_cpu_option")]
     pub cpu: Option<crate::claim::Claim>,
     /// The memory. Give a size such as `8GB`, or `half`, `guess`, `full`, `max`.
     pub mem: Option<crate::claim::Claim>,
@@ -601,10 +602,9 @@ impl JobSpec {
                     source = "learned";
                     s.cpu
                 }
-                None => cfg.default_cpu(),
+                None => cfg.default_cpu()?,
             },
-        }
-        .max(1);
+        };
 
         let mem = match asked_mem {
             Some(c) => {
@@ -695,6 +695,12 @@ impl JobSpec {
         // a code change.
         let mut claims: BTreeMap<String, PoolClaim> = BTreeMap::new();
         for (name, entry) in &file.resources.claims {
+            if entry.count() == 0 {
+                bail!(
+                    "the claim `[resources.claims] {name}` asks for 0 of `{name}`. A claim of zero \
+                     holds nothing, so delete the entry, or give 1 or more."
+                );
+            }
             let size = match entry.size() {
                 Some(s) => Some(
                     crate::units::parse_size(s)
@@ -1757,6 +1763,118 @@ mod tests {
             assert_eq!(spec.name, "t", "{fname}");
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn job_files_refuse_zero_and_typed_claims_in_every_format() {
+        let dir = tmpdir("bad-claims");
+        let cases = [
+            (
+                "cpu-zero.toml",
+                "command = [\"true\"]\n[resources]\ncpu = 0\n",
+                "1 core or more",
+            ),
+            (
+                "cpu-zero.yaml",
+                "command: [true]\nresources:\n  cpu: 0\n",
+                "1 core or more",
+            ),
+            (
+                "cpu-zero.json",
+                r#"{"command":["true"],"resources":{"cpu":0}}"#,
+                "1 core or more",
+            ),
+            (
+                "mem-zero.toml",
+                "command = [\"true\"]\n[resources]\nmem = 0\n",
+                "1 byte or more",
+            ),
+            (
+                "mem-zero.yaml",
+                "command: [true]\nresources:\n  mem: 0\n",
+                "1 byte or more",
+            ),
+            (
+                "mem-zero.json",
+                r#"{"command":["true"],"resources":{"mem":0}}"#,
+                "1 byte or more",
+            ),
+            (
+                "cpu-size.toml",
+                "command = [\"true\"]\n[resources]\ncpu = \"8GB\"\n",
+                "incorrect core count",
+            ),
+            (
+                "cpu-size.yaml",
+                "command: [true]\nresources:\n  cpu: 8GB\n",
+                "incorrect core count",
+            ),
+            (
+                "cpu-size.json",
+                r#"{"command":["true"],"resources":{"cpu":"8GB"}}"#,
+                "incorrect core count",
+            ),
+            (
+                "cpu-string.toml",
+                "command = [\"true\"]\n[resources]\ncpu = \"8\"\n",
+                "integer without quotation marks",
+            ),
+            (
+                "cpu-string.yaml",
+                "command: [true]\nresources:\n  cpu: '8'\n",
+                "integer without quotation marks",
+            ),
+            (
+                "cpu-string.json",
+                r#"{"command":["true"],"resources":{"cpu":"8"}}"#,
+                "integer without quotation marks",
+            ),
+        ];
+
+        for (name, body, expected) in cases {
+            let path = job_file(&dir, name, body);
+            let error = JobFile::load(&path).unwrap_err().to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_job_file_refuses_a_zero_pool_claim() {
+        let _guard = env_lock();
+        let dir = tmpdir("zero-pool-claim");
+        let path = job_file(
+            &dir,
+            "job.toml",
+            "command = [\"true\"]\n[resources.claims]\nnet = 0\n",
+        );
+        let options = SubmitOptions {
+            job_file: Some(path),
+            ..Default::default()
+        };
+        let error = JobSpec::resolve(&options, &Config::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("asks for 0 of `net`"), "got: {error}");
+        assert!(error.contains("give 1 or more"), "got: {error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zero_config_defaults_cannot_create_a_zero_job_claim() {
+        let _guard = env_lock();
+        for (config, expected) in [
+            ("[defaults]\ncpu = 0\n", "1 core or more"),
+            ("[defaults]\nmem = 0\n", "1 byte or more"),
+        ] {
+            let mut cfg: Config = toml::from_str(config).unwrap();
+            cfg.learn.enabled = false;
+            let error = JobSpec::resolve(&opts(&["true"]), &cfg)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{config} gave: {error}");
+        }
     }
 
     #[test]

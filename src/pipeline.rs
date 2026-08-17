@@ -327,6 +327,39 @@ command = ["make", "test"]
     }
 
     #[test]
+    fn a_pipeline_stage_cannot_reintroduce_zero_or_typed_claims() {
+        for (resource, expected) in [
+            ("cpu = 0", "1 core or more"),
+            ("mem = 0", "1 byte or more"),
+            ("cpu = \"8GB\"", "incorrect core count"),
+            ("cpu = \"8\"", "integer without quotation marks"),
+        ] {
+            let text = format!(
+                "[[jobs]]\nname = \"build\"\ncommand = [\"true\"]\n[jobs.resources]\n{resource}\n"
+            );
+            let error = toml::from_str::<PipelineFile>(&text)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{resource} gave: {error}");
+        }
+
+        let pipeline = file(
+            "[[jobs]]\nname = \"build\"\ncommand = [\"true\"]\n\
+             [jobs.resources.claims]\nnet = 0\n",
+        )
+        .unwrap();
+        let error = stage_spec(
+            &pipeline.jobs[0],
+            &crate::config::Config::default(),
+            uuid::Uuid::new_v4(),
+            "ci",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("asks for 0 of `net`"), "got: {error}");
+    }
+
+    #[test]
     fn a_file_with_stages_in_order_is_accepted() {
         let p = file(
             r#"

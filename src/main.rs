@@ -809,7 +809,7 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     );
     println!(
         "default job:  {} core(s), {}, {}",
-        cfg.default_cpu(),
+        cfg.default_cpu()?,
         units::format_size(cfg.default_mem()?),
         match cfg.default_timeout()? {
             Some(d) => format!("timeout {}", units::format_duration(d)),
