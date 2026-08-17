@@ -152,9 +152,9 @@ impl std::str::FromStr for JobState {
 /// job that claimed 40GB and used 6GB. The agent needs no other tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
-    /// The maximum memory in bytes, from `getrusage(RUSAGE_CHILDREN)`.
+    /// The maximum memory in bytes reached by any attempt of the job.
     pub max_rss: u64,
-    /// The CPU time in seconds for all the processes of the job.
+    /// The CPU time in seconds for all the processes of the latest attempt.
     pub cpu_secs: f64,
 }
 

@@ -367,8 +367,8 @@ pub const STATUS: &str = r##"{
       "type": "object",
       "description": "The resources that the job used. Compare these values with the claim, then correct your next claim.",
       "properties": {
-        "max_rss": { "type": "integer", "description": "The maximum memory in bytes." },
-        "cpu_secs": { "type": "number", "description": "The CPU time in seconds for all the processes of the job." }
+        "max_rss": { "type": "integer", "description": "The maximum memory in bytes reached by any attempt of the job." },
+        "cpu_secs": { "type": "number", "description": "The CPU time in seconds for all the processes of the latest attempt." }
       }
     },
     "forced": {

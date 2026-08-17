@@ -305,6 +305,11 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     let spec = job::read_spec(&dir).context("reading the job specification")?;
     let mut status = job::read_status(&dir).context("reading the job status")?;
 
+    // The error belongs to one attempt. A failed attempt writes why qex starts
+    // the job again, but that statement stops being true when the next attempt
+    // starts. Faults in this attempt add themselves below.
+    status.error = None;
+
     // Take the record, and say which process holds it.
     //
     // The coordinator knows this pid, and it deliberately does not write it:
@@ -540,6 +545,12 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
     // the kernel stopped would then report no kill at all.
     let oom_watch = crate::enforce::OomWatch::start();
 
+    // `RUSAGE_CHILDREN` accumulates for the lifetime of this supervisor. The
+    // same supervisor runs every retry, so take a snapshot for this attempt
+    // before its process exists. The difference after `wait` is the CPU time
+    // of this attempt alone.
+    let usage_before = read_usage();
+
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -754,7 +765,7 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 
     // Read the resources that the job used. The values include each child of
     // the job, so a job that forks gives a correct measurement.
-    let usage = read_usage();
+    let usage = usage_since(&usage_before);
 
     let signal = exit_signal(&exit);
     let code = exit.code();
@@ -1394,6 +1405,25 @@ fn read_usage() -> Usage {
     Usage { max_rss, cpu_secs }
 }
 
+/// Reads the use of the children that stopped after `before`.
+///
+/// `getrusage(RUSAGE_CHILDREN)` belongs to the supervisor process and therefore
+/// accumulates across its retries. CPU time is additive, so subtracting the
+/// snapshot removes every earlier retry. `ru_maxrss` is a high-water mark and
+/// cannot be subtracted: retain the largest resident set seen across the
+/// attempts. That remains a true peak of this job and is safe input for the
+/// learned memory claim.
+fn usage_since(before: &Usage) -> Usage {
+    usage_between(before, &read_usage())
+}
+
+fn usage_between(before: &Usage, after: &Usage) -> Usage {
+    Usage {
+        max_rss: after.max_rss,
+        cpu_secs: (after.cpu_secs - before.cpu_secs).max(0.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1994,5 +2024,21 @@ mod tests {
             crate::units::format_size(usage.max_rss)
         );
         assert!(usage.cpu_secs >= 0.0);
+    }
+
+    #[test]
+    fn the_use_measurement_subtracts_the_earlier_attempts() {
+        let before = Usage {
+            max_rss: 40 << 20,
+            cpu_secs: 12.5,
+        };
+        let after = Usage {
+            max_rss: 60 << 20,
+            cpu_secs: 14.0,
+        };
+        let usage = usage_between(&before, &after);
+
+        assert_eq!(usage.max_rss, 60 << 20, "RSS is the peak over all attempts");
+        assert_eq!(usage.cpu_secs, 1.5, "CPU is for the latest attempt only");
     }
 }
