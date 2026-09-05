@@ -764,9 +764,11 @@ names `cancelled`. `qex clean cancelled` deletes the records. It then stops
 each job that operates in the way that `qex kill` does: TERM, then KILL after
 `--grace` (default 10s).
 
-The pause and each cancel go to the disk before the answer, so a coordinator
-that stops during the command leaves no cancelled job that comes back; if the
-connection ends, run `qex abort` again for the rest.
+The pause and each cancel go to the disk before the answer. A coordinator that
+stops during the command therefore leaves no cancelled job that comes back. If
+the connection ends, run `qex abort` again for the rest. A record that qex
+could not write is not counted as cancelled: the job stays in the queue, the
+answer names it, and the exit code is 1.
 
 The queue **stays paused**, so nothing starts until you run `qex resume queue`.
 The pause covers the whole queue of your user, and every command that lists

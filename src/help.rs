@@ -1744,7 +1744,9 @@ What it does, in order
 
 The pause and each cancel go to the disk before the answer, so a coordinator
 that stops during the command leaves no cancelled job that comes back. If the
-connection ends during the command, run `qex abort` again for the rest.
+connection ends during the command, run `qex abort` again for the rest. A
+record that qex could not write is not counted as cancelled: the job stays in
+the queue, the answer names it, and the exit code is 1.
 
 Steps 1 to 3 happen in one request to the coordinator, which does the first
 two under one lock. No job can start between the pause and the cancel, and

@@ -2785,6 +2785,7 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         )?;
     let Response::Aborted {
         cancelled,
+        not_cancelled,
         signalled,
         not_stopped,
         continues,
@@ -2794,9 +2795,13 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         return report(response);
     };
 
-    // A job that qex could not stop is work that continues, so the code says
-    // that the reader must act.
-    let code = if not_stopped.is_empty() { 0 } else { 1 };
+    // A job that qex could not stop, or could not cancel, is work that can
+    // still happen, so the code says that the reader must act.
+    let code = if not_stopped.is_empty() && not_cancelled.is_empty() {
+        0
+    } else {
+        1
+    };
 
     if args.json {
         println!(
@@ -2804,6 +2809,7 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "scope": scope,
                 "cancelled": cancelled,
+                "not_cancelled": not_cancelled,
                 "signalled": signalled,
                 "not_stopped": not_stopped,
                 "continues": continues,
@@ -2869,6 +2875,17 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
             "cancelled: {}; the records stay in the state `cancelled`",
             count_of(cancelled, "queued job")
         );
+    }
+
+    if !not_cancelled.is_empty() {
+        println!(
+            "not cancelled: {}; qex could not write the record, so each one stays in the \
+             queue. Correct the directory, then run `qex abort` again.",
+            count_of(not_cancelled.len(), "queued job")
+        );
+        for n in &not_cancelled {
+            println!("           {} ({}): {}", n.id, safe_name(&n.name), n.why);
+        }
     }
 
     if args.keep_running {

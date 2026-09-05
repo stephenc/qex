@@ -375,6 +375,9 @@ pub struct AbortPlan {
     /// each one holds now. The caller writes each record to the disk and runs
     /// the stop hook, as `qex cancel` does.
     pub cancelled: Vec<(uuid::Uuid, JobStatus)>,
+    /// The queued jobs whose record qex could not write. Each one stays in
+    /// the queue, and the answer names it.
+    pub not_cancelled: Vec<AbortedJob>,
     /// The jobs of the scope that operate: each one is a job to signal.
     pub running: Vec<(uuid::Uuid, String)>,
     /// The jobs that wait or operate outside the scope.
@@ -449,6 +452,7 @@ pub fn plan_abort(
 
     let now = crate::sys::now_secs();
     let mut cancelled = Vec::new();
+    let mut not_cancelled = Vec::new();
     let mut running = Vec::new();
     let mut outside = 0usize;
     for job in state.jobs.values_mut() {
@@ -460,23 +464,51 @@ pub fn plan_abort(
         }
         match job.status.state {
             JobState::Queued => {
-                job.status.state = JobState::Cancelled;
-                job.status.finished_at = Some(now);
-                job.status.blocked_reason = None;
+                let mut next = job.status.clone();
+                next.state = JobState::Cancelled;
+                next.finished_at = Some(now);
+                next.blocked_reason = None;
                 // A cancel that a person asked for leaves no error text. See
                 // `cancel_queued` in the daemon module.
-                job.status.error = None;
-                // THE RECORD GOES TO THE DISK HERE, UNDER THE LOCK. A
-                // coordinator can die at any moment, and the next coordinator
-                // reads the disk. A record that this coordinator cancelled in
-                // memory and did not write would come back as a queued job,
-                // and one `qex resume queue` would start the work that the
-                // abort stopped. The queue is paused during this loop, so the
-                // stall costs nothing that a reader waits for.
-                if let Ok(dir) = paths::job_dir(&job.status.id) {
-                    job::write_status(&dir, &job.status).ok();
+                next.error = None;
+                // THE RECORD GOES TO THE DISK FIRST, UNDER THE LOCK, AND THE
+                // MEMORY FOLLOWS. A coordinator can die at any moment, and
+                // the next coordinator reads the disk. A record that this
+                // coordinator cancelled in memory and did not write would
+                // come back as a queued job, and one `qex resume queue` would
+                // start the work that the abort stopped. A record that qex
+                // could not write therefore stays queued in memory as well,
+                // and the answer names it: the count of cancelled jobs is the
+                // count of records on the disk that say so.
+                //
+                // The write does not wait for the disk. Every other request
+                // waits for this lock, and a wait for the disk on each of
+                // thousands of records would hold them all for the whole
+                // abort. The page cache survives the death of the
+                // coordinator, which is the death that this write protects
+                // against.
+                let written = paths::job_dir(&job.status.id)
+                    .map_err(|e| e.to_string())
+                    .and_then(|dir| {
+                        job::write_status_unsynced(&dir, &next).map_err(|e| format!("{e:#}"))
+                    });
+                match written {
+                    Ok(()) => {
+                        job.status = next;
+                        cancelled.push((job.status.id, job.status.clone()));
+                    }
+                    Err(why) => {
+                        log(&format!(
+                            "qex abort could not write the record of the job {}: {why}",
+                            job.status.id
+                        ));
+                        not_cancelled.push(AbortedJob {
+                            id: job.status.id,
+                            name: job.status.display_name(),
+                            why,
+                        });
+                    }
                 }
-                cancelled.push((job.status.id, job.status.clone()));
             }
             JobState::Starting | JobState::Running => {
                 running.push((job.status.id, job.status.display_name()));
@@ -494,13 +526,16 @@ pub fn plan_abort(
 
     AbortPlan {
         cancelled,
+        not_cancelled,
         running,
         outside,
     }
 }
 
 /// Names the variable that makes the coordinator stop after the lock section
-/// of an abort. **This variable exists for the tests of qex.**
+/// of an abort. **This variable exists for the tests of qex**, and a release
+/// build does not read it.
+#[cfg(debug_assertions)]
 const CRASH_AFTER_PLAN: &str = "QEX_TEST_CRASH_AFTER_ABORT_PLAN";
 
 /// How long an abort waits for a job that is between the queue and its first
@@ -544,7 +579,10 @@ pub fn abort(
 
     // A test of qex stops the coordinator here, in the moment after the lock
     // and before any answer. The next coordinator must then hold every
-    // cancelled job as cancelled. No other program sets this variable.
+    // cancelled job as cancelled. A release build has no such switch: a
+    // coordinator inherits the environment of the shell that started it, and
+    // a variable that a person left set must not stop a real queue.
+    #[cfg(debug_assertions)]
     if std::env::var_os(CRASH_AFTER_PLAN).is_some() {
         log("qex stops here because QEX_TEST_CRASH_AFTER_ABORT_PLAN is set");
         std::process::abort();
@@ -600,9 +638,10 @@ pub fn abort(
     }
 
     log(&format!(
-        "qex abort: {} cancelled, {} signalled, {} not stopped, {} continue, \
-         {} outside the scope; the queue is paused",
+        "qex abort: {} cancelled, {} not cancelled, {} signalled, {} not stopped, \
+         {} continue, {} outside the scope; the queue is paused",
         plan.cancelled.len(),
+        plan.not_cancelled.len(),
         signalled.len(),
         not_stopped.len(),
         continues.len(),
@@ -611,6 +650,7 @@ pub fn abort(
 
     Response::Aborted {
         cancelled: plan.cancelled.len(),
+        not_cancelled: plan.not_cancelled,
         signalled,
         not_stopped,
         continues,
@@ -715,6 +755,9 @@ mod tests {
         let earlier_start = queued_job(Some("boot-before"), chain());
         let ids = [this_start.status.id, earlier_start.status.id];
         for job in [this_start, earlier_start] {
+            // The cancel goes to the disk first, so each job needs its
+            // directory, as a submission makes it.
+            std::fs::create_dir_all(paths::job_dir(&job.status.id).unwrap()).unwrap();
             state.queue.push(job.status.id);
             state.jobs.insert(job.status.id, job);
         }

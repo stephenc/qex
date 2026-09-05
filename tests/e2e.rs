@@ -17287,6 +17287,11 @@ fn an_abort_at_the_moment_of_a_resume_accounts_for_every_job() {
 /// `qex resume queue` then starts the work that the abort stopped.
 #[test]
 fn a_coordinator_that_dies_during_an_abort_leaves_every_cancel_on_the_disk() {
+    // The switch that stops the coordinator exists in a debug build only.
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build has no test switch to stop the coordinator");
+        return;
+    }
     let mut h = Harness::new("abortcrash", ABORT_CONFIG);
     h.extra_env
         .push(("QEX_TEST_CRASH_AFTER_ABORT_PLAN".into(), "1".into()));
@@ -17327,4 +17332,56 @@ fn a_coordinator_that_dies_during_an_abort_leaves_every_cancel_on_the_disk() {
     let pause = h.ok(&["pause", "--json"]);
     let pause: serde_json::Value = serde_json::from_str(&pause).unwrap();
     assert_eq!(pause["paused"], true, "the pause survives too: {pause}");
+}
+
+/// The report never counts as cancelled a job whose cancel is not on the disk.
+///
+/// A record that qex could not write would come back as a queued job at the
+/// next coordinator, so the abort leaves such a job in the queue, names it,
+/// and gives the exit code 1.
+#[test]
+fn an_abort_does_not_count_a_cancel_that_did_not_reach_the_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new("abortunwritable", ABORT_CONFIG);
+    h.ok(&["pause", "queue"]);
+    let fine = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let unwritable = h.submit(&[
+        "submit",
+        "--name",
+        "unwritable",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--",
+        "true",
+    ]);
+    let dir = h.job_dir(&unwritable);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = h.qex_within(&["abort", "--all", "--json"], Duration::from_secs(60));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the abort output is not valid JSON");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a cancel that failed gives 1: {report}"
+    );
+    assert_eq!(report["cancelled"], 1, "the report: {report}");
+    let failed = report["not_cancelled"].as_array().expect("a list");
+    assert_eq!(failed.len(), 1, "the report: {report}");
+    assert_eq!(failed[0]["id"], unwritable, "the report: {report}");
+    assert_eq!(failed[0]["name"], "unwritable", "the report: {report}");
+
+    assert_eq!(h.state_of(&fine), "cancelled");
+    assert_eq!(
+        h.state_of(&unwritable),
+        "queued",
+        "a job whose cancel did not reach the disk stays in the queue"
+    );
+    let text = std::fs::read_to_string(dir.join("status.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(record["state"], "queued", "the disk agrees with the memory");
 }
