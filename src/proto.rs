@@ -368,11 +368,8 @@ pub enum Response {
     /// the queue is empty while a record still waits in it.
     Aborted {
         /// The jobs that waited in the queue and that this request cancelled.
+        /// Their records stay, as after `qex cancel`.
         cancelled: usize,
-        /// The records of cancelled jobs that this request deleted.
-        deleted: usize,
-        /// The records of cancelled jobs that stay, and why each one stays.
-        kept: Vec<AbortedJob>,
         /// The jobs that operated and that received the signal TERM.
         signalled: Vec<uuid::Uuid>,
         /// The jobs that operated and that the request could not signal.

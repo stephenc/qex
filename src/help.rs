@@ -376,7 +376,9 @@ Other commands
     qex logs <id> --grep ERR   the lines that you want from a large log
     qex kill <id>              stop a job that operates
     qex cancel <id>            remove a job from the queue
-    qex abort                  stop your jobs and empty your part of the queue
+    qex abort                  stop your jobs and empty your part of the queue.
+                               To stop many jobs, use it: it pauses first, so
+                               the kills do not race the scheduler.
     qex rerun <id>             submit the same job again, with a new id
     qex clean --state done     delete the records of the jobs that stopped
     qex info                   the coordinator and the free capacity
@@ -1717,23 +1719,23 @@ pub const ABORT: &str = "\
 qex abort
 =========
 
-Use this command to give up a piece of work: a sweep of thousands of jobs, or a
-run that must not continue.
+Use this command to stop work that must not continue: a sweep of thousands of
+jobs, or a run that is wrong.
 
     qex abort                    your jobs of this directory
     qex abort --tag phase        the same, with the tag `phase` only
     qex abort --keep-running     cancel the queued jobs; let the jobs that operate finish
-    qex abort --cwd              every job of this directory, whatever process submitted it
+    qex abort --cwd              every job of this directory, from every process
     qex abort --all              every job of your queue
 
 What it does, in order
 ----------------------
 
 1. It pauses the queue. No job starts from this moment.
-2. It cancels every queued job of the scope, and it deletes their records. A
-   job that never ran leaves nothing that a reader needs, and `qex status <id>`
-   still says that the job existed and was cancelled. A record that a job
-   outside the scope needs stays, in the state `cancelled`.
+2. It cancels every queued job of the scope. Each record stays in the state
+   `cancelled`, exactly as after `qex cancel`: a `qex wait` on the job gives
+   125, `qex status` shows the state, and the stop hook runs for a filter that
+   names `cancelled`. Run `qex clean cancelled` to delete the records.
 3. It sends TERM to every job of the scope that operates, and KILL after the
    grace time (`--grace`, default 10s) to each one that continues. This is
    `qex kill`, for each job. Their records stay, so you can read their output.
@@ -1770,6 +1772,8 @@ What you can predict:
     whatever shell the agent ran for each command.
   * Two agents in two panes of one multiplexer, or in two windows of one
     terminal program, share nothing below the boundary. They are two contexts.
+  * Two agents that one shell started share that shell, so they are one
+    context: an abort by one reaches the jobs of the other in that directory.
   * A job that a job submitted has the supervisor of that job as its boundary.
     It is in the context of that job, and in no context of an agent.
   * A job from an earlier qex, or from a helper that left your process tree,
@@ -1777,8 +1781,8 @@ What you can predict:
   * When qex cannot find the end of your session, your context is empty, and
     the default scope is no job. The scope line says so.
 
-`--cwd` drops the process test: every job of this directory, whatever
-submitted it. `--all` is every job of your queue. `--tag` narrows each level.
+`--cwd` drops the process test: every job of this directory, from every
+process. `--all` is every job of your queue. `--tag` narrows each level.
 qex stops only the jobs of the user who runs it. A queue belongs to one user,
 and no option reaches the jobs of another user.
 

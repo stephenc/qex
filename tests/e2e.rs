@@ -16760,7 +16760,6 @@ fn abort_stops_the_running_job_and_empties_the_queue() {
 
     let report = h.abort_json(&[]);
     assert_eq!(report["cancelled"], 5, "the report: {report}");
-    assert_eq!(report["deleted"], 5, "the report: {report}");
     assert_eq!(
         report["signalled"],
         serde_json::json!([running]),
@@ -16774,10 +16773,17 @@ fn abort_stops_the_running_job_and_empties_the_queue() {
     assert_eq!(report["outside"], 0, "the report: {report}");
     assert_eq!(report["queue_paused"], true, "the report: {report}");
 
-    // The queued jobs are gone, and the coordinator says that they existed.
+    // The queued jobs are cancelled, and their records stay, as after
+    // `qex cancel`. `qex clean cancelled` then deletes them.
     for id in &queued {
-        let out = h.qex(&["status", id]);
-        assert!(!out.status.success(), "the record of {id} must be deleted");
+        assert_eq!(
+            h.state_of(id),
+            "cancelled",
+            "the job {id} must be cancelled"
+        );
+    }
+    h.ok(&["clean", "cancelled"]);
+    for id in &queued {
         assert!(
             !h.job_dir(id).exists(),
             "the directory of {id} must be deleted"
@@ -16848,7 +16854,11 @@ fn abort_keep_running_leaves_the_job_that_operates() {
         "the report: {report}"
     );
 
-    assert!(!h.job_dir(&queued).exists(), "the queued job must be gone");
+    assert_eq!(
+        h.state_of(&queued),
+        "cancelled",
+        "the queued job must be cancelled"
+    );
     // Measure for a period. A job that a signal reaches stops a moment later.
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
@@ -16921,7 +16931,7 @@ fn abort_touches_only_the_jobs_of_the_caller() {
     let report = h.abort_json(&["--tag", "phase"]);
     assert_eq!(report["cancelled"], 1, "the report: {report}");
     assert_eq!(report["outside"], 7, "the report: {report}");
-    assert!(!h.job_dir(&mine_tagged).exists());
+    assert_eq!(state(&mine_tagged), "cancelled");
     all_queued(&[&mine[0], &mine[1], &other_dir[0], &other_dir[1]]);
     all_queued(&[&other_context[0], &other_context[1], &no_context]);
 
@@ -16929,8 +16939,8 @@ fn abort_touches_only_the_jobs_of_the_caller() {
     let report = h.abort_json(&[]);
     assert_eq!(report["cancelled"], 2, "the report: {report}");
     assert_eq!(report["outside"], 5, "the report: {report}");
-    assert!(!h.job_dir(&mine[0]).exists());
-    assert!(!h.job_dir(&mine[1]).exists());
+    assert_eq!(state(&mine[0]), "cancelled");
+    assert_eq!(state(&mine[1]), "cancelled");
     all_queued(&[&other_dir[0], &other_dir[1]]);
     all_queued(&[&other_context[0], &other_context[1], &no_context]);
 
@@ -16939,18 +16949,21 @@ fn abort_touches_only_the_jobs_of_the_caller() {
     assert_eq!(report["cancelled"], 3, "the report: {report}");
     assert_eq!(report["outside"], 2, "the report: {report}");
     all_queued(&[&other_dir[0], &other_dir[1]]);
-    assert!(!h.job_dir(&other_context[0]).exists());
-    assert!(!h.job_dir(&no_context).exists());
+    assert_eq!(state(&other_context[0]), "cancelled");
+    assert_eq!(state(&no_context), "cancelled");
 
     // Level 3: every job of the queue.
     let report = h.abort_json(&["--all"]);
     assert_eq!(report["cancelled"], 2, "the report: {report}");
     assert_eq!(report["outside"], 0, "the report: {report}");
-    assert!(h.list_json().is_empty(), "the queue must be empty");
+    assert!(
+        h.list_json().iter().all(|j| j["state"] == "cancelled"),
+        "every job of the queue must be cancelled"
+    );
 }
 
-/// The counts say what the coordinator did, and a record that a job outside
-/// the scope needs stays.
+/// The counts say what the coordinator did, and a job outside the scope
+/// keeps its state.
 #[test]
 fn abort_counts_what_it_did_and_keeps_a_record_that_another_job_needs() {
     let h = Harness::new("abortcount", ABORT_CONFIG);
@@ -16983,18 +16996,7 @@ fn abort_counts_what_it_did_and_keeps_a_record_that_another_job_needs() {
         report["cancelled"], 1,
         "the stopped job is not cancelled: {report}"
     );
-    assert_eq!(
-        report["deleted"], 0,
-        "the held record is not deleted: {report}"
-    );
     assert_eq!(report["outside"], 1, "the dependent is outside: {report}");
-    let kept = report["kept"].as_array().expect("kept is a list");
-    assert_eq!(kept.len(), 1, "the report: {report}");
-    assert_eq!(kept[0]["id"], cause, "the report: {report}");
-    assert!(
-        kept[0]["why"].as_str().unwrap().contains(&dependent[..8]),
-        "the reason names the job that needs the record: {report}"
-    );
 
     assert_eq!(h.state_of(&cause), "cancelled");
     assert_eq!(
@@ -17128,4 +17130,149 @@ fn pause_with_no_word_says_how_to_pause() {
         text.contains("qex pause queue"),
         "the report must name the command that pauses: {text}"
     );
+}
+
+/// After an abort, every reader that asks about a cancelled job gets the
+/// answer that it gets after `qex cancel` of that job.
+///
+/// THE READERS: `qex wait`, `qex submit --wait`, `qex run` (each gives 125),
+/// `qex status` (the state `cancelled`), the stop hook (one line for each
+/// job), and `qex status` after `qex clean` (the job never ran).
+#[test]
+fn after_an_abort_every_reader_gets_the_answer_of_a_cancel() {
+    let h = Harness::new("abortreaders", ABORT_CONFIG);
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "{ABORT_CONFIG}[hooks]\non_stop_states = [\"cancelled\"]\n\
+         on_stop = [\"sh\", \"-c\", \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let occupier = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&occupier) == "running"
+    });
+
+    let waited = h.submit(&[
+        "submit", "--name", "waited", "--cpu", "1", "--mem", "64MB", "--", "true",
+    ]);
+    let waiter = h.spawn(&["wait", &waited]);
+    let submit_wait = h.spawn(&[
+        "submit",
+        "--wait",
+        "--name",
+        "submitted",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--",
+        "true",
+    ]);
+    let (run, ran) = h.run_bg(&["--name", "ran", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.until("every job waits", Duration::from_secs(30), || {
+        h.state_of(&ran) == "queued" && h.list_json().len() == 4
+    });
+
+    let report = h.abort_json(&[]);
+    assert_eq!(report["cancelled"], 3, "the report: {report}");
+
+    let out = wait_for_child(waiter, Duration::from_secs(30), "qex wait after an abort");
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex wait` must give 125 for a cancelled job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = wait_for_child(
+        submit_wait,
+        Duration::from_secs(30),
+        "submit --wait after an abort",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex submit --wait` must give 125 for a cancelled job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = wait_run(run, "an abort cancelled the job of `qex run`");
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex run` must give 125 for a cancelled job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(h.state_of(&waited), "cancelled");
+    h.until(
+        "the stop hook wrote three lines",
+        Duration::from_secs(30),
+        || h.hook_lines().len() == 3,
+    );
+    let mut lines = h.hook_lines();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec![
+            "cancelled ran".to_string(),
+            "cancelled submitted".to_string(),
+            "cancelled waited".to_string()
+        ],
+        "the stop hook must run for each cancelled job"
+    );
+
+    // After `qex clean`, the history says that the job never ran.
+    h.ok(&["clean", "cancelled"]);
+    let out = h.qex(&["status", &waited]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("NEVER RAN") && !err.contains("HAPPENED"),
+        "a cancelled job never ran, and the reader must not repeat nothing: {err}"
+    );
+
+    h.qex(&["kill", &occupier, "--grace", "1s"]);
+}
+
+/// An abort that arrives at the moment of a resume accounts for every job:
+/// each one is cancelled or signalled, and none is reported as not stopped.
+///
+/// WHAT THIS TEST DOES NOT PROVE: that the abort waits for the pid of a job
+/// between the queue and its first process. A test cannot hold that window
+/// open, and on a quiet machine the abort meets no job in it. The unit test
+/// `lifecycle::tests::an_abort_waits_for_the_pid_of_a_job_that_starts` makes
+/// the state and proves the wait. This test runs the real path under load.
+#[test]
+fn an_abort_at_the_moment_of_a_resume_accounts_for_every_job() {
+    let h = Harness::new(
+        "abortstarting",
+        "[budget]\ncpu = \"8\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    h.ok(&["info"]);
+    for round in 0..3 {
+        h.ok(&["pause", "queue"]);
+        for _ in 0..20 {
+            h.submit(&["submit", "--cpu", "1", "--mem", "1MB", "--", "sleep", "5"]);
+        }
+        h.ok(&["resume", "queue"]);
+        let report = h.abort_json(&["--all"]);
+        assert_eq!(
+            report["not_stopped"],
+            serde_json::json!([]),
+            "round {round}: every job must receive the signal: {report}"
+        );
+        let cancelled = report["cancelled"].as_u64().unwrap();
+        let signalled = report["signalled"].as_array().unwrap().len() as u64;
+        assert_eq!(cancelled + signalled, 20, "round {round}: {report}");
+        h.until("no job operates", Duration::from_secs(30), || {
+            h.list_json()
+                .iter()
+                .all(|j| matches!(j["state"].as_str(), Some("cancelled" | "killed")))
+        });
+        h.ok(&["clean", "done"]);
+    }
 }

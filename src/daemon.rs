@@ -691,7 +691,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    fn new(cfg: Config, config_seen: u64) -> Self {
+    pub(crate) fn new(cfg: Config, config_seen: u64) -> Self {
         Self {
             state: Mutex::new(State {
                 cfg,

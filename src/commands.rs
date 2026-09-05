@@ -2769,8 +2769,6 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
     })?;
     let Response::Aborted {
         cancelled,
-        deleted,
-        kept,
         signalled,
         not_stopped,
         continues,
@@ -2790,14 +2788,13 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "scope": scope,
                 "cancelled": cancelled,
-                "deleted": deleted,
-                "kept": kept,
                 "signalled": signalled,
                 "not_stopped": not_stopped,
                 "continues": continues,
                 "outside": outside,
                 "queue_paused": true,
                 "next": "qex resume queue",
+                "clean": "qex clean cancelled",
             }))?
         );
         return Ok(code);
@@ -2823,7 +2820,7 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         );
     } else if args.cwd {
         println!(
-            "scope:     every job of {}{tags}, whatever process submitted it",
+            "scope:     every job of {}{tags}, from every process",
             here.display()
         );
     } else {
@@ -2847,33 +2844,28 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         }
     }
 
-    if kept.is_empty() {
-        println!(
-            "cancelled: {}; qex deleted {}",
-            count_of(cancelled, "queued job"),
-            if deleted == cancelled {
-                String::from("their records")
-            } else {
-                count_of(deleted, "record")
-            }
-        );
+    // A count of zero says what did not happen, so it gets no sentence
+    // about what qex did with it.
+    if cancelled == 0 {
+        println!("cancelled: no job waited in the scope");
     } else {
         println!(
-            "cancelled: {}; qex deleted {}, and {} stayed:",
-            count_of(cancelled, "queued job"),
-            count_of(deleted, "record"),
-            count_of(kept.len(), "record")
+            "cancelled: {}; the records stay in the state `cancelled`",
+            count_of(cancelled, "queued job")
         );
-        for k in &kept {
-            println!("           {} ({}): {}", k.id, safe_name(&k.name), k.why);
-        }
     }
 
     if args.keep_running {
-        println!(
-            "continues: {} that operate; this command left them alone",
-            count_of(continues.len(), "job")
-        );
+        if continues.is_empty() {
+            println!("continues: no job of the scope operates");
+        } else {
+            println!(
+                "continues: {} that operate; this command left them alone",
+                count_of(continues.len(), "job")
+            );
+        }
+    } else if signalled.is_empty() {
+        println!("signalled: no job of the scope operated");
     } else {
         println!(
             "signalled: {} received TERM; qex sends KILL after {}s to each one that continues",
@@ -2896,15 +2888,23 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         } else if args.cwd {
             "`qex abort --all` reaches every job of your queue."
         } else {
-            "`qex abort --cwd` reaches every job of this directory, and `qex abort --all` \
-             reaches every job of your queue."
+            "`qex abort --cwd` reaches the jobs of this directory from every process. A \
+             job of another directory needs `qex abort` from that directory, or \
+             `qex abort --all`."
         };
         println!(
             "outside:   {} outside this scope wait or operate; this command did not touch them. {wider}",
             count_of(outside, "job")
         );
     }
-    println!("The queue is paused. Run `qex resume queue` to start new work.");
+    println!(
+        "The queue is paused. Run `qex resume queue` to start new work{}",
+        if cancelled == 0 {
+            String::from(".")
+        } else {
+            String::from(", and `qex clean cancelled` to delete the cancelled records.")
+        }
+    );
     Ok(code)
 }
 

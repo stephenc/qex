@@ -371,15 +371,10 @@ fn finish_removal(removal: Removal) -> Result<(), String> {
 /// later change computed from the request would say what the reader asked
 /// for, and the answer must say what qex did.
 pub struct AbortPlan {
-    /// The jobs that waited and that the plan cancelled.
-    pub cancelled: Vec<uuid::Uuid>,
-    /// The records of cancelled jobs that leave the memory of the coordinator.
-    /// `finish_removal` deletes each one from the disk.
-    pub removals: Vec<Removal>,
-    /// The records of cancelled jobs that stay, and why.
-    pub kept: Vec<AbortedJob>,
-    /// The records that stay, to write to the disk.
-    pub kept_statuses: Vec<(uuid::Uuid, JobStatus)>,
+    /// The jobs that waited and that the plan cancelled, with the record that
+    /// each one holds now. The caller writes each record to the disk and runs
+    /// the stop hook, as `qex cancel` does.
+    pub cancelled: Vec<(uuid::Uuid, JobStatus)>,
     /// The jobs of the scope that operate: each one is a job to signal.
     pub running: Vec<(uuid::Uuid, String)>,
     /// The jobs that wait or operate outside the scope.
@@ -392,13 +387,21 @@ pub struct AbortPlan {
 /// nothing. The directory is the directory OF THE JOB, as `qex status` shows
 /// it, and not the directory of the process that submitted it: a reader can
 /// see the first one on every record.
-fn in_scope(job: &crate::daemon::Job, scope: &crate::proto::AbortScope) -> bool {
+///
+/// `boot` is the identifier of the current start of the machine. The start
+/// time of a process counts from that start, and a queued record survives a
+/// restart of the machine, so a record from an earlier start could name a
+/// process of this start by accident. Such a record is outside every context.
+fn in_scope(job: &crate::daemon::Job, scope: &crate::proto::AbortScope, boot: &str) -> bool {
     if let Some(dir) = &scope.cwd {
         if Path::new(&job.status.cwd) != Path::new(dir) {
             return false;
         }
     }
     if let Some(caller) = &scope.submitter {
+        if job.status.boot_id.as_deref() != Some(boot) {
+            return false;
+        }
         if !crate::context::shared(&job.status.submitter, caller) {
             return false;
         }
@@ -417,7 +420,17 @@ fn in_scope(job: &crate::daemon::Job, scope: &crate::proto::AbortScope) -> bool 
 /// A command that paused, released the lock, and then cancelled would let the
 /// scheduler start a job between the two steps, which is the fault that a
 /// cancel loop in a script has.
-pub fn plan_abort(state: &mut State, scope: &crate::proto::AbortScope, by_pid: i32) -> AbortPlan {
+///
+/// THE RECORD OF A CANCELLED JOB STAYS, in the state `cancelled`, exactly as
+/// after `qex cancel`. A reader that waits for the job, a reader that asks
+/// `qex status`, and the stop hook each need that record, and each must get
+/// the answer that a cancel gives. `qex clean cancelled` deletes the records.
+pub fn plan_abort(
+    state: &mut State,
+    scope: &crate::proto::AbortScope,
+    by_pid: i32,
+    boot: &str,
+) -> AbortPlan {
     // The process id of each job that operates comes from the disk. Without
     // this read, a job that started a moment ago has no pid and no signal
     // reaches it.
@@ -439,7 +452,7 @@ pub fn plan_abort(state: &mut State, scope: &crate::proto::AbortScope, by_pid: i
     let mut running = Vec::new();
     let mut outside = 0usize;
     for job in state.jobs.values_mut() {
-        if !in_scope(job, scope) {
+        if !in_scope(job, scope, boot) {
             if !job.status.state.is_terminal() {
                 outside += 1;
             }
@@ -453,7 +466,7 @@ pub fn plan_abort(state: &mut State, scope: &crate::proto::AbortScope, by_pid: i
                 // A cancel that a person asked for leaves no error text. See
                 // `cancel_queued` in the daemon module.
                 job.status.error = None;
-                cancelled.push(job.status.id);
+                cancelled.push((job.status.id, job.status.clone()));
             }
             JobState::Starting | JobState::Running => {
                 running.push((job.status.id, job.status.display_name()));
@@ -465,56 +478,12 @@ pub fn plan_abort(state: &mut State, scope: &crate::proto::AbortScope, by_pid: i
     // One pass over the queue for every cancelled job. A pass for each job
     // would cost the square of the queue, and the queue is large exactly when
     // this command matters.
-    let gone: std::collections::HashSet<uuid::Uuid> = cancelled.iter().copied().collect();
+    let gone: std::collections::HashSet<uuid::Uuid> = cancelled.iter().map(|(id, _)| *id).collect();
     state.queue.retain(|q| !gone.contains(q));
-    state.publish_changes();
-
-    // Delete the records of the cancelled jobs. A job that never ran leaves
-    // nothing that a reader needs, and the history keeps one line for each.
-    //
-    // A record that a job outside the scope needs stays, by the rule of
-    // `crate::deps`, in the state `cancelled`. The rule runs ONE time for the
-    // whole set. A walk for each record would cost the square of the queue.
-    let held = crate::deps::held_by_unfinished(&dep_nodes(state));
-    let mut removals = Vec::new();
-    let mut kept = Vec::new();
-    let mut kept_statuses = Vec::new();
-    for id in &cancelled {
-        if held.contains(id) {
-            let why = match crate::deps::hold_reason(&dep_nodes(state), *id) {
-                Some(crate::deps::Hold::Needed(holders)) => {
-                    format!(
-                        "a job that has not stopped needs it: {}",
-                        named(state, &holders)
-                    )
-                }
-                Some(crate::deps::Hold::Pipeline(holders)) => format!(
-                    "it belongs to a pipeline that has work left: {}",
-                    named(state, &holders)
-                ),
-                None => String::from("a job that has not stopped needs it"),
-            };
-            if let Some(job) = state.jobs.get(id) {
-                kept.push(AbortedJob {
-                    id: *id,
-                    name: job.status.display_name(),
-                    why,
-                });
-                kept_statuses.push((*id, job.status.clone()));
-            }
-            continue;
-        }
-        if let Some(removal) = remove_record(state, *id) {
-            removals.push(removal);
-        }
-    }
     state.publish_changes();
 
     AbortPlan {
         cancelled,
-        removals,
-        kept,
-        kept_statuses,
         running,
         outside,
     }
@@ -551,37 +520,22 @@ pub fn abort(
     grace_secs: u64,
     by_pid: i32,
 ) -> Response {
+    let boot = crate::sys::boot_id();
     let plan = {
         let mut state = coord.state.lock().unwrap();
-        plan_abort(&mut state, &scope, by_pid)
+        plan_abort(&mut state, &scope, by_pid, &boot)
     };
     // Wake the scheduler, so the jobs that wait get the pause as their reason.
     coord.notify();
 
-    let mut kept = plan.kept;
-    for (id, status) in plan.kept_statuses {
-        if let Ok(dir) = paths::job_dir(&id) {
-            job::write_status(&dir, &status).ok();
-            // A cancelled job is not in the default filter of the hook. A
-            // user who asks for `cancelled` gets it here. A record that the
-            // abort deletes gets no hook: the hook reads the directory, and
-            // the directory goes.
-            crate::hook::fire_detached(&dir, &status);
-        }
-    }
-
-    let mut deleted = 0usize;
-    for removal in plan.removals {
-        let id = removal.status.id;
-        let name = removal.status.display_name();
-        match finish_removal(removal) {
-            Ok(()) => deleted += 1,
-            Err(why) => {
-                log(&format!(
-                    "qex abort could not delete the record of the job {id}: {why}"
-                ));
-                kept.push(AbortedJob { id, name, why });
-            }
+    // The disk work of a cancel, for each cancelled job, outside the lock.
+    // This is what `cancel_queued` does for one job: the record goes to the
+    // disk, and the stop hook runs for a reader whose filter names
+    // `cancelled`.
+    for (id, status) in &plan.cancelled {
+        if let Ok(dir) = paths::job_dir(id) {
+            job::write_status(&dir, status).ok();
+            crate::hook::fire_detached(&dir, status);
         }
     }
 
@@ -626,10 +580,9 @@ pub fn abort(
     }
 
     log(&format!(
-        "qex abort: {} cancelled, {deleted} records deleted, {} kept, {} signalled, \
-         {} not stopped, {} continue, {} outside the scope; the queue is paused",
+        "qex abort: {} cancelled, {} signalled, {} not stopped, {} continue, \
+         {} outside the scope; the queue is paused",
         plan.cancelled.len(),
-        kept.len(),
         signalled.len(),
         not_stopped.len(),
         continues.len(),
@@ -638,8 +591,6 @@ pub fn abort(
 
     Response::Aborted {
         cancelled: plan.cancelled.len(),
-        deleted,
-        kept,
         signalled,
         not_stopped,
         continues,
@@ -650,6 +601,185 @@ pub fn abort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queued_job(boot: Option<&str>, chain: Vec<crate::job::Ancestor>) -> crate::daemon::Job {
+        let spec = crate::spec::JobSpec {
+            id: uuid::Uuid::new_v4(),
+            name: "t".into(),
+            cwd: "/".into(),
+            command: vec!["true".into()],
+            env: Default::default(),
+            cpu: 1,
+            mem: 1 << 20,
+            timeout: None,
+            max_queue_time: None,
+            tags: vec![],
+            priority: 0,
+            env_capture: crate::config::EnvCapture::None,
+            claim_source: "explicit".into(),
+            group: None,
+            group_name: None,
+            locks: vec![],
+            claims: Default::default(),
+            retries: 0,
+            nice: None,
+            needs: vec![],
+            after: vec![],
+            dedupe_key: None,
+            dedupe_window: 0,
+            learn_key: None,
+            submitted_at: 0,
+        };
+        let mut status = JobStatus::new(&spec);
+        status.boot_id = boot.map(String::from);
+        status.submitter = chain;
+        crate::daemon::Job {
+            spec,
+            status,
+            supervisor_pid: None,
+        }
+    }
+
+    fn chain() -> Vec<crate::job::Ancestor> {
+        vec![
+            crate::job::Ancestor {
+                pid: 50,
+                ppid: 1,
+                start: Some(7),
+                name: "claude".into(),
+                cwd: None,
+                terminal: true,
+            },
+            crate::job::Ancestor {
+                pid: 1,
+                ppid: 0,
+                start: Some(0),
+                name: "systemd".into(),
+                cwd: None,
+                terminal: false,
+            },
+        ]
+    }
+
+    /// Points the state directory at a directory of this test.
+    ///
+    /// `plan_abort` writes the pause file, and a unit test inherits the
+    /// environment of the person who runs it. Without this guard the test
+    /// would pause the real queue of that person.
+    fn isolated_state() -> (
+        std::sync::MutexGuard<'static, ()>,
+        crate::testutil::EnvVar,
+        std::path::PathBuf,
+    ) {
+        let lock = crate::testutil::env_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "qex-lifecycle-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let var = crate::testutil::EnvVar::set("XDG_STATE_HOME", dir.to_str().unwrap());
+        (lock, var, dir)
+    }
+
+    /// A record from an earlier start of the machine is outside the context,
+    /// whatever its chain says: the start time of a process counts from the
+    /// start of the machine, so the chain can name a process of this start by
+    /// accident.
+    #[test]
+    fn a_record_from_an_earlier_start_of_the_machine_is_outside_the_context() {
+        let (_lock, _var, dir) = isolated_state();
+        let coord = Arc::new(Coordinator::new(crate::config::Config::default(), 0));
+        let mut state = coord.state.lock().unwrap();
+        let this_start = queued_job(Some("boot-now"), chain());
+        let earlier_start = queued_job(Some("boot-before"), chain());
+        let ids = [this_start.status.id, earlier_start.status.id];
+        for job in [this_start, earlier_start] {
+            state.queue.push(job.status.id);
+            state.jobs.insert(job.status.id, job);
+        }
+
+        let scope = crate::proto::AbortScope {
+            cwd: Some("/".into()),
+            submitter: Some(chain()),
+            tags: vec![],
+        };
+        let plan = plan_abort(&mut state, &scope, 1, "boot-now");
+
+        assert_eq!(plan.cancelled.len(), 1);
+        assert_eq!(plan.cancelled[0].0, ids[0]);
+        assert_eq!(plan.outside, 1);
+        assert_eq!(state.jobs[&ids[1]].status.state, JobState::Queued);
+        drop(state);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// An abort waits for the pid of a job that is between the queue and its
+    /// first process, and then signals it.
+    ///
+    /// WHAT THIS TEST OBSERVES: the wait, with a pid that arrives late. The
+    /// job is `starting` with no pid, as the coordinator holds it in the
+    /// moment after the scheduler took it and before the supervisor wrote the
+    /// pid. A thread of the test then gives it the pid of a process that the
+    /// test owns, in its own process group, as the supervisor would. A race
+    /// against a real supervisor cannot hold that window open, so this test
+    /// makes the state instead of racing for it.
+    #[test]
+    fn an_abort_waits_for_the_pid_of_a_job_that_starts() {
+        use std::os::unix::process::CommandExt;
+
+        let (_lock, _var, dir) = isolated_state();
+        let coord = Arc::new(Coordinator::new(crate::config::Config::default(), 0));
+        let mut job = queued_job(Some("boot"), chain());
+        job.status.state = JobState::Starting;
+        job.status.pid = None;
+        let id = job.status.id;
+        coord.state.lock().unwrap().jobs.insert(id, job);
+
+        // The process that the job "starts": a child of this test, in its own
+        // group, so that the signal reaches it and nothing else.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("the test cannot start sleep");
+        let pid = child.id() as i32;
+
+        let late = Arc::clone(&coord);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            let mut state = late.state.lock().unwrap();
+            if let Some(job) = state.jobs.get_mut(&id) {
+                job.status.state = JobState::Running;
+                job.status.pid = Some(pid);
+            }
+        });
+
+        let answer = abort(&coord, crate::proto::AbortScope::default(), false, 0, 1);
+        writer.join().unwrap();
+
+        let (signalled, not_stopped) = match answer {
+            Response::Aborted {
+                signalled,
+                not_stopped,
+                ..
+            } => (signalled, not_stopped),
+            other => panic!("the abort gave {other:?}"),
+        };
+        assert_eq!(
+            not_stopped,
+            Vec::<AbortedJob>::new(),
+            "the abort must wait for the pid and then signal the job"
+        );
+        assert_eq!(signalled, vec![id]);
+
+        let status = child.wait().expect("the test cannot reap its child");
+        assert!(
+            !status.success(),
+            "the signal must reach the process of the job: {status:?}"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn signal_names_parse_in_each_usual_form() {

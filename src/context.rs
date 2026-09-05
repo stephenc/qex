@@ -22,7 +22,7 @@
 //!     bash            the shell that the agent runs for one command
 //!     claude          the agent
 //!     bash            the shell of the terminal pane
-//!     tmux: server    the multiplexer: every pane shares it
+//!     tmux_server     the multiplexer: every pane shares it
 //!     systemd         the first process: everything shares it
 //! ```
 //!
@@ -49,7 +49,8 @@
 //! Two commands from one agent share the agent process, so they share a
 //! context, whatever shell the agent ran for each one. Two agents in two panes
 //! of one multiplexer share nothing below the multiplexer, so they do not.
-//! Two commands that a person types in one shell share that shell. A job that
+//! Two commands that a person types in one shell share that shell, and so do
+//! two agents that one shell started: the shell is below the boundary. A job that
 //! a job submitted has the supervisor of that job as its boundary, so the jobs
 //! that one job submits share a context with each other and with nothing
 //! above them. A command with no terminal anywhere above it, such as a command
@@ -63,9 +64,11 @@ use crate::job::Ancestor;
 /// The names of the programs at which a session ends.
 ///
 /// THIS LIST IS A CLAIM ABOUT THE MACHINES THAT RUN QEX, and a later reader
-/// extends it. The names are the names that the system gives: on Linux, the
-/// first 15 characters of the program name. Rules 1 and 3 in the module
-/// documentation catch most of what this list does not name.
+/// extends it. Each name is in the SAFE FORM of `job::safe_name`, because the
+/// chain stores the names in that form: `tmux: server` is stored as
+/// `tmux_server`. Linux gives the first 15 characters of a program name.
+/// Rules 1 and 3 in the module documentation catch most of what this list
+/// does not name.
 pub const BOUNDARY_NAMES: &[&str] = &[
     // The first process.
     "init",
@@ -78,7 +81,7 @@ pub const BOUNDARY_NAMES: &[&str] = &[
     "conmon",
     "containerd-shim",
     // A multiplexer, a login service, a scheduler.
-    "tmux: server",
+    "tmux_server",
     "tmux",
     "screen",
     "sshd",
@@ -172,7 +175,7 @@ mod tests {
             process(shell, agent, "bash", false),
             process(agent, pane, "claude", true),
             process(pane, 6152, "bash", true),
-            process(6152, 1, "tmux: server", false),
+            process(6152, 1, "tmux_server", false),
             process(1, 0, "systemd", false),
         ]
     }
@@ -269,6 +272,19 @@ mod tests {
             !shared(&one, &two),
             "the shared process is above an unknown boundary"
         );
+    }
+
+    /// The multiplexer is found by its stored name, with no terminal below
+    /// it to make rule 3 fire.
+    #[test]
+    fn the_multiplexer_is_a_boundary_by_its_stored_name() {
+        let chain = vec![
+            process(100, 50, "bash", false),
+            process(50, 6152, "claude", false),
+            process(6152, 1, "tmux_server", false),
+            process(1, 0, "systemd", false),
+        ];
+        assert_eq!(boundary_index(&chain), Some(2));
     }
 
     /// The jobs that a job submits share the supervisor as their boundary.

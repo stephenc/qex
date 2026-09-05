@@ -64,10 +64,11 @@ pub enum Command {
     /// Stop your jobs and empty your part of the queue.
     ///
     /// qex pauses the queue first, so no job starts while this command
-    /// operates. It then cancels every queued job of the scope and deletes
-    /// their records, and it sends TERM to every job of the scope that
-    /// operates, then KILL after the grace time. The queue stays paused; run
-    /// `qex resume queue` to start new work.
+    /// operates. It then cancels every queued job of the scope, and it sends
+    /// TERM to every job of the scope that operates, then KILL after the
+    /// grace time. The records stay, as after `qex cancel`; `qex clean
+    /// cancelled` deletes them. The queue stays paused; run `qex resume
+    /// queue` to start new work.
     ///
     /// Without an option, the scope is the jobs of this directory that your
     /// own process tree submitted. Run `qex help abort` for the rule.
@@ -584,10 +585,10 @@ pub struct AbortArgs {
     #[arg(long, value_name = "TAG")]
     pub tag: Vec<String>,
 
-    /// Every job of this directory, whatever process submitted it.
+    /// Every job of this directory, from every process.
     ///
-    /// Use this option for a job whose submitter qex could not connect to
-    /// you: a job that a job submitted, or a job from a detached helper.
+    /// Use this option for a job whose chain does not reach your process: a
+    /// job that a job submitted, or a job from a detached helper.
     #[arg(long, conflicts_with = "all")]
     pub cwd: bool,
 
