@@ -1228,7 +1228,17 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     // module. A reader can then see why a job was, or was not, in scope.
     if !s.submitter.is_empty() {
         let boundary = crate::context::boundary_index(&s.submitter);
-        println!("submitter: the processes above `qex submit`, nearest first");
+        // A restart of the machine ends every process of the chain, and the
+        // start times count from the restart, so `qex abort` refuses such a
+        // record. Say it here, or the reader cannot see why.
+        if s.boot_id.as_deref() != Some(crate::sys::boot_id().as_str()) {
+            println!(
+                "submitter: the machine restarted after this submission, so every process below \
+                 is gone and `qex abort` does not match this job"
+            );
+        } else {
+            println!("submitter: the processes above `qex submit`, nearest first");
+        }
         for (index, a) in s.submitter.iter().enumerate() {
             let mark = match boundary {
                 Some(b) if b == index => "  <- the session ends here",
@@ -2761,12 +2771,18 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
     let mut client = Client::connect()?;
     require_command(&mut client, "abort", "qex abort", ABORT_DANGER)?;
 
-    let response = client.call(&Request::Abort {
-        scope: scope.clone(),
-        keep_running: args.keep_running,
-        grace_secs: grace,
-        by_pid: std::process::id() as i32,
-    })?;
+    let response = client
+        .call(&Request::Abort {
+            scope: scope.clone(),
+            keep_running: args.keep_running,
+            grace_secs: grace,
+            by_pid: std::process::id() as i32,
+        })
+        .context(
+            "the connection to the coordinator ended during the abort.\n\
+             The pause and every cancel that qex made are on the disk, so no job starts \
+             and no cancelled job comes back. Run `qex abort` again for the rest.",
+        )?;
     let Response::Aborted {
         cancelled,
         signalled,

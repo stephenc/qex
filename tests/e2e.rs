@@ -17276,3 +17276,55 @@ fn an_abort_at_the_moment_of_a_resume_accounts_for_every_job() {
         h.ok(&["clean", "done"]);
     }
 }
+
+/// When the coordinator dies during an abort, the next coordinator holds every
+/// job that the abort cancelled as cancelled.
+///
+/// The coordinator of this test stops in the moment after the lock section of
+/// the abort, before any answer, through a variable that exists for this test.
+/// The cancel of each job must be on the disk by then: a record that was
+/// cancelled in memory only comes back as a queued job, and one
+/// `qex resume queue` then starts the work that the abort stopped.
+#[test]
+fn a_coordinator_that_dies_during_an_abort_leaves_every_cancel_on_the_disk() {
+    let mut h = Harness::new("abortcrash", ABORT_CONFIG);
+    h.extra_env
+        .push(("QEX_TEST_CRASH_AFTER_ABORT_PLAN".into(), "1".into()));
+    h.ok(&["pause", "queue"]);
+    let mut ids = Vec::new();
+    for _ in 0..12 {
+        ids.push(h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]));
+    }
+    let coordinator = h.coordinator_pid();
+
+    let out = h.qex_within(&["abort", "--all"], Duration::from_secs(60));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the connection must end: {err}");
+    assert!(
+        err.contains("Run `qex abort` again"),
+        "the command must say what the reader does next: {err}"
+    );
+    h.until("the coordinator stopped", Duration::from_secs(30), || {
+        (unsafe { libc::kill(coordinator, 0) }) != 0
+    });
+
+    // The disk, before any coordinator reads it.
+    for id in &ids {
+        let text = std::fs::read_to_string(h.job_dir(id).join("status.json")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            record["state"], "cancelled",
+            "the record of {id} on the disk"
+        );
+    }
+
+    // The next coordinator, without the variable.
+    h.extra_env.clear();
+    h.ok(&["info"]);
+    for id in &ids {
+        assert_eq!(h.state_of(id), "cancelled");
+    }
+    let pause = h.ok(&["pause", "--json"]);
+    let pause: serde_json::Value = serde_json::from_str(&pause).unwrap();
+    assert_eq!(pause["paused"], true, "the pause survives too: {pause}");
+}

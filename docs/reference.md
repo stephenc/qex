@@ -764,6 +764,10 @@ names `cancelled`. `qex clean cancelled` deletes the records. It then stops
 each job that operates in the way that `qex kill` does: TERM, then KILL after
 `--grace` (default 10s).
 
+The pause and each cancel go to the disk before the answer, so a coordinator
+that stops during the command leaves no cancelled job that comes back; if the
+connection ends, run `qex abort` again for the rest.
+
 The queue **stays paused**, so nothing starts until you run `qex resume queue`.
 The pause covers the whole queue of your user, and every command that lists
 jobs says so.
@@ -784,7 +788,7 @@ start time), below the point where the session ends: a terminal multiplexer,
 a login service, a terminal program, a service manager, the first process of
 the machine, or the supervisor of a qex job. Two commands of one agent share
 the agent process; two agents in two panes share nothing below the multiplexer;
-two agents that one shell started share that shell, and so one context.
+two agents that one shell started share that shell, so they share one context.
 `qex status <id>` shows the chain of a job with that point marked, and
 `qex help abort` gives the rule in full.
 

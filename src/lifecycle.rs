@@ -466,6 +466,16 @@ pub fn plan_abort(
                 // A cancel that a person asked for leaves no error text. See
                 // `cancel_queued` in the daemon module.
                 job.status.error = None;
+                // THE RECORD GOES TO THE DISK HERE, UNDER THE LOCK. A
+                // coordinator can die at any moment, and the next coordinator
+                // reads the disk. A record that this coordinator cancelled in
+                // memory and did not write would come back as a queued job,
+                // and one `qex resume queue` would start the work that the
+                // abort stopped. The queue is paused during this loop, so the
+                // stall costs nothing that a reader waits for.
+                if let Ok(dir) = paths::job_dir(&job.status.id) {
+                    job::write_status(&dir, &job.status).ok();
+                }
                 cancelled.push((job.status.id, job.status.clone()));
             }
             JobState::Starting | JobState::Running => {
@@ -488,6 +498,10 @@ pub fn plan_abort(
         outside,
     }
 }
+
+/// Names the variable that makes the coordinator stop after the lock section
+/// of an abort. **This variable exists for the tests of qex.**
+const CRASH_AFTER_PLAN: &str = "QEX_TEST_CRASH_AFTER_ABORT_PLAN";
 
 /// How long an abort waits for a job that is between the queue and its first
 /// process.
@@ -528,13 +542,19 @@ pub fn abort(
     // Wake the scheduler, so the jobs that wait get the pause as their reason.
     coord.notify();
 
-    // The disk work of a cancel, for each cancelled job, outside the lock.
-    // This is what `cancel_queued` does for one job: the record goes to the
-    // disk, and the stop hook runs for a reader whose filter names
-    // `cancelled`.
+    // A test of qex stops the coordinator here, in the moment after the lock
+    // and before any answer. The next coordinator must then hold every
+    // cancelled job as cancelled. No other program sets this variable.
+    if std::env::var_os(CRASH_AFTER_PLAN).is_some() {
+        log("qex stops here because QEX_TEST_CRASH_AFTER_ABORT_PLAN is set");
+        std::process::abort();
+    }
+
+    // The stop hook, for each cancelled job, outside the lock: a reader whose
+    // filter names `cancelled` gets one line for each job, as after
+    // `qex cancel`. The record itself went to the disk under the lock.
     for (id, status) in &plan.cancelled {
         if let Ok(dir) = paths::job_dir(id) {
-            job::write_status(&dir, status).ok();
             crate::hook::fire_detached(&dir, status);
         }
     }

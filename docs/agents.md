@@ -246,7 +246,7 @@ qex kill <id>                stop a job and each of its children
 qex cancel <id>              take a job out of the queue
 qex abort                    stop your jobs of this directory and empty their queue.
                              To stop many jobs, use it: it pauses first, so the
-                             kills do not race the scheduler.
+                             scheduler starts nothing while it stops them.
 qex top                      watch the queue; j/k move, x stop, i info, t tail, q leave
 qex clean --auto             delete the records that stopped over an hour ago
 qex info                     the coordinator, the budget and the load

@@ -378,7 +378,7 @@ Other commands
     qex cancel <id>            remove a job from the queue
     qex abort                  stop your jobs and empty your part of the queue.
                                To stop many jobs, use it: it pauses first, so
-                               the kills do not race the scheduler.
+                               the scheduler starts nothing while it stops them.
     qex rerun <id>             submit the same job again, with a new id
     qex clean --state done     delete the records of the jobs that stopped
     qex info                   the coordinator and the free capacity
@@ -1741,6 +1741,10 @@ What it does, in order
    `qex kill`, for each job. Their records stay, so you can read their output.
 4. It reports what it did, and the queue STAYS PAUSED. Run `qex resume queue`
    to start new work.
+
+The pause and each cancel go to the disk before the answer, so a coordinator
+that stops during the command leaves no cancelled job that comes back. If the
+connection ends during the command, run `qex abort` again for the rest.
 
 Steps 1 to 3 happen in one request to the coordinator, which does the first
 two under one lock. No job can start between the pause and the cancel, and
