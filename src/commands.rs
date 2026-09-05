@@ -789,10 +789,10 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         }
 
         println!(
-            "{:<8}  {:<10}  {:<16.16}  {:>5}  {:>8}  {:>8}  {}",
+            "{:<8}  {:<10}  {:<16}  {:>5}  {:>8}  {:>8}  {}",
             short_id(&j.id),
             j.state.as_str(),
-            j.name,
+            crate::job::fit_name(&j.name, 16),
             j.cpu,
             format_size(j.mem),
             elapsed,
@@ -6280,11 +6280,11 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
         println!("The largest job records:");
         for (id, name, state, size, old) in per_job.iter().take(args.top) {
             println!(
-                "  {:>9}  {}  {:<10} {:<16.16}{}",
+                "  {:>9}  {}  {:<10} {:<16}{}",
                 format_size(*size),
                 &id.to_string()[..8],
                 state,
-                name,
+                crate::job::fit_name(name, 16),
                 if *old {
                     "  (qex gc would free this)"
                 } else {

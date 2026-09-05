@@ -7768,7 +7768,9 @@ fn each_line_gives_one_job_for_each_line_in_one_group() {
         "--id-file",
         ids.to_str().unwrap(),
         "--",
-        "echo",
+        // A program given by its path. The base of each name is the last part
+        // of that path, and not the path.
+        "/bin/echo",
         "value={}",
     ]);
     assert_eq!(
@@ -10182,10 +10184,14 @@ fn the_default_name_tells_the_jobs_of_one_launcher_apart() {
     );
 }
 
-/// Every page that names the default rule states the same rule. A reader
-/// predicts the name from the command line with the page in front of them,
-/// so a page that states an earlier rule sends the reader to a name that no
+/// Every page that names the default rule holds the one sentence of the rule.
+/// A reader predicts the name from the command line with the page in front of
+/// them, so a page that lost the sentence sends the reader to a name that no
 /// job has.
+///
+/// This gate proves that the sentence is PRESENT on each page, and nothing
+/// more: a page that negates the sentence around it passes. The unit tests of
+/// `spec::derived_name` hold the rule itself.
 #[test]
 fn every_page_states_the_rule_of_the_default_name() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

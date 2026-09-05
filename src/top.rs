@@ -768,12 +768,12 @@ fn job_line(
     // succeeded faint. That job needs no attention, and the eye must go to
     // the jobs that operate and to the failures.
     let line = format!(
-        "{:<8}  {:<9}  {:<14.14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}",
+        "{:<8}  {:<9}  {:<14}  {:>9}  {:>7}  {:>17}  {:>7}  {:>6}  {:.40}",
         &job.id.to_string()[..8],
         job.state.as_str(),
         // The SAFE name. A name that holds an ESC byte would move the
         // cursor of the terminal and write over this page.
-        job.display_name(),
+        crate::job::fit_name(&job.display_name(), 14),
         job.cpu,
         cpu_text,
         mem_text,

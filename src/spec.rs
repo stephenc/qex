@@ -932,15 +932,18 @@ impl JobSpec {
 ///
 /// The name is the last part of the program path, then the FIRST and the LAST
 /// argument that do not start with `-`, joined with `-`. Each argument gives
-/// the last part of its path. A command with no such argument gives the
+/// the last part of its path, and a script, which is an argument that holds a
+/// space, gives its whole text. A command with no such argument gives the
 /// program alone, so `make` stays `make`:
 ///
 ///     uv run a.py                                    -> uv-run-a.py
 ///     python -m pytest tests/api                     -> python-pytest-api
 ///     cargo test foo -- --nocapture                  -> cargo-test-foo
 ///     uv run --project P python /w/run.py /d/a.json  -> uv-run-a.json
-///     bash -c 'cargo test'                           -> bash-cargo_test
+///     bash -c 'cd /p && cargo test'                  -> bash-cd_p_cargo_test
 ///     make                                           -> make
+///
+/// An empty argument, and an argument that is `/` alone, name nothing.
 ///
 /// # Why the first and the last argument
 ///
@@ -953,8 +956,15 @@ impl JobSpec {
 /// the command line with no table of launchers and no table of options.
 ///
 /// An argument that starts with `-` is an option, so it stays out of the name.
-/// The value of an option can enter the name, and the name still tells the two
-/// jobs of one launcher apart.
+/// The value of an option can enter the name, and the name can still tell the
+/// two jobs of one launcher apart.
+///
+/// # Why a script gives its whole text
+///
+/// A script of `bash -c` frequently holds a path, and the text after its last
+/// `/` is a file of the script and not the work: `cd /p && cargo test` would
+/// give `p_cargo_test`, and `cargo test > /tmp/out.log` would give `out.log`.
+/// The whole text is longer, and a reader predicts it.
 ///
 /// The user did not choose this name, so a character outside the name set
 /// becomes the safe form and the job starts. `job::sanitize_name` holds the
@@ -966,8 +976,7 @@ pub fn derived_name(command: &[String]) -> String {
         .iter()
         .skip(1)
         .filter(|a| !a.starts_with('-'))
-        .map(|a| last_part(a))
-        .filter(|w| !w.is_empty())
+        .filter_map(|a| work_word(a))
         .collect();
     if let Some(first) = words.first() {
         parts.push(first);
@@ -991,6 +1000,19 @@ pub fn program_name(command: &[String]) -> &str {
 /// part is empty.
 fn last_part(word: &str) -> &str {
     word.rsplit('/').find(|p| !p.is_empty()).unwrap_or(word)
+}
+
+/// Gives the part of an argument that goes into the name, or `None` for an
+/// argument that names nothing.
+///
+/// A script, which is an argument that holds a space, gives its whole text.
+/// Every other argument gives the last part of its path, so an empty argument
+/// and an argument of `/` alone give nothing.
+fn work_word(arg: &str) -> Option<&str> {
+    if arg.chars().any(char::is_whitespace) {
+        return Some(arg);
+    }
+    arg.rsplit('/').find(|p| !p.is_empty())
 }
 
 /// Refuses a name that a person or an agent chose, when it is not in the set.
@@ -2285,11 +2307,25 @@ mod tests {
         );
         assert_eq!(name(&["bash", "-c", "cargo test"]), "bash-cargo_test");
         assert_eq!(name(&["make"]), "make");
-        // The last part of a path, and the whole word when that part is empty.
+        // A script gives its whole text, and qex does not cut it at a `/`.
+        assert_eq!(
+            name(&["bash", "-c", "cd /p && cargo test"]),
+            "bash-cd_p_cargo_test"
+        );
+        assert_eq!(
+            name(&["bash", "-c", "cargo test > /tmp/out.log"]),
+            "bash-cargo_test_tmp_out.log"
+        );
+        assert_eq!(
+            name(&["sh", "-c", "for f in a b; do echo $f; done"]),
+            "sh-for_f_in_a_b_do_echo_f_done"
+        );
+        // The last part of a path. A `/` at the end does not count.
         assert_eq!(name(&["go", "test", "./cmd/x/"]), "go-test-x");
-        assert_eq!(name(&["sh", "-c", "exit 7", "/"]), "sh-exit_7-_");
-        // An empty argument names nothing.
+        // An empty argument, and an argument of `/` alone, name nothing.
+        assert_eq!(name(&["sh", "-c", "exit 7", "/"]), "sh-exit_7");
         assert_eq!(name(&["true", "", "x"]), "true-x");
+        assert_eq!(name(&["true", "/", "/"]), "true");
         assert_eq!(name(&[]), "job");
     }
 

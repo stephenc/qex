@@ -220,6 +220,25 @@ pub fn safe_name(name: &str) -> String {
     out
 }
 
+/// Fits a name into a column of `width` characters.
+///
+/// A name that is longer shows its first four characters, `..`, and its last
+/// characters. The jobs of one command share their first words, which are the
+/// program and the subcommand, and they differ at the END, in the file or the
+/// argument that names the work. A column that showed the start alone would
+/// show `uv-run-scan_b0.2` for every job of `uv run ... scan_b0.2_cv*.json`.
+pub fn fit_name(name: &str, width: usize) -> String {
+    let count = name.chars().count();
+    if count <= width {
+        return name.to_string();
+    }
+    let head = 4.min(width.saturating_sub(2));
+    let tail = width.saturating_sub(head + 2);
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(count - tail).collect();
+    format!("{start}..{end}")
+}
+
 /// True when `name` is already in the form that [`safe_name`] shows.
 ///
 /// A name that a person or an agent chose must pass this test at submission.
@@ -851,6 +870,21 @@ pub fn write_spec(dir: &Path, spec: &JobSpec) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_long_name_in_a_column_shows_its_start_and_its_end() {
+        assert_eq!(fit_name("uv-run-a.py", 16), "uv-run-a.py");
+        assert_eq!(fit_name("0123456789abcdef", 16), "0123456789abcdef");
+        assert_eq!(
+            fit_name("uv-run-scan_b0.2_cv0_0.json", 16),
+            "uv-r..cv0_0.json"
+        );
+        assert_eq!(
+            fit_name("uv-run-scan_b0.2_cv3_1.json", 14),
+            "uv-r..3_1.json"
+        );
+        assert_eq!(fit_name("abcdefgh", 4), "ab..");
+    }
 
     #[test]
     fn a_safe_name_keeps_the_allowed_set_and_nothing_else() {

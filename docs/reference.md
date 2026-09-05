@@ -1724,22 +1724,28 @@ name that the record holds and the name that qex shows are the same.
 
 A submission with no `--name` takes its name from the command: the last part
 of the program path, then the first and the last argument that do not start
-with `-`, joined with `-`. Each argument gives the last part of its path. A
+with `-`, joined with `-`. Each argument gives the last part of its path, and
+a script, which is an argument that holds a space, gives its whole text. A
 command with no such argument keeps the program name.
 
 ```
 uv run a.py                                    ->  uv-run-a.py
 cargo test foo -- --nocapture                  ->  cargo-test-foo
 uv run --project P python /w/run.py /d/a.json  ->  uv-run-a.json
-bash -c 'cargo test'                           ->  bash-cargo_test
+bash -c 'cd /p && cargo test'                  ->  bash-cd_p_cargo_test
+python train.py --epochs 5                     ->  python-train.py-5
 make                                           ->  make
 ```
 
-The first argument is the subcommand of the launcher, and the last one is the
-script, the module, the test or the input file that names the work. A value
-of an option can enter the name, and the jobs of one launcher still get
-different names. A character outside the set becomes `_`, and the job still
-starts: you did not choose that name.
+The two arguments are the words that most often name the work: the subcommand
+of the launcher, and the script, the module, the test or the input file. A
+value of an option enters the name in the same way, as `5` does above. Two
+commands that differ in an argument that the rule does not take get one name.
+
+A `/` at the end of an argument does not count. An empty argument, and an
+argument of `/` alone, name nothing. A character outside the set becomes `_`,
+a run of them becomes one `_`, and the name stops at 128 characters. The job
+still starts: you did not choose that name.
 
 **The record on the disk keeps the name that an earlier qex stored.** qex
 changes no record. A record from before this rule can hold a name outside the
@@ -1747,8 +1753,10 @@ set. qex shows the safe form of that name.
 
 **A safe name goes back into a command as it stands.** Take it from `qex list
 --json` or from `qex status`, which give the whole name. The NAME column of the
-table stops at 16 characters, as it did before this rule, so a long name in that
-column is not the whole name. The name that the record holds still finds the
+table holds 16 characters, and `qex top` holds 14. A longer name shows its first
+four characters, `..`, and its last characters, so `uv-run-scan_b0.2_cv0_0.json`
+shows as `uv-r..cv0_0.json`: the end of a name is the part that tells the jobs
+of one command apart. A name with `..` in that column is not the whole name. The name that the record holds still finds the
 job as well:
 
 ```sh
