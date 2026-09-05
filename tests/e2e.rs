@@ -16994,7 +16994,11 @@ fn abort_touches_only_the_jobs_of_the_caller() {
 /// Gives the chain of the caller, as `qex abort --json` reports its scope.
 ///
 /// A dry form: the scope of a `--keep-running` abort on a tag that no job
-/// carries touches nothing, and it carries the chain that the CLI sent.
+/// carries touches no job, and it carries the chain that the CLI sent.
+///
+/// CALL IT ON A PAUSED QUEUE ONLY. Every abort pauses the queue first, so on
+/// a queue that operates this helper would pause it, with the reason
+/// `qex abort`, and the test would then measure a queue that it changed.
 fn report_scope_chain(h: &Harness) -> String {
     let report = h.abort_json(&["--keep-running", "--tag", "no-such-tag-for-the-chain"]);
     report["scope"]["submitter"].to_string()

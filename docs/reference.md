@@ -791,9 +791,9 @@ a login service, a terminal program, a service manager, the first process of
 the machine, the supervisor of a qex job, or the top of a chain whose parent
 qex could not read. A chain with no terminal and no named boundary, such as a
 command under a service, is one context as a whole. The supervisor boundary
-matches the program name `qex`, so a qex installed under another name gives
-the jobs that a job submits no boundary of their own. Two commands of one
-agent share the agent process; two agents in two panes share nothing below the
+matches the program name `qex`. A qex installed under another name gives no
+such boundary to the jobs that a job submits. Two commands of one agent share
+the agent process; two agents in two panes share nothing below the
 multiplexer; two agents that one shell started share that shell, so they share
 one context.
 `qex status <id>` shows the chain of a job with that point marked, and
