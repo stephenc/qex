@@ -369,6 +369,33 @@ pub struct Assignment {
     pub size: Option<u64>,
 }
 
+/// One process above the command that submitted a job.
+///
+/// The record holds the whole chain, and the `context` module reads it. The
+/// rule that says where a session ends lives there, so a later change to that
+/// rule reads the records that exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ancestor {
+    pub pid: i32,
+    /// The parent of this process. `0` says that this process has no parent,
+    /// which is the first process of the machine or of a container.
+    #[serde(default)]
+    pub ppid: i32,
+    /// The start time of the process, as `sys::process_start_token` gives it.
+    /// THE UNIT DIFFERS BETWEEN SYSTEMS; compare for equality only.
+    #[serde(default)]
+    pub start: Option<u64>,
+    /// The name of the program, in the SAFE form. See `safe_name`.
+    #[serde(default)]
+    pub name: String,
+    /// The working directory of the process, when qex could read it.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// True when the process has a controlling terminal.
+    #[serde(default)]
+    pub terminal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: uuid::Uuid,
@@ -421,6 +448,16 @@ pub struct JobStatus {
     /// job that stopped.
     #[serde(default)]
     pub supervisor_pid: Option<i32>,
+    /// The processes above the command that submitted the job, from the parent
+    /// of that command up to the first process of the machine.
+    ///
+    /// `qex abort` reads this list to decide if a job belongs to the caller:
+    /// see the `context` module for the rule. Each entry carries the start
+    /// time of the process, so a later process with the same number never
+    /// matches. An empty list means that the submission recorded nothing,
+    /// and such a job is outside every context.
+    #[serde(default)]
+    pub submitter: Vec<Ancestor>,
     /// The identifier of the start of the machine that this record belongs
     /// to. See `sys::boot_id`. The submission writes it, and the supervisor
     /// writes it again, so every record has one from its birth.
@@ -600,6 +637,7 @@ impl JobStatus {
             command: spec.command.clone(),
             cwd: spec.cwd.to_string_lossy().into_owned(),
             state: JobState::Queued,
+            submitter: Vec::new(),
             pid: None,
             pid_start_token: None,
             last_pid: None,

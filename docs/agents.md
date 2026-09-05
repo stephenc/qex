@@ -244,6 +244,7 @@ qex logs <id> --grep ERROR   the lines you want from a large log
 qex logs <id> --tail 50      the last lines of a log
 qex kill <id>                stop a job and each of its children
 qex cancel <id>              take a job out of the queue
+qex abort                    stop your jobs of this directory and empty their queue
 qex top                      watch the queue; j/k move, x stop, i info, t tail, q leave
 qex clean --auto             delete the records that stopped over an hour ago
 qex info                     the coordinator, the budget and the load

@@ -321,6 +321,142 @@ pub fn process_start_token(pid: i32) -> Option<u64> {
     None
 }
 
+/// What qex reads about one process for the chain of a submission.
+pub struct ProcessInfo {
+    pub ppid: i32,
+    pub start: Option<u64>,
+    /// The name of the program, as the system gives it.
+    pub name: String,
+    pub cwd: Option<String>,
+    pub terminal: bool,
+}
+
+/// Reads the parent, the start time, the name, the directory and the terminal
+/// of one process. Gives `None` when the process does not exist or when the
+/// system refuses to say.
+#[cfg(target_os = "linux")]
+pub fn process_info(pid: i32) -> Option<ProcessInfo> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is in parentheses and can hold spaces and `)`. The
+    // stable fields start after the LAST `)`.
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat.get(open + 1..close)?.to_string();
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After the name: state, ppid, pgrp, session, tty_nr, ... and the start
+    // time is the 20th of them.
+    let ppid = fields.get(1)?.parse().ok()?;
+    let tty: i64 = fields.get(4)?.parse().ok()?;
+    let start = fields.get(19).and_then(|f| f.parse().ok());
+    // The directory of a process of another user is refused. That is not a
+    // fault: the chain then names the process with no directory.
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    Some(ProcessInfo {
+        ppid,
+        start,
+        name,
+        cwd,
+        terminal: tty != 0,
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_info(pid: i32) -> Option<ProcessInfo> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    let name = unsafe { std::ffi::CStr::from_ptr(info.pbi_comm.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    // `NODEV` says that the process has no controlling terminal.
+    let terminal = info.e_tdev != u32::MAX;
+
+    let mut paths = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+    let paths_size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            paths.as_mut_ptr().cast(),
+            paths_size,
+        )
+    };
+    let cwd = if rc == paths_size {
+        let paths = unsafe { paths.assume_init() };
+        // libc declares the path as a two-dimensional array of bytes.
+        let path = unsafe {
+            std::ffi::CStr::from_ptr(paths.pvi_cdir.vip_path.as_ptr().cast::<libc::c_char>())
+        }
+        .to_string_lossy()
+        .into_owned();
+        (!path.is_empty()).then_some(path)
+    } else {
+        None
+    };
+
+    Some(ProcessInfo {
+        ppid: info.pbi_ppid as i32,
+        start: Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec),
+        name,
+        cwd,
+        terminal,
+    })
+}
+
+/// Gives the chain of processes above this process, from its parent up to
+/// the first process of the machine.
+///
+/// `qex submit` records this chain on the job, and `qex abort` reads it. The
+/// walk records EVERY process, and the `context` module decides where the
+/// session ends when it compares two chains, so a change to that rule reads
+/// the records that exist.
+pub fn submitter_chain() -> Vec<crate::job::Ancestor> {
+    let mut out = Vec::new();
+    let mut pid = unsafe { libc::getppid() };
+    // A limit, so a strange process table cannot make an endless loop.
+    for _ in 0..64 {
+        if pid <= 0 {
+            break;
+        }
+        let Some(info) = process_info(pid) else {
+            break;
+        };
+        out.push(crate::job::Ancestor {
+            pid,
+            ppid: info.ppid,
+            start: info.start,
+            // The name of a process is text that the process chose. See
+            // `job::safe_name`.
+            name: crate::job::safe_name(&info.name),
+            cwd: info.cwd,
+            terminal: info.terminal,
+        });
+        pid = info.ppid;
+    }
+    out
+}
+
 /// Gives the number of seconds after the Unix epoch.
 ///
 /// qex writes each time value as an integer. A reader can then compare the

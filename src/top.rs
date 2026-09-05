@@ -1423,6 +1423,7 @@ mod tests {
             command: vec!["true".into()],
             cwd: "/".into(),
             state,
+            submitter: Vec::new(),
             pid: Some(std::process::id() as i32),
             pid_start_token: None,
             last_pid: None,

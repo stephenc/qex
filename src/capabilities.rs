@@ -181,6 +181,7 @@ pub fn check_floor(coordinator_version: &str, coordinator_pid: i32) -> Floor {
 
 /// Everything that this build can do.
 pub const ALL: &[&str] = &[
+    "abort",
     "dedupe",
     "dependencies",
     "events",

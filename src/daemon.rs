@@ -495,7 +495,14 @@ impl State {
             {
                 changed = true;
             }
+            // The supervisor writes the file, and a supervisor from an
+            // earlier program does not know the chain of the submitter. The
+            // copy in memory keeps it, so `qex abort` can still read it.
+            let submitter = std::mem::take(&mut job.status.submitter);
             job.status = disk;
+            if job.status.submitter.is_empty() {
+                job.status.submitter = submitter;
+            }
         }
         changed
     }
@@ -1462,7 +1469,7 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
                 .map(|s| s.to_string())
                 .collect(),
         },
-        Request::Submit { spec } => handle_submit(coord, *spec),
+        Request::Submit { spec, submitter } => handle_submit(coord, *spec, submitter),
         Request::List => {
             let mut state = coord.state.lock().unwrap();
             state.refresh_active();
@@ -1515,6 +1522,12 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
                 locks: state.paused_locks(),
             }
         }
+        Request::Abort {
+            scope,
+            keep_running,
+            grace_secs,
+            by_pid,
+        } => crate::lifecycle::abort(coord, scope, keep_running, grace_secs, by_pid),
     }
 }
 
@@ -1589,7 +1602,7 @@ fn handle_pause(
 /// A second command therefore ADDS: it keeps the start, and it keeps the end
 /// and the reason that it does not give. To replace an end, run `qex resume`
 /// first.
-fn keep_the_end(
+pub fn keep_the_end(
     old: Option<crate::pause::PauseRecord>,
     by_pid: i32,
     reason: Option<String>,
@@ -1756,9 +1769,14 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
     }
 }
 
-fn handle_submit(coord: &Arc<Coordinator>, spec: JobSpec) -> Response {
+fn handle_submit(
+    coord: &Arc<Coordinator>,
+    spec: JobSpec,
+    submitter: Vec<crate::job::Ancestor>,
+) -> Response {
     let id = spec.id;
     let mut status = JobStatus::new(&spec);
+    status.submitter = submitter;
 
     // Test each dependency here as well as in the CLI.
     //

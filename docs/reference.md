@@ -23,6 +23,8 @@ qex status <id> [--wait|--follow] [--quiet] [--timeout TIME] [--json]
 qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
 qex kill   <id>...          stop a job that operates
 qex cancel <id>...          remove a job from the queue
+qex abort  [--tag TAG] [--cwd|--all] [--keep-running] [--grace TIME] [--json]
+                            stop your jobs and empty your part of the queue
 qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
 qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
@@ -738,6 +740,59 @@ A pause of the queue changes the reason of every job that waits, so a reader of
 `qex events` sees one `job` line with `change: "reason"` for each of those jobs,
 and the same at the resume. The pause itself is not a job, so it has no event of
 its own; a reader that must know the pause reads `qex pause --json`.
+## Stop everything, and empty the queue
+
+A sweep of thousands of jobs is sometimes wrong, and a cancel for each job is
+one round trip for each job, in a race with the scheduler that starts the next
+one. `qex abort` is one request:
+
+```sh
+qex abort                    # your jobs of this directory
+qex abort --tag phase        # the same, with the tag `phase` only
+qex abort --keep-running     # cancel the queued jobs; let the running ones finish
+qex abort --cwd              # every job of this directory, whatever process submitted it
+qex abort --all              # every job of your queue
+```
+
+The coordinator pauses the queue, cancels every queued job of the scope, and
+lists the jobs of the scope that operate, under **one** hold of its lock. The
+scheduler moves a job out of the queue under that same lock, so no job starts
+between the pause and the cancel. It then deletes the records of the cancelled
+jobs (a job that never ran leaves nothing that a reader needs, and
+`qex status <id>` still says that it existed), and it stops each job that
+operates in the way that `qex kill` does: TERM, then KILL after `--grace`
+(default 10s). A cancelled record that a job outside the scope needs stays, in
+the state `cancelled`.
+
+The queue **stays paused**, so nothing starts until you run `qex resume queue`.
+The pause covers the whole queue of your user, and every command that lists
+jobs says so.
+
+The report counts what the coordinator did, and never what the command asked
+for. A job that qex could not signal is listed with the reason, and the exit
+code is then 1. The `outside` line counts the jobs that wait or operate outside
+the scope. `--json` gives the same fields.
+
+### The scope
+
+Several agents run as one user on one machine, and one queue holds the jobs of
+all of them. The default scope is therefore **the jobs of this directory that
+your process tree submitted**. `qex submit` records the chain of processes
+above it, and `qex abort` reads its own chain. A job is yours when the two
+chains share one process that is still the same process (the number and the
+start time), below the point where the session ends: a terminal multiplexer,
+a login service, a terminal program, a service manager, the first process of
+the machine, or the supervisor of a qex job. Two commands of one agent share
+the agent process; two agents in two panes share nothing below the multiplexer.
+`qex status <id>` shows the chain of a job with that point marked, and
+`qex help abort` gives the rule in full.
+
+`--cwd` drops the process test. Use it for a job whose chain does not reach
+you: a job that a job submitted, a job from a detached helper, or a job that an
+earlier qex recorded without a chain. `--all` is every job of your queue.
+`--tag` narrows each level. qex stops only the jobs of the user who runs it: a
+queue belongs to one user, and no option reaches the jobs of another user.
+
 ## The order of the queue
 
 qex starts the jobs in the order of the queue. The first job that cannot start
@@ -2068,6 +2123,7 @@ qex help events      the event stream, its numbers and its gaps
 qex help exit-codes  the exit code of each command
 qex help config      each configuration field
 qex help pause       stop the queue, or take a lock for yourself
+qex help abort       stop your jobs and empty your part of the queue
 qex schema job       the JSON Schema of a job file
 qex schema status    the JSON Schema of status.json
 qex schema event     the JSON Schema of one line of `qex events`

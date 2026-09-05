@@ -34,6 +34,7 @@ pub const TOPICS: &[&str] = &[
     "pipeline",
     "each-line",
     "pause",
+    "abort",
 ];
 
 /// Gives the text for one topic.
@@ -52,6 +53,7 @@ pub fn topic(name: &str) -> Option<&'static str> {
         "pipeline" | "pipelines" => Some(PIPELINE),
         "each-line" | "eachline" | "fan-out" | "fanout" => Some(EACH_LINE),
         "pause" | "resume" => Some(PAUSE),
+        "abort" => Some(ABORT),
         _ => None,
     }
 }
@@ -374,6 +376,7 @@ Other commands
     qex logs <id> --grep ERR   the lines that you want from a large log
     qex kill <id>              stop a job that operates
     qex cancel <id>            remove a job from the queue
+    qex abort                  stop your jobs and empty your part of the queue
     qex rerun <id>             submit the same job again, with a new id
     qex clean --state done     delete the records of the jobs that stopped
     qex info                   the coordinator and the free capacity
@@ -1708,6 +1711,84 @@ after a deletion. Change that time with `[history] keep` in the config file.
 `qex clean --all` deletes the record of EVERY job of this user, including the
 jobs of a different agent that shares this machine. Use `qex clean <id>` when
 another agent uses qex at the same time.
+";
+
+pub const ABORT: &str = "\
+qex abort
+=========
+
+Use this command to give up a piece of work: a sweep of thousands of jobs, or a
+run that must not continue.
+
+    qex abort                    your jobs of this directory
+    qex abort --tag phase        the same, with the tag `phase` only
+    qex abort --keep-running     cancel the queued jobs; let the jobs that operate finish
+    qex abort --cwd              every job of this directory, whatever process submitted it
+    qex abort --all              every job of your queue
+
+What it does, in order
+----------------------
+
+1. It pauses the queue. No job starts from this moment.
+2. It cancels every queued job of the scope, and it deletes their records. A
+   job that never ran leaves nothing that a reader needs, and `qex status <id>`
+   still says that the job existed and was cancelled. A record that a job
+   outside the scope needs stays, in the state `cancelled`.
+3. It sends TERM to every job of the scope that operates, and KILL after the
+   grace time (`--grace`, default 10s) to each one that continues. This is
+   `qex kill`, for each job. Their records stay, so you can read their output.
+4. It reports what it did, and the queue STAYS PAUSED. Run `qex resume queue`
+   to start new work.
+
+Steps 1 to 3 happen in one request to the coordinator, which does the first
+two under one lock. No job can start between the pause and the cancel, and
+the cost does not grow with one round trip for each job.
+
+The report counts what the coordinator DID. A job that it could not signal is
+listed with the reason, and the exit code is then 1. The `outside` line counts
+the jobs that wait or operate outside the scope, so you know what the command
+did not touch.
+
+The scope
+---------
+
+Several agents run as one user on one machine, and one queue holds the jobs of
+all of them. Without an option, the scope is therefore narrow:
+
+    the jobs of THIS DIRECTORY that YOUR PROCESS TREE submitted
+
+`qex submit` records the chain of processes above it, up to the first process
+of the machine. `qex abort` reads its own chain. A job is yours when the two
+chains share one process that is still the same process, below the point where
+the session ends: a terminal multiplexer, a login service, a terminal program,
+a service manager, the first process of the machine, or the supervisor of a
+qex job. `qex status <id>` shows the chain of a job with that point marked.
+
+What you can predict:
+
+  * Two commands of one agent share the agent process. They are one context,
+    whatever shell the agent ran for each command.
+  * Two agents in two panes of one multiplexer, or in two windows of one
+    terminal program, share nothing below the boundary. They are two contexts.
+  * A job that a job submitted has the supervisor of that job as its boundary.
+    It is in the context of that job, and in no context of an agent.
+  * A job from an earlier qex, or from a helper that left your process tree,
+    has no chain that reaches you. It is outside your context.
+  * When qex cannot find the end of your session, your context is empty, and
+    the default scope is no job. The scope line says so.
+
+`--cwd` drops the process test: every job of this directory, whatever
+submitted it. `--all` is every job of your queue. `--tag` narrows each level.
+qex stops only the jobs of the user who runs it. A queue belongs to one user,
+and no option reaches the jobs of another user.
+
+The pause
+---------
+
+The pause is the pause of `qex pause queue`: it covers the whole queue of your
+user, so the jobs of the other agents wait as well until somebody runs
+`qex resume queue`. Every command that lists jobs says so, and names the pid
+that asked. A pause that a person made earlier keeps its end and its reason.
 ";
 
 pub const PIPELINE: &str = "\

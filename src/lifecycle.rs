@@ -4,10 +4,11 @@
 //! job that forks children thus stops completely, and no process stays and
 //! holds memory that qex counted.
 
-use crate::daemon::{log, Coordinator};
-use crate::job::{self, JobState};
+use crate::daemon::{log, Coordinator, State};
+use crate::job::{self, JobState, JobStatus};
 use crate::paths;
-use crate::proto::{ErrorKind, Response};
+use crate::proto::{AbortedJob, ErrorKind, Response};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -169,12 +170,6 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     // so no submission can name this job in the window between the check and
     // the removal.
     let mut state = coord.state.lock().unwrap();
-    let (cause_name, cause_state) = match state.jobs.get(&id) {
-        // The SAFE name: this value goes into a sentence that a reader sees,
-        // through `status.error`. See `job::safe_name`.
-        Some(job) => (job.status.display_name(), job.status.state.to_string()),
-        None => (String::from("unknown"), String::from("unknown")),
-    };
 
     match state.jobs.get(&id) {
         None => {
@@ -204,51 +199,27 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     // for the deletion. It uses the rule of `crate::deps`, which `qex clean`
     // and `qex gc` use as well: one rule gives one answer, and a command
     // cannot say that it kept a record while this code deletes it.
-    let nodes: Vec<crate::deps::Node> = state
-        .jobs
-        .values()
-        .map(|j| crate::deps::Node {
-            id: j.status.id,
-            group: j.status.group,
-            terminal: j.status.state.is_terminal(),
-            needs: &j.spec.needs,
-            after: &j.spec.after,
-        })
-        .collect();
-
-    if let Some(hold) = crate::deps::hold_reason(&nodes, id) {
-        let name = |holder: &uuid::Uuid| -> Option<String> {
-            state.jobs.get(holder).map(|j| {
-                format!(
-                    "{} ({})",
-                    &j.status.id.to_string()[..8],
-                    j.status.display_name()
-                )
-            })
-        };
-
+    if let Some(hold) = crate::deps::hold_reason(&dep_nodes(&state), id) {
         // Each rule is a DIFFERENT relation, so each gets its own words. A
         // stage of a pipeline that no other stage waits for is not a job
         // that another job needs, and a message that says so is false.
         let text = match &hold {
             crate::deps::Hold::Needed(holders) => {
-                let waiting: Vec<String> = holders.iter().filter_map(name).collect();
-                let one = waiting.len() == 1;
+                let one = holders.len() == 1;
                 format!(
                     "the job {id} is needed by {}. Wait for {}, or cancel {}.",
-                    waiting.join(", "),
+                    named(&state, holders),
                     if one { "that job" } else { "those jobs" },
                     if one { "it" } else { "them" }
                 )
             }
             crate::deps::Hold::Pipeline(holders) => {
-                let working: Vec<String> = holders.iter().filter_map(name).collect();
-                let one = working.len() == 1;
+                let one = holders.len() == 1;
                 format!(
                     "the job {id} belongs to a pipeline that has work left: {}. \
                          The record of a stage stays while the pipeline operates, so that \
                          a reader can see the whole pipeline. Wait for {}, or cancel {}.",
-                    working.join(", "),
+                    named(&state, holders),
                     if one { "that job" } else { "those jobs" },
                     if one { "it" } else { "them" }
                 )
@@ -261,7 +232,78 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     // Remove the job while the dependency check is still protected by the
     // same lock. A submit can run as soon as this lock goes, and it must then
     // see either the job throughout or no job throughout.
-    let removed = state.jobs.remove(&id).expect("the job was checked above");
+    let Some(removal) = remove_record(&mut state, id) else {
+        return Response::error(
+            ErrorKind::NoSuchJob,
+            format!("there is no job with the id {id}"),
+        );
+    };
+    state.publish_changes();
+    drop(state);
+    coord.notify();
+
+    match finish_removal(removal) {
+        Ok(()) => Response::Ok,
+        Err(message) => Response::error(ErrorKind::Internal, message),
+    }
+}
+
+/// Gives the records in the form that the rule of `crate::deps` reads.
+fn dep_nodes(state: &State) -> Vec<crate::deps::Node<'_>> {
+    state
+        .jobs
+        .values()
+        .map(|j| crate::deps::Node {
+            id: j.status.id,
+            group: j.status.group,
+            terminal: j.status.state.is_terminal(),
+            needs: &j.spec.needs,
+            after: &j.spec.after,
+        })
+        .collect()
+}
+
+/// Names jobs for a sentence, as `a1b2c3d4 (train), e5f6a7b8 (test)`.
+fn named(state: &State, ids: &[uuid::Uuid]) -> String {
+    ids.iter()
+        .filter_map(|holder| {
+            state.jobs.get(holder).map(|j| {
+                format!(
+                    "{} ({})",
+                    &j.status.id.to_string()[..8],
+                    j.status.display_name()
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The removal of one record, in two parts.
+///
+/// `remove_record` changes the memory of the coordinator, and it runs under the
+/// lock. `finish_removal` does the disk work, and it must NOT run under the
+/// lock: the deletion of a large log is slow, and a lock held for it stops the
+/// scheduler. This structure carries what the second part needs from the
+/// first.
+pub struct Removal {
+    status: JobStatus,
+    /// The jobs that named the removed job as their cause, with the record
+    /// that each one holds now.
+    dependents: Vec<(uuid::Uuid, JobStatus)>,
+}
+
+/// Takes one record out of the memory of the coordinator.
+///
+/// The caller holds the lock, and it made the checks: the job stopped, and no
+/// job needs its record. Gives `None` when there is no such job.
+fn remove_record(state: &mut State, id: uuid::Uuid) -> Option<Removal> {
+    let removed = state.jobs.remove(&id)?;
+    // The SAFE name: this value goes into a sentence that a reader sees,
+    // through `status.error`. See `job::safe_name`.
+    let cause_name = removed.status.display_name();
+    let cause_state = removed.status.state.to_string();
+
     state.queue.retain(|q| *q != id);
 
     // Free the dedupe key of this job with its record.
@@ -269,7 +311,7 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     // The key must go at the same moment as the record. A key that names a job
     // with no record would give an id that `qex status` cannot answer, and the
     // caller could not learn anything about the work.
-    crate::daemon::release_dedupe(&mut state, id);
+    crate::daemon::release_dedupe(state, id);
 
     // Make each job that names this job as its cause self-contained.
     //
@@ -280,33 +322,32 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     //
     // Write the name and the state of the deleted job into the text of each
     // dependent, so the record still answers the question.
-    let dependents: Vec<uuid::Uuid> = state
-        .jobs
-        .values()
-        .filter(|j| j.status.caused_by == Some(id))
-        .map(|j| j.status.id)
-        .collect();
-
-    let mut dependent_statuses = Vec::new();
-    for dep in dependents {
-        if let Some(job) = state.jobs.get_mut(&dep) {
-            job.status.error = Some(format!(
-                "the job `{}` ({}) did not succeed, so this job did not run. \
-                 Its record is deleted, so there is no log to read.",
-                cause_name, cause_state
-            ));
-            job.status.caused_by = None;
-            dependent_statuses.push((dep, job.status.clone()));
+    let mut dependents = Vec::new();
+    for job in state.jobs.values_mut() {
+        if job.status.caused_by != Some(id) {
+            continue;
         }
+        job.status.error = Some(format!(
+            "the job `{}` ({}) did not succeed, so this job did not run. \
+             Its record is deleted, so there is no log to read.",
+            cause_name, cause_state
+        ));
+        job.status.caused_by = None;
+        dependents.push((job.status.id, job.status.clone()));
     }
-    state.publish_changes();
-    drop(state);
-    coord.notify();
 
-    // Disk work can be slow (especially deletion of large logs), so none of it
-    // holds the coordinator mutex. The in-memory removal above already closes
-    // the dependency race.
-    for (dep, status) in dependent_statuses {
+    Some(Removal {
+        status: removed.status,
+        dependents,
+    })
+}
+
+/// Does the disk work of one removal.
+///
+/// Gives the fault when the directory stays. Such a record is not deleted: the
+/// next coordinator reads the directory and holds the job again.
+fn finish_removal(removal: Removal) -> Result<(), String> {
+    for (dep, status) in removal.dependents {
         if let Ok(dir) = paths::job_dir(&dep) {
             job::write_status(&dir, &status).ok();
         }
@@ -314,22 +355,296 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
 
     // Record the removal before deleting the directory. A reader of history
     // can then learn that this job existed and that its work happened.
-    crate::history::record_removed(&removed.status);
+    crate::history::record_removed(&removal.status);
 
-    let dir = match paths::job_dir(&id) {
-        Ok(d) => d,
-        Err(e) => return Response::error(ErrorKind::Internal, e.to_string()),
-    };
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Response::error(
-                ErrorKind::Internal,
-                format!("qex could not delete {}: {e}", dir.display()),
-            );
+    let dir = paths::job_dir(&removal.status.id).map_err(|e| e.to_string())?;
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("qex could not delete {}: {e}", dir.display())),
+    }
+}
+
+/// What the part of an abort that runs under the lock decided.
+///
+/// The lists name jobs, and the counts come from the lists. A number that a
+/// later change computed from the request would say what the reader asked
+/// for, and the answer must say what qex did.
+pub struct AbortPlan {
+    /// The jobs that waited and that the plan cancelled.
+    pub cancelled: Vec<uuid::Uuid>,
+    /// The records of cancelled jobs that leave the memory of the coordinator.
+    /// `finish_removal` deletes each one from the disk.
+    pub removals: Vec<Removal>,
+    /// The records of cancelled jobs that stay, and why.
+    pub kept: Vec<AbortedJob>,
+    /// The records that stay, to write to the disk.
+    pub kept_statuses: Vec<(uuid::Uuid, JobStatus)>,
+    /// The jobs of the scope that operate: each one is a job to signal.
+    pub running: Vec<(uuid::Uuid, String)>,
+    /// The jobs that wait or operate outside the scope.
+    pub outside: usize,
+}
+
+/// Tests one job against the scope of an abort.
+///
+/// Every part of the scope narrows it, and a part that is `None` narrows
+/// nothing. The directory is the directory OF THE JOB, as `qex status` shows
+/// it, and not the directory of the process that submitted it: a reader can
+/// see the first one on every record.
+fn in_scope(job: &crate::daemon::Job, scope: &crate::proto::AbortScope) -> bool {
+    if let Some(dir) = &scope.cwd {
+        if Path::new(&job.status.cwd) != Path::new(dir) {
+            return false;
+        }
+    }
+    if let Some(caller) = &scope.submitter {
+        if !crate::context::shared(&job.status.submitter, caller) {
+            return false;
+        }
+    }
+    scope.tags.is_empty() || scope.tags.iter().any(|t| job.spec.tags.contains(t))
+}
+
+/// The part of an abort that runs under the lock: the pause, the cancel, and
+/// the list of the jobs to signal.
+///
+/// THE THREE STEPS ARE ONE LOCK HOLD, AND THAT IS THE WHOLE GUARANTEE. The
+/// scheduler moves a job from the queue to a process under this same lock,
+/// and it reads the pause there. So after this function returns, every job
+/// that waited in the scope is cancelled, every job of the scope that left the
+/// queue is in `running`, and no job of the queue can start until a resume.
+/// A command that paused, released the lock, and then cancelled would let the
+/// scheduler start a job between the two steps, which is the fault that a
+/// cancel loop in a script has.
+pub fn plan_abort(state: &mut State, scope: &crate::proto::AbortScope, by_pid: i32) -> AbortPlan {
+    // The process id of each job that operates comes from the disk. Without
+    // this read, a job that started a moment ago has no pid and no signal
+    // reaches it.
+    state.refresh_active();
+
+    // The pause comes FIRST. A pause that a person made earlier keeps its end
+    // and its reason; see `keep_the_end`.
+    let reason = state
+        .paused
+        .queue
+        .is_none()
+        .then(|| String::from("qex abort"));
+    let record = crate::daemon::keep_the_end(state.paused.queue.take(), by_pid, reason, None);
+    state.paused.queue = Some(record);
+    state.save_pause();
+
+    let now = crate::sys::now_secs();
+    let mut cancelled = Vec::new();
+    let mut running = Vec::new();
+    let mut outside = 0usize;
+    for job in state.jobs.values_mut() {
+        if !in_scope(job, scope) {
+            if !job.status.state.is_terminal() {
+                outside += 1;
+            }
+            continue;
+        }
+        match job.status.state {
+            JobState::Queued => {
+                job.status.state = JobState::Cancelled;
+                job.status.finished_at = Some(now);
+                job.status.blocked_reason = None;
+                // A cancel that a person asked for leaves no error text. See
+                // `cancel_queued` in the daemon module.
+                job.status.error = None;
+                cancelled.push(job.status.id);
+            }
+            JobState::Starting | JobState::Running => {
+                running.push((job.status.id, job.status.display_name()));
+            }
+            _ => {}
         }
     }
 
-    Response::Ok
+    // One pass over the queue for every cancelled job. A pass for each job
+    // would cost the square of the queue, and the queue is large exactly when
+    // this command matters.
+    let gone: std::collections::HashSet<uuid::Uuid> = cancelled.iter().copied().collect();
+    state.queue.retain(|q| !gone.contains(q));
+    state.publish_changes();
+
+    // Delete the records of the cancelled jobs. A job that never ran leaves
+    // nothing that a reader needs, and the history keeps one line for each.
+    //
+    // A record that a job outside the scope needs stays, by the rule of
+    // `crate::deps`, in the state `cancelled`. The rule runs ONE time for the
+    // whole set. A walk for each record would cost the square of the queue.
+    let held = crate::deps::held_by_unfinished(&dep_nodes(state));
+    let mut removals = Vec::new();
+    let mut kept = Vec::new();
+    let mut kept_statuses = Vec::new();
+    for id in &cancelled {
+        if held.contains(id) {
+            let why = match crate::deps::hold_reason(&dep_nodes(state), *id) {
+                Some(crate::deps::Hold::Needed(holders)) => {
+                    format!(
+                        "a job that has not stopped needs it: {}",
+                        named(state, &holders)
+                    )
+                }
+                Some(crate::deps::Hold::Pipeline(holders)) => format!(
+                    "it belongs to a pipeline that has work left: {}",
+                    named(state, &holders)
+                ),
+                None => String::from("a job that has not stopped needs it"),
+            };
+            if let Some(job) = state.jobs.get(id) {
+                kept.push(AbortedJob {
+                    id: *id,
+                    name: job.status.display_name(),
+                    why,
+                });
+                kept_statuses.push((*id, job.status.clone()));
+            }
+            continue;
+        }
+        if let Some(removal) = remove_record(state, *id) {
+            removals.push(removal);
+        }
+    }
+    state.publish_changes();
+
+    AbortPlan {
+        cancelled,
+        removals,
+        kept,
+        kept_statuses,
+        running,
+        outside,
+    }
+}
+
+/// How long an abort waits for a job that is between the queue and its first
+/// process.
+///
+/// The scheduler took such a job out of the queue before the abort, so the
+/// abort must signal it, and the signal needs the pid that the supervisor
+/// writes a moment after the fork. A job that has no pid after this time is
+/// reported, with the command that stops it.
+const STARTING_WAIT: Duration = Duration::from_secs(5);
+
+/// Tests if a job left the queue and has no process yet.
+fn starts_now(coord: &Arc<Coordinator>, id: uuid::Uuid) -> bool {
+    let state = coord.state.lock().unwrap();
+    state
+        .jobs
+        .get(&id)
+        .map(|j| j.status.state.is_active() && j.status.pid.is_none())
+        .unwrap_or(false)
+}
+
+/// Stops the jobs of one scope, and empties their part of the queue.
+///
+/// See `plan_abort` for the part that gives the guarantee. This function does
+/// the disk work outside the lock, and it then stops each job that operates
+/// with `kill`, which is the one way that qex stops a process tree.
+pub fn abort(
+    coord: &Arc<Coordinator>,
+    scope: crate::proto::AbortScope,
+    keep_running: bool,
+    grace_secs: u64,
+    by_pid: i32,
+) -> Response {
+    let plan = {
+        let mut state = coord.state.lock().unwrap();
+        plan_abort(&mut state, &scope, by_pid)
+    };
+    // Wake the scheduler, so the jobs that wait get the pause as their reason.
+    coord.notify();
+
+    let mut kept = plan.kept;
+    for (id, status) in plan.kept_statuses {
+        if let Ok(dir) = paths::job_dir(&id) {
+            job::write_status(&dir, &status).ok();
+            // A cancelled job is not in the default filter of the hook. A
+            // user who asks for `cancelled` gets it here. A record that the
+            // abort deletes gets no hook: the hook reads the directory, and
+            // the directory goes.
+            crate::hook::fire_detached(&dir, &status);
+        }
+    }
+
+    let mut deleted = 0usize;
+    for removal in plan.removals {
+        let id = removal.status.id;
+        let name = removal.status.display_name();
+        match finish_removal(removal) {
+            Ok(()) => deleted += 1,
+            Err(why) => {
+                log(&format!(
+                    "qex abort could not delete the record of the job {id}: {why}"
+                ));
+                kept.push(AbortedJob { id, name, why });
+            }
+        }
+    }
+
+    let mut signalled = Vec::new();
+    let mut not_stopped = Vec::new();
+    let mut continues = Vec::new();
+
+    if keep_running {
+        continues.extend(plan.running.into_iter().map(|(id, _)| id));
+    } else {
+        let deadline = std::time::Instant::now() + STARTING_WAIT;
+        let mut pending = plan.running;
+        loop {
+            let mut later = Vec::new();
+            for (id, name) in pending {
+                match kill(coord, id, libc::SIGTERM, grace_secs) {
+                    Response::Ok => signalled.push(id),
+                    Response::Error { message, .. } => {
+                        if starts_now(coord, id) && std::time::Instant::now() < deadline {
+                            later.push((id, name));
+                        } else {
+                            not_stopped.push(AbortedJob {
+                                id,
+                                name,
+                                why: message,
+                            });
+                        }
+                    }
+                    other => not_stopped.push(AbortedJob {
+                        id,
+                        name,
+                        why: format!("qex gave an answer that this command cannot read: {other:?}"),
+                    }),
+                }
+            }
+            if later.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            pending = later;
+        }
+    }
+
+    log(&format!(
+        "qex abort: {} cancelled, {deleted} records deleted, {} kept, {} signalled, \
+         {} not stopped, {} continue, {} outside the scope; the queue is paused",
+        plan.cancelled.len(),
+        kept.len(),
+        signalled.len(),
+        not_stopped.len(),
+        continues.len(),
+        plan.outside,
+    ));
+
+    Response::Aborted {
+        cancelled: plan.cancelled.len(),
+        deleted,
+        kept,
+        signalled,
+        not_stopped,
+        continues,
+        outside: plan.outside,
+    }
 }
 
 #[cfg(test)]

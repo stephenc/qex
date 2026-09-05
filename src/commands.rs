@@ -195,6 +195,7 @@ pub fn submit(args: cli::SubmitArgs) -> Result<i32> {
 
     match client.call(&Request::Submit {
         spec: Box::new(spec),
+        submitter: crate::sys::submitter_chain(),
     })? {
         Response::Submitted {
             id,
@@ -568,6 +569,7 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
         // group id has no way to reach them.
         let answer = match client.call(&Request::Submit {
             spec: Box::new(spec),
+            submitter: crate::sys::submitter_chain(),
         }) {
             Ok(answer) => answer,
             Err(e) => {
@@ -1220,6 +1222,36 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
             _ => "",
         }
     );
+
+    // The chain of the submitter, with the point where the session ends.
+    // `qex abort` acts on the part below that point; see the `context`
+    // module. A reader can then see why a job was, or was not, in scope.
+    if !s.submitter.is_empty() {
+        let boundary = crate::context::boundary_index(&s.submitter);
+        println!("submitter: the processes above `qex submit`, nearest first");
+        for (index, a) in s.submitter.iter().enumerate() {
+            let mark = match boundary {
+                Some(b) if b == index => "  <- the session ends here",
+                Some(b) if b < index => "     (above the session)",
+                _ => "",
+            };
+            println!(
+                "           {} {}{}{}",
+                a.pid,
+                safe_name(&a.name),
+                a.cwd
+                    .as_deref()
+                    .map(|d| format!("  {d}"))
+                    .unwrap_or_default(),
+                mark
+            );
+        }
+        if boundary.is_none() {
+            println!(
+                "           (no end of the session found: `qex abort` does not match this job)"
+            );
+        }
+    }
 
     if s.usage.max_rss > 0 || s.usage.cpu_secs > 0.0 {
         println!(
@@ -2697,6 +2729,183 @@ pub fn kill(args: cli::KillArgs) -> Result<i32> {
         }
     }
     Ok(worst)
+}
+
+/// Why a refused `qex abort` matters.
+const ABORT_DANGER: &str = "That coordinator would refuse the request and change nothing, so the \
+     queue would keep its jobs and start them.";
+
+/// Stops the jobs of one scope and empties their part of the queue.
+///
+/// The coordinator does the work in one request. This command sends the scope
+/// and reports what the coordinator did; it holds no loop over jobs, because a
+/// loop in a client races the scheduler, and that race is the fault that this
+/// command removes.
+pub fn abort(args: cli::AbortArgs) -> Result<i32> {
+    let grace = parse_duration(&args.grace)
+        .map_err(|e| anyhow::anyhow!("--grace: {e}"))?
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // The directory of a job is the directory that the CLI resolved at the
+    // submission, so this value must be resolved in the same way.
+    let here = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .context("qex cannot read the current directory")?;
+    let scope = crate::proto::AbortScope {
+        cwd: (!args.all).then(|| here.to_string_lossy().into_owned()),
+        submitter: (!args.all && !args.cwd).then(crate::sys::submitter_chain),
+        tags: args.tag.clone(),
+    };
+
+    let mut client = Client::connect()?;
+    require_command(&mut client, "abort", "qex abort", ABORT_DANGER)?;
+
+    let response = client.call(&Request::Abort {
+        scope: scope.clone(),
+        keep_running: args.keep_running,
+        grace_secs: grace,
+        by_pid: std::process::id() as i32,
+    })?;
+    let Response::Aborted {
+        cancelled,
+        deleted,
+        kept,
+        signalled,
+        not_stopped,
+        continues,
+        outside,
+    } = response
+    else {
+        return report(response);
+    };
+
+    // A job that qex could not stop is work that continues, so the code says
+    // that the reader must act.
+    let code = if not_stopped.is_empty() { 0 } else { 1 };
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "scope": scope,
+                "cancelled": cancelled,
+                "deleted": deleted,
+                "kept": kept,
+                "signalled": signalled,
+                "not_stopped": not_stopped,
+                "continues": continues,
+                "outside": outside,
+                "queue_paused": true,
+                "next": "qex resume queue",
+            }))?
+        );
+        return Ok(code);
+    }
+
+    // Say the scope first. A reader who asked for a wider scope than qex
+    // has learns here that the queue holds the jobs of one user.
+    let tags = if args.tag.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", with the tag {}",
+            args.tag
+                .iter()
+                .map(|t| format!("`{}`", safe_name(t)))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        )
+    };
+    if args.all {
+        println!(
+            "scope:     every job of your queue{tags}. qex cannot reach the jobs of another user."
+        );
+    } else if args.cwd {
+        println!(
+            "scope:     every job of {}{tags}, whatever process submitted it",
+            here.display()
+        );
+    } else {
+        let context = crate::context::below_boundary(scope.submitter.as_deref().unwrap_or(&[]));
+        if context.is_empty() {
+            println!(
+                "scope:     the jobs of {}{tags} from your process tree, and qex found no end of \
+                 your session, so that is no job. Use `--cwd` for every job of this directory.",
+                here.display()
+            );
+        } else {
+            println!(
+                "scope:     the jobs of {}{tags} that were submitted below {}",
+                here.display(),
+                context
+                    .iter()
+                    .map(|a| format!("{} ({})", a.pid, safe_name(&a.name)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    if kept.is_empty() {
+        println!(
+            "cancelled: {}; qex deleted {}",
+            count_of(cancelled, "queued job"),
+            if deleted == cancelled {
+                String::from("their records")
+            } else {
+                count_of(deleted, "record")
+            }
+        );
+    } else {
+        println!(
+            "cancelled: {}; qex deleted {}, and {} stayed:",
+            count_of(cancelled, "queued job"),
+            count_of(deleted, "record"),
+            count_of(kept.len(), "record")
+        );
+        for k in &kept {
+            println!("           {} ({}): {}", k.id, safe_name(&k.name), k.why);
+        }
+    }
+
+    if args.keep_running {
+        println!(
+            "continues: {} that operate; this command left them alone",
+            count_of(continues.len(), "job")
+        );
+    } else {
+        println!(
+            "signalled: {} received TERM; qex sends KILL after {}s to each one that continues",
+            count_of(signalled.len(), "job"),
+            grace
+        );
+    }
+    if !not_stopped.is_empty() {
+        println!(
+            "not stopped: {}. Use `qex kill <id>` when it operates.",
+            count_of(not_stopped.len(), "job")
+        );
+        for n in &not_stopped {
+            println!("           {} ({}): {}", n.id, safe_name(&n.name), n.why);
+        }
+    }
+    if outside > 0 {
+        let wider = if args.all {
+            "Give no `--tag` to reach them."
+        } else if args.cwd {
+            "`qex abort --all` reaches every job of your queue."
+        } else {
+            "`qex abort --cwd` reaches every job of this directory, and `qex abort --all` \
+             reaches every job of your queue."
+        };
+        println!(
+            "outside:   {} outside this scope wait or operate; this command did not touch them. {wider}",
+            count_of(outside, "job")
+        );
+    }
+    println!("The queue is paused. Run `qex resume queue` to start new work.");
+    Ok(code)
 }
 
 /// Tells whether this job already stopped.
@@ -4202,7 +4411,7 @@ fn print_pause_state(
         );
     }
     if queue.is_none() && locks.is_empty() {
-        println!("nothing is paused");
+        println!("nothing is paused. To pause the queue, run `qex pause queue`.");
     }
     Ok(0)
 }
@@ -4481,6 +4690,7 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
         let id = spec.id;
         match client.call(&Request::Submit {
             spec: Box::new(spec),
+            submitter: crate::sys::submitter_chain(),
         })? {
             Response::Submitted {
                 id: given, warning, ..
@@ -4995,6 +5205,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
 
     let (id, deduplicated) = match client.call(&Request::Submit {
         spec: Box::new(spec),
+        submitter: crate::sys::submitter_chain(),
     })? {
         Response::Submitted {
             id,
@@ -5519,6 +5730,7 @@ pub fn rerun(args: cli::RerunArgs) -> Result<i32> {
 
     match client.call(&Request::Submit {
         spec: Box::new(spec),
+        submitter: crate::sys::submitter_chain(),
     })? {
         Response::Submitted {
             id: new_id,
@@ -6112,6 +6324,7 @@ mod tests {
             command: vec!["true".into()],
             cwd: "/".into(),
             state,
+            submitter: Vec::new(),
             pid: Some(1),
             pid_start_token: None,
             last_pid: None,
