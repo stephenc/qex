@@ -160,12 +160,20 @@ pub fn describe_missing(id: uuid::Uuid) -> String {
             (Some(when), Some(state)) => format!(
                 "the job {id} ({}) existed and its state was `{state}`. Something deleted \
                  its record {} ago, with `qex clean` or by a deletion of the state \
-                 directory. The work of that job HAPPENED. Do not submit it again unless \
-                 you want to repeat the work.",
+                 directory. {}",
                 crate::job::safe_name(&entry.name),
                 crate::units::format_duration(std::time::Duration::from_secs(
                     crate::sys::now_secs().saturating_sub(when)
-                ))
+                )),
+                // A job in one of these states never started, so the reader
+                // who submits it again repeats nothing. Every other final
+                // state comes from a process that ran.
+                if matches!(state.as_str(), "cancelled" | "skipped" | "expired") {
+                    "The job NEVER RAN. Submit it again if you still want the work."
+                } else {
+                    "The work of that job HAPPENED. Do not submit it again unless you \
+                     want to repeat the work."
+                }
             ),
             (Some(when), None) => format!(
                 "the job {id} ({}) existed. Something deleted its record {} ago. qex does \

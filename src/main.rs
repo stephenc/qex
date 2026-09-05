@@ -40,6 +40,7 @@ mod client;
 mod commands;
 #[cfg(unix)]
 mod config;
+mod context;
 #[cfg(unix)]
 mod daemon;
 mod deps;
@@ -216,6 +217,7 @@ fn speaks_for_a_job(name: &str) -> bool {
 /// conventional 2 and nothing can read it as the code of a job.
 #[cfg(unix)]
 const SPEAKS_FOR_ITSELF: &[&str] = &[
+    "abort",
     "list",
     "logs",
     "events",
@@ -298,6 +300,7 @@ fn run() -> Result<i32> {
         Command::Logs(args) => commands::logs(args),
         Command::Events(args) => commands::events(args),
         Command::Kill(args) => commands::kill(args),
+        Command::Abort(args) => commands::abort(args),
         Command::Cancel(args) => commands::cancel(args),
         Command::Rerun(args) => commands::rerun(args),
         Command::Clean(args) => commands::clean(args),

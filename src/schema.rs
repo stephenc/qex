@@ -311,6 +311,21 @@ pub const STATUS: &str = r##"{
       "type": ["integer", "null"],
       "description": "The process id that the job HAD. This value stays after the job stops, for a reader of a machine log. Never send a signal to it, and never look for it in the process list: the machine gives that number to another process later."
     },
+    "submitter": {
+      "type": "array",
+      "description": "The processes above the `qex submit` command, nearest first, up to the first process of the machine. `qex abort` acts on the jobs whose chain shares a live process with its own, below the point where the session ends. Run `qex help abort`.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "pid": { "type": "integer" },
+          "ppid": { "type": "integer", "description": "The parent. 0 means the first process." },
+          "start": { "type": ["integer", "null"], "description": "The start time of the process, in a unit of the system. Compare for equality only." },
+          "name": { "type": "string", "description": "The program name, in the safe form." },
+          "cwd": { "type": ["string", "null"], "description": "The working directory of the process, when qex could read it." },
+          "terminal": { "type": "boolean", "description": "True when the process has a controlling terminal." }
+        }
+      }
+    },
     "exit_code": {
       "type": ["integer", "null"],
       "description": "The exit code, if the job stopped without a signal."

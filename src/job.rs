@@ -369,6 +369,33 @@ pub struct Assignment {
     pub size: Option<u64>,
 }
 
+/// One process above the command that submitted a job.
+///
+/// The record holds the whole chain, and the `context` module reads it. The
+/// rule that says where a session ends lives there, so a later change to that
+/// rule reads the records that exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ancestor {
+    pub pid: i32,
+    /// The parent of this process. `0` says that this process has no parent,
+    /// which is the first process of the machine or of a container.
+    #[serde(default)]
+    pub ppid: i32,
+    /// The start time of the process, as `sys::process_start_token` gives it.
+    /// THE UNIT DIFFERS BETWEEN SYSTEMS; compare for equality only.
+    #[serde(default)]
+    pub start: Option<u64>,
+    /// The name of the program, in the SAFE form. See `safe_name`.
+    #[serde(default)]
+    pub name: String,
+    /// The working directory of the process, when qex could read it.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// True when the process has a controlling terminal.
+    #[serde(default)]
+    pub terminal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
     pub id: uuid::Uuid,
@@ -421,6 +448,16 @@ pub struct JobStatus {
     /// job that stopped.
     #[serde(default)]
     pub supervisor_pid: Option<i32>,
+    /// The processes above the command that submitted the job, from the parent
+    /// of that command up to the first process of the machine.
+    ///
+    /// `qex abort` reads this list to decide if a job belongs to the caller:
+    /// see the `context` module for the rule. Each entry carries the start
+    /// time of the process, so a later process with the same number never
+    /// matches. An empty list means that the submission recorded nothing,
+    /// and such a job is outside every context.
+    #[serde(default)]
+    pub submitter: Vec<Ancestor>,
     /// The identifier of the start of the machine that this record belongs
     /// to. See `sys::boot_id`. The submission writes it, and the supervisor
     /// writes it again, so every record has one from its birth.
@@ -600,6 +637,7 @@ impl JobStatus {
             command: spec.command.clone(),
             cwd: spec.cwd.to_string_lossy().into_owned(),
             state: JobState::Queued,
+            submitter: Vec::new(),
             pid: None,
             pid_start_token: None,
             last_pid: None,
@@ -677,6 +715,21 @@ impl JobStatus {
 /// An error in any of these steps is an error of this function. A record that
 /// qex could not write is not a record, and a caller must hear that.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    write_atomic_with(path, bytes, mode, true)
+}
+
+/// Writes a file in one step, and does not wait for the disk.
+///
+/// The bytes reach the page cache of the kernel before this function returns,
+/// so a process that dies afterwards leaves the file complete for the next
+/// process. A loss of power can still lose it. Use this form where a caller
+/// holds a lock that every other request waits for, and where the record
+/// protects against the death of a process and not against a loss of power.
+pub fn write_atomic_unsynced(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    write_atomic_with(path, bytes, mode, false)
+}
+
+fn write_atomic_with(path: &Path, bytes: &[u8], mode: u32, sync: bool) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -707,8 +760,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         // Step 1. Write the data to the disk now. If the machine loses power
         // during a job, the status file must not be incomplete after the
         // restart.
-        f.sync_all()
-            .with_context(|| format!("writing {} to the disk", tmp.display()))?;
+        if sync {
+            f.sync_all()
+                .with_context(|| format!("writing {} to the disk", tmp.display()))?;
+        }
     }
 
     // Step 2.
@@ -722,8 +777,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     // Step 3. Some systems give an error for a sync of a directory. That is not
     // a failure of the write, and the file is in place, so this step gives no
     // error to the caller.
-    if let Ok(handle) = std::fs::File::open(dir) {
-        handle.sync_all().ok();
+    if sync {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            handle.sync_all().ok();
+        }
     }
     Ok(())
 }
@@ -738,6 +795,18 @@ pub fn read_status(dir: &Path) -> Result<JobStatus> {
 pub fn write_status(dir: &Path, status: &JobStatus) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(status)?;
     write_atomic(&dir.join("status.json"), &bytes, 0o600)
+}
+
+/// Writes the record of a job, and does not wait for the disk.
+///
+/// See `write_atomic_unsynced` for what this form promises and what it does
+/// not. `qex abort` uses it under the lock of the coordinator: a wait for the
+/// disk on each of thousands of records would hold every other request for
+/// the whole abort, and the record protects against the death of the
+/// coordinator, which the page cache survives.
+pub fn write_status_unsynced(dir: &Path, status: &JobStatus) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(status)?;
+    write_atomic_unsynced(&dir.join("status.json"), &bytes, 0o600)
 }
 
 /// Reads the record of every job from the state directory.

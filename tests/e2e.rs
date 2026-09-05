@@ -16654,3 +16654,776 @@ fn a_command_that_asks_about_a_coordinator_does_not_report_absence_for_silence()
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// qex abort
+// ---------------------------------------------------------------------------
+
+/// The configuration for the tests of `qex abort`: one core, so one job
+/// operates and every other job waits.
+const ABORT_CONFIG: &str = "[budget]\ncpu = \"1\"\nmem = \"1GB\"\n\
+     [peers]\nenabled = false\n\
+     [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n";
+
+impl Harness {
+    /// Runs `qex abort` with these options, and gives its JSON answer.
+    fn abort_json(&self, args: &[&str]) -> serde_json::Value {
+        let mut full = vec!["abort", "--json", "--grace", "1s"];
+        full.extend_from_slice(args);
+        let out = self.qex_within(&full, Duration::from_secs(60));
+        assert!(
+            out.status.success(),
+            "`qex {}` failed with the code {:?}\nstdout: {}\nstderr: {}",
+            full.join(" "),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("the abort output is not valid JSON")
+    }
+
+    /// Submits a job from a process tree that is NOT the tree of this test.
+    ///
+    /// The instrument: a copy of `sh` under the name `tmux`, which the
+    /// context rule of qex treats as the end of a session. The submission
+    /// runs as `tmux -c 'sh -c "qex submit ..."'`, so the chain of the job is
+    /// `qex <- sh <- tmux <- this test`. Its context is the one `sh`, which
+    /// no other command shares. `direct` runs the submit as a child of the
+    /// copy itself, so the chain is `qex <- tmux <- this test` and the
+    /// context is EMPTY: a job with no context is outside every default
+    /// scope.
+    fn submit_from_another_context(
+        &self,
+        direct: bool,
+        dir: Option<&Path>,
+        args: &[&str],
+    ) -> String {
+        let wrapper = self.root.join("tmux");
+        if !wrapper.exists() {
+            // A copy of bash, and not of sh. On macOS `/bin/sh` is a program
+            // that replaces itself with the selected shell, so the process
+            // takes the name `bash` and the fake boundary is gone. The
+            // context rule then sees the test process in the chain of the
+            // job, and the job is in the context of the test.
+            let shell = if Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            std::fs::copy(shell, &wrapper).expect("the test cannot copy the shell");
+        }
+        let mut cmd = Command::new(&wrapper);
+        // The `exit` after the command forces a fork: a shell that runs one
+        // command alone replaces itself with it, and the chain would then
+        // lose the shell.
+        if direct {
+            cmd.arg("-c").arg("\"$0\" \"$@\"; exit $?");
+        } else {
+            cmd.arg("-c")
+                .arg("sh -c '\"$0\" \"$@\"; exit $?' \"$0\" \"$@\"; exit $?");
+        }
+        cmd.arg(env!("CARGO_BIN_EXE_qex")).arg("submit").args(args);
+        isolate(&mut cmd, &self.root, &self.peers_dir);
+        if let Some(dir) = dir {
+            cmd.current_dir(dir);
+        }
+        let out = cmd.output().expect("the wrapper did not start");
+        assert!(
+            out.status.success(),
+            "the submit through the wrapper failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(id.parse::<uuid::Uuid>().is_ok(), "not a job id: {id}");
+        id
+    }
+}
+
+/// `qex abort` stops the jobs that operate, empties the queue, and leaves the
+/// queue paused so that nothing new starts until a resume.
+///
+/// THE PROPERTIES OF THE COMMAND, in the order that the assertions test them:
+///
+///   * a job that was queued before the command is gone, and it never starts;
+///   * the counts in the report are what the coordinator did;
+///   * the job that operated stops, through the kill mechanism of qex;
+///   * a job submitted after the command waits until `qex resume`.
+#[test]
+fn abort_stops_the_running_job_and_empties_the_queue() {
+    let h = Harness::new("abort", ABORT_CONFIG);
+
+    let running = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&running) == "running"
+    });
+    let mut queued = Vec::new();
+    for _ in 0..5 {
+        queued.push(h.submit(&[
+            "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+        ]));
+    }
+    for id in &queued {
+        assert_eq!(h.state_of(id), "queued");
+    }
+
+    let report = h.abort_json(&[]);
+    assert_eq!(report["cancelled"], 5, "the report: {report}");
+    assert_eq!(
+        report["signalled"],
+        serde_json::json!([running]),
+        "the report: {report}"
+    );
+    assert_eq!(
+        report["not_stopped"],
+        serde_json::json!([]),
+        "the report: {report}"
+    );
+    assert_eq!(report["outside"], 0, "the report: {report}");
+    assert_eq!(report["queue_paused"], true, "the report: {report}");
+
+    // The queued jobs are cancelled, and their records stay, as after
+    // `qex cancel`. `qex clean cancelled` then deletes them.
+    for id in &queued {
+        assert_eq!(
+            h.state_of(id),
+            "cancelled",
+            "the job {id} must be cancelled"
+        );
+    }
+    h.ok(&["clean", "cancelled"]);
+    for id in &queued {
+        assert!(
+            !h.job_dir(id).exists(),
+            "the directory of {id} must be deleted"
+        );
+    }
+    let ids: Vec<String> = h
+        .list_json()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![running.clone()],
+        "only the signalled job keeps a record"
+    );
+
+    // The running job stops, and its state says that qex stopped it.
+    h.until("the running job stops", Duration::from_secs(30), || {
+        h.state_of(&running) == "killed"
+    });
+
+    // Nothing starts until a resume. Measure for a period, and not one time.
+    let later = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert_eq!(
+            h.state_of(&later),
+            "queued",
+            "no job starts after an abort until a resume"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let pause = h.ok(&["pause", "--json"]);
+    let pause: serde_json::Value = serde_json::from_str(&pause).unwrap();
+    assert_eq!(pause["paused"], true, "the queue must be paused: {pause}");
+
+    h.ok(&["resume", "queue"]);
+    h.until("the later job starts", Duration::from_secs(45), || {
+        h.has_started(&later)
+    });
+}
+
+/// `--keep-running` cancels the queued jobs and leaves the running one.
+#[test]
+fn abort_keep_running_leaves_the_job_that_operates() {
+    let h = Harness::new("abortkeep", ABORT_CONFIG);
+
+    let running = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&running) == "running"
+    });
+    let queued = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+
+    let report = h.abort_json(&["--keep-running"]);
+    assert_eq!(report["cancelled"], 1, "the report: {report}");
+    assert_eq!(
+        report["continues"],
+        serde_json::json!([running]),
+        "the report: {report}"
+    );
+    assert_eq!(
+        report["signalled"],
+        serde_json::json!([]),
+        "the report: {report}"
+    );
+
+    assert_eq!(
+        h.state_of(&queued),
+        "cancelled",
+        "the queued job must be cancelled"
+    );
+    // Measure for a period. A job that a signal reaches stops a moment later.
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        h.state_of(&running),
+        "running",
+        "the job that operates must continue"
+    );
+    let pid = h.status_json(&running)["pid"].as_i64().unwrap() as i32;
+    assert!(
+        count_in_group(pid) >= 1,
+        "the process of the job must still exist"
+    );
+
+    h.ok(&["kill", &running, "--grace", "1s"]);
+}
+
+/// The three levels of the scope, and the tag that narrows each one.
+///
+/// THE PROPERTY: when `qex abort` returns with no scope option, no job of a
+/// different context or of a different directory has changed state; with
+/// `--cwd`, no job of a different directory has; with `--all`, the queue is
+/// empty. Every submitter here is THE SAME UNIX USER, which is the population
+/// that the scope exists to protect.
+///
+/// The queue is paused first, so every job waits and no job can start
+/// between two steps of this test.
+#[test]
+fn abort_touches_only_the_jobs_of_the_caller() {
+    let h = Harness::new("abortscope", ABORT_CONFIG);
+    h.ok(&["pause", "queue"]);
+    let elsewhere = h.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = elsewhere.canonicalize().unwrap();
+
+    let job = ["--cpu", "1", "--mem", "64MB", "--", "true"];
+    let submit = |extra: &[&str]| {
+        let mut args = vec!["submit"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&job);
+        h.submit(&args)
+    };
+    // Mine: this process tree, this directory.
+    let mine = [submit(&[]), submit(&[])];
+    let mine_tagged = submit(&["--tag", "phase"]);
+    // This process tree, another directory.
+    let mut other_dir = Vec::new();
+    for _ in 0..2 {
+        let mut cmd = h.command(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+        cmd.current_dir(&elsewhere);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        other_dir.push(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    // Another process tree, this directory.
+    let other_context = [
+        h.submit_from_another_context(false, None, &job),
+        h.submit_from_another_context(false, None, &job),
+    ];
+    // No context at all, this directory.
+    let no_context = h.submit_from_another_context(true, None, &job);
+
+    let state = |id: &str| h.state_of(id);
+    let all_queued = |ids: &[&String]| {
+        for id in ids {
+            assert_eq!(state(id), "queued", "the job {id} must not change state");
+        }
+    };
+
+    // `--tag` narrows the default scope.
+    let report = h.abort_json(&["--tag", "phase"]);
+    assert_eq!(report["cancelled"], 1, "the report: {report}");
+    assert_eq!(report["outside"], 7, "the report: {report}");
+    assert_eq!(state(&mine_tagged), "cancelled");
+    all_queued(&[&mine[0], &mine[1], &other_dir[0], &other_dir[1]]);
+    all_queued(&[&other_context[0], &other_context[1], &no_context]);
+
+    // The chain of each job that must stay outside, for the message of a
+    // failure: a reader of a build log can then see why the rule took it.
+    let chains = || {
+        let mut text = String::new();
+        for (what, id) in [
+            ("other context", &other_context[0]),
+            ("other context", &other_context[1]),
+            ("no context", &no_context),
+            ("other dir", &other_dir[0]),
+        ] {
+            text.push_str(&format!(
+                "\n{what} {id}: {}",
+                h.status_json(id)["submitter"]
+            ));
+        }
+        text.push_str(&format!("\ncaller: {}", report_scope_chain(&h)));
+        text
+    };
+
+    // Level 1: this process tree AND this directory.
+    let report = h.abort_json(&[]);
+    assert_eq!(report["cancelled"], 2, "the report: {report}{}", chains());
+    assert_eq!(report["outside"], 5, "the report: {report}{}", chains());
+    assert_eq!(state(&mine[0]), "cancelled");
+    assert_eq!(state(&mine[1]), "cancelled");
+    all_queued(&[&other_dir[0], &other_dir[1]]);
+    all_queued(&[&other_context[0], &other_context[1], &no_context]);
+
+    // Level 2: this directory, whatever process submitted the job.
+    let report = h.abort_json(&["--cwd"]);
+    assert_eq!(report["cancelled"], 3, "the report: {report}");
+    assert_eq!(report["outside"], 2, "the report: {report}");
+    all_queued(&[&other_dir[0], &other_dir[1]]);
+    assert_eq!(state(&other_context[0]), "cancelled");
+    assert_eq!(state(&no_context), "cancelled");
+
+    // Level 3: every job of the queue.
+    let report = h.abort_json(&["--all"]);
+    assert_eq!(report["cancelled"], 2, "the report: {report}");
+    assert_eq!(report["outside"], 0, "the report: {report}");
+    assert!(
+        h.list_json().iter().all(|j| j["state"] == "cancelled"),
+        "every job of the queue must be cancelled"
+    );
+}
+
+/// Gives the chain of the caller, as `qex abort --json` reports its scope.
+///
+/// A dry form: the scope of a `--keep-running` abort on a tag that no job
+/// carries touches no job, and it carries the chain that the CLI sent.
+///
+/// CALL IT ON A PAUSED QUEUE ONLY. Every abort pauses the queue first, so on
+/// a queue that operates this helper would pause it, with the reason
+/// `qex abort`, and the test would then measure a queue that it changed.
+fn report_scope_chain(h: &Harness) -> String {
+    let report = h.abort_json(&["--keep-running", "--tag", "no-such-tag-for-the-chain"]);
+    report["scope"]["submitter"].to_string()
+}
+
+/// The counts say what the coordinator did, and a job outside the scope
+/// keeps its state.
+#[test]
+fn abort_counts_what_it_did_and_keeps_a_record_that_another_job_needs() {
+    let h = Harness::new("abortcount", ABORT_CONFIG);
+    let elsewhere = h.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    // A job of this directory that already stopped. It is in the directory
+    // and in this process tree, and the abort must not count it.
+    let done = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &done]);
+
+    h.ok(&["pause", "queue"]);
+    let cause = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    // A job in another directory that needs the first one. It is outside the
+    // default scope, so it holds the record of the cause.
+    let mut cmd = h.command(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--needs", &cause, "--", "true",
+    ]);
+    cmd.current_dir(&elsewhere);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dependent = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    let report = h.abort_json(&[]);
+    assert_eq!(
+        report["cancelled"], 1,
+        "the stopped job is not cancelled: {report}"
+    );
+    assert_eq!(report["outside"], 1, "the dependent is outside: {report}");
+
+    assert_eq!(h.state_of(&cause), "cancelled");
+    assert_eq!(
+        h.state_of(&done),
+        "completed",
+        "a stopped job keeps its record"
+    );
+    // The abort did not touch the dependent. The SCHEDULER then skips it,
+    // because the job that it needs did not succeed; that is the rule for a
+    // dependency, and `qex cancel` on the cause gives the same result.
+    let state = h.state_of(&dependent);
+    assert!(
+        state == "queued" || state == "skipped",
+        "a job outside the scope is not cancelled: {state}"
+    );
+    assert!(
+        h.job_dir(&dependent).exists(),
+        "a job outside the scope keeps its record"
+    );
+}
+
+/// A coordinator that cannot obey `qex abort` must REFUSE it, by name.
+///
+/// An earlier coordinator does not know the request. It would answer with an
+/// error and change nothing, and a reader who did not see that answer would
+/// believe that the queue is empty while every job in it starts.
+#[test]
+fn a_coordinator_that_cannot_abort_refuses_the_command() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let root = std::env::temp_dir().join(format!("qxoldabort{}", std::process::id()));
+    let run = root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::create_dir_all(root.join("cfg")).unwrap();
+    let socket = run.join("s");
+
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let server = std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().unwrap();
+        for line in BufReader::new(stream).lines() {
+            let Ok(line) = line else { return };
+            let answer = if line.contains("\"info\"") {
+                serde_json::json!({
+                    "result": "info", "pid": 4321, "version": "0.9.0",
+                    "started_at": 0, "program_replaced": false,
+                    "jobs_running": 0, "jobs_queued": 0,
+                    "cpu_budget": 1, "mem_budget": 1, "cpu_claimed": 0, "mem_claimed": 0,
+                })
+            } else if line.contains("\"capabilities\"") {
+                serde_json::json!({ "result": "capabilities", "names": ["locks", "pause"] })
+            } else {
+                serde_json::json!({
+                    "result": "error", "kind": "internal",
+                    "message": "qex could not read this request",
+                })
+            };
+            writeln!(writer, "{answer}").ok();
+            writer.flush().ok();
+        }
+    });
+
+    let peers = root.join("peers");
+    std::fs::create_dir_all(&peers).ok();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+    cmd.args(["abort", "--all"]);
+    isolate(&mut cmd, &root, &peers);
+    let out = cmd.output().expect("qex did not start");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    drop(server);
+    std::fs::remove_dir_all(&root).ok();
+
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "the command must fail. stdout: {stdout} stderr: {err}"
+    );
+    assert!(
+        err.contains("cannot obey `qex abort`"),
+        "the message must say what happened: {err}"
+    );
+    assert!(
+        err.contains("kill 4321"),
+        "the message must give the remedy: {err}"
+    );
+}
+
+/// The record of a job shows the chain of its submitter, so a reader can see
+/// why `qex abort` did, or did not, take it.
+#[test]
+fn a_record_shows_the_chain_of_its_submitter() {
+    let h = Harness::with_default_config("chain");
+    let id = h.submit(&["submit", "--", "true"]);
+    let me = std::process::id() as i64;
+
+    let status = h.status_json(&id);
+    let chain = status["submitter"].as_array().expect("the chain is a list");
+    assert!(
+        chain.iter().any(|a| a["pid"].as_i64() == Some(me)),
+        "the chain must name this test process: {chain:?}"
+    );
+    assert!(
+        chain.iter().all(|a| a["start"].is_number()),
+        "each process must carry its start time: {chain:?}"
+    );
+
+    let text = h.ok(&["status", &id]);
+    assert!(
+        text.contains("submitter:"),
+        "the text must show the chain: {text}"
+    );
+    assert!(
+        text.contains(&format!(" {me} ")),
+        "the text must name this test process: {text}"
+    );
+    h.ok(&["wait", &id]);
+}
+
+/// `qex pause` with no word reports, and it says how to pause when nothing is
+/// paused. A reader who typed it to pause must not read "nothing is paused"
+/// as "my pause did not take".
+#[test]
+fn pause_with_no_word_says_how_to_pause() {
+    let h = Harness::with_default_config("pausehow");
+    h.ok(&["info"]);
+    let text = h.ok(&["pause"]);
+    assert!(
+        text.contains("qex pause queue"),
+        "the report must name the command that pauses: {text}"
+    );
+}
+
+/// After an abort, every reader that asks about a cancelled job gets the
+/// answer that it gets after `qex cancel` of that job.
+///
+/// THE READERS: `qex wait`, `qex submit --wait`, `qex run` (each gives 125),
+/// `qex status` (the state `cancelled`), the stop hook (one line for each
+/// job), and `qex status` after `qex clean` (the job never ran).
+#[test]
+fn after_an_abort_every_reader_gets_the_answer_of_a_cancel() {
+    let h = Harness::new("abortreaders", ABORT_CONFIG);
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "{ABORT_CONFIG}[hooks]\non_stop_states = [\"cancelled\"]\n\
+         on_stop = [\"sh\", \"-c\", \"echo \\\"$QEX_STATE $QEX_JOB_NAME\\\" >> {}\"]\n",
+        mark.display()
+    ));
+
+    let occupier = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&occupier) == "running"
+    });
+
+    let waited = h.submit(&[
+        "submit", "--name", "waited", "--cpu", "1", "--mem", "64MB", "--", "true",
+    ]);
+    let waiter = h.spawn(&["wait", &waited]);
+    let submit_wait = h.spawn(&[
+        "submit",
+        "--wait",
+        "--name",
+        "submitted",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--",
+        "true",
+    ]);
+    let (run, ran) = h.run_bg(&["--name", "ran", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.until("every job waits", Duration::from_secs(30), || {
+        h.state_of(&ran) == "queued" && h.list_json().len() == 4
+    });
+
+    let report = h.abort_json(&[]);
+    assert_eq!(report["cancelled"], 3, "the report: {report}");
+
+    let out = wait_for_child(waiter, Duration::from_secs(30), "qex wait after an abort");
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex wait` must give 125 for a cancelled job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = wait_for_child(
+        submit_wait,
+        Duration::from_secs(30),
+        "submit --wait after an abort",
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex submit --wait` must give 125 for a cancelled job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = wait_run(run, "an abort cancelled the job of `qex run`");
+    assert_eq!(
+        out.status.code(),
+        Some(125),
+        "`qex run` must give 125 for a cancelled job: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(h.state_of(&waited), "cancelled");
+    h.until(
+        "the stop hook wrote three lines",
+        Duration::from_secs(30),
+        || h.hook_lines().len() == 3,
+    );
+    let mut lines = h.hook_lines();
+    lines.sort();
+    assert_eq!(
+        lines,
+        vec![
+            "cancelled ran".to_string(),
+            "cancelled submitted".to_string(),
+            "cancelled waited".to_string()
+        ],
+        "the stop hook must run for each cancelled job"
+    );
+
+    // After `qex clean`, the history says that the job never ran.
+    h.ok(&["clean", "cancelled"]);
+    let out = h.qex(&["status", &waited]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("NEVER RAN") && !err.contains("HAPPENED"),
+        "a cancelled job never ran, and the reader must not repeat nothing: {err}"
+    );
+
+    h.qex(&["kill", &occupier, "--grace", "1s"]);
+}
+
+/// An abort that arrives at the moment of a resume accounts for every job:
+/// each one is cancelled or signalled, and none is reported as not stopped.
+///
+/// WHAT THIS TEST DOES NOT PROVE: that the abort waits for the pid of a job
+/// between the queue and its first process. A test cannot hold that window
+/// open, and on a quiet machine the abort meets no job in it. The unit test
+/// `lifecycle::tests::an_abort_waits_for_the_pid_of_a_job_that_starts` makes
+/// the state and proves the wait. This test runs the real path under load.
+#[test]
+fn an_abort_at_the_moment_of_a_resume_accounts_for_every_job() {
+    let h = Harness::new(
+        "abortstarting",
+        "[budget]\ncpu = \"8\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
+    h.ok(&["info"]);
+    for round in 0..3 {
+        h.ok(&["pause", "queue"]);
+        for _ in 0..20 {
+            h.submit(&["submit", "--cpu", "1", "--mem", "1MB", "--", "sleep", "5"]);
+        }
+        h.ok(&["resume", "queue"]);
+        let report = h.abort_json(&["--all"]);
+        assert_eq!(
+            report["not_stopped"],
+            serde_json::json!([]),
+            "round {round}: every job must receive the signal: {report}"
+        );
+        let cancelled = report["cancelled"].as_u64().unwrap();
+        let signalled = report["signalled"].as_array().unwrap().len() as u64;
+        assert_eq!(cancelled + signalled, 20, "round {round}: {report}");
+        h.until("no job operates", Duration::from_secs(30), || {
+            h.list_json()
+                .iter()
+                .all(|j| matches!(j["state"].as_str(), Some("cancelled" | "killed")))
+        });
+        h.ok(&["clean", "done"]);
+    }
+}
+
+/// When the coordinator dies during an abort, the next coordinator holds every
+/// job that the abort cancelled as cancelled.
+///
+/// The coordinator of this test stops in the moment after the lock section of
+/// the abort, before any answer, through a variable that exists for this test.
+/// The cancel of each job must be on the disk by then: a record that was
+/// cancelled in memory only comes back as a queued job, and one
+/// `qex resume queue` then starts the work that the abort stopped.
+#[test]
+fn a_coordinator_that_dies_during_an_abort_leaves_every_cancel_on_the_disk() {
+    // The switch that stops the coordinator exists in a debug build only.
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: a release build has no test switch to stop the coordinator");
+        return;
+    }
+    let mut h = Harness::new("abortcrash", ABORT_CONFIG);
+    h.extra_env
+        .push(("QEX_TEST_CRASH_AFTER_ABORT_PLAN".into(), "1".into()));
+    h.ok(&["pause", "queue"]);
+    let mut ids = Vec::new();
+    for _ in 0..12 {
+        ids.push(h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]));
+    }
+    let coordinator = h.coordinator_pid();
+
+    let out = h.qex_within(&["abort", "--all"], Duration::from_secs(60));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "the connection must end: {err}");
+    assert!(
+        err.contains("Run `qex abort` again"),
+        "the command must say what the reader does next: {err}"
+    );
+    h.until("the coordinator stopped", Duration::from_secs(30), || {
+        (unsafe { libc::kill(coordinator, 0) }) != 0
+    });
+
+    // The disk, before any coordinator reads it.
+    for id in &ids {
+        let text = std::fs::read_to_string(h.job_dir(id).join("status.json")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            record["state"], "cancelled",
+            "the record of {id} on the disk"
+        );
+    }
+
+    // The next coordinator, without the variable.
+    h.extra_env.clear();
+    h.ok(&["info"]);
+    for id in &ids {
+        assert_eq!(h.state_of(id), "cancelled");
+    }
+    let pause = h.ok(&["pause", "--json"]);
+    let pause: serde_json::Value = serde_json::from_str(&pause).unwrap();
+    assert_eq!(pause["paused"], true, "the pause survives too: {pause}");
+}
+
+/// The report never counts as cancelled a job whose cancel is not on the disk.
+///
+/// A record that qex could not write would come back as a queued job at the
+/// next coordinator, so the abort leaves such a job in the queue, names it,
+/// and gives the exit code 1.
+#[test]
+fn an_abort_does_not_count_a_cancel_that_did_not_reach_the_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::new("abortunwritable", ABORT_CONFIG);
+    h.ok(&["pause", "queue"]);
+    let fine = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    let unwritable = h.submit(&[
+        "submit",
+        "--name",
+        "unwritable",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--",
+        "true",
+    ]);
+    let dir = h.job_dir(&unwritable);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = h.qex_within(&["abort", "--all", "--json"], Duration::from_secs(60));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("the abort output is not valid JSON");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a cancel that failed gives 1: {report}"
+    );
+    assert_eq!(report["cancelled"], 1, "the report: {report}");
+    let failed = report["not_cancelled"].as_array().expect("a list");
+    assert_eq!(failed.len(), 1, "the report: {report}");
+    assert_eq!(failed[0]["id"], unwritable, "the report: {report}");
+    assert_eq!(failed[0]["name"], "unwritable", "the report: {report}");
+
+    assert_eq!(h.state_of(&fine), "cancelled");
+    assert_eq!(
+        h.state_of(&unwritable),
+        "queued",
+        "a job whose cancel did not reach the disk stays in the queue"
+    );
+    let text = std::fs::read_to_string(dir.join("status.json")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(record["state"], "queued", "the disk agrees with the memory");
+}

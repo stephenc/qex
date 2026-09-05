@@ -61,6 +61,19 @@ pub enum Command {
     /// Stop a job that operates.
     Kill(KillArgs),
 
+    /// Stop your jobs and empty your part of the queue.
+    ///
+    /// qex pauses the queue first, so no job starts while this command
+    /// operates. It then cancels every queued job of the scope, and it sends
+    /// TERM to every job of the scope that operates, then KILL after the
+    /// grace time. The records stay, as after `qex cancel`; `qex clean
+    /// cancelled` deletes them. The queue stays paused; run `qex resume
+    /// queue` to start new work.
+    ///
+    /// Without an option, the scope is the jobs of this directory that your
+    /// own process tree submitted. Run `qex help abort` for the rule.
+    Abort(AbortArgs),
+
     /// Remove a job from the queue before it starts.
     Cancel(CancelArgs),
 
@@ -564,6 +577,38 @@ pub struct KillArgs {
     /// The time to wait before qex sends KILL. Example: 10s.
     #[arg(long, value_name = "TIME", default_value = "10s")]
     pub grace: String,
+}
+
+#[derive(Debug, Args)]
+pub struct AbortArgs {
+    /// Act on the jobs with this tag only. Repeat the option for more tags.
+    #[arg(long, value_name = "TAG")]
+    pub tag: Vec<String>,
+
+    /// Every job of this directory, from every process.
+    ///
+    /// Use this option for a job whose chain does not reach your process: a
+    /// job that a job submitted, or a job from a detached helper.
+    #[arg(long, conflicts_with = "all")]
+    pub cwd: bool,
+
+    /// Every job of your queue: every directory, and every agent that runs
+    /// as your user. qex stops only the jobs of the user who runs it; it
+    /// cannot reach the jobs of another user.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Cancel the queued jobs only. The jobs that operate now continue.
+    #[arg(long)]
+    pub keep_running: bool,
+
+    /// The time to wait before qex sends KILL. Example: 10s.
+    #[arg(long, value_name = "TIME", default_value = "10s")]
+    pub grace: String,
+
+    /// Write the result as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

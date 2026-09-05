@@ -42,7 +42,15 @@ pub enum Request {
     /// Tests that the coordinator operates.
     Ping,
     /// Puts a job in the queue.
-    Submit { spec: Box<JobSpec> },
+    Submit {
+        spec: Box<JobSpec>,
+        /// The processes above the command that submits, from its parent up
+        /// to the first process of the machine. `qex abort` reads this list;
+        /// see the `context` module. An earlier CLI sends no list, and such a
+        /// job is outside every context.
+        #[serde(default)]
+        submitter: Vec<crate::job::Ancestor>,
+    },
     /// Says that this connection owns a job until the job starts.
     ///
     /// `qex run` sends this for the job that it started. Such a job has one
@@ -116,6 +124,55 @@ pub enum Request {
     Resume { target: PauseTarget },
     /// Gives what is paused now.
     PauseState,
+    /// Stops the jobs of one scope and empties their part of the queue.
+    ///
+    /// The coordinator pauses the queue, cancels every queued job of the
+    /// scope, and collects the jobs of the scope that operate, in ONE hold of
+    /// its lock. No job can therefore start between the pause and the cancel,
+    /// and a job that reached a process before the lock is in the list of jobs
+    /// to signal. The queue stays paused when the answer arrives.
+    ///
+    /// A CLI sends this request only to a coordinator that gives the
+    /// capability `abort`. An earlier coordinator would refuse the request and
+    /// change nothing, and the CLI must say so before the reader believes that
+    /// the queue is empty.
+    Abort {
+        scope: AbortScope,
+        /// True to leave the jobs that operate alone.
+        keep_running: bool,
+        /// The time before qex sends KILL to a job that TERM did not stop.
+        grace_secs: u64,
+        /// The process that asked. The pause record names it.
+        by_pid: i32,
+    },
+}
+
+/// The jobs that an `Abort` request acts on.
+///
+/// Every field narrows the scope. An empty scope is every job of the queue.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortScope {
+    /// Only the jobs of this directory. `None` reaches every directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Only the jobs whose submitter shares a context with this chain. See
+    /// the `context` module. `None` reaches every context.
+    #[serde(default)]
+    pub submitter: Option<Vec<crate::job::Ancestor>>,
+    /// Only the jobs that carry one of these tags. An empty list keeps every
+    /// job.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// One job that `Abort` names in its answer, with what happened to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbortedJob {
+    pub id: uuid::Uuid,
+    /// The SAFE name of the job. See `job::safe_name`.
+    pub name: String,
+    /// Why qex could not do what the request asked for this job.
+    pub why: String,
 }
 
 /// What a `Pause` or a `Resume` request acts on.
@@ -302,6 +359,33 @@ pub enum Response {
     PauseState {
         queue: Option<crate::pause::PauseRecord>,
         locks: Vec<LockPause>,
+    },
+    /// What an `Abort` request did.
+    ///
+    /// EVERY NUMBER HERE IS A COUNT OF WHAT THE COORDINATOR DID, and never a
+    /// count of what the request asked for. A reader acts on this answer as
+    /// fact, so a count of the jobs in the scope would tell that reader that
+    /// the queue is empty while a record still waits in it.
+    Aborted {
+        /// The jobs that waited in the queue and that this request cancelled.
+        /// Their records stay, as after `qex cancel`. The count is the count
+        /// of records on the disk that say `cancelled`.
+        cancelled: usize,
+        /// The queued jobs whose record qex could not write. Each one stays
+        /// in the queue, with the reason.
+        #[serde(default)]
+        not_cancelled: Vec<AbortedJob>,
+        /// The jobs that operated and that received the signal TERM.
+        signalled: Vec<uuid::Uuid>,
+        /// The jobs that operated and that the request could not signal.
+        not_stopped: Vec<AbortedJob>,
+        /// The jobs that operate and that the request left alone, because it
+        /// asked for `keep_running`.
+        continues: Vec<uuid::Uuid>,
+        /// The jobs that wait or operate outside the scope. The request did
+        /// not touch them, and a reader who expected an empty queue must
+        /// learn that they exist.
+        outside: usize,
     },
     /// The command failed.
     Error { message: String, kind: ErrorKind },
@@ -495,6 +579,23 @@ mod tests {
                 target: PauseTarget::Queue,
             },
             Request::PauseState,
+            Request::Abort {
+                scope: AbortScope {
+                    cwd: Some("/home/me/project".into()),
+                    submitter: Some(vec![crate::job::Ancestor {
+                        pid: 42,
+                        ppid: 1,
+                        start: Some(7),
+                        name: "claude".into(),
+                        cwd: None,
+                        terminal: true,
+                    }]),
+                    tags: vec!["phase".into()],
+                },
+                keep_running: false,
+                grace_secs: 10,
+                by_pid: 4321,
+            },
         ];
         for r in requests {
             let line = serde_json::to_string(&r).unwrap();
