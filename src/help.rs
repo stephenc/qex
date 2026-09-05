@@ -1781,7 +1781,9 @@ What you can predict:
   * Two agents that one shell started share that shell, so they are one
     context: an abort by one reaches the jobs of the other in that directory.
   * A job that a job submitted has the supervisor of that job as its boundary.
-    It is in the context of that job, and in no context of an agent.
+    It is in the context of that job, and in no context of an agent. The rule
+    matches the program name `qex`; a qex installed under another name gives
+    no such boundary.
   * A job from an earlier qex, or from a helper that left your process tree,
     has no chain that reaches you. It is outside your context.
   * A chain with no terminal and no named boundary, such as a command under a

@@ -16700,7 +16700,17 @@ impl Harness {
     ) -> String {
         let wrapper = self.root.join("tmux");
         if !wrapper.exists() {
-            std::fs::copy("/bin/sh", &wrapper).expect("the test cannot copy sh");
+            // A copy of bash, and not of sh. On macOS `/bin/sh` is a program
+            // that replaces itself with the selected shell, so the process
+            // takes the name `bash` and the fake boundary is gone. The
+            // context rule then sees the test process in the chain of the
+            // job, and the job is in the context of the test.
+            let shell = if Path::new("/bin/bash").exists() {
+                "/bin/bash"
+            } else {
+                "/bin/sh"
+            };
+            std::fs::copy(shell, &wrapper).expect("the test cannot copy the shell");
         }
         let mut cmd = Command::new(&wrapper);
         // The `exit` after the command forces a fork: a shell that runs one
@@ -16935,10 +16945,29 @@ fn abort_touches_only_the_jobs_of_the_caller() {
     all_queued(&[&mine[0], &mine[1], &other_dir[0], &other_dir[1]]);
     all_queued(&[&other_context[0], &other_context[1], &no_context]);
 
+    // The chain of each job that must stay outside, for the message of a
+    // failure: a reader of a build log can then see why the rule took it.
+    let chains = || {
+        let mut text = String::new();
+        for (what, id) in [
+            ("other context", &other_context[0]),
+            ("other context", &other_context[1]),
+            ("no context", &no_context),
+            ("other dir", &other_dir[0]),
+        ] {
+            text.push_str(&format!(
+                "\n{what} {id}: {}",
+                h.status_json(id)["submitter"]
+            ));
+        }
+        text.push_str(&format!("\ncaller: {}", report_scope_chain(&h)));
+        text
+    };
+
     // Level 1: this process tree AND this directory.
     let report = h.abort_json(&[]);
-    assert_eq!(report["cancelled"], 2, "the report: {report}");
-    assert_eq!(report["outside"], 5, "the report: {report}");
+    assert_eq!(report["cancelled"], 2, "the report: {report}{}", chains());
+    assert_eq!(report["outside"], 5, "the report: {report}{}", chains());
     assert_eq!(state(&mine[0]), "cancelled");
     assert_eq!(state(&mine[1]), "cancelled");
     all_queued(&[&other_dir[0], &other_dir[1]]);
@@ -16960,6 +16989,15 @@ fn abort_touches_only_the_jobs_of_the_caller() {
         h.list_json().iter().all(|j| j["state"] == "cancelled"),
         "every job of the queue must be cancelled"
     );
+}
+
+/// Gives the chain of the caller, as `qex abort --json` reports its scope.
+///
+/// A dry form: the scope of a `--keep-running` abort on a tag that no job
+/// carries touches nothing, and it carries the chain that the CLI sent.
+fn report_scope_chain(h: &Harness) -> String {
+    let report = h.abort_json(&["--keep-running", "--tag", "no-such-tag-for-the-chain"]);
+    report["scope"]["submitter"].to_string()
 }
 
 /// The counts say what the coordinator did, and a job outside the scope
