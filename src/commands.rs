@@ -522,8 +522,13 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
                 .to_string()
         }
     });
-    // `first.name` is the `--name` value, or the program name of the command.
-    let base = first.name.clone();
+    // The base is the `--name` value, or the program of the first line alone.
+    // The line is the part of the name that tells the jobs of the fan-out
+    // apart, so the arguments of the command stay out of the base.
+    let base = args
+        .name
+        .clone()
+        .unwrap_or_else(|| crate::spec::program_name(&first.command).to_string());
 
     let mut client = Client::connect()?;
     warn_if_version_differs(&mut client);

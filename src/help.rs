@@ -252,6 +252,11 @@ give both to `--since` when you start again. Run `qex help events`.
 The jobs that did not stop then have no watcher, so wait again for them. qex
 names them when it returns.
 
+`qex list` names each job by its command: the program, then the first and the
+last argument that do not start with `-`, so `uv run --project P python run.py
+a.json` is `uv-run-a.json` and `make` is `make`. Give `--name` when that name
+does not tell your jobs apart.
+
 Resource claims
 ---------------
 
@@ -342,7 +347,9 @@ Other options
 -------------
 
     --name NAME        letters, numbers, `-`, `_` and `.` only. Not a first
-                       `-`. 128 characters or fewer.
+                       `-`. 128 characters or fewer. The default is the
+                       program, then the first and the last argument that do
+                       not start with `-`: `uv run a.py` is `uv-run-a.py`.
     --timeout 4h       stop the JOB after this time. `--wait-timeout` stops
                        your wait instead, and the job continues.
     --retries 3        run the job again when it fails. One id, one record,

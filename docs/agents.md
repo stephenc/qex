@@ -236,6 +236,11 @@ both to `--since` when you start again. A new coordinator restarts the numbers
 and gives you a `gap` line; with a number alone it cannot. **Act on `id` and
 `state`, not on the arrival of a line.** Run `qex help events`.
 
+`qex list` names each job by its command: the program, then the first and the
+last argument that do not start with `-`, so `uv run --project P python run.py
+a.json` is `uv-run-a.json` and `make` is `make`. Give `--name` when that name
+does not tell your jobs apart.
+
 ## The other commands
 
 ```sh

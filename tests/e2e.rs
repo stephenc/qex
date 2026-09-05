@@ -5183,8 +5183,12 @@ fn logs_shows_the_last_lines_by_default() {
 #[test]
 fn the_status_of_a_job_that_failed_holds_its_error_output() {
     let h = Harness::with_default_config("statuslogs");
+    // The test names the job. The default name holds the words of the script,
+    // and the test below asks that `--no-logs` removes a word of the OUTPUT.
     let id = h.submit(&[
         "submit",
+        "--name",
+        "failing",
         "--",
         "sh",
         "-c",
@@ -5225,8 +5229,12 @@ fn the_status_of_a_job_that_failed_holds_its_error_output() {
 #[test]
 fn the_status_of_a_failure_gives_both_streams() {
     let h = Harness::with_default_config("bothstreams");
+    // The test names the job. The default name holds the words of the script,
+    // and the test below asks that `--stderr` gives one STREAM only.
     let id = h.submit(&[
         "submit",
+        "--name",
+        "failing",
         "--",
         "sh",
         "-c",
@@ -10149,6 +10157,59 @@ fn a_derived_name_outside_the_set_becomes_the_safe_form() {
         Some("my_build.sh"),
         "the derived name must be the safe form of the program"
     );
+}
+
+/// The default name holds the words that name the work, so two jobs of one
+/// launcher have two names in `qex list`, and each name finds its job.
+#[test]
+fn the_default_name_tells_the_jobs_of_one_launcher_apart() {
+    let h = Harness::with_default_config("defaultname");
+    let a = h.submit(&["submit", "--", "true", "run", "--project", "/p", "a.py"]);
+    let b = h.submit(&["submit", "--", "true", "run", "--project", "/p", "b.py"]);
+    assert_eq!(h.status_json(&a)["name"].as_str(), Some("true-run-a.py"));
+    assert_eq!(h.status_json(&b)["name"].as_str(), Some("true-run-b.py"));
+
+    // The name finds the job, in `qex status` and in the completions.
+    assert_eq!(
+        h.status_json("true-run-b.py")["id"].as_str(),
+        Some(b.as_str()),
+        "the default name must find the job"
+    );
+    let offered = h.ok(&["__complete", "ids"]);
+    assert!(
+        offered.contains("true-run-a.py") && offered.contains("true-run-b.py"),
+        "the completions must offer each name: {offered}"
+    );
+}
+
+/// Every page that names the default rule states the same rule. A reader
+/// predicts the name from the command line with the page in front of them,
+/// so a page that states an earlier rule sends the reader to a name that no
+/// job has.
+#[test]
+fn every_page_states_the_rule_of_the_default_name() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rule = "the first and the last argument that do not start with `-`";
+    for page in [
+        "src/cli.rs",
+        "src/help.rs",
+        "skills/qex/SKILL.md",
+        "docs/agents.md",
+        "docs/reference.md",
+    ] {
+        // Each page wraps the sentence at its own width, and a doc comment
+        // holds `///` at the start of each line.
+        let text = std::fs::read_to_string(root.join(page))
+            .unwrap()
+            .replace("///", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains(rule),
+            "{page} must state the rule of the default name: `{rule}`"
+        );
+    }
 }
 
 /// A tag, a lock, the program and the environment reach a reader in a form

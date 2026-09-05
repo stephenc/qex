@@ -1722,9 +1722,24 @@ field of a job file refuse a name that holds another character, a name that
 starts with `-`, and a name longer than 128 characters. After that refusal, the
 name that the record holds and the name that qex shows are the same.
 
-A submission with no `--name` takes the last part of the program path. A
-character outside the set in that path becomes `_`, and the job still starts:
-you did not choose that name.
+A submission with no `--name` takes its name from the command: the last part
+of the program path, then the first and the last argument that do not start
+with `-`, joined with `-`. Each argument gives the last part of its path. A
+command with no such argument keeps the program name.
+
+```
+uv run a.py                                    ->  uv-run-a.py
+cargo test foo -- --nocapture                  ->  cargo-test-foo
+uv run --project P python /w/run.py /d/a.json  ->  uv-run-a.json
+bash -c 'cargo test'                           ->  bash-cargo_test
+make                                           ->  make
+```
+
+The first argument is the subcommand of the launcher, and the last one is the
+script, the module, the test or the input file that names the work. A value
+of an option can enter the name, and the jobs of one launcher still get
+different names. A character outside the set becomes `_`, and the job still
+starts: you did not choose that name.
 
 **The record on the disk keeps the name that an earlier qex stored.** qex
 changes no record. A record from before this rule can hold a name outside the
