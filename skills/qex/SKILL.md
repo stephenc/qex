@@ -70,6 +70,12 @@ qex submit --wait --cpu 2 --mem 4GB --id-file build.id -- make release
   result.
 - Your harness waits, because the command waits. Run it as a background command
   and the harness reports the end — no timer, no second command.
+- **A subagent waits in the foreground.** A harness often does not wake a
+  subagent when a background command ends: it resumes the subagent only when
+  the parent sends a message. A subagent that ends its turn to wait then stays
+  stopped until its parent notices. Use `qex submit --wait`, or
+  `qex wait <id> --timeout TIME` with a `TIME` below the command limit of your
+  harness, and wait again when it gives 124.
 - The output goes to the log file, so a job of two hours does not fill your
   context. The command ends with the **record**: state, exit code, resources and
   the last lines of both streams. Add `-q` for the exit code alone.
