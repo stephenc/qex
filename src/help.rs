@@ -98,6 +98,13 @@ USE `qex submit --wait` FOR YOUR LONG WORK:
 - Your harness waits, because the command waits. Run it as a background command
   of your harness: the harness reports the end, so you need no timer and no
   second command.
+- A SUBAGENT WAITS IN THE FOREGROUND. A harness often does not wake a subagent
+  when a background command ends. Such a harness resumes the subagent only when
+  the parent sends a message. A subagent that ends its turn to wait then stays
+  stopped until its parent notices the silence. Give every wait a limit below
+  the command limit of your harness:
+  `qex submit --wait --wait-timeout TIME`, or `qex wait <id> --timeout TIME`.
+  Wait again when the command gives 124.
 - The output goes to the log file, so a job of two hours does not fill your
   context. The command ends with the RECORD: the state, the exit code, the
   resources, and the last lines of both streams.

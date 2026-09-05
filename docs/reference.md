@@ -194,7 +194,9 @@ stderr when it returns, with the command that waits for them again.
 
 With a harness that reports a background command, prefer one
 `qex submit --wait` for each job. Each notification then names its own job, and
-no job is left unwatched.
+no job is left unwatched. A subagent runs the wait in the foreground, because a
+harness often does not wake a subagent when a background command ends. Give
+that wait a `--wait-timeout` below the command limit of the harness.
 
 ## A job that never starts
 
