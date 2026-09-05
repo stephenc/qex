@@ -2849,8 +2849,9 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         let context = crate::context::below_boundary(scope.submitter.as_deref().unwrap_or(&[]));
         if context.is_empty() {
             println!(
-                "scope:     the jobs of {}{tags} from your process tree, and qex found no end of \
-                 your session, so that is no job. Use `--cwd` for every job of this directory.",
+                "scope:     the jobs of {}{tags} from your process tree, and qex could read no \
+                 process above this command, so that is no job. Use `--cwd` for every job of \
+                 this directory.",
                 here.display()
             );
         } else {

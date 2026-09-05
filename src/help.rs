@@ -1784,8 +1784,13 @@ What you can predict:
     It is in the context of that job, and in no context of an agent.
   * A job from an earlier qex, or from a helper that left your process tree,
     has no chain that reaches you. It is outside your context.
-  * When qex cannot find the end of your session, your context is empty, and
-    the default scope is no job. The scope line says so.
+  * A chain with no terminal and no named boundary, such as a command under a
+    service or a build runner, ends at the first process of the machine. The
+    whole chain is then one context, so every command under that service
+    shares it. Use `--tag` there.
+  * A chain that ends at a process whose parent qex could not read ends at
+    that process. Only a command with no process above it has an empty
+    context, and the scope line says so.
 
 `--cwd` drops the process test: every job of this directory, from every
 process. `--all` is every job of your queue. `--tag` narrows each level.

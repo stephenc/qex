@@ -26,7 +26,7 @@
 //!     systemd         the first process: everything shares it
 //! ```
 //!
-//! The agent is the process to match on. Three rules find the end of the
+//! The agent is the process to match on. Four rules find the end of the
 //! session, and the first process that one of them names is the boundary:
 //!
 //! 1. The first process of the machine, or of a container: pid 1, or a
@@ -38,11 +38,17 @@
 //!    A terminal program holds the other end of the terminal, so it has no
 //!    controlling terminal itself. This rule finds a terminal program that the
 //!    list does not name.
+//! 4. The top of the chain. The walk stops at a process whose parent qex
+//!    could not read. When that parent is the first process (macOS refuses
+//!    to describe it to a user), the boundary is that first process, above
+//!    the chain, and the whole chain is the context: a chain with no terminal
+//!    and no named boundary, such as a command under a service, still matches
+//!    its own earlier commands. When that parent is any other process, qex
+//!    cannot say what it is, so the top process itself is the boundary: a
+//!    match through it could reach the work of everybody under it.
 //!
-//! The context is the part of the chain BELOW the boundary. A chain with no
-//! boundary gives an empty context, and an empty context matches nothing: qex
-//! could not read the whole chain, so it cannot say where the session ends,
-//! and a match above an unknown boundary can reach the work of everybody.
+//! The context is the part of the chain BELOW the boundary. Only an empty
+//! chain gives an empty context, and an empty context matches nothing.
 //!
 //! # What a reader can predict
 //!
@@ -54,7 +60,8 @@
 //! a job submitted has the supervisor of that job as its boundary, so the jobs
 //! that one job submits share a context with each other and with nothing
 //! above them. A command with no terminal anywhere above it, such as a command
-//! under `cron`, shares a context with everything under the same service.
+//! under `cron` or under a runner of a build service, shares a context with
+//! everything under the same service.
 //!
 //! `qex status` shows the chain of a job with the boundary marked, so a reader
 //! can see why a job was, or was not, in scope.
@@ -114,16 +121,20 @@ pub const BOUNDARY_NAMES: &[&str] = &[
 
 /// Gives the part of a chain below the point where the session ends.
 ///
-/// The chain runs from the command upward. The result is empty when the chain
-/// holds no boundary, and an empty result matches nothing.
+/// The chain runs from the command upward. The result is empty for an empty
+/// chain only, and an empty result matches nothing.
 pub fn below_boundary(chain: &[Ancestor]) -> &[Ancestor] {
     match boundary_index(chain) {
-        Some(index) => &chain[..index],
+        Some(index) => &chain[..index.min(chain.len())],
         None => &[],
     }
 }
 
-/// Gives the position of the first process at which the session ends.
+/// Gives the position at which the session ends.
+///
+/// A position equal to the length of the chain says that the boundary is the
+/// first process of the machine, above the chain (rule 4). `None` is an empty
+/// chain.
 pub fn boundary_index(chain: &[Ancestor]) -> Option<usize> {
     let mut terminal_below = false;
     for (index, process) in chain.iter().enumerate() {
@@ -138,7 +149,13 @@ pub fn boundary_index(chain: &[Ancestor]) -> Option<usize> {
         }
         terminal_below |= process.terminal;
     }
-    None
+    // Rule 4: the top of the chain.
+    let top = chain.last()?;
+    if top.ppid == 1 {
+        Some(chain.len())
+    } else {
+        Some(chain.len() - 1)
+    }
 }
 
 /// Tests if two chains share one process below the end of the session.
@@ -256,9 +273,11 @@ mod tests {
         assert_eq!(boundary_index(&chain), Some(3));
     }
 
-    /// A chain that ends before a boundary gives an empty context.
+    /// A chain that ends at a process whose parent qex could not read ends
+    /// there: that process is the boundary, because the unknown parent can
+    /// be a terminal program or a service that everybody shares.
     #[test]
-    fn a_chain_with_no_boundary_matches_nothing() {
+    fn a_chain_whose_parent_is_unknown_ends_at_its_top() {
         let one = vec![
             process(100, 50, "bash", false),
             process(50, 40, "claude", false),
@@ -267,11 +286,44 @@ mod tests {
             process(101, 50, "bash", false),
             process(50, 40, "claude", false),
         ];
-        assert!(below_boundary(&one).is_empty());
+        assert_eq!(boundary_index(&one), Some(1));
+        assert_eq!(below_boundary(&one).len(), 1);
+        assert!(!shared(&one, &two), "the shared process is the boundary");
+    }
+
+    /// A chain with no terminal and no named boundary, whose top is a child
+    /// of the first process, is one context as a whole: two commands under a
+    /// runner of a build service share the shell that started the tests.
+    ///
+    /// This is the chain of a macOS build machine, where qex cannot read the
+    /// first process and so never records it.
+    #[test]
+    fn a_chain_under_a_service_with_no_terminal_matches_its_own_commands() {
+        let runner = |test_pid: i32| {
+            vec![
+                process(test_pid, 7465, "e2e-c044ff0b01e", false),
+                process(7465, 7464, "cargo", false),
+                process(7464, 6536, "bash", false),
+                process(6536, 6530, "Runner.Worker", false),
+                process(6530, 898, "Runner.Listener", false),
+                process(898, 885, "hosted-compute-", false),
+                process(885, 1, "bash", false),
+            ]
+        };
+        let one = runner(7741);
+        let two = runner(7742);
+        assert_eq!(boundary_index(&one), Some(one.len()));
+        assert_eq!(below_boundary(&one).len(), one.len());
         assert!(
-            !shared(&one, &two),
-            "the shared process is above an unknown boundary"
+            shared(&one, &two),
+            "the same caller must match its own jobs"
         );
+    }
+
+    #[test]
+    fn an_empty_chain_has_no_boundary() {
+        assert_eq!(boundary_index(&[]), None);
+        assert!(below_boundary(&[]).is_empty());
     }
 
     /// The multiplexer is found by its stored name, with no terminal below
