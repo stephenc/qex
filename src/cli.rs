@@ -202,6 +202,11 @@ pub struct SubmitArgs {
     ///
     /// Letters, numbers, `-`, `_` and `.` only. It must not start with `-`.
     /// At most 128 characters.
+    ///
+    /// The default is the program, then the first and the last argument that
+    /// do not start with `-`, joined with `-`: `uv run a.py` gives
+    /// `uv-run-a.py`, `cargo test foo` gives `cargo-test-foo`, and `make`
+    /// gives `make`.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 

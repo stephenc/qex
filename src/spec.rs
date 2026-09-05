@@ -795,10 +795,10 @@ impl JobSpec {
                 }
                 name
             }
-            // The program name is the default. `qex list` is then easy to read,
-            // and the user does not need to remember the `--name` option. The
-            // user did not select this name, so a character outside the set
-            // becomes the safe form and the job still starts.
+            // The command gives the default: the program and the words that
+            // name the work, so the jobs of one launcher have different names
+            // in `qex list`. The user did not select this name, so a character
+            // outside the set becomes the safe form and the job still starts.
             None => derived_name(&command),
         };
 
@@ -927,23 +927,92 @@ impl JobSpec {
     }
 }
 
-/// Gives the last part of the program path, in the form that qex accepts.
+/// Gives the default name of a job: the program, and the words that name the
+/// work.
 ///
-/// For example, `/usr/bin/python3` gives `python3`. A path that holds a space
-/// or a character outside the name set becomes the safe form. The user did not
-/// choose this name, so qex does not stop the submission.
-fn derived_name(command: &[String]) -> String {
-    let raw = command
-        .first()
-        .map(|c| {
-            Path::new(c)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(c)
-                .to_string()
-        })
-        .unwrap_or_else(|| "job".to_string());
-    crate::job::sanitize_name(&raw)
+/// The name is the last part of the program path, then the FIRST and the LAST
+/// argument that do not start with `-`, joined with `-`. Each argument gives
+/// the last part of its path, and a script, which is an argument that holds a
+/// space, gives its whole text. A command with no such argument gives the
+/// program alone, so `make` stays `make`:
+///
+///     uv run a.py                                    -> uv-run-a.py
+///     python -m pytest tests/api                     -> python-pytest-api
+///     cargo test foo -- --nocapture                  -> cargo-test-foo
+///     uv run --project P python /w/run.py /d/a.json  -> uv-run-a.json
+///     bash -c 'cd /p && cargo test'                  -> bash-cd_p_cargo_test
+///     make                                           -> make
+///
+/// An empty argument, and an argument that is `/` alone, name nothing.
+///
+/// # Why the first and the last argument
+///
+/// An agent submits the jobs of one session through one launcher, so the
+/// program alone gives every row of `qex list` one name. The argument that
+/// names the work is the script, the module, the test or the input file. That
+/// argument is the first one after the launcher word, or the last one when a
+/// launcher option carries a value in between, as `--project P` does. The two
+/// together name the work in each shape, and a reader predicts the name from
+/// the command line with no table of launchers and no table of options.
+///
+/// An argument that starts with `-` is an option, so it stays out of the name.
+/// The value of an option can enter the name, and the name can still tell the
+/// two jobs of one launcher apart.
+///
+/// # Why a script gives its whole text
+///
+/// A script of `bash -c` frequently holds a path, and the text after its last
+/// `/` is a file of the script and not the work: `cd /p && cargo test` would
+/// give `p_cargo_test`, and `cargo test > /tmp/out.log` would give `out.log`.
+/// The whole text is longer, and a reader predicts it.
+///
+/// The user did not choose this name, so a character outside the name set
+/// becomes the safe form and the job starts. `job::sanitize_name` holds the
+/// form: letters, numbers, `-`, `_` and `.`, no first `-`, and 128 characters
+/// at the most.
+pub fn derived_name(command: &[String]) -> String {
+    let mut parts = vec![program_name(command)];
+    let words: Vec<&str> = command
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .filter_map(|a| work_word(a))
+        .collect();
+    if let Some(first) = words.first() {
+        parts.push(first);
+    }
+    if words.len() > 1 {
+        parts.push(words[words.len() - 1]);
+    }
+    crate::job::sanitize_name(&parts.join("-"))
+}
+
+/// Gives the last part of the program path, or `job` for an empty command.
+///
+/// `/usr/bin/python3` gives `python3`. A fan-out uses this alone as the base
+/// of each name, because the line of the fan-out is the part that names the
+/// work there.
+pub fn program_name(command: &[String]) -> &str {
+    command.first().map(|c| last_part(c)).unwrap_or("job")
+}
+
+/// Gives the part of a word after its last `/`, or the whole word when that
+/// part is empty.
+fn last_part(word: &str) -> &str {
+    word.rsplit('/').find(|p| !p.is_empty()).unwrap_or(word)
+}
+
+/// Gives the part of an argument that goes into the name, or `None` for an
+/// argument that names nothing.
+///
+/// A script, which is an argument that holds a space, a tab or a line end,
+/// gives its whole text. Every other argument gives the last part of its path,
+/// so an empty argument and an argument of `/` alone give nothing.
+fn work_word(arg: &str) -> Option<&str> {
+    if arg.chars().any(char::is_whitespace) {
+        return Some(arg);
+    }
+    arg.rsplit('/').find(|p| !p.is_empty())
 }
 
 /// Refuses a name that a person or an agent chose, when it is not in the set.
@@ -2204,11 +2273,139 @@ mod tests {
         );
     }
 
+    /// The default name is the program, then the first and the last argument
+    /// that do not start with `-`. This is the rule that the documentation
+    /// states, so each example here is an example of the documentation.
     #[test]
-    fn name_defaults_to_the_program_basename() {
+    fn the_default_name_holds_the_program_and_the_words_that_name_the_work() {
+        let _guard = env_lock();
         let spec =
             JobSpec::resolve(&opts(&["/usr/bin/python3", "x.py"]), &Config::default()).unwrap();
-        assert_eq!(spec.name, "python3");
+        assert_eq!(spec.name, "python3-x.py");
+
+        let name = |c: &[&str]| derived_name(&c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(name(&["uv", "run", "a.py"]), "uv-run-a.py");
+        assert_eq!(
+            name(&["python", "-m", "pytest", "tests/api"]),
+            "python-pytest-api"
+        );
+        assert_eq!(
+            name(&["cargo", "test", "foo", "--", "--nocapture"]),
+            "cargo-test-foo"
+        );
+        assert_eq!(
+            name(&[
+                "uv",
+                "run",
+                "--project",
+                "/p",
+                "python",
+                "/w/run.py",
+                "/d/a.json"
+            ]),
+            "uv-run-a.json"
+        );
+        assert_eq!(name(&["bash", "-c", "cargo test"]), "bash-cargo_test");
+        assert_eq!(name(&["make"]), "make");
+        // A script gives its whole text, and qex does not cut it at a `/`.
+        assert_eq!(
+            name(&["bash", "-c", "cd /p && cargo test"]),
+            "bash-cd_p_cargo_test"
+        );
+        assert_eq!(
+            name(&["bash", "-c", "cargo test > /tmp/out.log"]),
+            "bash-cargo_test_tmp_out.log"
+        );
+        assert_eq!(
+            name(&["sh", "-c", "for f in a b; do echo $f; done"]),
+            "sh-for_f_in_a_b_do_echo_f_done"
+        );
+        // A tab and a line end make a script as a space does, and a `/` at
+        // the end of a script counts.
+        assert_eq!(name(&["sh", "-c", "cd\t/p\n/x/"]), "sh-cd_p_x_");
+        assert_eq!(name(&["true", "a/b c/"]), "true-a_b_c_");
+        assert_eq!(name(&["true", "  "]), "true-_");
+        // The last part of a path. A `/` at the end does not count.
+        assert_eq!(name(&["go", "test", "./cmd/x/"]), "go-test-x");
+        // An empty argument, and an argument of `/` alone, name nothing.
+        assert_eq!(name(&["sh", "-c", "exit 7", "/"]), "sh-exit_7");
+        assert_eq!(name(&["true", "", "x"]), "true-x");
+        assert_eq!(name(&["true", "/", "/"]), "true");
+        assert_eq!(name(&[]), "job");
+    }
+
+    /// Two commands of one launcher that differ in the argument that names
+    /// the work get different default names. This is the reason the rule
+    /// exists: `qex list` with sixty rows named `uv` is not readable.
+    #[test]
+    fn two_commands_of_one_launcher_get_different_default_names() {
+        let name = |c: &[&str]| derived_name(&c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let pairs: &[(&[&str], &[&str])] = &[
+            (&["uv", "run", "a.py"], &["uv", "run", "b.py"]),
+            (
+                &["uv", "run", "--project", "/p", "a.py"],
+                &["uv", "run", "--project", "/p", "b.py"],
+            ),
+            (&["python", "-m", "x"], &["python", "-m", "y"]),
+            (&["cargo", "test", "foo"], &["cargo", "test", "bar"]),
+            (&["npx", "tool"], &["npx", "other"]),
+            (&["bash", "-c", "make one"], &["bash", "-c", "make two"]),
+            (&["sh", "a.sh"], &["sh", "b.sh"]),
+            (
+                &["docker", "run", "img", "a"],
+                &["docker", "run", "img", "b"],
+            ),
+            (
+                &["python", "train.py", "--epochs", "3"],
+                &["python", "train.py", "--epochs", "5"],
+            ),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(name(a), name(b), "{a:?} and {b:?} must get different names");
+        }
+    }
+
+    /// A command with no argument that names the work keeps the program
+    /// name, and `--name` always wins over the default.
+    #[test]
+    fn a_command_with_no_work_word_keeps_the_program_and_a_chosen_name_wins() {
+        let _guard = env_lock();
+        for (c, expected) in [
+            (vec!["make"], "make"),
+            (vec!["/usr/bin/make"], "make"),
+            (vec!["make", "-j4"], "make"),
+            (vec!["cargo", "--version"], "cargo"),
+        ] {
+            let spec = JobSpec::resolve(&opts(&c), &Config::default()).unwrap();
+            assert_eq!(spec.name, expected, "{c:?}");
+        }
+        let mut o = opts(&["uv", "run", "a.py"]);
+        o.name = Some("chosen".into());
+        let spec = JobSpec::resolve(&o, &Config::default()).unwrap();
+        assert_eq!(spec.name, "chosen");
+    }
+
+    /// The same command line gives the same name on each call, and the name is
+    /// in the allowed form whatever the arguments hold: the safe characters, no
+    /// first `-`, and 128 characters at the most.
+    #[test]
+    fn the_default_name_is_the_same_each_time_and_in_the_allowed_form() {
+        let long = "y".repeat(300);
+        let commands: Vec<Vec<String>> = vec![
+            vec!["bash".into(), "-c".into(), "echo $(id); ls /".into()],
+            vec!["python".into(), long.clone(), long.clone()],
+            vec![long.clone()],
+            vec!["x".into(), "a b".into(), "-".into(), "c\u{1b}[2J".into()],
+            vec!["x".into(), "550e8400-e29b-41d4-a716-446655440000".into()],
+        ];
+        for c in &commands {
+            let name = derived_name(c);
+            assert_eq!(name, derived_name(c), "{c:?} must give one name");
+            assert!(crate::job::name_is_safe(&name), "{c:?} gave {name:?}");
+            assert!(name.len() <= 128, "{c:?} gave {} characters", name.len());
+        }
+        assert_eq!(derived_name(&commands[0]), "bash-echo_id_ls_");
+        assert_eq!(derived_name(&commands[3]), "x-a_b-c_2J");
     }
 
     /// Gives a configuration with a pool of two devices.

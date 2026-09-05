@@ -522,8 +522,13 @@ fn submit_each_line(args: cli::SubmitArgs) -> Result<i32> {
                 .to_string()
         }
     });
-    // `first.name` is the `--name` value, or the program name of the command.
-    let base = first.name.clone();
+    // The base is the `--name` value, or the program of the first line alone.
+    // The line is the part of the name that tells the jobs of the fan-out
+    // apart, so the arguments of the command stay out of the base.
+    let base = args
+        .name
+        .clone()
+        .unwrap_or_else(|| crate::spec::program_name(&first.command).to_string());
 
     let mut client = Client::connect()?;
     warn_if_version_differs(&mut client);
@@ -784,10 +789,10 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         }
 
         println!(
-            "{:<8}  {:<10}  {:<16.16}  {:>5}  {:>8}  {:>8}  {}",
+            "{:<8}  {:<10}  {:<16}  {:>5}  {:>8}  {:>8}  {}",
             short_id(&j.id),
             j.state.as_str(),
-            j.name,
+            crate::job::fit_name(&j.name, 16),
             j.cpu,
             format_size(j.mem),
             elapsed,
@@ -6275,11 +6280,11 @@ pub fn du(args: cli::DuArgs) -> Result<i32> {
         println!("The largest job records:");
         for (id, name, state, size, old) in per_job.iter().take(args.top) {
             println!(
-                "  {:>9}  {}  {:<10} {:<16.16}{}",
+                "  {:>9}  {}  {:<10} {:<16}{}",
                 format_size(*size),
                 &id.to_string()[..8],
                 state,
-                name,
+                crate::job::fit_name(name, 16),
                 if *old {
                     "  (qex gc would free this)"
                 } else {

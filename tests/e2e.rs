@@ -5183,8 +5183,12 @@ fn logs_shows_the_last_lines_by_default() {
 #[test]
 fn the_status_of_a_job_that_failed_holds_its_error_output() {
     let h = Harness::with_default_config("statuslogs");
+    // The test names the job. The default name holds the words of the script,
+    // and the test below asks that `--no-logs` removes a word of the OUTPUT.
     let id = h.submit(&[
         "submit",
+        "--name",
+        "failing",
         "--",
         "sh",
         "-c",
@@ -5225,8 +5229,12 @@ fn the_status_of_a_job_that_failed_holds_its_error_output() {
 #[test]
 fn the_status_of_a_failure_gives_both_streams() {
     let h = Harness::with_default_config("bothstreams");
+    // The test names the job. The default name holds the words of the script,
+    // and the test below asks that `--stderr` gives one STREAM only.
     let id = h.submit(&[
         "submit",
+        "--name",
+        "failing",
         "--",
         "sh",
         "-c",
@@ -7760,7 +7768,9 @@ fn each_line_gives_one_job_for_each_line_in_one_group() {
         "--id-file",
         ids.to_str().unwrap(),
         "--",
-        "echo",
+        // A program given by its path. The base of each name is the last part
+        // of that path, and not the path.
+        "/bin/echo",
         "value={}",
     ]);
     assert_eq!(
@@ -10149,6 +10159,96 @@ fn a_derived_name_outside_the_set_becomes_the_safe_form() {
         Some("my_build.sh"),
         "the derived name must be the safe form of the program"
     );
+}
+
+/// The default name holds the words that name the work, so two jobs of one
+/// launcher have two names in `qex list`, and each name finds its job.
+#[test]
+fn the_default_name_tells_the_jobs_of_one_launcher_apart() {
+    let h = Harness::with_default_config("defaultname");
+    let a = h.submit(&["submit", "--", "true", "run", "--project", "/p", "a.py"]);
+    let b = h.submit(&["submit", "--", "true", "run", "--project", "/p", "b.py"]);
+    assert_eq!(h.status_json(&a)["name"].as_str(), Some("true-run-a.py"));
+    assert_eq!(h.status_json(&b)["name"].as_str(), Some("true-run-b.py"));
+
+    // The name finds the job, in `qex status` and in the completions.
+    assert_eq!(
+        h.status_json("true-run-b.py")["id"].as_str(),
+        Some(b.as_str()),
+        "the default name must find the job"
+    );
+    let offered = h.ok(&["__complete", "ids"]);
+    assert!(
+        offered.contains("true-run-a.py") && offered.contains("true-run-b.py"),
+        "the completions must offer each name: {offered}"
+    );
+}
+
+/// A name that does not fit the NAME column shows its start, `..`, and its
+/// end, in `qex list`, in `qex top` and in `qex du --top`. The width of the
+/// column is the property: a row that held the whole name would push every
+/// column after it, and a row that held the start alone would show one text
+/// for the jobs of one command.
+#[test]
+fn a_long_name_shows_its_start_and_its_end_in_each_table() {
+    let h = Harness::with_default_config("fitname");
+    let name = format!("uv-run-{}-scan_b0.2_cv0_0.json", "x".repeat(100));
+    assert_eq!(name.len(), 128);
+    let id = h.submit(&["submit", "--name", &name, "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+
+    for (args, width) in [
+        (vec!["list"], 16),
+        (vec!["top", "--once", "--no-color"], 14),
+        (vec!["du", "--top", "5"], 16),
+    ] {
+        let text = h.ok(&args);
+        let row = text
+            .lines()
+            .find(|l| l.contains(&id[..8]))
+            .unwrap_or_else(|| panic!("{args:?} must show the job: {text}"));
+        let tail: String = name.chars().skip(name.len() - (width - 6)).collect();
+        let shown = format!("uv-r..{tail}");
+        assert!(row.contains(&shown), "{args:?} must show `{shown}`: {row}");
+        assert!(
+            !row.contains("xxxxxxxxxx"),
+            "{args:?} must not show the whole name: {row}"
+        );
+    }
+}
+
+/// Every page that names the default rule holds the one sentence of the rule.
+/// A reader predicts the name from the command line with the page in front of
+/// them, so a page that lost the sentence sends the reader to a name that no
+/// job has.
+///
+/// This gate proves that the sentence is PRESENT on each page, and nothing
+/// more: a page that negates the sentence around it passes. The unit tests of
+/// `spec::derived_name` hold the rule itself.
+#[test]
+fn every_page_states_the_rule_of_the_default_name() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let rule = "the first and the last argument that do not start with `-`";
+    for page in [
+        "src/cli.rs",
+        "src/help.rs",
+        "skills/qex/SKILL.md",
+        "docs/agents.md",
+        "docs/reference.md",
+    ] {
+        // Each page wraps the sentence at its own width, and a doc comment
+        // holds `///` at the start of each line.
+        let text = std::fs::read_to_string(root.join(page))
+            .unwrap()
+            .replace("///", " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains(rule),
+            "{page} must state the rule of the default name: `{rule}`"
+        );
+    }
 }
 
 /// A tag, a lock, the program and the environment reach a reader in a form
