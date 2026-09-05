@@ -1725,8 +1725,8 @@ name that the record holds and the name that qex shows are the same.
 A submission with no `--name` takes its name from the command: the last part
 of the program path, then the first and the last argument that do not start
 with `-`, joined with `-`. Each argument gives the last part of its path, and
-a script, which is an argument that holds a space, gives its whole text. A
-command with no such argument keeps the program name.
+a script, which is an argument that holds a space, a tab or a line end, gives
+its whole text. A command with no such argument keeps the program name.
 
 ```
 uv run a.py                                    ->  uv-run-a.py
@@ -1742,8 +1742,9 @@ of the launcher, and the script, the module, the test or the input file. A
 value of an option enters the name in the same way, as `5` does above. Two
 commands that differ in an argument that the rule does not take get one name.
 
-A `/` at the end of an argument does not count. An empty argument, and an
-argument of `/` alone, name nothing. A character outside the set becomes `_`,
+A `/` at the end of an argument that is not a script does not count. An empty
+argument, and an argument of `/` alone, name nothing; an argument of spaces
+alone is a script, and it gives `_`. A character outside the set becomes `_`,
 a run of them becomes one `_`, and the name stops at 128 characters. The job
 still starts: you did not choose that name.
 
@@ -1756,8 +1757,10 @@ set. qex shows the safe form of that name.
 table holds 16 characters, and `qex top` holds 14. A longer name shows its first
 four characters, `..`, and its last characters, so `uv-run-scan_b0.2_cv0_0.json`
 shows as `uv-r..cv0_0.json`: the end of a name is the part that tells the jobs
-of one command apart. A name with `..` in that column is not the whole name. The name that the record holds still finds the
-job as well:
+of one command apart. Two names that differ in the middle only show one text in
+that column; give `--name` to such jobs. A name with `..` in that column can be
+a cut name, so take the whole name from `qex list --json` or from `qex status`.
+The name that the record holds still finds the job as well:
 
 ```sh
 qex status deploy_prod_id_     # the name that qex shows

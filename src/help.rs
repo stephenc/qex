@@ -253,7 +253,7 @@ The jobs that did not stop then have no watcher, so wait again for them. qex
 names them when it returns.
 
 `qex list` names each job by its command: the program, then the first and the
-last argument that do not start with `-`, each cut to the last part of its
+last argument that do not start with `-`, and each gives the last part of its
 path, so `uv run --project P python run.py /d/a.json` is `uv-run-a.json` and
 `make` is `make`. A script, which is an argument that holds a space, enters
 whole: `bash -c 'cd /p && make'` is `bash-cd_p_make`. Give `--name` when that

@@ -10184,6 +10184,39 @@ fn the_default_name_tells_the_jobs_of_one_launcher_apart() {
     );
 }
 
+/// A name that does not fit the NAME column shows its start, `..`, and its
+/// end, in `qex list`, in `qex top` and in `qex du --top`. The width of the
+/// column is the property: a row that held the whole name would push every
+/// column after it, and a row that held the start alone would show one text
+/// for the jobs of one command.
+#[test]
+fn a_long_name_shows_its_start_and_its_end_in_each_table() {
+    let h = Harness::with_default_config("fitname");
+    let name = format!("uv-run-{}-scan_b0.2_cv0_0.json", "x".repeat(100));
+    assert_eq!(name.len(), 128);
+    let id = h.submit(&["submit", "--name", &name, "--", "true"]);
+    h.ok(&["wait", &id, "--timeout", "45s"]);
+
+    for (args, width) in [
+        (vec!["list"], 16),
+        (vec!["top", "--once", "--no-color"], 14),
+        (vec!["du", "--top", "5"], 16),
+    ] {
+        let text = h.ok(&args);
+        let row = text
+            .lines()
+            .find(|l| l.contains(&id[..8]))
+            .unwrap_or_else(|| panic!("{args:?} must show the job: {text}"));
+        let tail: String = name.chars().skip(name.len() - (width - 6)).collect();
+        let shown = format!("uv-r..{tail}");
+        assert!(row.contains(&shown), "{args:?} must show `{shown}`: {row}");
+        assert!(
+            !row.contains("xxxxxxxxxx"),
+            "{args:?} must not show the whole name: {row}"
+        );
+    }
+}
+
 /// Every page that names the default rule holds the one sentence of the rule.
 /// A reader predicts the name from the command line with the page in front of
 /// them, so a page that lost the sentence sends the reader to a name that no

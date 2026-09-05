@@ -1005,9 +1005,9 @@ fn last_part(word: &str) -> &str {
 /// Gives the part of an argument that goes into the name, or `None` for an
 /// argument that names nothing.
 ///
-/// A script, which is an argument that holds a space, gives its whole text.
-/// Every other argument gives the last part of its path, so an empty argument
-/// and an argument of `/` alone give nothing.
+/// A script, which is an argument that holds a space, a tab or a line end,
+/// gives its whole text. Every other argument gives the last part of its path,
+/// so an empty argument and an argument of `/` alone give nothing.
 fn work_word(arg: &str) -> Option<&str> {
     if arg.chars().any(char::is_whitespace) {
         return Some(arg);
@@ -2320,6 +2320,11 @@ mod tests {
             name(&["sh", "-c", "for f in a b; do echo $f; done"]),
             "sh-for_f_in_a_b_do_echo_f_done"
         );
+        // A tab and a line end make a script as a space does, and a `/` at
+        // the end of a script counts.
+        assert_eq!(name(&["sh", "-c", "cd\t/p\n/x/"]), "sh-cd_p_x_");
+        assert_eq!(name(&["true", "a/b c/"]), "true-a_b_c_");
+        assert_eq!(name(&["true", "  "]), "true-_");
         // The last part of a path. A `/` at the end does not count.
         assert_eq!(name(&["go", "test", "./cmd/x/"]), "go-test-x");
         // An empty argument, and an argument of `/` alone, name nothing.
