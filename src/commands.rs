@@ -1985,6 +1985,32 @@ fn wait_one(
     deadline: Option<Instant>,
     reporter: &mut ReasonReporter,
 ) -> Result<WaitOutcome> {
+    // A job that stopped has a result, and no limit takes a result away: the
+    // record on the disk holds it, and to read it costs no wait. Only a job
+    // with no result gives `TimedOut`.
+    //
+    // The test is HERE, for every path below, because the limit can pass at
+    // any moment: before the wait begins, or between the request and the read
+    // of an answer that the coordinator already gave.
+    match wait_one_until(raw_id, deadline, reporter)? {
+        WaitOutcome::TimedOut => {
+            if let Some(status) = read_status_on_disk(raw_id)? {
+                if status.state.is_terminal() {
+                    return Ok(WaitOutcome::Finished(Box::new(status)));
+                }
+            }
+            Ok(WaitOutcome::TimedOut)
+        }
+        outcome => Ok(outcome),
+    }
+}
+
+/// The wait of `wait_one`, which gives `TimedOut` without a look at the record.
+fn wait_one_until(
+    raw_id: &str,
+    deadline: Option<Instant>,
+    reporter: &mut ReasonReporter,
+) -> Result<WaitOutcome> {
     loop {
         // THE LIMIT CAN PASS BEFORE THIS WAIT BEGINS. It spans the command, so
         // the wait for an earlier job, or a slow connect, can use all of it.
@@ -1992,15 +2018,8 @@ fn wait_one(
         // start after the limit. That is not a coordinator that stopped, and
         // the lines below must not say that it is.
         //
-        // A job that stopped has a result, and no limit takes a result away:
-        // the record on the disk holds it, and to read it costs no wait. Only
-        // a job with no result gives `TimedOut`.
+        // `wait_one` reads the record on the disk before it gives `TimedOut`.
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            if let Some(status) = read_status_on_disk(raw_id)? {
-                if status.state.is_terminal() {
-                    return Ok(WaitOutcome::Finished(Box::new(status)));
-                }
-            }
             return Ok(WaitOutcome::TimedOut);
         }
         match wait_through_coordinator(raw_id, deadline, reporter)? {
