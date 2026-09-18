@@ -2144,7 +2144,16 @@ fn wait_through_coordinator(
     deadline: Option<Instant>,
     reporter: &mut ReasonReporter,
 ) -> Result<Option<WaitOutcome>> {
+    // THE LIMIT OF THE READER CAN PASS IN ANY STEP BELOW, before the loop that
+    // tests it. Each step then gives an error, and an error here reads as "the
+    // coordinator stopped". That is false when the limit ended the step: the
+    // caller would tell the reader about a coordinator that is fine.
+    let the_limit_passed = || deadline.is_some_and(|d| Instant::now() >= d);
+
     let Some(mut client) = Client::connect_existing() else {
+        if the_limit_passed() {
+            return Ok(Some(WaitOutcome::TimedOut));
+        }
         return Ok(None);
     };
     // Give every read a limit.
@@ -2167,6 +2176,7 @@ fn wait_through_coordinator(
     let id = match resolve_id_for_wait(&mut client, raw_id) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(Some(WaitOutcome::NoSuchJob)),
+        Err(_) if the_limit_passed() => return Ok(Some(WaitOutcome::TimedOut)),
         // The coordinator did not answer. Find the answer without it.
         Err(_) => return Ok(None),
     };
@@ -2175,6 +2185,9 @@ fn wait_through_coordinator(
     // coordinator that stops before it reads the request gives an error here,
     // and the caller then finds the answer without it.
     if client.send(&Request::Wait { id }).is_err() {
+        if the_limit_passed() {
+            return Ok(Some(WaitOutcome::TimedOut));
+        }
         return Ok(None);
     }
 

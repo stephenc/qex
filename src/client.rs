@@ -808,10 +808,16 @@ pub fn is_a_passed_reader_limit(error: &anyhow::Error) -> bool {
 fn timed_out(message: String) -> anyhow::Error {
     // Keep the FIRST message: it is the wait that used the limit. See
     // `A_COORDINATOR_THAT_DID_NOT_ANSWER`.
-    A_COORDINATOR_THAT_DID_NOT_ANSWER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(|| message.clone());
+    //
+    // Keep it only when the limit of the READER ended that wait. A wait that
+    // the ceiling of qex ended did not use the limit of the reader, and a later
+    // message must not say that it did.
+    if spent_limit_of_the_reader().is_some() {
+        A_COORDINATOR_THAT_DID_NOT_ANSWER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| message.clone());
+    }
     anyhow::Error::new(CoordinatorTimeout).context(message)
 }
 
