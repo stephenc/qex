@@ -102,9 +102,24 @@ struct ReaderLimit {
     gave: Duration,
     /// The time that qex gave to the read of the record, when `ends` is the
     /// end of that time and no longer the end of `gave`. A message must then
-    /// name this time: the number of the reader did not end a wait that began
-    /// after it passed. See `give_the_record_its_own_time`.
-    record_allowance: Option<Duration>,
+    /// name this time, because this time ended the wait and the number of the
+    /// reader did not. There are two cases, and the value says which one
+    /// occurred: the limit of the reader passed before the record got this
+    /// time, or the job stopped with less than this time left of a limit that
+    /// did not pass. See `give_the_record_its_own_time`.
+    record_allowance: Option<RecordAllowance>,
+}
+
+/// The time that qex gave to the read of the record of a job.
+#[derive(Clone, Copy)]
+struct RecordAllowance {
+    /// The time that the record got.
+    time: Duration,
+    /// Says whether the limit of the reader passed before the record got this
+    /// time. When it did not pass, a RESULT ended the wait for the job and the
+    /// limit ended nothing, so a message must not say that the limit ended a
+    /// wait.
+    the_limit_had_passed: bool,
 }
 
 /// The first message of this command about a coordinator that gave no answer
@@ -228,19 +243,45 @@ fn the_limit_that_ended_it() -> String {
 /// Writes the sentence of `the_limit_that_ended_it` for a limit that passed.
 fn name_the_limit(spent: Option<ReaderLimit>) -> String {
     match spent {
-        // The number of the reader ended the wait for the JOB. This wait began
-        // after that, in a time that qex gave, so that time is the limit that
-        // ended it. To name the number of the reader here says that a wait of
-        // five seconds ended at a limit of three.
+        // The number of the reader passed before this wait began. This wait
+        // ran in a time that qex gave, so that time is the limit that ended
+        // it. To name the number of the reader here says that a wait of five
+        // seconds ended at a limit of three.
+        //
+        // The sentence says that the limit PASSED, and not that it ended the
+        // wait for the job: a result can end that wait in the same moment.
         Some(ReaderLimit {
             gave,
-            record_allowance: Some(allowance),
+            record_allowance:
+                Some(RecordAllowance {
+                    time,
+                    the_limit_had_passed: true,
+                }),
             ..
         }) => format!(
-            "Your time limit of {} ended the wait for the job before this. qex gave the \
-             record {} more, and that time ended this wait.",
+            "Your time limit of {} passed before this wait began. qex gave the record {} \
+             more, and that time ended this wait.",
             as_the_reader_gave(gave),
-            seconds(allowance)
+            seconds(time)
+        ),
+        // A RESULT ended the wait for the job, and the limit of the reader
+        // still had time. That limit ended nothing, so the message must not
+        // say that it ended a wait. It says why the number of the reader is
+        // not the time of this wait.
+        Some(ReaderLimit {
+            gave,
+            record_allowance:
+                Some(RecordAllowance {
+                    time,
+                    the_limit_had_passed: false,
+                }),
+            ..
+        }) => format!(
+            "The job stopped before your time limit of {} passed, and less than {} of that \
+             limit remained. qex gave the record {}, and that time ended this wait.",
+            as_the_reader_gave(gave),
+            seconds(time),
+            seconds(time)
         ),
         Some(limit) => format!(
             "Your time limit of {} ended this wait.",
@@ -310,17 +351,38 @@ fn a_passed_limit(gave: Duration, what: &str, earlier: Option<&str>) -> String {
 pub fn give_the_record_its_own_time() {
     let mut held = reader_deadline().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(limit) = held.as_mut() {
-        // A limit with more time left than the allowance stays as it is: the
-        // record then has that time, and the number of the reader still holds.
-        let allowed = Instant::now() + RECORD_ALLOWANCE;
-        if limit.ends < allowed {
-            limit.ends = allowed;
-            limit.record_allowance = Some(RECORD_ALLOWANCE);
-        }
+        *limit = with_time_for_the_record(*limit, Instant::now());
     }
 }
 
-/// The time that the record gets after the limit of the reader ended the wait.
+/// Gives the limit that `give_the_record_its_own_time` leaves in place.
+fn with_time_for_the_record(limit: ReaderLimit, now: Instant) -> ReaderLimit {
+    // A limit with more time left than the allowance stays as it is: the
+    // record then has that time, and the number of the reader still holds.
+    let allowed = now + RECORD_ALLOWANCE;
+    if limit.ends >= allowed {
+        return limit;
+    }
+    // One command can ask for this time more than once. After the first time,
+    // `ends` is the end of the allowance and no longer the end of the limit of
+    // the reader, so the first answer about that limit is the one to keep.
+    let the_limit_had_passed = match limit.record_allowance {
+        Some(earlier) => earlier.the_limit_had_passed,
+        None => limit.ends <= now,
+    };
+    ReaderLimit {
+        ends: allowed,
+        record_allowance: Some(RecordAllowance {
+            time: RECORD_ALLOWANCE,
+            the_limit_had_passed,
+        }),
+        ..limit
+    }
+}
+
+/// The time that the record gets after a wait, when the limit of the reader
+/// has less than this time left. The limit can be one that passed, or one that
+/// did not pass because the job stopped a moment before it.
 const RECORD_ALLOWANCE: Duration = Duration::from_secs(5);
 
 /// Takes the limit of the READER for the whole command.
@@ -1406,7 +1468,7 @@ mod tests {
     }
 
     /// The time that qex gave to the record is the limit that ends a read of
-    /// the record. The number of the reader ended the wait before it.
+    /// the record. In this case the number of the reader passed before it.
     #[test]
     fn a_read_of_the_record_names_the_time_that_qex_gave() {
         let limit = ReaderLimit {
@@ -1420,11 +1482,81 @@ mod tests {
         );
 
         let text = name_the_limit(Some(ReaderLimit {
-            record_allowance: Some(RECORD_ALLOWANCE),
+            record_allowance: Some(RecordAllowance {
+                time: RECORD_ALLOWANCE,
+                the_limit_had_passed: true,
+            }),
             ..limit
         }));
         assert!(text.contains("gave the record 5.0 seconds more"), "{text}");
         assert!(!text.contains("3s ended this wait"), "{text}");
+    }
+
+    /// A result can end the wait for a job while the limit of the reader still
+    /// has time. The limit then ended nothing, and a message that says that it
+    /// ended the wait for the job sends the reader to a longer limit that
+    /// changes nothing.
+    #[test]
+    fn a_limit_that_did_not_pass_ended_no_wait() {
+        let now = Instant::now();
+        let limit = ReaderLimit {
+            ends: now + Duration::from_secs(2),
+            gave: Duration::from_secs(10),
+            record_allowance: None,
+        };
+        let given = with_time_for_the_record(limit, now);
+        assert_eq!(given.ends, now + RECORD_ALLOWANCE);
+        let text = name_the_limit(Some(given));
+        assert!(
+            text.contains("The job stopped before your time limit of 10s passed"),
+            "{text}"
+        );
+        assert!(text.contains("qex gave the record 5.0 seconds,"), "{text}");
+        assert!(!text.contains("ended the wait for the job"), "{text}");
+        assert!(!text.contains("10s ended"), "{text}");
+
+        // A second request in the same command keeps the first answer: `ends`
+        // is then the end of the allowance, and says nothing about the limit.
+        let later = now + Duration::from_secs(1);
+        let again = with_time_for_the_record(given, later);
+        assert_eq!(again.ends, later + RECORD_ALLOWANCE);
+        assert_eq!(name_the_limit(Some(again)), text);
+    }
+
+    /// The limit of the reader passed, and the record then got its time. The
+    /// message says that the limit passed, in each later request also.
+    #[test]
+    fn a_limit_that_passed_is_named_as_passed() {
+        let now = Instant::now();
+        let limit = ReaderLimit {
+            ends: now,
+            gave: Duration::from_secs(3),
+            record_allowance: None,
+        };
+        let given = with_time_for_the_record(limit, now);
+        let again = with_time_for_the_record(given, now + Duration::from_secs(1));
+        for one in [given, again] {
+            let text = name_the_limit(Some(one));
+            assert!(
+                text.contains("Your time limit of 3s passed before this wait began"),
+                "{text}"
+            );
+            assert!(text.contains("gave the record 5.0 seconds more"), "{text}");
+        }
+    }
+
+    /// A limit with more time than the allowance stays the limit of the reader.
+    #[test]
+    fn a_limit_with_time_left_stays_as_it_is() {
+        let now = Instant::now();
+        let limit = ReaderLimit {
+            ends: now + Duration::from_secs(60),
+            gave: Duration::from_secs(90),
+            record_allowance: None,
+        };
+        let given = with_time_for_the_record(limit, now);
+        assert_eq!(given.ends, limit.ends);
+        assert!(given.record_allowance.is_none());
     }
 
     /// The limit in a message is a value that `--timeout` reads again.
