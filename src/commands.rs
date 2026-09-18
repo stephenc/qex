@@ -1161,10 +1161,11 @@ fn dropped_notice(status: &JobStatus, stream: &str) -> Option<String> {
 
     let mut text = match dropped.of(stream) {
         Some((bytes, lines)) => format!(
-            "... qex removed {} and {lines} line(s) from the middle of this stream.{limit} \
+            "... qex removed {} and {} from the middle of this stream.{limit} \
              The first part and the last part are here. To keep more, make max_bytes larger \
              in the configuration file.",
-            format_size(bytes)
+            format_size(bytes),
+            count_of(lines as usize, "line")
         ),
         // A stream with no count can still be incomplete, so the test of the
         // count comes second.
@@ -1193,6 +1194,57 @@ fn read_log(dir: &std::path::Path, file: &str) -> String {
     }
 }
 
+/// Writes the claim of a job, with a note beside each value that qex chose.
+///
+/// A note at the end of the line covers the whole line. A person who gave
+/// `--cpu 10` then read that qex learned the 10 cores also, and could not see
+/// which option changes which value. The note thus goes beside the value that
+/// it describes, and a value that the person gave has no note.
+fn claim_text(s: &JobStatus) -> String {
+    let cores = count_of(s.cpu as usize, "core");
+    let mem = format_size(s.mem);
+
+    // A record of an earlier qex has one source for the whole claim, and that
+    // source says `learned` when qex learned ONE value. qex cannot say which
+    // one, so the note does not say it.
+    if s.cpu_source.is_empty() || s.mem_source.is_empty() {
+        let note = match s.claim_source.as_str() {
+            "learned" => " (qex learned one value or both from the earlier jobs of this command)",
+            "fan-out" => " (qex learned one value or both from the earlier jobs of this fan-out)",
+            "default" => " (the default; give --cpu and --mem to change it)",
+            _ => "",
+        };
+        return format!("{cores}, {mem}{note}");
+    }
+
+    // One note for two values says `both`, so the reader does not ask which
+    // value it covers.
+    if s.cpu_source == s.mem_source {
+        let note = match s.cpu_source.as_str() {
+            "learned" => " (both from the earlier jobs of this command)",
+            // A job of a fan-out learns against its template, so its claim can
+            // come from a different line of an earlier run. Do not say `this
+            // command`: the command of this job can have no measurement at all.
+            "fan-out" => " (both from the earlier jobs of this fan-out)",
+            "default" => " (the default; give --cpu and --mem to change it)",
+            _ => "",
+        };
+        return format!("{cores}, {mem}{note}");
+    }
+
+    let note = |source: &str, option: &str| match source {
+        "learned" => " (from the earlier jobs of this command)".to_string(),
+        "fan-out" => " (from the earlier jobs of this fan-out)".to_string(),
+        "default" => format!(" (the default; give {option} to change it)"),
+        _ => String::new(),
+    };
+    format!(
+        "{cores}{}, {mem}{}",
+        note(&s.cpu_source, "--cpu"),
+        note(&s.mem_source, "--mem")
+    )
+}
+
 fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     println!("id:        {}", s.id);
     println!("name:      {}", s.name);
@@ -1211,22 +1263,7 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
     if let Some(sig) = s.signal {
         println!("signal:    {sig}");
     }
-    println!(
-        "claim:     {} core(s), {}{}",
-        s.cpu,
-        format_size(s.mem),
-        match s.claim_source.as_str() {
-            // Say where the claim came from. A reader then knows that qex
-            // calculated it from the earlier jobs, and that no agent chose it.
-            "learned" => "  (from the earlier jobs of this command)",
-            // A job of a fan-out learns against its template, so its claim can
-            // come from a different line of an earlier run. Do not say `this
-            // command`: the command of this job can have no measurement at all.
-            "fan-out" => "  (from the earlier jobs of this fan-out)",
-            "default" => "  (the default; give --cpu and --mem to change it)",
-            _ => "",
-        }
-    );
+    println!("claim:     {}", claim_text(s));
 
     // The chain of the submitter, with the point where the session ends.
     // `qex abort` acts on the part below that point; see the `context`
@@ -1312,16 +1349,16 @@ fn print_status(s: &JobStatus, show_env: bool) -> Result<()> {
         let mut parts = Vec::new();
         if d.stdout_bytes > 0 {
             parts.push(format!(
-                "{} ({} line(s)) from stdout",
+                "{} ({}) from stdout",
                 format_size(d.stdout_bytes),
-                d.stdout_lines
+                count_of(d.stdout_lines as usize, "line")
             ));
         }
         if d.stderr_bytes > 0 {
             parts.push(format!(
-                "{} ({} line(s)) from stderr",
+                "{} ({}) from stderr",
                 format_size(d.stderr_bytes),
-                d.stderr_lines
+                count_of(d.stderr_lines as usize, "line")
             ));
         }
         if !parts.is_empty() {
@@ -1659,8 +1696,9 @@ fn warn_about_the_jobs_that_stay(args: &cli::WaitArgs, ids: &[String], done: &st
     }
     let names = rest.join(" ");
     eprintln!(
-        "qex: {} job(s) did not stop, and no command watches them now. Wait again:",
-        rest.len()
+        "qex: {} did not stop, and no command watches {} now. Wait again:",
+        count_of(rest.len(), "job"),
+        if rest.len() == 1 { "it" } else { "them" }
     );
     eprintln!("qex:   qex wait --next {names}");
 }
@@ -2182,7 +2220,7 @@ fn pipeline_dependency(
         }
         if all_stopped {
             bail!(
-                "{option}: the name `{name}` gives a pipeline of {} stage(s), and every \
+                "{option}: the name `{name}` gives a pipeline of {}, and every \
                  stage already stopped.\n\n\
                  A name can give a pipeline of an earlier run. Did you forget to start a \
                  new `{name}` pipeline?\n\n\
@@ -2190,7 +2228,7 @@ fn pipeline_dependency(
                  \x20   GROUP=$(qex pipeline your-file)\n\
                  \x20   qex submit {option} $GROUP -- ...\n\n\
                  A group id always names one run, so qex accepts it whatever its state.",
-                stages.len()
+                count_of(stages.len(), "stage")
             );
         }
     }
@@ -3521,7 +3559,7 @@ fn group_targets(by_group: &[&JobStatus], raw: &str) -> Result<Targets> {
             .iter()
             .map(|g| {
                 let count = by_group.iter().filter(|j| j.group == Some(*g)).count();
-                format!("  {g}  {count} stage(s)")
+                format!("  {g}  {}", count_of(count, "stage"))
             })
             .collect();
         bail!(
@@ -3680,9 +3718,9 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
         return Ok(found.ids[0]);
     }
     bail!(
-        "`{raw}` is a pipeline of {} job(s), and this command takes one job. Name \
+        "`{raw}` is a pipeline of {}, and this command takes one job. Name \
          the stage that you want:\n{}",
-        found.ids.len(),
+        count_of(found.ids.len(), "job"),
         found
             .ids
             .iter()
@@ -4003,7 +4041,7 @@ fn event_text(event: &crate::events::Event) -> String {
             "{}  GAP: {}. {reason}",
             crate::sys::clock_text(*time),
             match missed {
-                Some(n) => format!("qex lost {n} event(s)"),
+                Some(n) => format!("qex lost {}", count_of(*n as usize, "event")),
                 None => "qex cannot count the events that you lost".to_string(),
             }
         ),
@@ -4078,11 +4116,12 @@ pub fn queue_line(info: &Response) -> String {
     match state.as_str() {
         "running" => format!("queue: running · {started} · {counts}"),
         "held" => format!(
-            "queue: held for the job {} · {} job(s) started before it · {started} · {counts}",
+            "queue: held for the job {} · {} started before it · {started} · {counts}",
             head_job.clone().unwrap_or_else(|| "unknown".into()),
+            // With no count, the words `unknown jobs` would name a kind of job.
             head_passed_by
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "unknown".into()),
+                .map(|n| count_of(n as usize, "job"))
+                .unwrap_or_else(|| "an unknown number of jobs".into()),
         ),
         "waits-for-peer" => format!(
             "queue: waits for another user · {started} · {} {} cores and {}{front}",
@@ -4252,9 +4291,9 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             // waits name the same numbers.
             match &health {
                 Some(h) if h.peer_cpu > 0 || h.peer_mem > 0 => println!(
-                    "other users:     {} coordinator(s) with {} cores and {}",
-                    h.peer_count,
-                    h.peer_cpu,
+                    "other users:     {} with {} and {}",
+                    count_of(h.peer_count, "coordinator"),
+                    count_of(h.peer_cpu as usize, "core"),
                     format_size(h.peer_mem)
                 ),
                 Some(_) => println!("other users:     none"),
@@ -4493,11 +4532,21 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
             if !(json || args.json) {
                 let running = jobs_running(&mut client).unwrap_or(0);
                 if running > 0 {
-                    println!(
-                        "{running} job(s) still operate. They continue, because each one already \
-                         holds its capacity. Use `qex pause queue --drain` to wait for them, or \
-                         `qex kill <id>` to stop one."
-                    );
+                    // The singular and the plural are separate texts. ASD-STE100
+                    // does not accept `job(s)`.
+                    if running == 1 {
+                        println!(
+                            "1 job still operates. It continues, because it already holds its \
+                             capacity. Use `qex pause queue --drain` to wait for it, or \
+                             `qex kill <id>` to stop it."
+                        );
+                    } else {
+                        println!(
+                            "{running} jobs still operate. They continue, because each one \
+                             already holds its capacity. Use `qex pause queue --drain` to wait \
+                             for them, or `qex kill <id>` to stop one."
+                        );
+                    }
                 }
             }
             Ok(code)
@@ -4741,11 +4790,7 @@ pub fn pipeline(args: cli::PipelineArgs) -> Result<i32> {
                 submitted.push((stage.name.clone(), given));
             }
             other => {
-                eprintln!(
-                    "qex: the stage `{}` was refused. The stages before it are in the queue; \
-                     use `qex cancel --group {group}` to remove them.",
-                    stage.name
-                );
+                eprintln!("{}", stage_refused_text(&stage.name, group));
                 let _ = id;
                 return report_for_a_job(other);
             }
@@ -5984,6 +6029,18 @@ fn resolve_directory(path: &std::path::Path, option: &str) -> Result<std::path::
         .with_context(|| format!("{option}: the directory {} does not exist", path.display()))
 }
 
+/// Says that the coordinator refused one stage of a pipeline, with the remedy.
+///
+/// The remedy is a command that the reader types, so it must be a command that
+/// qex accepts. `qex cancel` takes ids, and a group id gives every stage of the
+/// pipeline. It has no `--group` option.
+fn stage_refused_text(stage: &str, group: uuid::Uuid) -> String {
+    format!(
+        "qex: the stage `{stage}` was refused. The stages before it are in the queue; \
+         use `qex cancel {group}` to remove them."
+    )
+}
+
 /// Collects the old records of every directory.
 ///
 /// `qex clean --auto` works on one directory tree and on one hour, for a user
@@ -6075,7 +6132,12 @@ pub fn gc(args: cli::GcArgs) -> Result<i32> {
                     "id": id.to_string(), "name": name
                 })).collect::<Vec<_>>(),
                 "directories_with_no_record": orphans.len(),
-                "kept_because_a_job_needs_them": held_back,
+                // The key says what qex tested, and nothing more. A record stays
+                // because a job waits for it, OR because its pipeline has work
+                // left; the second is not a job that needs the record. An
+                // agent parses this key, so a key that names a need sends the
+                // agent to look for a job that does not exist.
+                "kept_because_work_has_not_stopped": held_back,
                 "bytes": bytes,
             }))?
         );
@@ -6378,6 +6440,8 @@ mod tests {
             cpu: 1,
             mem: 1 << 30,
             claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
             group: None,
             group_name: None,
             usage: Usage::default(),
@@ -6553,12 +6617,89 @@ mod tests {
 
         let err = resolve_targets_in(&jobs, "ci").unwrap_err().to_string();
         assert!(
-            err.contains(&format!("{big}  3 stage(s)")),
+            err.contains(&format!("{big}  3 stages")),
             "the run of three stages must show 3: {err}"
         );
         assert!(
-            err.contains(&format!("{small}  1 stage(s)")),
-            "the run of one stage must show 1: {err}"
+            // The END of the line, so that `1 stages` does not pass.
+            err.lines()
+                .any(|line| line.ends_with(&format!("{small}  1 stage"))),
+            "the run of one stage must show `1 stage`: {err}"
+        );
+    }
+
+    /// The remedy for a stage that qex refused is a command that qex accepts.
+    ///
+    /// The fault: the text named `qex cancel --group <id>`, and `qex cancel` has
+    /// no such option, so the reader could not type the remedy.
+    #[test]
+    fn the_remedy_for_a_refused_stage_is_a_command_that_exists() {
+        use clap::Parser;
+        let group = uuid::Uuid::new_v4();
+        let text = stage_refused_text("test", group);
+        let remedy = text
+            .split('`')
+            .find(|part| part.starts_with("qex "))
+            .expect("the text must give a command");
+        assert_eq!(remedy, format!("qex cancel {group}"));
+        let cli = cli::Cli::try_parse_from(remedy.split_whitespace())
+            .unwrap_or_else(|e| panic!("qex must accept its own remedy `{remedy}`: {e}"));
+        let Some(cli::Command::Cancel(args)) = cli.command else {
+            panic!("`{remedy}` must be the command `cancel`");
+        };
+        // The group id must be an ID of the command, and not the value of an
+        // option.
+        assert_eq!(args.ids, vec![group.to_string()]);
+    }
+
+    /// The note about a claim goes beside the value that qex chose.
+    ///
+    /// The fault: a person gave `--cpu 10`, qex learned the memory, and the
+    /// line ended with one note for the whole claim. The person read that qex
+    /// learned the 10 cores also.
+    #[test]
+    fn the_note_about_a_claim_covers_the_value_that_qex_chose_only() {
+        let mut s = status_with(JobState::Queued, None);
+        s.cpu = 10;
+        s.mem = 512 << 20;
+        s.claim_source = "learned".into();
+        s.cpu_source = "explicit".into();
+        s.mem_source = "learned".into();
+        assert_eq!(
+            claim_text(&s),
+            "10 cores, 512MB (from the earlier jobs of this command)"
+        );
+
+        // The other half: the note follows the cores, and not the memory.
+        s.cpu = 1;
+        s.cpu_source = "default".into();
+        s.mem_source = "explicit".into();
+        assert_eq!(
+            claim_text(&s),
+            "1 core (the default; give --cpu to change it), 512MB"
+        );
+
+        // One note for two values says that it covers the two.
+        s.cpu_source = "fan-out".into();
+        s.mem_source = "fan-out".into();
+        assert_eq!(
+            claim_text(&s),
+            "1 core, 512MB (both from the earlier jobs of this fan-out)"
+        );
+
+        // A value that the person gave has no note.
+        s.cpu_source = "explicit".into();
+        s.mem_source = "explicit".into();
+        assert_eq!(claim_text(&s), "1 core, 512MB");
+
+        // A record of an earlier qex does not say which value qex learned, so
+        // the note must not say it either.
+        s.cpu_source = String::new();
+        s.mem_source = String::new();
+        assert_eq!(
+            claim_text(&s),
+            "1 core, 512MB (qex learned one value or both from the earlier jobs of this \
+             command)"
         );
     }
 

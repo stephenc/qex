@@ -419,9 +419,13 @@ fn paint_once(
             out.push('\n');
         }
     }
-    if hidden > 0 {
+    // The singular and the plural are separate texts. ASD-STE100 does not
+    // accept `job(s)`.
+    if hidden == 1 {
+        out.push_str("\n1 more job that stopped is not shown. Use `qex list`.\n");
+    } else if hidden > 1 {
         out.push_str(&format!(
-            "\n{hidden} more job(s) that stopped are not shown. Use `qex list`.\n"
+            "\n{hidden} more jobs that stopped are not shown. Use `qex list`.\n"
         ));
     }
     out.push_str(&crate::style::faint(
@@ -1439,6 +1443,8 @@ mod tests {
             cpu,
             mem,
             claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
             group: None,
             group_name: None,
             usage: Usage::default(),

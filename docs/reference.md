@@ -234,6 +234,14 @@ The clock starts at the submission. A coordinator that stops and starts again
 continues the same count, so a restart does not give a queued job a new full
 wait.
 
+**The count includes the time that the machine was off.** Only a pause of the
+queue comes off it. A job with a limit of one hour, on a machine that was off for
+two hours, becomes `expired` when the next coordinator starts, and it never had
+a place to start in. For work that must run after a restart of the machine, give
+no limit, or a limit that covers the restart.
+[The design page](design.md#after-the-machine-restarts) says what a restart does
+to each state.
+
 **qex counts the wait in whole seconds.** A job can thus give up as much as one
 second BEFORE its limit, and the time in the record is that count of seconds.
 Give a limit of a minute or more, where one second changes nothing. With a limit
@@ -854,7 +862,7 @@ The last line answers the question:
 ```
 queue: running · last start 8s ago · 2 running, 5 queued
 queue: waits for another user · no job started for 42m · 1 other user holds 6 cores and 16GB · the job at the front is a1b2c3d4 (train)
-queue: held for the job a1b2c3d4 (train) · 2 job(s) started before it · no job started for 12s · 0 running, 3 queued
+queue: held for the job a1b2c3d4 (train) · 2 jobs started before it · no job started for 12s · 0 running, 3 queued
 ```
 
 The queue is healthy when a job started recently, **or** when the line names a
@@ -1324,9 +1332,11 @@ fan-out gets its claim from the first run. Without this rule a fan-out of 1000
 lines would add 1000 records that no later job can use.
 
 The record keeps the largest measurement, so the claim goes to the size of the
-largest line. `qex status` says `(from the earlier jobs of this fan-out)` for
-such a claim, and not `(from the earlier jobs of this command)`: the command of
-one line can have no measurement at all.
+largest line. The note in `qex status` for such a claim says `from the earlier
+jobs of this fan-out`, and not `from the earlier jobs of this command`: the
+command of one line can have no measurement at all. The note starts with `both`
+when qex learned the cores and the memory, for example
+`claim: 1 core, 512MB (both from the earlier jobs of this fan-out)`.
 
 `--id-file` writes the group id and the id of each job. A name that ends in
 `.json` gives a JSON object.
@@ -1410,6 +1420,10 @@ max_bypass = 2                # jobs that may start before the job at the front
 
 [logs]
 max_bytes = "32MB"    # the output that qex keeps for each stream of each job
+
+[gc]
+keep = "1d"           # the age of a record that `qex gc` deletes, WHEN YOU RUN
+                      # IT. qex removes no record by itself; see the design page
 
 [defaults]
 cpu = 1               # the default is 1 core
@@ -1814,7 +1828,7 @@ qex keeps **both ends** of the output:
 ```
 line 1                        <- the head: the start-up and the configuration
 ...
-[qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+[qex] ---- 361MB and 4201177 lines of the output are not in this file ----
 [qex] The limit is `[logs] max_bytes` = 32MB. qex kept the first 8MB and the
       last 24MB. To keep more, make max_bytes larger.
 ...

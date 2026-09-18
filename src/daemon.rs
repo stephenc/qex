@@ -1294,7 +1294,10 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     state.publish_changes();
 
     if recovered > 0 {
-        log(&format!("the coordinator read {recovered} job record(s)"));
+        log(&format!(
+            "the coordinator read {}",
+            crate::units::count_of(recovered, "job record")
+        ));
     }
     Ok(())
 }
@@ -2478,6 +2481,8 @@ mod tests {
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
             claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
             group: None,
             group_name: None,
             locks: vec![],

@@ -639,7 +639,8 @@ pub struct GcArgs {
     /// Delete a record that stopped before this time.
     ///
     /// The default comes from `[gc] keep` in the config file, and that default
-    /// is one day.
+    /// is one day. qex removes no record by itself: that value does nothing
+    /// until you run this command.
     #[arg(long, value_name = "TIME")]
     pub older_than: Option<String>,
 
@@ -1204,6 +1205,86 @@ mod tests {
                 arg.get_id()
             );
         }
+    }
+
+    /// The topic must steer staged work away from a shell script.
+    ///
+    /// Two measured faults lived in a script that chained `qex submit --wait`
+    /// calls, and not in a job: a merge stage ran on the files of an earlier
+    /// run, because the script did not test the exit code of a wait, and a
+    /// change to the script stopped five chains that a shell still read.
+    #[test]
+    fn the_agents_topic_steers_staged_work_to_a_pipeline() {
+        let text = crate::help::AGENTS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("DO NOT WRITE A SHELL SCRIPT THAT DOES THE WAITS"),
+            "the topic must say what not to do"
+        );
+        assert!(
+            text.contains("run `qex pipeline ci.toml`"),
+            "the topic must name the command to use"
+        );
+        assert!(
+            text.contains("becomes `skipped`, with the code 126"),
+            "the topic must say what qex does when a stage fails"
+        );
+    }
+
+    /// The states topic must say what a restart of the machine does.
+    ///
+    /// A reader who comes back after a restart finds `running` in the record of
+    /// a job that no process runs, and an `expired` job that never had a place
+    /// to start in. The source was the only page that explained the two.
+    #[test]
+    fn the_states_topic_says_what_a_restart_of_the_machine_does() {
+        let text = crate::help::STATES
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for words in [
+            "A job that was `queued` stays `queued`",
+            "A job that was `running` becomes `failed`",
+            "`--max-queue-time` COUNTS THE TIME THAT THE MACHINE WAS OFF",
+            "the record on the disk still says `running`",
+            // The command that makes the correction happen.
+            "run `qex list`. It starts a coordinator",
+        ] {
+            assert!(text.contains(words), "the topic must say: {words}");
+        }
+    }
+
+    /// Each help page that names `[gc] keep` must say that qex deletes nothing
+    /// by itself. The word `keep` in a config file reads as a rule that
+    /// something applies, and the first sign of the truth was a full disk.
+    #[test]
+    fn the_help_says_that_qex_removes_no_record_by_itself() {
+        for (name, page) in [
+            ("config", crate::help::CONFIG),
+            ("output", crate::help::OUTPUT),
+        ] {
+            let text = page
+                .split_whitespace()
+                .filter(|word| *word != "#")
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            assert!(
+                text.contains("[gc] keep"),
+                "this test reads the pages that name `[gc] keep`, and `{name}` does not"
+            );
+            assert!(
+                text.contains("qex removes no record by itself"),
+                "the topic `{name}` names `[gc] keep`, so it must say that qex removes no \
+                 record by itself"
+            );
+        }
+        assert!(
+            crate::help::OUTPUT.contains("qex du"),
+            "the topic must give the command that shows the size"
+        );
     }
 
     /// The topic must show the pattern that operates inside a harness.

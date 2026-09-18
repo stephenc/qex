@@ -335,6 +335,16 @@ pub struct JobSpec {
     /// Where the claim came from: `explicit`, `learned` or `default`.
     #[serde(default)]
     pub claim_source: String,
+    /// Where the number of cores came from, with the same words as
+    /// `claim_source`. `claim_source` says `learned` when qex learned one value
+    /// only, so it cannot say which value the person gave.
+    ///
+    /// The value is empty in a record of a qex that did not write it.
+    #[serde(default)]
+    pub cpu_source: String,
+    /// Where the memory claim came from. See `cpu_source`.
+    #[serde(default)]
+    pub mem_source: String,
     /// The pipeline that this job belongs to, when one command submitted
     /// several jobs together.
     #[serde(default)]
@@ -591,15 +601,23 @@ impl JobSpec {
         }
         let learned = learned;
 
+        // `source` is one word for the whole claim, and it says `learned` when
+        // qex learned ONE value. `cpu_source` and `mem_source` say it for each
+        // value, so `qex status` can put its note beside the value that qex
+        // chose and give no note to the value that the person gave.
         let mut source = "default";
+        let mut cpu_source = "default";
+        let mut mem_source = "default";
         let cpu = match asked_cpu {
             Some(c) => {
                 source = "explicit";
+                cpu_source = "explicit";
                 c.cores(cfg)
             }
             None => match &learned {
                 Some(s) => {
                     source = "learned";
+                    cpu_source = "learned";
                     s.cpu
                 }
                 None => cfg.default_cpu()?,
@@ -611,11 +629,13 @@ impl JobSpec {
                 if source != "learned" {
                     source = "explicit";
                 }
+                mem_source = "explicit";
                 c.bytes(cfg)
             }
             None => match &learned {
                 Some(s) => {
                     source = "learned";
+                    mem_source = "learned";
                     s.mem
                 }
                 None => cfg.default_mem()?,
@@ -685,6 +705,13 @@ impl JobSpec {
         // own command that is not true.
         if source == "learned" && learn_key.is_some() {
             source = "fan-out";
+        }
+        if learn_key.is_some() {
+            for one in [&mut cpu_source, &mut mem_source] {
+                if *one == "learned" {
+                    *one = "fan-out";
+                }
+            }
         }
 
         // Collect the pool claims: the job file first, then the command line.
@@ -901,6 +928,8 @@ impl JobSpec {
                 priority: opts.priority.or(file.priority).unwrap_or(0),
                 env_capture: capture,
                 claim_source: source.to_string(),
+                cpu_source: cpu_source.to_string(),
+                mem_source: mem_source.to_string(),
                 group: None,
                 group_name: None,
                 locks: {
@@ -1597,6 +1626,25 @@ mod tests {
             budget,
             "a learned claim must stop at the budget, and it was {}",
             crate::units::format_size(spec.mem)
+        );
+        assert_eq!(
+            (spec.cpu_source.as_str(), spec.mem_source.as_str()),
+            ("learned", "learned"),
+            "qex learned the two values"
+        );
+
+        // A PERSON WHO GIVES ONE VALUE GAVE THAT VALUE. `claim_source` says
+        // `learned` for this job, because one word cannot hold two answers, and
+        // `qex status` then told a person who gave `--cpu 2` that qex learned
+        // the 2 cores.
+        let mut one_value = opts(&["train-at-the-budget"]);
+        one_value.cpu = Some(crate::claim::Claim::parse("2", false).unwrap());
+        let spec = JobSpec::resolve(&one_value, &cfg).unwrap();
+        assert_eq!(spec.claim_source, "learned");
+        assert_eq!(
+            (spec.cpu_source.as_str(), spec.mem_source.as_str()),
+            ("explicit", "learned"),
+            "the person gave the cores, and qex learned the memory only"
         );
 
         std::fs::remove_dir_all(&home).ok();
