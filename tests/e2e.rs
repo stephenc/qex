@@ -17564,3 +17564,191 @@ fn an_abort_does_not_count_a_cancel_that_did_not_reach_the_disk() {
     let record: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(record["state"], "queued", "the disk agrees with the memory");
 }
+
+/// Gives the two streams of a command that must end with 124.
+fn streams_of_a_wait_at_its_limit(h: &Harness, args: &[&str]) -> (String, String) {
+    let out = h.qex_within(args, Duration::from_secs(60));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "`qex {}` must reach the limit of the reader: {stderr}",
+        args.join(" ")
+    );
+    (stdout, stderr)
+}
+
+/// A wait that ends at the limit of the reader gives the record, and it
+/// reports no limit that it never waited for.
+///
+/// The limit of the reader spans the command, so the wait for the job uses all
+/// of it. The read of the record then got a deadline in the past: qex asked a
+/// coordinator that ANSWERED nothing at all, reported "no answer in 1 seconds",
+/// sent the reader to the log of the coordinator, and lost the record.
+///
+/// The hint must carry the limit also. A reader gives a limit because its
+/// harness has one, and a hint with no limit sends it to a wait with no end.
+#[test]
+fn a_wait_at_the_limit_of_the_reader_gives_the_record_and_the_same_limit() {
+    let h = Harness::with_default_config("waitlimitrecord");
+    let id = h.ok(&["submit", "--", "sleep", "30"]);
+    let id = id.trim();
+
+    let (stdout, stderr) =
+        streams_of_a_wait_at_its_limit(&h, &["status", id, "--wait", "--timeout", "1s"]);
+    assert!(
+        !stderr.contains("gave no answer") && !stderr.contains("qex info --no-start"),
+        "the coordinator answered, so no message may say that it did not: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("qex status {id} --wait --timeout 1s")),
+        "the hint must carry the limit of the reader: {stderr}"
+    );
+    assert!(
+        stdout.contains(id) && stdout.contains("state:"),
+        "the reader asked for the record, and the record exists: {stdout}"
+    );
+
+    // `qex wait` writes one line for each job that stopped, and none stopped.
+    let (_, stderr) = streams_of_a_wait_at_its_limit(&h, &["wait", id, "--timeout", "1s"]);
+    assert!(
+        stderr.contains(&format!("qex status {id} --wait --timeout 1s")),
+        "the hint of `qex wait` must carry the limit of the reader: {stderr}"
+    );
+
+    // `--follow` asks for the state of the job in each step. A step after the
+    // limit asks nothing, and that is not a coordinator that stopped.
+    let (_, stderr) =
+        streams_of_a_wait_at_its_limit(&h, &["status", id, "--follow", "--timeout", "1s"]);
+    assert!(
+        !stderr.contains("the coordinator stopped"),
+        "the coordinator operates, so no message may say that it stopped: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("qex status {id} --follow --timeout 1s")),
+        "the hint of `--follow` must carry the limit of the reader: {stderr}"
+    );
+
+    // `--next` names its own command again.
+    let (_, stderr) =
+        streams_of_a_wait_at_its_limit(&h, &["wait", "--next", id, "--timeout", "1s"]);
+    assert!(
+        stderr.contains(&format!("qex wait --next {id} --timeout 1s")),
+        "the hint of `--next` must carry the limit of the reader: {stderr}"
+    );
+
+    h.ok(&["kill", id]);
+}
+
+/// `qex submit --wait` gives the record and the same limit at the limit of the
+/// reader, in the same way as `qex status --wait`.
+#[test]
+fn a_submit_that_waits_gives_the_record_and_the_same_limit() {
+    let h = Harness::with_default_config("submitlimitrecord");
+    let (stdout, stderr) = streams_of_a_wait_at_its_limit(
+        &h,
+        &[
+            "submit",
+            "--wait",
+            "--wait-timeout",
+            "1s",
+            "--",
+            "sleep",
+            "30",
+        ],
+    );
+    assert!(
+        !stderr.contains("gave no answer"),
+        "the coordinator answered, so no message may say that it did not: {stderr}"
+    );
+    assert!(
+        stderr.contains("--wait --timeout 1s"),
+        "the hint must carry the limit of the reader: {stderr}"
+    );
+    assert!(
+        stdout.contains("state:"),
+        "the reader asked for the record, and the record exists: {stdout}"
+    );
+    // Stop the job, so that it does not hold the machine after the test.
+    h.qex(&["abort", "--all"]);
+}
+
+/// `qex events` names the limit that ended it.
+///
+/// The code 124 alone says nothing about the limit that the reader gave, and a
+/// stream that ends with no word looks like a coordinator that stopped.
+#[test]
+fn an_event_stream_names_the_limit_that_ended_it() {
+    let h = Harness::with_default_config("eventslimit");
+    h.ok(&["info"]);
+    let (_, stderr) = streams_of_a_wait_at_its_limit(&h, &["events", "--timeout", "1s"]);
+    assert!(
+        stderr.contains("reached your time limit of 1s"),
+        "the message must name the limit of the reader: {stderr}"
+    );
+    assert!(
+        !stderr.contains("asked the coordinator nothing more"),
+        "the state of a connection is no cause that a reader can act on: {stderr}"
+    );
+}
+
+/// A limit that passed takes no result away from a job that stopped.
+///
+/// The limit spans the command, so it can pass before the wait for a job
+/// begins: the wait for an earlier job used it. A job that stopped has a
+/// result on the disk, and the command gives it, with the code of the job and
+/// not 124.
+#[test]
+fn a_limit_that_passed_gives_the_result_of_a_job_that_stopped() {
+    let h = Harness::with_default_config("waitlimitresult");
+    let id = h.ok(&["submit", "--", "sh", "-c", "exit 7"]);
+    let id = id.trim();
+    h.qex_within(&["wait", id], Duration::from_secs(60));
+
+    // One millisecond passes before the command reaches its wait.
+    let out = h.qex_within(
+        &["wait", id, "--timeout", "0.001s"],
+        Duration::from_secs(60),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "the job has a result, so the limit ends no wait: {stderr}"
+    );
+    assert!(
+        !stderr.contains("continues"),
+        "a job that stopped does not continue: {stderr}"
+    );
+}
+
+/// A coordinator that gave no answer for the whole limit is named as that,
+/// also when the first caller drops the error.
+///
+/// `qex events` asks for the version as a courtesy and drops the error of that
+/// question. The next question then finds the limit spent. It must not say
+/// that qex waited no time: the reader then loses the one fact that is true,
+/// and the remedy for it.
+#[test]
+fn a_silent_coordinator_is_named_when_it_used_the_limit() {
+    let h = Harness::with_default_config("eventssilent");
+    let pid = h.coordinator_pid();
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let out = h.qex_within(&["events", "--timeout", "2s"], Duration::from_secs(60));
+    unsafe { libc::kill(pid, libc::SIGCONT) };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(124), "{stderr}");
+    assert!(
+        stderr.contains("gave no answer in") && stderr.contains("qex info --no-start"),
+        "the coordinator gave no answer, and the message must say so: {stderr}"
+    );
+    assert!(
+        !stderr.contains("waited no time"),
+        "qex waited the whole limit for the coordinator: {stderr}"
+    );
+    assert!(
+        stderr.lines().all(|line| !line.starts_with(' ')) && !stderr.contains("  "),
+        "the message must have whole lines: {stderr:?}"
+    );
+}

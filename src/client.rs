@@ -89,8 +89,34 @@ fn step_of_a_wait() -> Duration {
 /// This is the ONE value that belongs to the whole command, because the reader
 /// asked for the whole command: `--timeout 5s` means five seconds of command.
 /// It is `None` when the reader gave no limit.
-static READER_DEADLINE: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
+static READER_DEADLINE: std::sync::OnceLock<std::sync::Mutex<Option<ReaderLimit>>> =
     std::sync::OnceLock::new();
+
+/// The limit that the reader gave for the whole command.
+#[derive(Clone, Copy)]
+struct ReaderLimit {
+    /// The moment at which the command must stop.
+    ends: Instant,
+    /// The time that the reader wrote. A message that names the limit gives
+    /// this value, so the reader knows their own number again.
+    gave: Duration,
+    /// The time that qex gave to the read of the record, when `ends` is the
+    /// end of that time and no longer the end of `gave`. A message must then
+    /// name this time: the number of the reader did not end a wait that began
+    /// after it passed. See `give_the_record_its_own_time`.
+    record_allowance: Option<Duration>,
+}
+
+/// The first message of this command about a coordinator that gave no answer
+/// inside a limit.
+///
+/// A caller can drop that error, because the answer was a courtesy to it. The
+/// silent coordinator used the limit of the reader all the same, and the next
+/// operation then finds the limit spent. That operation must not say that qex
+/// waited no time: qex waited the whole limit, and this text holds the fact and
+/// the remedy that the reader needs.
+static A_COORDINATOR_THAT_DID_NOT_ANSWER: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
 
 /// Says whether qex said already that it still waits.
 ///
@@ -98,7 +124,7 @@ static READER_DEADLINE: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
 /// line for each of them teaches the reader to read none of them.
 static SAID_IT_WAITS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn reader_deadline() -> &'static std::sync::Mutex<Option<Instant>> {
+fn reader_deadline() -> &'static std::sync::Mutex<Option<ReaderLimit>> {
     READER_DEADLINE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
@@ -146,10 +172,156 @@ fn ceiling() -> Duration {
 fn deadline_for_one_wait() -> Instant {
     let mine = Instant::now() + ceiling();
     match *reader_deadline().lock().unwrap_or_else(|e| e.into_inner()) {
-        Some(asked) if asked < mine => asked,
+        Some(asked) if asked.ends < mine => asked.ends,
         _ => mine,
     }
 }
+
+/// Gives the limit of the reader when that limit passed already.
+///
+/// # A wait that takes no time is not a wait
+///
+/// The limit of the reader spans the command, so it can pass while the command
+/// does something else: the wait for a job uses all of it, by design. The next
+/// operation then gets a deadline in the past. It asked the coordinator
+/// nothing and waited no time, so it must not report "no answer in N seconds":
+/// the coordinator answered every question that it got, and the reader then
+/// goes to a log that holds nothing. The operation says instead that the limit
+/// of the reader ended the command, and it names that limit.
+fn spent_limit_of_the_reader() -> Option<ReaderLimit> {
+    match *reader_deadline().lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(asked) if asked.ends <= Instant::now() => Some(asked),
+        _ => None,
+    }
+}
+
+/// Writes a time in seconds, and never more than the time that passed.
+///
+/// A floor of one second made a wait of no time read as "1 seconds". A reader
+/// uses this number to decide which limit ended the command, so it must be the
+/// number that qex measured.
+fn seconds(time: Duration) -> String {
+    if time >= Duration::from_secs(10) {
+        format!("{} seconds", time.as_secs())
+    } else {
+        format!("{:.1} seconds", time.as_secs_f64())
+    }
+}
+
+/// Writes the limit of the reader in the form that `--timeout` reads.
+fn as_the_reader_gave(limit: Duration) -> String {
+    if limit.subsec_nanos() == 0 {
+        format!("{}s", limit.as_secs())
+    } else {
+        format!("{}s", limit.as_secs_f64())
+    }
+}
+
+/// Names the limit that ended a wait for the coordinator.
+///
+/// A message that names a limit is the evidence of the reader about which
+/// limit ended their command: their own number, or the ceiling of qex.
+fn the_limit_that_ended_it() -> String {
+    name_the_limit(spent_limit_of_the_reader())
+}
+
+/// Writes the sentence of `the_limit_that_ended_it` for a limit that passed.
+fn name_the_limit(spent: Option<ReaderLimit>) -> String {
+    match spent {
+        // The number of the reader ended the wait for the JOB. This wait began
+        // after that, in a time that qex gave, so that time is the limit that
+        // ended it. To name the number of the reader here says that a wait of
+        // five seconds ended at a limit of three.
+        Some(ReaderLimit {
+            gave,
+            record_allowance: Some(allowance),
+            ..
+        }) => format!(
+            "Your time limit of {} ended the wait for the job before this. qex gave the \
+             record {} more, and that time ended this wait.",
+            as_the_reader_gave(gave),
+            seconds(allowance)
+        ),
+        Some(limit) => format!(
+            "Your time limit of {} ended this wait.",
+            as_the_reader_gave(limit.gave)
+        ),
+        None => "qex waits no longer than that for one answer of the coordinator.".to_string(),
+    }
+}
+
+/// The error of an operation that began after the limit of the reader passed.
+///
+/// `what` names the thing that qex did NOT do, as a verb phrase: "ask the
+/// coordinator".
+fn the_reader_limit_passed(spent: ReaderLimit, what: &str) -> anyhow::Error {
+    let earlier = A_COORDINATOR_THAT_DID_NOT_ANSWER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    anyhow::Error::new(ReaderLimitPassed {
+        message: a_passed_limit(spent.gave, what, earlier.as_deref()),
+    })
+}
+
+/// Writes the message of `the_reader_limit_passed`.
+///
+/// `earlier` is the message of a wait of this command that a coordinator did
+/// not answer. With it, the limit did not pass while the command did its
+/// work: the silent coordinator used it. The reader then needs that fact and
+/// its remedy, and "qex waited no time" would hide both.
+fn a_passed_limit(gave: Duration, what: &str, earlier: Option<&str>) -> String {
+    let first = format!(
+        "your time limit of {} ended this command before qex could {what}.",
+        as_the_reader_gave(gave)
+    );
+    match earlier {
+        Some(earlier) => format!(
+            "{first}\n\
+             An earlier wait of this command used that limit: {earlier}"
+        ),
+        None => format!(
+            "{first}\n\
+             qex waited no time for the coordinator here, so this says nothing about \
+             the state of the coordinator.\n\
+             Run the command again with a longer time limit if you need the answer."
+        ),
+    }
+}
+
+/// Gives the record of a job a short time of its own.
+///
+/// # Why the limit of the reader does not cover the record
+///
+/// A wait that ends at the limit of the reader has used all of that limit. The
+/// reader still needs the record: the job continues, the record exists, and it
+/// is the state that the reader asked for. With the spent limit in place the
+/// read of the record got no time at all, and the command reported a broken
+/// coordinator in place of the record.
+///
+/// The record costs the coordinator no work, so a coordinator that operates
+/// answers in milliseconds. This allowance bounds a coordinator that does not
+/// answer, so the command still ends close to the limit of the reader.
+///
+/// A wait that ends with a RESULT a moment before the limit needs the same
+/// time: the job stopped, and the read of its record must not find the limit
+/// spent. So a caller asks for this after every wait, and not only after a
+/// wait that reached the limit.
+pub fn give_the_record_its_own_time() {
+    let mut held = reader_deadline().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(limit) = held.as_mut() {
+        // A limit with more time left than the allowance stays as it is: the
+        // record then has that time, and the number of the reader still holds.
+        let allowed = Instant::now() + RECORD_ALLOWANCE;
+        if limit.ends < allowed {
+            limit.ends = allowed;
+            limit.record_allowance = Some(RECORD_ALLOWANCE);
+        }
+    }
+}
+
+/// The time that the record gets after the limit of the reader ended the wait.
+const RECORD_ALLOWANCE: Duration = Duration::from_secs(5);
 
 /// Takes the limit of the READER for the whole command.
 ///
@@ -164,8 +336,14 @@ pub fn take_the_limit_of_the_reader(limit: Duration) {
     let asked = Instant::now() + limit;
     let mut held = reader_deadline().lock().unwrap_or_else(|e| e.into_inner());
     match *held {
-        Some(earlier) if earlier <= asked => {}
-        _ => *held = Some(asked),
+        Some(earlier) if earlier.ends <= asked => {}
+        _ => {
+            *held = Some(ReaderLimit {
+                ends: asked,
+                gave: limit,
+                record_allowance: None,
+            })
+        }
     }
 }
 
@@ -191,15 +369,15 @@ fn say_that_qex_still_waits(since: Instant, deadline: Instant, what: &str) {
     if reader_gave {
         eprintln!(
             "qex: still waiting for the coordinator: {what}. \
-             Your `--timeout` gives it {} seconds more.",
-            left.as_secs().max(1)
+             Your `--timeout` gives it {} more.",
+            seconds(left)
         );
     } else {
         eprintln!(
             "qex: still waiting for the coordinator: {what}. \
-             qex gives this answer {} seconds more, and `--timeout` gives the \
+             qex gives this answer {} more, and `--timeout` gives the \
              command a shorter limit.",
-            left.as_secs().max(1)
+            seconds(left)
         );
     }
 }
@@ -362,6 +540,14 @@ impl Client {
     /// can drive the limit without writing a value that every other test in the
     /// same program would then read.
     fn call_within(&mut self, request: &Request, deadline: Instant) -> Result<Response> {
+        // THE LIMIT OF THE READER PASSED BEFORE THIS QUESTION. Ask nothing, and
+        // say which limit ended the command. See `spent_limit_of_the_reader`.
+        // This test comes first: the state of the connection is a detail of
+        // qex, and the limit is the cause that the reader can act on. Nothing
+        // went to the coordinator, so the connection keeps its place.
+        if let Some(spent) = spent_limit_of_the_reader() {
+            return Err(the_reader_limit_passed(spent, "ask the coordinator"));
+        }
         if self.lost_its_place {
             return Err(timed_out(
                 "qex asked the coordinator nothing more on this connection.\n\
@@ -588,14 +774,53 @@ impl std::fmt::Display for CoordinatorTimeout {
 
 impl std::error::Error for CoordinatorTimeout {}
 
+/// The mark of an operation that began after the limit of the reader passed.
+///
+/// It is apart from [`CoordinatorTimeout`] because the two facts differ: here
+/// qex asked nothing and waited no time, so nothing is known about the
+/// coordinator. A caller that falls back when a coordinator is silent must be
+/// able to tell the two apart. Both give 124, because in both a limit ended
+/// the command.
+///
+/// The mark holds the whole message. qex writes an error with all of its
+/// causes on one line, so a message above a mark with words of its own gets
+/// those words after its last full stop.
+#[derive(Debug)]
+pub struct ReaderLimitPassed {
+    message: String,
+}
+
+impl std::fmt::Display for ReaderLimitPassed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ReaderLimitPassed {}
+
+/// Says whether an operation did nothing because the limit of the reader had
+/// passed already.
+pub fn is_a_passed_reader_limit(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReaderLimitPassed>().is_some()
+}
+
 /// Gives an error that carries the mark, so that the command answers 124.
 fn timed_out(message: String) -> anyhow::Error {
+    // Keep the FIRST message: it is the wait that used the limit. See
+    // `A_COORDINATOR_THAT_DID_NOT_ANSWER`.
+    A_COORDINATOR_THAT_DID_NOT_ANSWER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(|| message.clone());
     anyhow::Error::new(CoordinatorTimeout).context(message)
 }
 
 /// Says whether the limit for a coordinator ended this error.
+///
+/// A limit of the reader that passed before the operation counts also: the
+/// code 124 says that a limit ended the command, and that is what happened.
 pub fn is_a_coordinator_timeout(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<CoordinatorTimeout>().is_some()
+    error.downcast_ref::<CoordinatorTimeout>().is_some() || is_a_passed_reader_limit(error)
 }
 
 /// Says whether a read ended because it reached its own limit.
@@ -619,11 +844,12 @@ fn a_read_that_reached_its_limit(error: &anyhow::Error) -> bool {
 /// long queue meets this state and a short one does not.
 fn a_cut_answer(waited: Duration) -> String {
     format!(
-        "the coordinator began an answer and did not finish it in {} seconds.\n\
+        "the coordinator began an answer and did not finish it in {}. {}\n\
          The part that arrived is not a whole answer, so qex read none of it.\n\
          Run `qex info --no-start` to see whether it answers now, and read {} \
          for what it did.",
-        waited.as_secs().max(1),
+        seconds(waited),
+        the_limit_that_ended_it(),
         paths::daemon_log_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "the log of the coordinator".to_string())
@@ -641,10 +867,11 @@ fn a_cut_answer(waited: Duration) -> String {
 /// same from here.
 fn a_silent_coordinator(waited: Duration) -> String {
     format!(
-        "the coordinator took the request and gave no answer in {} seconds.\n\
+        "the coordinator took the request and gave no answer in {}. {}\n\
          Run `qex info --no-start` to see whether it answers now, and read {} \
          for what it did.",
-        waited.as_secs().max(1),
+        seconds(waited),
+        the_limit_that_ended_it(),
         paths::daemon_log_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "the log of the coordinator".to_string())
@@ -661,19 +888,24 @@ fn a_silent_coordinator(waited: Duration) -> String {
 fn try_connect(socket: &Path) -> Result<Option<UnixStream>> {
     // THIS WAIT STARTS NOW, as every wait for an answer does.
     let started = Instant::now();
+    // The limit of the reader passed before this connect, so qex probes
+    // nothing. See `spent_limit_of_the_reader`.
+    if let Some(spent) = spent_limit_of_the_reader() {
+        return Err(the_reader_limit_passed(spent, "connect to the coordinator"));
+    }
     let deadline = deadline_for_one_wait();
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             // The socket did not answer inside the limit. Say only that, and do
-            // NOT say that a process holds the socket: this path is also the
-            // one that a spent limit reaches, and qex probed nothing then.
+            // NOT say that a process holds the socket: qex cannot know it.
             return Err(timed_out(format!(
-                "the socket {} gave no answer in {} seconds.\n\
+                "the socket {} gave no answer in {}. {}\n\
                  Run `qex info --no-start` to see whether a coordinator answers, \
                  and read {} for what it did.",
                 socket.display(),
-                started.elapsed().as_secs().max(1),
+                seconds(started.elapsed()),
+                the_limit_that_ended_it(),
                 paths::daemon_log_path()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "the log of the coordinator".to_string())
@@ -1011,6 +1243,9 @@ impl SpawnLock {
         // arrives, and the caller tries again.
         // THIS WAIT STARTS NOW.
         let started = Instant::now();
+        // The limit of the reader passed before this wait. The first attempt
+        // below still runs, because a lock that is free costs no time.
+        let passed_before = spent_limit_of_the_reader();
         let deadline = deadline_for_one_wait();
         loop {
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -1024,16 +1259,23 @@ impl SpawnLock {
                 }
             }
             say_that_qex_still_waits(started, deadline, "the lock that guards a start");
+            if let Some(gave) = passed_before {
+                return Err(the_reader_limit_passed(
+                    gave,
+                    "wait for the lock that guards a start",
+                ));
+            }
             if Instant::now() >= deadline {
                 return Err(timed_out(format!(
-                    "a different qex command held the lock {} for {} seconds.\n\
+                    "a different qex command held the lock {} for {}. {}\n\
                      That lock covers the start of a coordinator, so this \
                      command waited for a start that did not finish.\n\
                      The kernel gives the lock back when the process that holds \
                      it stops, so the holder still operates.\n\
                      Run `qex info --no-start` to see whether a coordinator answers.",
                     path.display(),
-                    started.elapsed().as_secs().max(1)
+                    seconds(started.elapsed()),
+                    the_limit_that_ended_it()
                 )));
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1103,6 +1345,91 @@ mod tests {
             said.contains("question that you did not ask"),
             "the fault must say what it prevented: {said}"
         );
+    }
+
+    /// A time in a message is the time that qex measured. A floor of one
+    /// second made a wait of no time read as "1 seconds", and the reader then
+    /// took its own limit for a fault of the coordinator.
+    #[test]
+    fn a_time_in_a_message_has_no_floor() {
+        assert_eq!(seconds(Duration::ZERO), "0.0 seconds");
+        assert_eq!(seconds(Duration::from_millis(340)), "0.3 seconds");
+        assert_eq!(seconds(Duration::from_secs(1)), "1.0 seconds");
+        assert_eq!(seconds(Duration::from_secs(300)), "300 seconds");
+    }
+
+    /// The message of a limit that passed has whole lines: no line begins with
+    /// the indent of the source, and no run of spaces is in a sentence.
+    #[test]
+    fn the_message_of_a_passed_limit_has_whole_lines() {
+        for earlier in [None, Some("the coordinator gave no answer in 3.0 seconds.")] {
+            let error = anyhow::Error::new(ReaderLimitPassed {
+                message: a_passed_limit(Duration::from_secs(3), "ask the coordinator", earlier),
+            });
+            // The form that `main` writes.
+            let text = format!("{error:#}");
+            assert!(text.starts_with("your time limit of 3s ended this command"));
+            assert!(!text.contains("  "), "a run of spaces: {text:?}");
+            assert!(
+                text.lines().all(|line| !line.starts_with(' ')),
+                "a line with an indent: {text:?}"
+            );
+            assert!(
+                text.ends_with('.'),
+                "words after the last full stop: {text:?}"
+            );
+            assert!(is_a_passed_reader_limit(&error) && is_a_coordinator_timeout(&error));
+        }
+    }
+
+    /// A wait that a silent coordinator used is not "no time". The message of
+    /// the limit that passed gives the fact and the remedy of that wait.
+    #[test]
+    fn a_passed_limit_keeps_the_fact_of_a_silent_coordinator() {
+        let silent = "the coordinator took the request and gave no answer in 3.0 seconds.\n\
+                      Run `qex info --no-start` to see whether it answers now.";
+        let text = a_passed_limit(Duration::from_secs(3), "ask the coordinator", Some(silent));
+        assert!(text.contains("gave no answer in 3.0 seconds"), "{text}");
+        assert!(text.contains("qex info --no-start"), "{text}");
+        assert!(!text.contains("waited no time"), "{text}");
+
+        let text = a_passed_limit(Duration::from_secs(3), "ask the coordinator", None);
+        assert!(text.contains("waited no time"), "{text}");
+    }
+
+    /// The time that qex gave to the record is the limit that ends a read of
+    /// the record. The number of the reader ended the wait before it.
+    #[test]
+    fn a_read_of_the_record_names_the_time_that_qex_gave() {
+        let limit = ReaderLimit {
+            ends: Instant::now(),
+            gave: Duration::from_secs(3),
+            record_allowance: None,
+        };
+        assert_eq!(
+            name_the_limit(Some(limit)),
+            "Your time limit of 3s ended this wait."
+        );
+
+        let text = name_the_limit(Some(ReaderLimit {
+            record_allowance: Some(RECORD_ALLOWANCE),
+            ..limit
+        }));
+        assert!(text.contains("gave the record 5.0 seconds more"), "{text}");
+        assert!(!text.contains("3s ended this wait"), "{text}");
+    }
+
+    /// The limit in a message is a value that `--timeout` reads again.
+    #[test]
+    fn the_limit_of_the_reader_reads_back() {
+        for limit in [Duration::from_secs(1800), Duration::from_millis(2500)] {
+            let text = as_the_reader_gave(limit);
+            assert_eq!(
+                crate::units::parse_duration(&text),
+                Ok(Some(limit)),
+                "`{text}` must give the same limit again"
+            );
+        }
     }
 
     fn refused(kind: std::io::ErrorKind) -> impl Fn(&Path) -> std::io::Result<()> {
