@@ -152,10 +152,10 @@ pub fn describe(cfg: &Config) -> String {
         Some(dir) => {
             let c = claims(cfg);
             format!(
-                "on, in {} ({} other coordinator(s), {} cores and {} claimed)",
+                "on, in {} ({}, {} and {} claimed)",
                 dir.display(),
-                c.count,
-                c.cpu,
+                crate::units::count_of(c.count, "other coordinator"),
+                crate::units::count_of(c.cpu as usize, "core"),
                 crate::units::format_size(c.mem)
             )
         }

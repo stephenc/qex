@@ -522,6 +522,17 @@ pub struct JobStatus {
     /// is not a value that the agent chose.
     #[serde(default)]
     pub claim_source: String,
+    /// Where the number of cores came from, with the same words as
+    /// `claim_source`. `claim_source` says `learned` when qex learned one value
+    /// only, so `qex status` reads this field and `mem_source` to put its note
+    /// beside the value that qex chose.
+    ///
+    /// The value is empty in a record of a qex that did not write it.
+    #[serde(default)]
+    pub cpu_source: String,
+    /// Where the memory claim came from. See `cpu_source`.
+    #[serde(default)]
+    pub mem_source: String,
     /// The pipeline that this job belongs to.
     #[serde(default)]
     pub group: Option<uuid::Uuid>,
@@ -676,6 +687,8 @@ impl JobStatus {
             cpu: spec.cpu,
             mem: spec.mem,
             claim_source: spec.claim_source.clone(),
+            cpu_source: spec.cpu_source.clone(),
+            mem_source: spec.mem_source.clone(),
             group: spec.group,
             group_name: spec.group_name.clone(),
             usage: Usage::default(),

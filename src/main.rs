@@ -811,8 +811,8 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
         units::format_size(cfg.budget_mem()?)
     );
     println!(
-        "default job:  {} core(s), {}, {}",
-        cfg.default_cpu()?,
+        "default job:  {}, {}, {}",
+        units::count_of(cfg.default_cpu()? as usize, "core"),
         units::format_size(cfg.default_mem()?),
         match cfg.default_timeout()? {
             Some(d) => format!("timeout {}", units::format_duration(d)),
@@ -907,9 +907,9 @@ fn print_config_summary(cfg: &config::Config) -> Result<()> {
     // reader forgot, is a program that starts and gives no sign of its cause.
     match cfg.hooks.on_stop.first() {
         Some(program) => println!(
-            "stop hook:    {} ({} argument(s)); states {}; limit {}",
+            "stop hook:    {} ({}); states {}; limit {}",
             program,
-            cfg.hooks.on_stop.len() - 1,
+            units::count_of(cfg.hooks.on_stop.len() - 1, "argument"),
             cfg.hooks.on_stop_states.join(", "),
             units::format_duration(cfg.hook_timeout()?)
         ),

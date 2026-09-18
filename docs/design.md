@@ -58,6 +58,56 @@ in one operation,
 so a reader sees the old contents or the new contents, and never a part of them.
 `qex wait` reads this file directly when no coordinator operates.
 
+### After the machine restarts
+
+The state directory is `~/.local/state/qex`, or `$XDG_STATE_HOME/qex`. It is not
+a temporary file system, so every record stays through a restart of the machine.
+The next coordinator reads each record and corrects it:
+
+- **A job that was `queued` stays `queued`.** The coordinator puts the queue back
+  in its order: the priority first, then the time of the submission.
+- **A job that was `running` becomes `failed`.** Each record holds the identity of
+  the start of the machine that wrote it. A record of an earlier start is dead,
+  whatever its pids say, because the machine gives each number to a new process.
+  The `error` field says that the machine restarted while the job was active, and
+  a stop hook runs one time.
+- **A job that was `starting`, and whose program never started, goes back into
+  the queue.** No command ran, so there is no result to lose.
+- **`--max-queue-time` counts the time that the machine was off.** The clock is
+  the time since the submission, and only a pause of the queue comes off it. A
+  job with a limit of one hour, on a machine that was off for two hours, becomes
+  `expired` when the next coordinator starts, and it never had a place to start
+  in. For work that must run after a restart, give no limit, or a limit that
+  covers the restart.
+
+**Only a coordinator makes these changes, and no coordinator starts by itself
+after a restart.** Until one starts, `status.json` still says `running` for a job
+that no process runs. `qex wait` and `qex top` start no coordinator and read
+that file, so they show that state, and `qex wait` continues to wait. Run
+`qex list` when you come back after a restart: it starts a coordinator, the
+coordinator corrects every record, and the queue operates again. `qex status
+<id>` and `qex info` do the same.
+
+### qex removes no record by itself
+
+The coordinator has no timer that deletes a record. The directory of every job
+stays until somebody runs `qex clean` or `qex gc`. `[gc] keep = "1d"` in the
+config file is the age that `qex gc` USES when you run it, and it is not a rule
+that qex applies for you.
+
+What grows is `jobs/<uuid>/` for each job: the two small JSON files, and
+`stdout.log` and `stderr.log`. `[logs] max_bytes` limits each log file, and the
+default is 32MB, so the two logs of one job hold about 64MB at most with the
+default. A queue that
+an agent drives for days, with no person who watches it, is the case where
+nobody runs `qex gc`, and the first sign is then a full disk.
+
+```sh
+qex du              # how much the state directory holds, and the largest jobs
+qex gc --dry-run    # what `qex gc` would delete
+qex gc              # delete every record that stopped more than `[gc] keep` ago
+```
+
 ### Several users
 
 Each coordinator writes its claims to `/tmp/qex`, and it reads the records of

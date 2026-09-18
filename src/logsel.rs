@@ -98,6 +98,15 @@ pub struct Selected {
     pub matches_shown: usize,
 }
 
+/// Writes a count of lines with the correct verb: `1 line matches`.
+fn lines_match(found: usize) -> String {
+    if found == 1 {
+        "1 line matches".to_string()
+    } else {
+        format!("{found} lines match")
+    }
+}
+
 impl Selected {
     /// Gives one line that says what the output does not hold.
     ///
@@ -105,14 +114,21 @@ impl Selected {
     /// output, so every command writes this line when something is missing.
     pub fn notice(&self) -> Option<String> {
         match (self.matches, self.truncated) {
+            // The singular and the plural are separate texts: `1 line matches`
+            // and `2 lines match`. ASD-STE100 does not accept `line(s)`.
             (Some(found), _) if found > self.matches_shown => Some(format!(
-                "... {} line(s) match, and qex shows the first {}. \
+                "... {}, and qex shows the first {}. \
                  Use `--max-matches N`, `--all`, or a narrower pattern.",
-                found, self.matches_shown
+                lines_match(found),
+                self.matches_shown
             )),
-            (Some(found), _) => Some(format!("... {found} line(s) match.")),
+            (Some(found), _) => Some(format!("... {}.", lines_match(found))),
+            (None, true) if self.hidden == 1 => Some(
+                "... 1 earlier line is not shown. Use `--all`, `--head N` or `--tail N`."
+                    .to_string(),
+            ),
             (None, true) => Some(format!(
-                "... {} earlier line(s) are not shown. Use `--all`, `--head N` or \
+                "... {} earlier lines are not shown. Use `--all`, `--head N` or \
                  `--tail N`.",
                 self.hidden
             )),

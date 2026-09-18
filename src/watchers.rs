@@ -320,11 +320,17 @@ pub fn report(json: bool) -> anyhow::Result<i32> {
     }
 
     let total: u64 = found.iter().map(|w| w.age_secs).sum();
-    println!(
-        "{} monitor script(s) wait for a proxy. Together they have waited {}.",
-        found.len(),
-        crate::units::format_duration(std::time::Duration::from_secs(total))
-    );
+    // The singular and the plural are separate texts. ASD-STE100 does not
+    // accept `script(s)`.
+    let waited = crate::units::format_duration(std::time::Duration::from_secs(total));
+    if found.len() == 1 {
+        println!("1 monitor script waits for a proxy. It has waited {waited}.");
+    } else {
+        println!(
+            "{} monitor scripts wait for a proxy. Together they have waited {waited}.",
+            found.len()
+        );
+    }
     println!();
 
     for w in &found {

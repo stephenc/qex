@@ -99,7 +99,7 @@ true. `qex watchers` finds them:
 
 ```console
 $ qex watchers
-1 monitor script(s) wait for a proxy. Together they have waited 63h 12m.
+1 monitor script waits for a proxy. It has waited 63h 12m.
 
 MONITOR  pid 3565469  waiting 63h 12m
   waits for: a count of the processes that match, which another user holds above zero
@@ -120,7 +120,7 @@ id:        073a71f8-d655-4b2f-9d4e-87af8922ab01
 name:      check
 state:     failed
 exit code: 2
-claim:     1 core(s), 1.8GB  (the default; give --cpu and --mem to change it)
+claim:     1 core, 1.8GB (the default; give --cpu and --mem to change it)
 used:      1.8MB of memory, 0.0s of CPU time
            the job used 0% of its memory claim
 time:      0s

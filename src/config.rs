@@ -784,6 +784,11 @@ impl Pool {
 pub struct GcConfig {
     /// The age of a record that `qex gc` deletes.
     ///
+    /// NOTHING READS THIS VALUE UNTIL A PERSON RUNS `qex gc`. The coordinator
+    /// has no timer that deletes a record, and the word `keep` in a config file
+    /// reads as a rule that something applies. Each page that names this value
+    /// must say so.
+    ///
     /// `qex gc` works on every directory, so this value is larger than the one
     /// hour of `qex clean --auto`, which works on one directory tree.
     #[serde(deserialize_with = "text_or_number")]

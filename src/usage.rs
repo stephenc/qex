@@ -588,6 +588,8 @@ mod tests {
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
             claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
             learn_key: None,
             group: None,
             group_name: None,

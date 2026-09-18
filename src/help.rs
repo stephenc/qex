@@ -328,8 +328,16 @@ separates its own failure from an earlier one.
 An ID must exist, and that is the only rule, so a script can submit its last
 stage while an earlier stage already failed. A NAME must give a job that waits
 or operates, because a name can give the job of yesterday. Use an id in a
-script, and a name when you type a command yourself. `qex pipeline ci.toml`
-gives the stages of one file their own names; run `qex help pipeline`.
+script, and a name when you type a command yourself.
+
+IF YOUR WORK IS SUBMIT, WAIT, THEN SUBMIT A JOB THAT READS THE RESULTS, DO NOT
+WRITE A SHELL SCRIPT THAT DOES THE WAITS. Give qex the dependency: use `--needs`
+as above, or put the stages in one file and run `qex pipeline ci.toml`. A script
+that does not test the exit code of one wait starts the next stage on the files
+of an earlier run. A shell reads its script part by part while it runs, so a
+change to the file breaks every chain that uses it. qex has neither fault: the
+stages are all in the queue from the first moment, and a stage whose dependency
+did not succeed becomes `skipped`, with the code 126. Run `qex help pipeline`.
 
 A job that never starts
 -----------------------
@@ -342,7 +350,8 @@ waits with no end.
 The job does not start after that time. Its state becomes `expired`, the code is
 123, and `qex status` says what the job waited for. Nothing ran, so there is no
 output. The clock starts at the submission and a restart of the coordinator
-continues it. There is no limit by default: work that a person wanted is work
+continues it. The time that the machine is off counts also; run `qex help
+states`. There is no limit by default: work that a person wanted is work
 that qex does not discard for you.
 
 Other options
@@ -717,7 +726,8 @@ that qex uses now.
     keep = \"1d\"           # how long to keep the id of a job after its removal
 
     [gc]
-    keep = \"1d\"           # the age of a record that `qex gc` deletes
+    keep = \"1d\"           # the age of a record that `qex gc` deletes, WHEN YOU
+                          # RUN IT. qex removes no record by itself.
 
     [defaults]
     cpu = 1               # the default is 1 core
@@ -974,7 +984,7 @@ qex keeps the first part of the output and the last part. The first part holds
 the start-up and the configuration. The last part holds the failure. Between
 the two, qex writes a line that says how many bytes and how many lines went:
 
-    [qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+    [qex] ---- 361MB and 4201177 lines of the output are not in this file ----
 
 `qex status` and `qex logs` also give that count, so a reader always knows that
 the file is not the whole output. `qex status --json` gives it in the field
@@ -1379,6 +1389,35 @@ slow, and the log file holds the output of the part that ran. For `expired`, the
 machine never gave the job a place, so the log file is empty. Read the `error`
 field: it says what the job waited for and how long it waited.
 
+After the machine restarts
+--------------------------
+
+The records are files in the state directory of your user, and not in a
+temporary directory: `~/.local/state/qex`, or `$XDG_STATE_HOME/qex`. They stay
+through a restart of the machine.
+
+  * A job that was `queued` stays `queued`. The next coordinator puts the queue
+    back in its order: the priority first, then the time of the submission.
+  * A job that was `running` becomes `failed`. Its `error` field says that the
+    machine restarted while the job was active. A stop hook runs one time.
+  * A job that was `starting`, and whose program never started, goes back into
+    the queue. No command ran, so there is no result to lose.
+  * `--max-queue-time` COUNTS THE TIME THAT THE MACHINE WAS OFF. The clock is
+    the time since the submission, and only a pause of the queue comes off it.
+    A job with a limit of one hour, on a machine that was off for two hours,
+    becomes `expired` when the next coordinator starts, and it never had a
+    place to start in. For work that must run after a restart, give no limit,
+    or a limit that covers the restart.
+
+ONLY A COORDINATOR MAKES THESE CHANGES, and no coordinator starts by itself
+after a restart. Until one starts, the record on the disk still says `running`
+for a job that no process runs. `qex wait` and `qex top` start no coordinator
+and read that file, so they show that state, and `qex wait` continues to wait.
+
+When you come back after a restart, run `qex list`. It starts a coordinator,
+the coordinator corrects every record, and the queue operates again.
+`qex status <id>` and `qex info` do the same.
+
 Use `qex list --state running` to select the jobs in one state.
 ";
 
@@ -1590,7 +1629,7 @@ A job can write more than `[logs] max_bytes` (the default is 32MB for each
 stream). qex then keeps the first part of the output and the last part, and it
 writes one line between them:
 
-    [qex] ---- 361MB and 4201177 line(s) of the output are not in this file ----
+    [qex] ---- 361MB and 4201177 lines of the output are not in this file ----
 
 Those lines are NOT on the disk. `--all` does not give them back, because
 nothing holds them. `qex status` and `qex logs` say how much went, and
@@ -1691,6 +1730,14 @@ Delete the records
 
     qex du                         how much disk space qex holds, and the
                                    job records that hold the most
+
+QEX REMOVES NO RECORD BY ITSELF. The coordinator has no timer that deletes a
+record, so the directory of every job stays until somebody runs `qex clean` or
+`qex gc`. `[gc] keep` is the age that `qex gc` uses when you run it, and it is
+not a rule that qex applies for you. Each job keeps its record and its two log
+files, and `[logs] max_bytes` limits each log file: about 64MB for one job with
+the default of 32MB. If you run jobs for days, run `qex du` to see the size and
+`qex gc` to free it, or the first sign is a full disk.
 
 `qex list` takes `--cwd` and `--under` as well, so you can see what a deletion
 would remove.
@@ -2092,7 +2139,10 @@ qex therefore measures every job of a fan-out against the TEMPLATE
 `./process {}`. One fan-out makes one record, and the second run of the same
 fan-out gets its claim from the first run.
 
-`qex status` says `(from the earlier jobs of this fan-out)` for such a claim.
+The note in `qex status` says `from the earlier jobs of this fan-out` for such
+a claim. It starts with `both` when qex learned the cores and the memory:
+
+    claim: 1 core, 512MB (both from the earlier jobs of this fan-out)
 
 Use `--lock` when the jobs must not operate together:
 

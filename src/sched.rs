@@ -15,7 +15,7 @@ use crate::job::{self, Assignment, JobState};
 use crate::paths;
 use crate::spec::{JobSpec, PoolClaim};
 use crate::sys;
-use crate::units::format_size;
+use crate::units::{count_of, format_size};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -565,17 +565,23 @@ fn pool_wait(
             let free = free_devices(&pool, claim, held, peers).len() as u64;
             let free_without_siblings =
                 free_devices(&pool, claim, &Held::default(), peers).len() as u64;
+            // One device takes the singular in each part of the sentence:
+            // `1 device that is free in full`, `2 devices that are free in
+            // full`.
+            let one = claim.count == 1;
             let each = match claim.size {
+                Some(size) if one => format!(" with {} free", format_size(size)),
                 Some(size) => format!(" with {} free each", format_size(size)),
-                None => " that is free in full".to_string(),
+                None if one => " that is free in full".to_string(),
+                None => " that are free in full".to_string(),
             };
             (
                 free < claim.count,
                 free_without_siblings < claim.count,
                 format!(
-                    "this job needs {} device(s){each}, the pool has {}, and {free} can hold this \
-                     job now.",
-                    claim.count, pool.total
+                    "this job needs {}{each}, the pool has {}, and {free} can hold this job now.",
+                    count_of(claim.count as usize, "device"),
+                    pool.total
                 ),
             )
         } else {
@@ -655,9 +661,8 @@ fn assign(
         let free = free_devices(&pool, claim, held, peers);
         if (free.len() as u64) < claim.count {
             return Err(format!(
-                "waits for the pool `{name}`: this job needs {} device(s), and {} can hold \
-                 it now",
-                claim.count,
+                "waits for the pool `{name}`: this job needs {}, and {} can hold it now",
+                count_of(claim.count as usize, "device"),
                 free.len()
             ));
         }
@@ -1735,12 +1740,12 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
                     later,
                     Some(format!(
                         "waits for the job {} ({}), which is at the front of the queue and needs \
-                         {}. qex keeps the capacity for that job, because {} job(s) already \
-                         started before it.",
+                         {}. qex keeps the capacity for that job, because {} already started \
+                         before it.",
                         &h.id.to_string()[..8],
                         h.name,
                         format_size(h.mem),
-                        h.passed_by
+                        count_of(h.passed_by as usize, "job")
                     )),
                 ));
             }
@@ -2166,6 +2171,8 @@ mod tests {
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
             claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
             learn_key: None,
             group: None,
             group_name: None,
@@ -3854,6 +3861,60 @@ mod tests {
             assign(&pools, &effective_claims(&small), &held, &no_peers).is_err(),
             "a device that a job owns in full must hold no second job"
         );
+    }
+
+    /// The count of devices decides the noun, the verb and `each` in the text
+    /// of a wait. A claim of one device reads `1 device that is free in full`
+    /// and a claim of two reads `2 devices that are free in full`.
+    #[test]
+    fn the_wait_for_devices_reads_correctly_for_one_device_and_for_many() {
+        let cfg: Config = toml::from_str(
+            "[budget]\ncpu = \"8\"\nmem = \"8GB\"\n\
+             [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+             [peers]\nenabled = false\n\
+             [[pool]]\nname = \"gpu\"\nsize = \"vram\"\ndevices = [\"24GB\", \"24GB\"]\n",
+        )
+        .unwrap();
+        let pools = cfg.pools().unwrap();
+        let no_peers = crate::peers::Claims::default();
+
+        // One job owns both devices in full, so every claim below must wait.
+        let owner = spec_claiming(&[("gpu", 2, None)]);
+        let mut held = Held::default();
+        let given = assign(&pools, &effective_claims(&owner), &held, &no_peers).unwrap();
+        hold(&mut held, &owner, given, &pools);
+
+        let cases = [
+            (1, None, "this job needs 1 device that is free in full,"),
+            (2, None, "this job needs 2 devices that are free in full,"),
+            (1, Some(1 << 30), "this job needs 1 device with 1GB free,"),
+            (
+                2,
+                Some(1 << 30),
+                "this job needs 2 devices with 1GB free each,",
+            ),
+        ];
+        for (count, size, text) in cases {
+            let claims = effective_claims(&spec_claiming(&[("gpu", count, size)]));
+            let wait = pool_wait(&pools, &claims, &held, &no_peers)
+                .expect("the claim must wait while a job owns both devices");
+            assert!(wait.reason.contains(text), "got: {}", wait.reason);
+            let held_reason = wait.held_reason.expect("a sibling wait has a second text");
+            assert!(held_reason.contains(text), "got: {held_reason}");
+
+            let refused = assign(&pools, &claims, &held, &no_peers)
+                .expect_err("no device can hold the claim");
+            let noun = if count == 1 {
+                "1 device,"
+            } else {
+                "2 devices,"
+            };
+            assert!(
+                refused.contains(&format!("this job needs {noun} and 0 can hold it now")),
+                "got: {refused}"
+            );
+            assert!(!wait.reason.contains("(s)") && !refused.contains("(s)"));
+        }
     }
 
     /// A device that a job holds in part must still take a second job while

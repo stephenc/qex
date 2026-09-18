@@ -4538,6 +4538,43 @@ fn gc_counts_only_the_records_that_the_age_selected() {
     release(&gate);
 }
 
+/// The JSON of `qex gc` says what qex tested: work that has not stopped holds
+/// the record.
+///
+/// An agent parses a key. The earlier key said that a job NEEDS each record
+/// that stayed, and a record also stays because its pipeline has work left,
+/// which is not a need. An agent that read the earlier key looked for a job
+/// that does not exist.
+#[test]
+fn the_json_of_gc_names_the_relation_that_qex_tested() {
+    let h = Harness::with_default_config("gckey");
+    let gate = h.root.join("gate");
+    let waiting = waits_for_the_test(&gate);
+
+    let a = h.submit(&["submit", "--name", "k-a", "--mem", "64MB", "--", "true"]);
+    h.ok(&["wait", &a, "--timeout", "30s"]);
+    let b = h.submit(&[
+        "submit", "--name", "k-b", "--mem", "64MB", "--needs", &a, "--", "sh", "-c", &waiting,
+    ]);
+    h.until("the second job operates", Duration::from_secs(30), || {
+        h.state_of(&b) == "running"
+    });
+
+    let out = h.ok(&["gc", "--dry-run", "--older-than", "0s", "--json"]);
+    let answer: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("`qex gc --json` must be JSON: {e}: {out}"));
+    assert_eq!(
+        answer["kept_because_work_has_not_stopped"], 1,
+        "the record of `k-a` is old enough, and a job that operates holds it: {answer}"
+    );
+    assert!(
+        answer.get("kept_because_a_job_needs_them").is_none(),
+        "the key that names a need must be gone: {answer}"
+    );
+
+    release(&gate);
+}
+
 /// The coordinator refuses a deletion that breaks a chain.
 ///
 /// `qex clean <id>` names one record, and the coordinator decides every
@@ -5309,7 +5346,7 @@ fn the_log_options_select_the_lines() {
     ]);
     let found = String::from_utf8_lossy(&out.stdout);
     let notice = String::from_utf8_lossy(&out.stderr);
-    assert!(notice.contains("10 line(s) match"), "got: {notice}");
+    assert!(notice.contains("10 lines match"), "got: {notice}");
     assert!(found.contains("line-10") && found.contains("line-12"));
     assert!(!found.contains("line-13"), "the limit must hold");
     // The standard output holds the log lines only, so a file or a parser gets
@@ -6916,7 +6953,7 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
     assert_eq!(
         kept + dropped["stdout_lines"].as_u64().unwrap(),
         500_000,
-        "the file holds {kept} line(s) and the record says that {} went. Together they \
+        "the file holds {kept} lines and the record says that {} went. Together they \
          must be the 500000 lines that the job wrote.",
         dropped["stdout_lines"]
     );
@@ -6939,7 +6976,7 @@ fn a_job_that_writes_more_than_the_limit_keeps_the_head_and_the_tail() {
     assert_eq!(
         kept_bytes + dropped["stdout_bytes"].as_u64().unwrap(),
         3_388_895,
-        "the file holds {kept_bytes} byte(s) of the job and the record says that {} went. \
+        "the file holds {kept_bytes} bytes of the job and the record says that {} went. \
          Together they must be the 3388895 bytes that `seq 1 500000` writes.",
         dropped["stdout_bytes"]
     );
@@ -16233,7 +16270,7 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                             match from_qex.read_line(&mut line) {
                                 Ok(0) => {
                                     note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
-                                        "{:?} the client closed after {} request(s)",
+                                        "{:?} the client closed after {} requests",
                                         began.elapsed(),
                                         served
                                     ));
@@ -16242,7 +16279,7 @@ fn a_coordinator_that_answers_late(front: &Path, real: &Path, delay: Duration) -
                                 Ok(_) => {}
                                 Err(e) => {
                                     note.lock().unwrap_or_else(|e| e.into_inner()).push(format!(
-                                        "{:?} READING THE REQUEST FAILED after {} request(s): {e}",
+                                        "{:?} READING THE REQUEST FAILED after {} requests: {e}",
                                         began.elapsed(),
                                         served
                                     ));

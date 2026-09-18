@@ -225,6 +225,16 @@ A skipped stage names the **first** job that failed, so you read the cause and
 not the chain. Use `--after` for a cleanup step that must run even when the step
 before it fails. Use an id in a script, and a name when you type a command.
 
+**If your work is submit, wait, then submit a job that reads the results, do not
+write a shell script that does the waits.** Give qex the dependency: use
+`--needs` as above, or put the stages in one file and run `qex pipeline
+ci.toml`. A script that does not test the exit code of one wait starts the next
+stage on the files of an earlier run. A shell reads its script part by part
+while it runs, so a change to the file breaks every chain that uses it. qex has
+neither fault: the stages are all in the queue from the first moment, and a
+stage whose dependency did not succeed becomes `skipped`, with the code 126. Run
+`qex help pipeline`.
+
 ## Many jobs at one time
 
 ```sh

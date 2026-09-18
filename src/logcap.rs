@@ -300,12 +300,12 @@ impl CapWriter {
             // count at all.
             if let Some(parts) = self.parts.filter(|_| self.overflowing) {
                 let note = format!(
-                    "{MARK} ---- {} and {} line(s) of the output are not in this file ----\n\
+                    "{MARK} ---- {} and {} of the output are not in this file ----\n\
                      {MARK} qex could not make the file for the last part of the output, so \
                      the last part is not here. The limit is `[logs] max_bytes` = {}. Read \
                      `supervisor.log` in this directory for the fault of the machine.\n",
                     crate::units::format_size(self.dropped.bytes),
-                    self.dropped.lines,
+                    crate::units::count_of(self.dropped.lines as usize, "line"),
                     crate::units::format_size(parts.max),
                 );
                 if let Err(e) = self.file.write_all(note.as_bytes()) {
@@ -345,11 +345,11 @@ impl CapWriter {
         self.dropped.lines += self.overflow_lines.saturating_sub(kept_lines);
 
         let mut note = format!(
-            "{MARK} ---- {} and {} line(s) of the output are not in this file ----\n\
+            "{MARK} ---- {} and {} of the output are not in this file ----\n\
              {MARK} The limit is `[logs] max_bytes` = {}. qex kept the first {} and the last {}. \
              To keep more, make max_bytes larger in the configuration file.\n",
             crate::units::format_size(self.dropped.bytes),
-            self.dropped.lines,
+            crate::units::count_of(self.dropped.lines as usize, "line"),
             crate::units::format_size(parts.max),
             crate::units::format_size(parts.head),
             crate::units::format_size(kept_bytes),
@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(
             dropped.bytes,
             written - kept,
-            "the file holds {kept} byte(s) of the {written} that the job wrote, so exactly \
+            "the file holds {kept} bytes of the {written} that the job wrote, so exactly \
              {} went, and the count says {}",
             written - kept,
             dropped.bytes
@@ -1166,7 +1166,7 @@ mod tests {
         assert_eq!(
             dropped.lines,
             lines - count_lines(kept_text.as_bytes()),
-            "the file holds {} line(s) of the {lines} that the job wrote, and the count says \
+            "the file holds {} lines of the {lines} that the job wrote, and the count says \
              that {} went",
             count_lines(kept_text.as_bytes()),
             dropped.lines

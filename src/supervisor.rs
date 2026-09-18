@@ -859,8 +859,8 @@ pub fn main(id: uuid::Uuid) -> Result<i32> {
 
     if retrying {
         log(&format!(
-            "job {id} failed and starts again; {} attempt(s) left",
-            status.retries_left
+            "job {id} failed and starts again; {} left",
+            crate::units::count_of(status.retries_left as usize, "attempt")
         ));
         // Give the machine a moment. A task that fails at once, such as a
         // network that is not ready, needs the time more than the CPU.
@@ -1861,6 +1861,8 @@ mod tests {
             priority: 0,
             env_capture: crate::config::EnvCapture::None,
             claim_source: "explicit".into(),
+            cpu_source: "explicit".into(),
+            mem_source: "explicit".into(),
             learn_key: None,
             group: None,
             group_name: None,

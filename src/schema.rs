@@ -344,6 +344,16 @@ pub const STATUS: &str = r##"{
       "enum": ["explicit", "learned", "default", "fan-out"],
       "description": "Where the claim came from. `learned` is a claim from the earlier jobs of THIS command. `fan-out` is a claim from the earlier jobs of the fan-out, which qex measures against the template and not against the command of one line."
     },
+    "cpu_source": {
+      "type": "string",
+      "enum": ["", "explicit", "learned", "default", "fan-out"],
+      "description": "Where `cpu` came from, with the words of `claim_source`. `claim_source` says `learned` when qex learned one value only; this field and `mem_source` say which one. Empty in a record of a qex that did not write it."
+    },
+    "mem_source": {
+      "type": "string",
+      "enum": ["", "explicit", "learned", "default", "fan-out"],
+      "description": "Where `mem` came from. See `cpu_source`."
+    },
     "attempts": { "type": "integer", "description": "The number of times that qex started this job." },
     "retries_left": { "type": "integer", "description": "The number of times that qex may still start this job again after a failure. See --retries." },
     "locks": {
