@@ -1264,13 +1264,15 @@ impl SpawnLock {
                     return Err(error).with_context(|| format!("locking {}", path.display()));
                 }
             }
-            say_that_qex_still_waits(started, deadline, "the lock that guards a start");
+            // No wait begins after the limit of the reader, so this test comes
+            // before the line that says that qex waits.
             if let Some(gave) = passed_before {
                 return Err(the_reader_limit_passed(
                     gave,
                     "wait for the lock that guards a start",
                 ));
             }
+            say_that_qex_still_waits(started, deadline, "the lock that guards a start");
             if Instant::now() >= deadline {
                 return Err(timed_out(format!(
                     "a different qex command held the lock {} for {}. {}\n\
