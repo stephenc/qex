@@ -345,6 +345,9 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
         WaitOutcome::Finished(status) => {
             let code = exit_code_for(&status);
             if !quiet {
+                // A job that stopped a moment before the limit leaves no time
+                // for the record.
+                crate::client::give_the_record_its_own_time();
                 report_the_record(raw_id, json);
             }
             Ok(code)
@@ -353,8 +356,12 @@ fn wait_after_submit(raw_id: &str, timeout: Option<&str>, json: bool, quiet: boo
         // and `--quiet` keeps the record away; neither hides the line that
         // carries the id.
         WaitOutcome::TimedOut => {
-            eprintln!("qex: the wait reached its time limit. The job continues.");
-            eprintln!("qex: attach to it again:  qex status {raw_id} --wait");
+            say_that_the_wait_reached_its_limit(&ids, timeout);
+            // The reader asked for the record, and the record exists. See
+            // `say_that_the_wait_reached_its_limit`.
+            if !quiet {
+                report_the_record(raw_id, json);
+            }
             Ok(EXIT_TIMEOUT)
         }
         WaitOutcome::NoSuchJob => {
@@ -826,7 +833,7 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         }
     };
     let is_pipeline = found.group.is_some();
-    let ids = found.ids;
+    let ids = found.ids.clone();
 
     if args.timeout.is_some() && !args.wait && !args.follow {
         bail!(
@@ -879,7 +886,14 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
         let id = ids[0];
         catch_run_signals();
         let dir = paths::job_dir(&id)?;
-        return stream_until_done(&mut client, id, &dir, false, deadline);
+        return stream_until_done(
+            &mut client,
+            id,
+            &dir,
+            false,
+            deadline,
+            args.timeout.as_deref(),
+        );
     }
 
     // Wait for the job first, if the user asked for that.
@@ -915,7 +929,10 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                 // A FAULT of the wait always reaches stderr. See
                 // `wait_after_submit`.
                 WaitOutcome::TimedOut => {
-                    eprintln!("qex: the wait for {id} reached its time limit. The job continues.");
+                    // Name the handle that the reader gave when it is a
+                    // pipeline, so one command attaches to every stage again.
+                    let handle = found.group.unwrap_or(*id).to_string();
+                    say_that_the_wait_reached_its_limit(&[handle], args.timeout.as_deref());
                     wait_code = EXIT_TIMEOUT;
                     break;
                 }
@@ -932,6 +949,12 @@ pub fn status(args: cli::StatusArgs) -> Result<i32> {
                 }
             }
         }
+    }
+
+    // The wait can end with a result a moment before the limit of the reader,
+    // and the records below must not find that limit spent.
+    if args.wait {
+        crate::client::give_the_record_its_own_time();
     }
 
     // `--quiet` gives the exit code and nothing else. A script that tests the
@@ -1539,7 +1562,10 @@ pub fn wait(args: cli::WaitArgs) -> Result<i32> {
         let status = match wait_one(raw_id, deadline, &mut reporter)? {
             WaitOutcome::Finished(s) => s,
             WaitOutcome::TimedOut => {
-                eprintln!("qex: the wait for {raw_id} reached its time limit. The job continues.");
+                // Name EVERY job of this command, and not only the jobs that
+                // did not stop. This command wrote no line yet, so the next
+                // wait must give the result of each job.
+                say_that_the_wait_reached_its_limit(&ids, args.timeout.as_deref());
                 return Ok(EXIT_TIMEOUT);
             }
             WaitOutcome::NoSuchJob => {
@@ -1668,6 +1694,11 @@ fn wait_for_the_next(
         if let Some(d) = deadline {
             if Instant::now() >= d {
                 eprintln!("qex: no job stopped before the time limit. They continue.");
+                eprintln!(
+                    "qex: wait again:  qex wait --next {}{}",
+                    ids.join(" "),
+                    the_same_limit(args.timeout.as_deref())
+                );
                 return Ok(EXIT_TIMEOUT);
             }
         }
@@ -1757,6 +1788,63 @@ fn catch_signals_while_waiting() {
 
 fn wait_was_interrupted() -> bool {
     WAIT_INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Writes the message of a wait that reached the limit of the reader.
+///
+/// # The hint carries the limit
+///
+/// A reader gives a limit because its harness has a limit for one command. A
+/// hint with no limit sends that reader to a wait with no end, and the harness
+/// then stops it with no result: the fault that the limit was there to
+/// prevent. The command that attaches again thus carries the same limit.
+///
+/// # The record comes after this
+///
+/// The wait used all of the limit of the reader, so the read of the record
+/// gets a short time of its own. Without it the read got no time, and the
+/// reader got a false report of a coordinator that gave no answer in place of
+/// the state of the job.
+///
+/// `--quiet` and `--json` do not silence these lines. See `wait_after_submit`.
+fn say_that_the_wait_reached_its_limit(ids: &[String], limit: Option<&str>) {
+    crate::client::give_the_record_its_own_time();
+    let again = attach_again(ids, limit);
+    if let [one] = ids {
+        eprintln!("qex: the wait for {one} reached its time limit. The job continues.");
+        eprintln!("qex: attach to it again:  {again}");
+    } else {
+        eprintln!("qex: the wait reached its time limit. The jobs that did not stop continue.");
+        eprintln!("qex: attach to them again:  {again}");
+    }
+}
+
+/// Gives the command that attaches to the jobs again, with the same limit.
+///
+/// ONE job gives the command that also gives the record. MANY jobs give
+/// `qex wait`, which is the command that takes many.
+fn attach_again(ids: &[String], limit: Option<&str>) -> String {
+    let mut command = match ids {
+        [one] => format!("qex status {one} --wait"),
+        many => format!("qex wait {}", many.join(" ")),
+    };
+    command.push_str(&the_same_limit(limit));
+    command
+}
+
+/// Gives the `--timeout` option that carries the limit of the reader again.
+///
+/// The text passed the reader of durations, so it holds digits, a point and
+/// the letters of a unit. That reader accepts a space before the unit, and a
+/// shell does not, so the space goes.
+fn the_same_limit(limit: Option<&str>) -> String {
+    match limit {
+        Some(limit) => {
+            let limit: String = limit.split_whitespace().collect();
+            format!(" --timeout {limit}")
+        }
+        None => String::new(),
+    }
 }
 
 /// Writes the message of a wait that a signal stopped, and gives its code.
@@ -1897,7 +1985,43 @@ fn wait_one(
     deadline: Option<Instant>,
     reporter: &mut ReasonReporter,
 ) -> Result<WaitOutcome> {
+    // A job that stopped has a result, and no limit takes a result away: the
+    // record on the disk holds it, and to read it costs no wait. Only a job
+    // with no result gives `TimedOut`.
+    //
+    // The test is HERE, for every path below, because the limit can pass at
+    // any moment: before the wait begins, or between the request and the read
+    // of an answer that the coordinator already gave.
+    match wait_one_until(raw_id, deadline, reporter)? {
+        WaitOutcome::TimedOut => {
+            if let Some(status) = read_status_on_disk(raw_id)? {
+                if status.state.is_terminal() {
+                    return Ok(WaitOutcome::Finished(Box::new(status)));
+                }
+            }
+            Ok(WaitOutcome::TimedOut)
+        }
+        outcome => Ok(outcome),
+    }
+}
+
+/// The wait of `wait_one`, which gives `TimedOut` without a look at the record.
+fn wait_one_until(
+    raw_id: &str,
+    deadline: Option<Instant>,
+    reporter: &mut ReasonReporter,
+) -> Result<WaitOutcome> {
     loop {
+        // THE LIMIT CAN PASS BEFORE THIS WAIT BEGINS. It spans the command, so
+        // the wait for an earlier job, or a slow connect, can use all of it.
+        // qex then reaches no coordinator, because every operation refuses to
+        // start after the limit. That is not a coordinator that stopped, and
+        // the lines below must not say that it is.
+        //
+        // `wait_one` reads the record on the disk before it gives `TimedOut`.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(WaitOutcome::TimedOut);
+        }
         match wait_through_coordinator(raw_id, deadline, reporter)? {
             Some(outcome) => return Ok(outcome),
             // The coordinator stopped. Its answer never arrives, so find the
@@ -2020,7 +2144,16 @@ fn wait_through_coordinator(
     deadline: Option<Instant>,
     reporter: &mut ReasonReporter,
 ) -> Result<Option<WaitOutcome>> {
+    // THE LIMIT OF THE READER CAN PASS IN ANY STEP BELOW, before the loop that
+    // tests it. Each step then gives an error, and an error here reads as "the
+    // coordinator stopped". That is false when the limit ended the step: the
+    // caller would tell the reader about a coordinator that is fine.
+    let the_limit_passed = || deadline.is_some_and(|d| Instant::now() >= d);
+
     let Some(mut client) = Client::connect_existing() else {
+        if the_limit_passed() {
+            return Ok(Some(WaitOutcome::TimedOut));
+        }
         return Ok(None);
     };
     // Give every read a limit.
@@ -2043,6 +2176,7 @@ fn wait_through_coordinator(
     let id = match resolve_id_for_wait(&mut client, raw_id) {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(Some(WaitOutcome::NoSuchJob)),
+        Err(_) if the_limit_passed() => return Ok(Some(WaitOutcome::TimedOut)),
         // The coordinator did not answer. Find the answer without it.
         Err(_) => return Ok(None),
     };
@@ -2051,6 +2185,9 @@ fn wait_through_coordinator(
     // coordinator that stops before it reads the request gives an error here,
     // and the caller then finds the answer without it.
     if client.send(&Request::Wait { id }).is_err() {
+        if the_limit_passed() {
+            return Ok(Some(WaitOutcome::TimedOut));
+        }
         return Ok(None);
     }
 
@@ -3842,7 +3979,7 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
         if let Some(end) = deadline {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Ok(EXIT_TIMEOUT);
+                return Ok(say_that_the_stream_reached_its_limit(&args));
             }
             client.set_read_timeout(Some(left))?;
         }
@@ -3862,7 +3999,9 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
                 );
                 return Ok(1);
             }
-            Err(e) if is_read_timeout(&e) => return Ok(EXIT_TIMEOUT),
+            Err(e) if is_read_timeout(&e) => {
+                return Ok(say_that_the_stream_reached_its_limit(&args))
+            }
             Err(e) => return Err(e),
         };
 
@@ -3898,6 +4037,27 @@ pub fn events(args: cli::EventsArgs) -> Result<i32> {
             }
         }
     }
+}
+
+/// Names the limit that ended `qex events`, and gives the code for it.
+///
+/// The code 124 alone told the reader nothing about the limit that they gave,
+/// and a stream that ends with no word looks like a coordinator that stopped.
+/// The line goes to stderr, so the stream on stdout keeps its form.
+fn say_that_the_stream_reached_its_limit(args: &cli::EventsArgs) -> i32 {
+    let limit: String = args
+        .timeout
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    eprintln!(
+        "qex: `qex events` reached your time limit of {limit}, and it stopped. \
+         The coordinator and the jobs continue.\n\
+         qex: to continue the stream, run the command again with \
+         `--since <stream_id>:<seq>` from the last line that you read."
+    );
+    EXIT_TIMEOUT
 }
 
 /// Reads the value of `--since`.
@@ -5348,7 +5508,7 @@ pub fn run(args: cli::RunArgs) -> Result<i32> {
 
     let dir = paths::job_dir(&id)?;
     // `qex run` sets no limit on its own wait. `--timeout` limits the JOB.
-    stream_until_done(&mut client, id, &dir, !deduplicated, None)
+    stream_until_done(&mut client, id, &dir, !deduplicated, None, None)
 }
 
 /// Asks the coordinator to cancel this job if this command stops.
@@ -5497,6 +5657,8 @@ fn stream_until_done(
     dir: &std::path::Path,
     owns_job: bool,
     deadline: Option<Instant>,
+    // The limit as the reader wrote it, for the hint that attaches again.
+    limit: Option<&str>,
 ) -> Result<i32> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -5576,6 +5738,14 @@ fn stream_until_done(
         let status = match client.call(&Request::Status { id }) {
             Ok(Response::Status { status }) => status,
             Ok(other) => return report_for_a_job(other),
+            // The limit of the reader passed, so qex asked nothing. That is
+            // not a coordinator that stopped, and the reader must not be told
+            // that it is. The record on the disk says whether the job has a
+            // result, which is the one thing that the test of the limit below
+            // needs.
+            Err(e) if crate::client::is_a_passed_reader_limit(&e) => {
+                Box::new(crate::job::read_status(dir)?)
+            }
             Err(_) => {
                 status_without_the_coordinator(client, id, dir, owns_job, &mut announced_loss)?
             }
@@ -5605,9 +5775,12 @@ fn stream_until_done(
         // that has a result.
         if let Some(d) = deadline.filter(|_| !status.state.is_terminal()) {
             if Instant::now() >= d {
+                // The hint carries the limit. See
+                // `say_that_the_wait_reached_its_limit`.
                 eprintln!(
                     "qex: your wait reached its time limit. The job {id} continues.\n\
-                     qex: attach to it again:  qex status {id} --follow"
+                     qex: attach to it again:  qex status {id} --follow{}",
+                    the_same_limit(limit)
                 );
                 return Ok(EXIT_TIMEOUT);
             }
