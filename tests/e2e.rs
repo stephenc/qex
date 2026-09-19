@@ -41,6 +41,23 @@ struct Harness {
     /// resists SIGKILL.
     stop_signal: i32,
     stop_limit: Duration,
+    /// Makes each look for the processes of this test fail.
+    ///
+    /// `false` in every test but one. No test can remove `lsof` from the
+    /// machine, so the test of a Drop that could not look sets this field.
+    look_fails: bool,
+}
+
+/// What one look for the processes of a test found.
+///
+/// "NOBODY HOLDS THE DIRECTORY" AND "I COULD NOT LOOK" ARE TWO ANSWERS. An
+/// empty list was the answer for both, and Drop then deleted the directory of
+/// a coordinator that it never looked for. `blind` holds the reason when the
+/// look was not complete. The list then holds what the look did find, and it
+/// is not the proof that no other process is there.
+struct Holders {
+    pids: Vec<i32>,
+    blind: Option<String>,
 }
 
 /// The name of the variable that moves the peer directory. It must match
@@ -155,6 +172,7 @@ impl Harness {
             peers_dir,
             stop_signal: libc::SIGKILL,
             stop_limit: STOP_LIMIT,
+            look_fails: false,
         }
     }
 
@@ -575,15 +593,15 @@ impl Harness {
     /// first then reports a process that it never tried to stop. Each process
     /// that this function gives received the signal, and the function looked
     /// again after it.
-    fn stop_holders(&self, signal: i32, limit: Duration) -> Vec<i32> {
+    fn stop_holders(&self, signal: i32, limit: Duration) -> Holders {
         let deadline = Instant::now() + limit;
         let mut sent = false;
         loop {
-            let pids = self.pids_holding_this_root();
-            if pids.is_empty() || (sent && Instant::now() >= deadline) {
-                return pids;
+            let found = self.pids_holding_this_root();
+            if found.pids.is_empty() || (sent && Instant::now() >= deadline) {
+                return found;
             }
-            for pid in &pids {
+            for pid in &found.pids {
                 unsafe {
                     libc::kill(*pid, signal);
                 }
@@ -596,7 +614,133 @@ impl Harness {
     /// Stops the coordinator of this test in the middle of the test.
     fn stop_coordinator(&self) {
         let stayed = self.stop_holders(libc::SIGKILL, STOP_LIMIT);
-        assert!(stayed.is_empty(), "{}", self.stayed_message(&stayed));
+        assert!(
+            stayed.pids.is_empty(),
+            "{}",
+            self.stayed_message(&stayed.pids)
+        );
+        if let Some(reason) = &stayed.blind {
+            if let Err(seen) = self.coordinator_is_gone(STOP_LIMIT) {
+                panic!("{}", self.blind_message(reason, &seen));
+            }
+        }
+    }
+
+    /// Waits until no coordinator of this test accepts a connection.
+    ///
+    /// This is the second evidence that the coordinator stopped, for a look
+    /// that could not inspect the processes. It is weaker than the look: it
+    /// says nothing about a supervisor.
+    ///
+    /// Two questions, and both must say no. `qex info --no-start` asks the
+    /// socket that the product calculates, which is outside this root when the
+    /// path is long. The second question goes to each file in the run
+    /// directory, because a test can move the socket to a different name, and
+    /// the coordinator still listens there.
+    ///
+    /// A socket FILE can stay: a coordinator that SIGKILL stopped does not
+    /// delete it. The system refuses the connection then, and that is the
+    /// answer "gone".
+    ///
+    /// `Err` carries what the harness saw at the limit, as a full sentence.
+    /// "A coordinator answers" and "the harness got no answer" are different
+    /// facts, and the reader of the failure must see which one happened.
+    fn coordinator_is_gone(&self, limit: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + limit;
+        // ONE LIMIT FOR THE WHOLE WAIT. Each question gets only the time that
+        // remains, so a slow answer cannot make the wait longer than `limit`.
+        let mut left = limit;
+        loop {
+            let product = self.ask_the_product(left);
+            let listener = std::fs::read_dir(self.root.join("state/qex/run"))
+                .ok()
+                .and_then(|dir| {
+                    dir.flatten()
+                        .map(|e| e.path())
+                        .find(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
+                });
+            let seen = match (&product, &listener) {
+                (Ok(false), None) => return Ok(()),
+                (Ok(true), _) => "`qex info --no-start` says that a coordinator of this test \
+                                  is running, so a process stayed, and the harness cannot \
+                                  name it."
+                    .to_string(),
+                (_, Some(path)) => format!(
+                    "The socket {} still accepts a connection, so a process listens there, \
+                     and the harness cannot name it.",
+                    path.display()
+                ),
+                (Err(why), None) => format!(
+                    "The harness could not confirm that the coordinator of this test is \
+                     gone: {why}. A process can remain."
+                ),
+            };
+            std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(seen);
+            }
+        }
+    }
+
+    /// Asks `qex info --no-start --json` if a coordinator is running.
+    ///
+    /// Drop calls this function, so it must not panic and it must not hang.
+    /// The command waits without end when a listener accepts the connection
+    /// and never answers, so the harness stops the command at the limit.
+    /// `Err` is the answer "not known", which is not "gone".
+    fn ask_the_product(&self, limit: Duration) -> Result<bool, String> {
+        const ASK: &str = "`qex info --no-start --json`";
+        let mut child = self
+            .command(&["info", "--no-start", "--json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("{ASK} did not start: {e}"))?;
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    return Err(format!("{ASK} gave no answer in {limit:?}"));
+                }
+            }
+        }
+        let mut text = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            use std::io::Read;
+            out.read_to_string(&mut text).ok();
+        }
+        // The answer of a coordinator is its status, which has no `running`
+        // key. Only the answer "no coordinator" carries `"running": false`.
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .filter(|v| v.is_object())
+            .map(|v| v["running"] != false)
+            .ok_or_else(|| format!("{ASK} gave an answer that the harness cannot read"))
+    }
+
+    /// The message for a look that failed, when the socket did not say "gone".
+    ///
+    /// `seen` is the `Err` of `coordinator_is_gone`. The three parts: what
+    /// happened, why it matters, what the reader must do.
+    fn blind_message(&self, reason: &str, seen: &str) -> String {
+        format!(
+            "the test harness could not inspect the processes that hold a file under {}: \
+             {reason}. {seen} Such a process can hold a part of the budget of this machine. \
+             The harness did not delete that directory. Find each process that holds a file \
+             there (`lsof +D {}`), stop it, and then delete the directory.",
+            self.root.display(),
+            self.root.display()
+        )
     }
 
     /// The message for processes that the harness could not stop.
@@ -619,9 +763,31 @@ impl Harness {
         pid > 1 && pid != std::process::id() as i32 && pid != unsafe { libc::getppid() }
     }
 
+    /// Gives the state letter of a process from `/proc/<pid>/stat`.
+    ///
+    /// `Z` and `X` are a process that ended. `None` says that the entry is
+    /// gone, which is the same fact.
+    ///
+    /// The name of the program is the second field, and it can contain spaces
+    /// and brackets. The state is the first field after the LAST `)`.
+    fn state_in_proc(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, after) = stat.rsplit_once(')')?;
+        after.trim_start().chars().next()
+    }
+
     /// Finds processes that still hold a file under this harness root.
-    fn pids_holding_this_root(&self) -> Vec<i32> {
+    ///
+    /// NEVER GIVE AN EMPTY LIST FOR A LOOK THAT FAILED. See `Holders`.
+    fn pids_holding_this_root(&self) -> Holders {
+        if self.look_fails {
+            return Holders {
+                pids: Vec::new(),
+                blind: Some("a test made the look fail on purpose".to_string()),
+            };
+        }
         let mut pids = std::collections::BTreeSet::new();
+        let mut blind = None;
         if let Ok(proc) = std::fs::read_dir("/proc") {
             for entry in proc.flatten() {
                 let Some(pid) = entry
@@ -634,8 +800,41 @@ impl Harness {
                 if !Self::may_stop(pid) {
                     continue;
                 }
-                let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-                    continue;
+                let fds = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+                    Ok(fds) => fds,
+                    // The process stopped after the list of `/proc`. It holds
+                    // nothing.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        // A process of a different user is never a process of
+                        // this test, and the system always refuses its files.
+                        // A process of THIS user that refuses can be one of
+                        // this test, so the look is not complete.
+                        use std::os::unix::fs::MetadataExt;
+                        let ours = entry
+                            .metadata()
+                            .is_ok_and(|m| m.uid() == unsafe { libc::getuid() });
+                        if !ours {
+                            continue;
+                        }
+                        // A PROCESS THAT ENDED HOLDS NOTHING. The system keeps
+                        // its entry until the parent collects it, and gives
+                        // the `fd` directory of that entry to root, so the
+                        // refusal is "Permission denied" and not "not found".
+                        // A test that does not collect a child leaves such an
+                        // entry until the test program ends, and each look
+                        // after it then failed on a build machine.
+                        match Self::state_in_proc(pid) {
+                            None | Some('Z') | Some('X') => {}
+                            Some(state) => {
+                                blind = Some(format!(
+                                    "/proc/{pid}/fd of a process in the state {state} cannot \
+                                     be read: {e}"
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                 };
                 let holds = fds.flatten().any(|fd| {
                     std::fs::read_link(fd.path()).is_ok_and(|target| target.starts_with(&self.root))
@@ -644,22 +843,41 @@ impl Harness {
                     pids.insert(pid);
                 }
             }
-            return pids.into_iter().collect();
+            return Holders {
+                pids: pids.into_iter().collect(),
+                blind,
+            };
         }
-        if let Ok(out) = Command::new("lsof")
+        match Command::new("lsof")
             .args(["-t", "+D"])
             .arg(&self.root)
             .output()
         {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Ok(pid) = line.trim().parse::<i32>() {
-                    if Self::may_stop(pid) {
-                        pids.insert(pid);
+            Ok(out) => {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        if Self::may_stop(pid) {
+                            pids.insert(pid);
+                        }
                     }
                 }
+                // THE EXIT CODE OF `lsof` SAYS NOTHING. It is 1 when no process
+                // holds a file, which is the usual good answer, and on macOS
+                // it is 1 also when `lsof` names a process. A signal, or a
+                // line on stderr, is the evidence of a look that failed.
+                let complaint = String::from_utf8_lossy(&out.stderr);
+                if out.status.code().is_none() {
+                    blind = Some(format!("lsof did not complete: {}", out.status));
+                } else if let Some(line) = complaint.lines().find(|l| !l.trim().is_empty()) {
+                    blind = Some(format!("lsof reported: {}", line.trim()));
+                }
             }
+            Err(e) => blind = Some(format!("lsof did not start: {e}")),
         }
-        pids.into_iter().collect()
+        Holders {
+            pids: pids.into_iter().collect(),
+            blind,
+        }
     }
 }
 
@@ -670,17 +888,39 @@ impl Drop for Harness {
         // Do not ask the socket for the pid. A test can hide that socket or
         // replace it, and the coordinator then stays after cargo test returns.
         let stayed = self.stop_holders(self.stop_signal, self.stop_limit);
-        if stayed.is_empty() {
-            std::fs::remove_dir_all(&self.root).ok();
-            return;
-        }
+        // A LOOK THAT FAILED IS NOT A CLEAN STATE. The second evidence is the
+        // socket: the directory goes only when no coordinator of this test
+        // accepts a connection. The line on stderr says that the harness did
+        // not see the processes, so nobody reads this end as a full proof.
+        let message = if !stayed.pids.is_empty() {
+            self.stayed_message(&stayed.pids)
+        } else {
+            match &stayed.blind {
+                None => {
+                    std::fs::remove_dir_all(&self.root).ok();
+                    return;
+                }
+                Some(reason) => match self.coordinator_is_gone(self.stop_limit) {
+                    Err(seen) => self.blind_message(reason, &seen),
+                    Ok(()) => {
+                        eprintln!(
+                            "the test harness could not inspect the processes that hold a file \
+                         under {}: {reason}. No coordinator of this test accepts a \
+                         connection, so the harness deleted the directory.",
+                            self.root.display()
+                        );
+                        std::fs::remove_dir_all(&self.root).ok();
+                        return;
+                    }
+                },
+            }
+        };
         // NEVER DELETE THE DIRECTORY IN SILENCE WHILE A PROCESS HOLDS IT. The
         // directory is the only thing that names that process, and the reader
         // is the person who must clean the machine. cargo hides the output of
         // a test that passes, so the message must be a failure. A second panic
         // stops the whole test program, so a test that already fails prints
         // the message and keeps its own failure.
-        let message = self.stayed_message(&stayed);
         if std::thread::panicking() {
             eprintln!("{message}");
         } else {
@@ -5639,6 +5879,18 @@ fn a_replacement_of_the_program_does_not_stop_the_jobs() {
     );
     assert!(holder.status.success());
     let holder = String::from_utf8_lossy(&holder.stdout).trim().to_string();
+
+    // WAIT UNTIL THE HOLDER OPERATES, AND THEN REPLACE THE FILE.
+    //
+    // The retire rule of the coordinator counts each job that is not in a final
+    // state (`!is_terminal()` in `src/daemon.rs`), so a job that is still
+    // `queued` already holds the coordinator. This wait is thus a SECOND guard
+    // and not the only one: a later rule that counts only the jobs that
+    // operate would open the race again for the time that a start takes, and
+    // this test would then fail some runs and name no cause.
+    h.until("the holder operates", Duration::from_secs(45), || {
+        h.state_of(&holder) == "running"
+    });
     let before = info()["pid"].as_i64().expect("a coordinator operates");
 
     // Replace the program file while the coordinator operates.
@@ -6929,15 +7181,26 @@ fn a_job_with_retries_keeps_its_slot_until_it_stops() {
                 }
             }
         }
-        assert_eq!(
-            h.state_of(&waiter),
-            "queued",
-            "a job with retries left must keep its slot"
-        );
-        assert!(
-            !h.has_started(&waiter),
-            "the waiter started while the retrying job still held the core"
-        );
+        // ONE READ OF EACH STATE IS NOT A PROOF. The first job can complete
+        // after the read above, and the coordinator then starts the waiter,
+        // which is correct. This test blamed the product for that on a build
+        // machine. When the waiter left the queue, read the first job AGAIN:
+        // the fault is a waiter that started while that job is still active.
+        // A job never goes back from `completed`, so a first job that is still
+        // active at this later read was active when the waiter started. The
+        // loop reads five times each second while the last attempt operates
+        // for 8 seconds, so a waiter that starts early is seen long before
+        // that job completes.
+        let waiter_state = h.state_of(&waiter);
+        if waiter_state != "queued" || h.has_started(&waiter) {
+            let first_now = h.state_of(&first);
+            assert_eq!(
+                first_now, "completed",
+                "a job with retries left must keep its slot: the waiter is `{waiter_state}` \
+                 and the retrying job is still `{first_now}`"
+            );
+            break;
+        }
         assert!(Instant::now() < deadline, "the retrying job did not finish");
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -7538,6 +7801,72 @@ fn the_configured_states_select_the_jobs_that_run_the_stop_hook() {
         "coordinator",
         "a job that never ran has no supervisor, so the coordinator notifies"
     );
+}
+
+/// `qex clean` must delete the record of a job whose stop hook still runs.
+///
+/// The hook of a job that never started runs in a thread of the coordinator,
+/// AFTER the job has its final state, and qex writes the verdict into
+/// `hook.log` in the directory of the job when the hook ends. A reader sees
+/// `cancelled` and deletes the record in that time. The deletion then met a
+/// file that was not in its list, and failed with `Directory not empty`: the
+/// record was gone from the coordinator and the directory stayed.
+///
+/// A job that OPERATED does not show this: its supervisor runs the hook before
+/// the coordinator learns the final state. So the job here waits in the queue
+/// behind a job that holds the one core, and a cancel ends it.
+///
+/// The hook shows that it started, and then continues for two seconds. The
+/// test deletes in that window, which is the window of the fault.
+///
+/// The fault itself needs the new file to arrive in the middle of the
+/// deletion, which no test can order. So the test proves the thing that
+/// removes the window: when `qex clean` gives its answer, the hook has ENDED.
+#[test]
+fn a_clean_waits_for_a_stop_hook_that_still_writes() {
+    let h = Harness::with_default_config("hookclean");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[budget]\ncpu = \"1\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop_states = [\"cancelled\"]\n\
+         on_stop = [\"sh\", \"-c\", \"echo started >> {0}; sleep 2; echo a late line; echo ended >> {0}\"]\n",
+        mark.display()
+    ));
+
+    let occupier = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&occupier) == "running"
+    });
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.ok(&["cancel", &id]);
+    h.until("the stop hook started", Duration::from_secs(30), || {
+        !h.hook_lines().is_empty()
+    });
+    let dir = h.job_dir(&id);
+    assert!(
+        !std::fs::read_to_string(dir.join("hook.log"))
+            .unwrap_or_default()
+            .contains("qex: the stop hook"),
+        "the hook must still run when the deletion starts, or this test proves nothing: {:?}",
+        std::fs::read_to_string(dir.join("hook.log"))
+    );
+
+    h.ok(&["clean", &id]);
+    assert_eq!(
+        h.hook_lines(),
+        vec!["started", "ended"],
+        "`qex clean` must wait for the hook, which writes into the directory that it deletes"
+    );
+    assert!(
+        !dir.exists(),
+        "the directory of a deleted record must not stay: {}",
+        dir.display()
+    );
+    h.ok(&["kill", &occupier]);
 }
 
 /// A job whose supervisor stopped must still notify, one time.
@@ -15696,6 +16025,33 @@ impl Drop for OpenSockets {
     }
 }
 
+/// Opens a stream socket that a child process does not get.
+///
+/// EACH CHILD OF THE TEST PROGRAM GETS A SOCKET THAT HAS NO SUCH FLAG. The
+/// tests run on more than one thread, so the coordinator of a DIFFERENT test
+/// can start while this socket is open. That coordinator then holds the
+/// listener after this test closes it, and the socket gives no answer for as
+/// long as that coordinator operates. The harness met this state: it asked the
+/// socket at the end of a test, got no answer, and could not say that the
+/// coordinator was gone.
+///
+/// Linux sets the flag in the same call, so no child can start between the two
+/// steps. macOS has no such call, so the flag comes one step later there.
+unsafe fn a_socket_that_no_child_gets() -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        fd
+    }
+}
+
 /// Opens a socket that accepts no connection, and fills its backlog.
 ///
 /// A connect to this socket gives no answer. The standard `UnixListener` asks
@@ -15735,7 +16091,7 @@ fn a_socket_that_never_answers(path: &Path) -> Option<OpenSockets> {
     let mut open = Vec::new();
 
     let can_wait = unsafe {
-        let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        let listener = a_socket_that_no_child_gets();
         assert!(listener >= 0, "the test cannot open a socket");
         open.push(listener);
         assert_eq!(
@@ -15750,7 +16106,7 @@ fn a_socket_that_never_answers(path: &Path) -> Option<OpenSockets> {
         // stays in the queue.
         let mut full = false;
         for _ in 0..256 {
-            let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let client = a_socket_that_no_child_gets();
             assert!(client >= 0, "the test cannot open a socket");
             let flags = libc::fcntl(client, libc::F_GETFL);
             libc::fcntl(client, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -17260,7 +17616,7 @@ fn the_harness_names_a_process_that_it_could_not_stop() {
     let h = Harness::with_default_config("dropstayed");
     let pid = h.coordinator_pid();
 
-    let stayed = h.stop_holders(0, Duration::from_millis(200));
+    let stayed = h.stop_holders(0, Duration::from_millis(200)).pids;
     assert!(
         stayed.contains(&pid),
         "the harness must give the coordinator {pid} that stayed: {stayed:?}"
@@ -17280,7 +17636,7 @@ fn the_harness_names_a_process_that_it_could_not_stop() {
     );
 
     // The true signal stops it, and nothing stays.
-    let stayed = h.stop_holders(libc::SIGKILL, Duration::from_secs(5));
+    let stayed = h.stop_holders(libc::SIGKILL, Duration::from_secs(5)).pids;
     assert!(stayed.is_empty(), "SIGKILL must stop it: {stayed:?}");
     assert!(
         unsafe { libc::kill(pid, 0) } != 0,
@@ -17314,6 +17670,7 @@ fn a_drop_with_a_process_that_stayed_keeps_the_directory_and_says_so() {
             peers_dir: root.join("peers"),
             stop_signal: libc::SIGKILL,
             stop_limit: STOP_LIMIT,
+            look_fails: false,
         };
         drop(again);
         assert!(
@@ -17371,6 +17728,165 @@ fn a_drop_with_a_process_that_stayed_keeps_the_directory_and_says_so() {
         "the drop deleted the directory while the process {pid} held it"
     );
     clean(&root, pid);
+}
+
+/// Drop must not delete the directory when it could not look for the processes.
+///
+/// The look gave an empty list when `lsof` did not start, when `lsof` failed,
+/// and when `/proc/<pid>/fd` refused. Drop read that list as "nothing is
+/// left", and it deleted the directory of a coordinator that still operated.
+/// A look that fails now says so, and Drop then asks the socket.
+///
+/// No test can remove `lsof` from the machine, so `look_fails` makes the state.
+///
+/// The two states of a Drop that could not look:
+///
+///   * a coordinator still answers, so Drop must FAIL the test, keep the
+///     directory, and say that it could not inspect the processes;
+///   * no coordinator answers, so Drop deletes the directory and does not fail.
+#[test]
+fn a_drop_that_could_not_look_asks_the_socket_and_says_so() {
+    // A COORDINATOR STILL ANSWERS.
+    let mut h = Harness::with_default_config("dropblind");
+    let pid = h.coordinator_pid();
+    let root = h.root.clone();
+    h.look_fails = true;
+    h.stop_limit = Duration::from_millis(200);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(h)))
+        .expect_err("a drop that could not look, with a coordinator that answers, must fail");
+    let message = failure
+        .downcast_ref::<String>()
+        .expect("the failure of the drop must carry a message");
+    assert!(
+        message.contains("could not inspect") && message.contains(root.to_str().unwrap()),
+        "the failure must say that the harness could not look, and name the directory: \
+         {message}"
+    );
+    assert!(
+        message.contains("says that a coordinator of this test is running"),
+        "the failure must say what the harness saw: {message}"
+    );
+    assert!(
+        message.contains("stop it"),
+        "the message must give the remedy: {message}"
+    );
+    assert!(
+        root.join("cfg/qex.toml").exists(),
+        "the drop deleted the directory and it never looked for the coordinator {pid}"
+    );
+    assert!(
+        unsafe { libc::kill(pid, 0) } == 0,
+        "a look that fails finds no process, so the coordinator {pid} must still operate"
+    );
+
+    // NO COORDINATOR ANSWERS. The same directory, and a look that operates,
+    // stops the coordinator first. SIGKILL leaves the socket FILE, so this part
+    // also holds the rule that a file that refuses a connection is "gone".
+    let mut again = Harness {
+        root: root.clone(),
+        extra_env: Vec::new(),
+        peers_dir: root.join("peers"),
+        stop_signal: libc::SIGKILL,
+        stop_limit: STOP_LIMIT,
+        look_fails: false,
+    };
+    again.stop_coordinator();
+    assert!(
+        unsafe { libc::kill(pid, 0) } != 0,
+        "the coordinator {pid} stayed after SIGKILL"
+    );
+    again.look_fails = true;
+    drop(again);
+    assert!(
+        !root.exists(),
+        "a drop that could not look must delete {} when no coordinator answers",
+        root.display()
+    );
+}
+
+/// A Drop that could not look must say what it saw, and no more than that.
+///
+/// "A coordinator answers" and "the harness got no answer" are different
+/// facts. The message said "a coordinator still accepts connections" for both,
+/// so it sent the reader to find a process that did not exist.
+///
+/// The state here has NO coordinator. A listener of the test itself accepts
+/// the connection and never answers, so `qex info --no-start` waits without
+/// end. The harness must stop that command at its limit, or Drop never
+/// returns. The two parts:
+///
+///   * the listener is in the run directory, so the harness names that socket;
+///   * the listener is outside the root, so the harness has no answer at all,
+///     and it says that it could not confirm.
+#[test]
+fn a_drop_that_could_not_look_says_only_what_it_saw() {
+    let failure_of = |h: Harness| -> String {
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(h)))
+            .expect_err("a drop that could not look, and got no answer \"gone\", must fail");
+        failure
+            .downcast_ref::<String>()
+            .expect("the failure of the drop must carry a message")
+            .clone()
+    };
+
+    // THE LISTENER IS IN THE RUN DIRECTORY.
+    let mut h = Harness::with_default_config("dropsilent");
+    let root = h.root.clone();
+    let run = root.join("state/qex/run");
+    std::fs::create_dir_all(&run).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(run.join("s")).unwrap();
+    h.look_fails = true;
+    h.stop_limit = Duration::from_millis(200);
+    let begin = Instant::now();
+    let message = failure_of(h);
+    assert!(
+        begin.elapsed() < Duration::from_secs(20),
+        "the drop waited {:?} for a command that never answers",
+        begin.elapsed()
+    );
+    assert!(
+        message.contains("could not inspect")
+            && message.contains(&format!(
+                "The socket {} still accepts a connection",
+                run.join("s").display()
+            )),
+        "the failure must name the socket that accepts: {message}"
+    );
+    assert!(
+        !message.contains("is running"),
+        "no coordinator exists, so the message must not say that one runs: {message}"
+    );
+    assert!(root.exists(), "the drop deleted the directory");
+    drop(listener);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    // THE LISTENER IS OUTSIDE THE ROOT. The run directory of the root has no
+    // file, so the product is the only source, and it gives no answer.
+    let mut h = Harness::with_default_config("dropunknown");
+    let root = h.root.clone();
+    let elsewhere = std::env::temp_dir().join(format!("qx{}-elsewhere", std::process::id()));
+    std::fs::create_dir_all(elsewhere.join("qex/run")).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(elsewhere.join("qex/run/s")).unwrap();
+    h.extra_env.push((
+        "XDG_STATE_HOME".to_string(),
+        elsewhere.to_str().unwrap().to_string(),
+    ));
+    h.look_fails = true;
+    h.stop_limit = Duration::from_millis(200);
+    let message = failure_of(h);
+    assert!(
+        message.contains("could not confirm that the coordinator of this test is gone")
+            && message.contains("gave no answer"),
+        "the failure must say that the harness does not know: {message}"
+    );
+    assert!(
+        !message.contains("is running") && !message.contains("still accepts"),
+        "no coordinator exists, so the message must not say that one answers: {message}"
+    );
+    assert!(root.exists(), "the drop deleted the directory");
+    drop(listener);
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&elsewhere).unwrap();
 }
 
 /// A test that deletes the pid file must still stop its coordinator.

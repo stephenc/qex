@@ -61,6 +61,15 @@ use std::time::{Duration, Instant};
 /// The name of the file that says that the hook of this job ran.
 const CLAIM_FILE: &str = "hook.ran";
 
+/// The words that start the verdict of qex in the file of the hook. The verdict
+/// is the LAST thing that a hook writes into the directory of its job, so
+/// these words say that the hook ended. See [`still_runs`].
+const VERDICT: &str = "qex: the stop hook";
+
+/// The time after the limit of a hook in which qex stops it and writes the
+/// verdict. A hook that is older than its limit and this time writes no more.
+const END_OF_A_HOOK: Duration = Duration::from_secs(10);
+
 /// The name of the file that holds the output of the hook.
 const LOG_FILE: &str = "hook.log";
 
@@ -192,7 +201,7 @@ fn fire_with(origin: Origin, cfg: &Config, dir: &Path, status: &JobStatus) {
     // coordinator, AND NO COMMAND READS THOSE FILES. A user whose notification
     // did not arrive had no way to learn the reason. `qex logs <id> --hook`
     // gives this file.
-    note(dir, &format!("qex: the stop hook {verdict}"));
+    note(dir, &format!("{VERDICT} {verdict}"));
     log(&format!("the stop hook of the job {} {verdict}", status.id));
 }
 
@@ -240,6 +249,50 @@ fn note(dir: &Path, text: &str) {
 /// claim file means that the supervisor has almost always run the hook already,
 /// so this call does nothing. The supervisor path keeps its limit at all times,
 /// because the supervisor waits for the hook itself.
+/// Tells whether a stop hook of the job in `dir` still runs, and thus still
+/// writes into that directory.
+///
+/// # Why a deletion asks this
+///
+/// The hook runs apart from the job: a thread of the coordinator or the
+/// supervisor starts it AFTER the job has its final state, and qex writes the
+/// verdict into `hook.log` when the hook ends. A reader sees `cancelled` and
+/// deletes the record in that time. The deletion lists the directory, deletes
+/// what it found, and then finds a `hook.log` that was not in the list:
+/// `Directory not empty`. The record is then gone from the coordinator and the
+/// directory stays, and the next coordinator holds the job again.
+///
+/// # The evidence
+///
+/// `hook.ran` holds the moment of the start. The verdict in `hook.log` is the
+/// end. A hook with a start, with no verdict, and younger than its limit plus
+/// the time that qex takes to stop it, still runs. An OLDER hook with no
+/// verdict belongs to a process that stopped before it wrote one, so nothing
+/// writes any more, and the answer is `false`: a deletion must never wait for
+/// a writer that does not exist.
+pub fn still_runs(dir: &Path, limit: Duration, now: u64) -> bool {
+    let Ok(claim) = std::fs::read_to_string(dir.join(CLAIM_FILE)) else {
+        return false;
+    };
+    // The form is `STATE ID SECONDS ORIGIN`. See `claim`.
+    let Some(started) = claim
+        .split_whitespace()
+        .nth(2)
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return false;
+    };
+    if now > started + limit.as_secs() + END_OF_A_HOOK.as_secs() {
+        return false;
+    }
+    match std::fs::read_to_string(dir.join(LOG_FILE)) {
+        Ok(text) => !text.lines().any(|line| line.starts_with(VERDICT)),
+        // The file does not exist yet, or it holds bytes that are not text.
+        // The hook has a start and no end that qex can read.
+        Err(_) => true,
+    }
+}
+
 pub fn fire_detached(dir: &Path, status: &JobStatus) {
     if !status.state.is_terminal() {
         return;
@@ -709,6 +762,49 @@ mod tests {
 
     fn cfg_with(hook: &str) -> Config {
         toml::from_str(hook).unwrap()
+    }
+
+    /// A deletion waits for a hook that still writes, and for no other hook.
+    ///
+    /// Each state is one that a directory really has: no hook at all, a hook
+    /// that started, a hook that wrote its verdict, and a hook whose process
+    /// stopped before the verdict. The last one must NOT hold a deletion, or a
+    /// record could never be deleted.
+    #[test]
+    fn a_hook_runs_from_its_start_to_its_verdict_and_never_after_its_limit() {
+        let t = temp("stillruns");
+        let dir = &t.0;
+        let limit = Duration::from_secs(30);
+
+        assert!(!still_runs(dir, limit, 1000), "no hook started");
+
+        std::fs::write(dir.join(CLAIM_FILE), "cancelled some-id 1000 coordinator\n").unwrap();
+        assert!(still_runs(dir, limit, 1001), "a start and no output yet");
+
+        std::fs::write(dir.join(LOG_FILE), "a line of the hook\n").unwrap();
+        assert!(still_runs(dir, limit, 1001), "output, and no verdict yet");
+        assert!(
+            still_runs(dir, limit, 1000 + 30 + END_OF_A_HOOK.as_secs()),
+            "qex still can write the verdict at the end of the limit"
+        );
+        assert!(
+            !still_runs(dir, limit, 1000 + 30 + END_OF_A_HOOK.as_secs() + 1),
+            "a hook that is older than its limit writes no more"
+        );
+
+        note(dir, &format!("{VERDICT} ended with the exit code 0"));
+        assert!(!still_runs(dir, limit, 1001), "the verdict is the end");
+
+        // A line of the HOOK that holds the words is not the verdict of qex:
+        // the verdict starts its own line.
+        std::fs::write(dir.join(LOG_FILE), format!("the hook says: {VERDICT}\n")).unwrap();
+        assert!(still_runs(dir, limit, 1001));
+
+        std::fs::write(dir.join(CLAIM_FILE), "not the form of a claim\n").unwrap();
+        assert!(
+            !still_runs(dir, limit, 1001),
+            "a claim that qex cannot read holds nothing"
+        );
     }
 
     /// The hook must run one time for each job. A person who receives the same

@@ -358,6 +358,20 @@ fn finish_removal(removal: Removal) -> Result<(), String> {
     crate::history::record_removed(&removal.status);
 
     let dir = paths::job_dir(&removal.status.id).map_err(|e| e.to_string())?;
+
+    // Let a stop hook of this job end first. It writes its verdict into this
+    // directory AFTER the job has its final state, and a file that arrives in
+    // the middle of the deletion leaves the directory in place with no record
+    // for it. The wait has an end of its own: `hook::still_runs` gives `false`
+    // for a hook that is older than its limit. See that function.
+    let limit = crate::config::Config::load_short()
+        .ok()
+        .and_then(|cfg| cfg.hook_timeout().ok())
+        .unwrap_or(std::time::Duration::from_secs(30));
+    while crate::hook::still_runs(&dir, limit, crate::sys::now_secs()) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
