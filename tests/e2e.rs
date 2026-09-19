@@ -647,8 +647,11 @@ impl Harness {
     /// facts, and the reader of the failure must see which one happened.
     fn coordinator_is_gone(&self, limit: Duration) -> Result<(), String> {
         let deadline = Instant::now() + limit;
+        // ONE LIMIT FOR THE WHOLE WAIT. Each question gets only the time that
+        // remains, so a slow answer cannot make the wait longer than `limit`.
+        let mut left = limit;
         loop {
-            let product = self.ask_the_product(limit);
+            let product = self.ask_the_product(left);
             let listener = std::fs::read_dir(self.root.join("state/qex/run"))
                 .ok()
                 .and_then(|dir| {
@@ -672,10 +675,13 @@ impl Harness {
                      gone: {why}. A process can remain."
                 ),
             };
-            if Instant::now() >= deadline {
+            std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
+            left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(seen);
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -757,6 +763,19 @@ impl Harness {
         pid > 1 && pid != std::process::id() as i32 && pid != unsafe { libc::getppid() }
     }
 
+    /// Gives the state letter of a process from `/proc/<pid>/stat`.
+    ///
+    /// `Z` and `X` are a process that ended. `None` says that the entry is
+    /// gone, which is the same fact.
+    ///
+    /// The name of the program is the second field, and it can contain spaces
+    /// and brackets. The state is the first field after the LAST `)`.
+    fn state_in_proc(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let (_, after) = stat.rsplit_once(')')?;
+        after.trim_start().chars().next()
+    }
+
     /// Finds processes that still hold a file under this harness root.
     ///
     /// NEVER GIVE AN EMPTY LIST FOR A LOOK THAT FAILED. See `Holders`.
@@ -795,8 +814,24 @@ impl Harness {
                         let ours = entry
                             .metadata()
                             .is_ok_and(|m| m.uid() == unsafe { libc::getuid() });
-                        if ours {
-                            blind = Some(format!("/proc/{pid}/fd cannot be read: {e}"));
+                        if !ours {
+                            continue;
+                        }
+                        // A PROCESS THAT ENDED HOLDS NOTHING. The system keeps
+                        // its entry until the parent collects it, and gives
+                        // the `fd` directory of that entry to root, so the
+                        // refusal is "Permission denied" and not "not found".
+                        // A test that does not collect a child leaves such an
+                        // entry until the test program ends, and each look
+                        // after it then failed on a build machine.
+                        match Self::state_in_proc(pid) {
+                            None | Some('Z') | Some('X') => {}
+                            Some(state) => {
+                                blind = Some(format!(
+                                    "/proc/{pid}/fd of a process in the state {state} cannot \
+                                     be read: {e}"
+                                ));
+                            }
                         }
                         continue;
                     }
@@ -15924,6 +15959,33 @@ impl Drop for OpenSockets {
     }
 }
 
+/// Opens a stream socket that a child process does not get.
+///
+/// EACH CHILD OF THE TEST PROGRAM GETS A SOCKET THAT HAS NO SUCH FLAG. The
+/// tests run on more than one thread, so the coordinator of a DIFFERENT test
+/// can start while this socket is open. That coordinator then holds the
+/// listener after this test closes it, and the socket gives no answer for as
+/// long as that coordinator operates. The harness met this state: it asked the
+/// socket at the end of a test, got no answer, and could not say that the
+/// coordinator was gone.
+///
+/// Linux sets the flag in the same call, so no child can start between the two
+/// steps. macOS has no such call, so the flag comes one step later there.
+unsafe fn a_socket_that_no_child_gets() -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd >= 0 {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        fd
+    }
+}
+
 /// Opens a socket that accepts no connection, and fills its backlog.
 ///
 /// A connect to this socket gives no answer. The standard `UnixListener` asks
@@ -15963,7 +16025,7 @@ fn a_socket_that_never_answers(path: &Path) -> Option<OpenSockets> {
     let mut open = Vec::new();
 
     let can_wait = unsafe {
-        let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        let listener = a_socket_that_no_child_gets();
         assert!(listener >= 0, "the test cannot open a socket");
         open.push(listener);
         assert_eq!(
@@ -15978,7 +16040,7 @@ fn a_socket_that_never_answers(path: &Path) -> Option<OpenSockets> {
         // stays in the queue.
         let mut full = false;
         for _ in 0..256 {
-            let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            let client = a_socket_that_no_child_gets();
             assert!(client >= 0, "the test cannot open a socket");
             let flags = libc::fcntl(client, libc::F_GETFL);
             libc::fcntl(client, libc::F_SETFL, flags | libc::O_NONBLOCK);
