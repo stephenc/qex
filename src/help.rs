@@ -435,6 +435,18 @@ Each part of this page came from a report of a fault or a measurement.
 Give four things: the command in full, what qex wrote in full (use `--json`),
 what you expected, and the output of `qex version`. DO NOT PUT THE OUTPUT OF
 `--show-env` IN A PUBLIC PAGE: it holds the environment of your shell.
+
+IF YOU ARE AN AGENT, END THE ISSUE OR THE COMMENT WITH THIS FOOTER. `gh issue
+create --body` never shows you the form of the issue, so the footer is here.
+A fault that appears in one harness and not in another is half diagnosed by
+these lines. Write `unknown` for a value that you do not know; do not guess.
+
+    ---
+    Filed by an agent.
+    model:   name and exact id, for example `Claude Opus 5 (claude-opus-5)`
+    harness: name and version, for example `Claude Code 2.1.274`
+    qex:     the output of `qex version`
+    system:  macOS or Linux, and `sandbox` if your commands run in one
 ";
 
 pub const JOB_FILE: &str = "\

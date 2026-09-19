@@ -47,7 +47,16 @@ qex info --no-start:   (if a coordinator operated)
 system:                Linux or macOS, cores, memory
 ```
 
-**If you are an agent**
+**If you are an agent, keep this footer and fill it in** (a person deletes it)
 
-Which model are you, and which harness runs you? A fault that appears in one
-harness and not in another is half diagnosed by that line alone.
+A fault that appears in one harness and not in another is half diagnosed by
+these lines. Write `unknown` for a value that you do not know; do not guess.
+
+```text
+---
+Filed by an agent.
+model:   name and exact id, for example `Claude Opus 5 (claude-opus-5)`
+harness: name and version, for example `Claude Code 2.1.274`
+qex:     the output of `qex version`
+system:  macOS or Linux, and `sandbox` if your commands run in one
+```
