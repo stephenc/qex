@@ -7803,6 +7803,72 @@ fn the_configured_states_select_the_jobs_that_run_the_stop_hook() {
     );
 }
 
+/// `qex clean` must delete the record of a job whose stop hook still runs.
+///
+/// The hook of a job that never started runs in a thread of the coordinator,
+/// AFTER the job has its final state, and qex writes the verdict into
+/// `hook.log` in the directory of the job when the hook ends. A reader sees
+/// `cancelled` and deletes the record in that time. The deletion then met a
+/// file that was not in its list, and failed with `Directory not empty`: the
+/// record was gone from the coordinator and the directory stayed.
+///
+/// A job that OPERATED does not show this: its supervisor runs the hook before
+/// the coordinator learns the final state. So the job here waits in the queue
+/// behind a job that holds the one core, and a cancel ends it.
+///
+/// The hook shows that it started, and then continues for two seconds. The
+/// test deletes in that window, which is the window of the fault.
+///
+/// The fault itself needs the new file to arrive in the middle of the
+/// deletion, which no test can order. So the test proves the thing that
+/// removes the window: when `qex clean` gives its answer, the hook has ENDED.
+#[test]
+fn a_clean_waits_for_a_stop_hook_that_still_writes() {
+    let h = Harness::with_default_config("hookclean");
+    let mark = h.root.join("hook.txt");
+    h.write_config(&format!(
+        "[budget]\ncpu = \"1\"\nmem = \"1GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
+         [hooks]\non_stop_states = [\"cancelled\"]\n\
+         on_stop = [\"sh\", \"-c\", \"echo started >> {0}; sleep 2; echo a late line; echo ended >> {0}\"]\n",
+        mark.display()
+    ));
+
+    let occupier = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sleep", "300",
+    ]);
+    h.until("the first job operates", Duration::from_secs(45), || {
+        h.state_of(&occupier) == "running"
+    });
+    let id = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    h.ok(&["cancel", &id]);
+    h.until("the stop hook started", Duration::from_secs(30), || {
+        !h.hook_lines().is_empty()
+    });
+    let dir = h.job_dir(&id);
+    assert!(
+        !std::fs::read_to_string(dir.join("hook.log"))
+            .unwrap_or_default()
+            .contains("qex: the stop hook"),
+        "the hook must still run when the deletion starts, or this test proves nothing: {:?}",
+        std::fs::read_to_string(dir.join("hook.log"))
+    );
+
+    h.ok(&["clean", &id]);
+    assert_eq!(
+        h.hook_lines(),
+        vec!["started", "ended"],
+        "`qex clean` must wait for the hook, which writes into the directory that it deletes"
+    );
+    assert!(
+        !dir.exists(),
+        "the directory of a deleted record must not stay: {}",
+        dir.display()
+    );
+    h.ok(&["kill", &occupier]);
+}
+
 /// A job whose supervisor stopped must still notify, one time.
 ///
 /// The supervisor runs the hook. A supervisor that a signal stops runs nothing,
