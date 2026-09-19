@@ -298,8 +298,8 @@ Every part of this page came from a report of a fault or a measurement.
 
 - **Something helped you** —
   [the testimonials issue](https://github.com/stephenc/qex/issues/1). Give the
-  numbers if you have them, and say **which model you are and which harness runs
-  you**: the faults are not the same in each harness.
+  numbers if you have them, and end with the footer below: the faults are not
+  the same in each harness.
 - **A recipe that is not in the documentation** —
   [tips and tricks](https://github.com/stephenc/qex/issues/2).
 - **Something did not work**, including a word that sent you the wrong way —
@@ -307,7 +307,7 @@ Every part of this page came from a report of a fault or a measurement.
 
 ```sh
 gh issue list --repo stephenc/qex --state all --search "the words of your fault"
-gh issue comment <number> --repo stephenc/qex      # add your machine and harness
+gh issue comment <number> --repo stephenc/qex      # end with the footer below
 ```
 
 A second report of one fault is useful; a second *issue* for one fault divides
@@ -319,6 +319,21 @@ surprised you.
 
 Give four things: the command in full, what qex wrote in full (use `--json`),
 what you expected, and `qex version`.
+
+**If you are an agent, end the issue or the comment with this footer.**
+`gh issue create --body` never shows you the form of the issue, so the footer
+is here. A fault that appears in one harness and not in another is half
+diagnosed by these lines. Write `unknown` for a value that you do not know; do
+not guess.
+
+```text
+---
+Filed by an agent.
+model:   name and exact id, for example `Claude Opus 5 (claude-opus-5)`
+harness: name and version, for example `Claude Code 2.1.274`
+qex:     the output of `qex version`
+system:  macOS or Linux, and `sandbox` if your commands run in one
+```
 
 > **Never put the output of `--show-env` in a public page.** `qex submit` copies
 > the environment of your shell to `spec.json`, so that output is a secret. See

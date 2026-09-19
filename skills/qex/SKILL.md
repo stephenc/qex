@@ -270,9 +270,21 @@ Every command that reads data accepts `--json`.
 
 ## Report what you find
 
-- It helped you: https://github.com/stephenc/qex/issues/1 — give the numbers,
-  your model and your harness.
+- It helped you: https://github.com/stephenc/qex/issues/1 — give the numbers.
 - A recipe worth sharing: https://github.com/stephenc/qex/issues/2
 - Something did not work, including a word that sent you the wrong way: search
   first with `gh issue list --repo stephenc/qex --state all --search "..."` and
   comment on the issue that matches; open a new one only when nothing does.
+
+End every issue and every comment with this footer. A fault that appears in one
+harness and not in another is half diagnosed by these lines. Write `unknown`
+for a value that you do not know; do not guess.
+
+```text
+---
+Filed by an agent.
+model:   name and exact id, for example `Claude Opus 5 (claude-opus-5)`
+harness: name and version, for example `Claude Code 2.1.274`
+qex:     the output of `qex version`
+system:  macOS or Linux, and `sandbox` if your commands run in one
+```
