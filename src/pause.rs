@@ -186,6 +186,14 @@ pub struct Paused {
     /// list is empty: a lock with no request is not in the map.
     #[serde(default, deserialize_with = "read_lock_requests")]
     pub locks: BTreeMap<String, Vec<PauseRecord>>,
+    /// Says that this set holds an id that the file does not hold yet.
+    ///
+    /// A record of the earlier shape has no id, and `read` gives it one. An id
+    /// that lives in memory only is a NEW id after each restart, and a receipt
+    /// that names it then names nothing. `expire` reports this as a change, so
+    /// the caller writes the file before a reader sees the id.
+    #[serde(skip)]
+    pub id_not_in_the_file: bool,
 }
 
 impl Paused {
@@ -232,8 +240,9 @@ impl Paused {
     /// Puts the set in its correct form after a read or a change: each request
     /// has an id, no lock has an empty list, and `queue_since` is set exactly
     /// while the queue is paused.
-    pub fn normalize(&mut self) {
+    pub fn normalize(&mut self) -> bool {
         let mut taken = self.ids();
+        let mut gave_an_id = false;
         for record in self
             .queue
             .iter_mut()
@@ -242,10 +251,12 @@ impl Paused {
             if record.id.is_empty() {
                 record.id = new_id(taken.iter().map(String::as_str));
                 taken.push(record.id.clone());
+                gave_an_id = true;
             }
         }
         self.locks.retain(|_, list| !list.is_empty());
         self.queue_since = self.since();
+        gave_an_id
     }
 
     /// Adds a request for the queue. Gives `true` when this request moved the
@@ -342,10 +353,13 @@ impl Paused {
             }),
             _ => None,
         };
-        self.normalize();
+        // An id that this pass gave is a change also. The file must hold it
+        // before a reader sees it: an id that lives in memory only is a new id
+        // after each restart, and the receipt that names it then names nothing.
+        let gave_an_id = self.normalize() || std::mem::take(&mut self.id_not_in_the_file);
         let after = self.queue.len() + self.locks.values().map(Vec::len).sum::<usize>();
         Expired {
-            changed: after != before,
+            changed: after != before || gave_an_id,
             queue_end,
         }
     }
@@ -381,7 +395,7 @@ impl Paused {
         };
         match serde_json::from_str::<Self>(&text) {
             Ok(mut paused) => {
-                paused.normalize();
+                paused.id_not_in_the_file = paused.normalize();
                 paused
             }
             Err(e) => Self::held_by_fault(&path, &e.to_string()),
@@ -404,6 +418,7 @@ impl Paused {
             }],
             queue_since: Some(now),
             locks: BTreeMap::new(),
+            id_not_in_the_file: false,
         }
     }
 
@@ -1959,6 +1974,25 @@ mod tests {
     ///
     /// A parse that refused either one would turn the file into a fault, and
     /// an upgrade would change a pause of a person into a pause of nobody.
+    /// An id that `read` gives to a record of the earlier shape must reach the
+    /// file. `expire` is the step that tells the coordinator to write, and the
+    /// number of requests does not change here, so the id itself must count.
+    #[test]
+    fn an_id_that_the_file_does_not_hold_is_a_change_to_write() {
+        let text = r#"{"queue":{"paused_at":10,"by_pid":7,"reason":"a demo","until":null}}"#;
+        let mut back: Paused = serde_json::from_str(text).expect("the file must parse");
+        back.id_not_in_the_file = back.normalize();
+        assert!(back.id_not_in_the_file, "the record had no id");
+        let id = back.queue[0].id.clone();
+
+        let first = back.expire(20);
+        assert!(first.changed, "the caller must write the id that qex gave");
+        assert_eq!(back.queue[0].id, id, "the id must not change again");
+
+        let second = back.expire(30);
+        assert!(!second.changed, "the file holds the id now");
+    }
+
     #[test]
     fn the_file_of_an_earlier_version_keeps_its_pause() {
         let text = r#"{"queue":{"paused_at":10,"by_pid":7,"reason":"a demo","until":null,

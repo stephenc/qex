@@ -3164,11 +3164,17 @@ fn print_other_pauses(others: &[&crate::pause::PauseView], target: crate::pause:
         return;
     }
     let now = crate::sys::now_secs();
+    // Name what stays held. A reader who ends a request for a lock and reads
+    // about the queue looks at the queue for a hold that is not there.
+    let effect = match target {
+        crate::pause::Target::Queue => "does not start the queue".to_string(),
+        crate::pause::Target::Lock(name) => format!("does not free the lock `{name}`"),
+    };
     if others.len() == 1 {
-        println!("1 other request stands, so the end of yours does not start the queue:");
+        println!("1 other request stands, so the end of yours {effect}:");
     } else {
         println!(
-            "{} other requests stand, so the end of yours does not start the queue:",
+            "{} other requests stand, so the end of yours {effect}:",
             others.len()
         );
     }
@@ -5221,6 +5227,14 @@ fn pause_report(json: bool, forensic: bool) -> Result<i32> {
     // report that lies in the dangerous direction, because the reader believes
     // that the machine stays quiet.
     let mut paused = crate::pause::Paused::read();
+    // Write an id that `read` gave to a record of the earlier shape, before
+    // this command prints it. No coordinator operates, so nobody else writes
+    // the file, and an id that this command printed and did not keep would be
+    // a different id for the next reader. A request whose end passed stays in
+    // the file for the coordinator, which pays the time of the pause back.
+    if paused.id_not_in_the_file && !paused.queue.iter().any(|r| r.fault) {
+        paused.write().ok();
+    }
     paused.expire(crate::sys::now_secs());
 
     // No coordinator walks the chain of this command, so this command walks
