@@ -67,8 +67,9 @@ pub enum Command {
     /// operates. It then cancels every queued job of the scope, and it sends
     /// TERM to every job of the scope that operates, then KILL after the
     /// grace time. The records stay, as after `qex cancel`; `qex clean
-    /// cancelled` deletes them. The queue stays paused; run `qex resume
-    /// queue` to start new work.
+    /// cancelled` deletes them. The queue stays paused: the answer gives the
+    /// id of the pause request that this command made, and `qex resume queue
+    /// --pause ID` ends it.
     ///
     /// Without an option, the scope is the jobs of this directory that your
     /// own process tree submitted. Run `qex help abort` for the rule.
@@ -113,7 +114,7 @@ pub enum Command {
 
     /// Start the queue again, or give a lock back.
     ///
-    /// `qex resume` alone starts the queue again.
+    /// `qex resume` alone ends nothing: it prints each request and its id.
     Resume(ResumeArgs),
 
     /// Show the configuration or its location.
@@ -774,6 +775,12 @@ pub struct PauseArgs {
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
+
+    /// Add what qex recorded about the issuer of each request: the chain of
+    /// processes, with the numbers of the machine of the coordinator, and the
+    /// number that the caller reported for itself, which nobody verified.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 /// The things that a person can pause.
@@ -825,21 +832,41 @@ pub struct ResumeArgs {
     #[command(subcommand)]
     pub target: Option<ResumeTarget>,
 
+    #[command(flatten)]
+    pub which: WhichPause,
+
     /// Write the output as JSON.
     #[arg(long)]
     pub json: bool,
 }
 
+/// The pause request that a resume ends.
+///
+/// A resume with neither option removes nothing: it prints each standing
+/// request with its id.
+#[derive(Debug, Clone, Default, Args)]
+pub struct WhichPause {
+    /// End this pause request only. The answer of `qex pause` gave the id,
+    /// and `qex pause` alone prints the id of each request that stands.
+    #[arg(long = "pause", value_name = "ID", global = true)]
+    pub pause: Option<String>,
+
+    /// End EVERY request, of every session. This is the recovery path for a
+    /// queue that nobody will resume. Read `qex pause` and each reason first.
+    #[arg(long, global = true, conflicts_with = "pause")]
+    pub all: bool,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ResumeTarget {
-    /// Start the queue again.
+    /// End a pause request of the queue.
     Queue {
         /// Write the output as JSON.
         #[arg(long)]
         json: bool,
     },
 
-    /// Give this lock back. The next job that needs it takes it.
+    /// End a pause request of this lock.
     Lock {
         /// The name of the lock.
         name: String,

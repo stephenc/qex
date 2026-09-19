@@ -1123,16 +1123,15 @@ fn step(coord: &Arc<Coordinator>) -> anyhow::Result<(usize, usize)> {
             // pause, so a pause can never end in the record and continue in the
             // decision.
             let now = sys::now_secs();
-            let queue_pause = state.paused.queue.clone();
-            if state.paused.expire(now) {
-                // A pause of the QUEUE that reached its `--for` ends in exactly
-                // the same way as `qex resume queue`. This call is before
-                // `choose`, so no job can expire on time that the pause took.
-                if let Some(record) = queue_pause {
-                    if state.paused.queue.is_none() {
-                        crate::pause::end_queue_pause(&mut state, &record, now);
-                        log("a pause reached its end; qex starts the queue again");
-                    }
+            let expired = state.paused.expire(now);
+            if expired.changed {
+                // A pause of the QUEUE whose LAST request reached its `--for`
+                // ends in exactly the same way as a resume of that request.
+                // This call is before `choose`, so no job can expire on time
+                // that the pause took.
+                if let Some(end) = expired.queue_end {
+                    crate::pause::end_queue_pause(&mut state, end);
+                    log("a pause reached its end; qex starts the queue again");
                 }
                 state.save_pause();
             }
@@ -1431,7 +1430,7 @@ fn overdue(state: &crate::daemon::State, chosen: Option<uuid::Uuid>) -> Vec<(uui
     // person who paused is away by construction and sees none of it. The wait
     // that the pause added comes back at the end of the pause, in
     // `pause::credit_paused_wait`.
-    if state.paused.queue.is_some() {
+    if state.paused.queue_paused() {
         return Vec::new();
     }
     let now = sys::now_secs();
@@ -1553,7 +1552,10 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     let pools = cfg.pools().unwrap_or_default();
     let active = state.count_state(|s| s.is_active());
     let idle_since = state.idle_since;
-    let paused = state.paused.queue.clone();
+    let paused = state
+        .paused
+        .queue_paused()
+        .then(|| crate::pause::queue_reason(&state.paused));
     let max_bypass = cfg.queue.max_bypass;
     let settle = cfg.settle().unwrap_or(Duration::from_secs(3));
     let quiet = active == 0 && idle_since.map(|t| t.elapsed() >= settle).unwrap_or(false);
@@ -1640,8 +1642,7 @@ fn choose(state: &mut crate::daemon::State) -> Choice {
     //   * The test comes before the oversized branch below. A paused queue is
     //     idle by construction, so a pause would otherwise start every job that
     //     is larger than the budget — the opposite of a quiet machine.
-    if let Some(record) = &paused {
-        let reason = crate::pause::queue_reason(record);
+    if let Some(reason) = &paused {
         for id in ready.iter().copied() {
             reasons.push((id, Some(reason.clone())));
         }
@@ -1884,7 +1885,7 @@ fn start_job(coord: &Arc<Coordinator>, id: uuid::Uuid) -> anyhow::Result<()> {
             return Ok(());
         }
 
-        if state.paused.queue.is_some() {
+        if state.paused.queue_paused() {
             log(&format!("job {id} does not start: the queue is paused"));
             return Ok(());
         }
@@ -2320,7 +2321,9 @@ mod tests {
              measures nothing"
         );
 
-        state.paused.queue = Some(crate::pause::PauseRecord::new(1, None, None));
+        state
+            .paused
+            .add_queue(crate::pause::PauseRecord::new(1, None, None));
         assert!(
             overdue(&state, None).is_empty(),
             "a paused queue must expire no job"
@@ -2406,12 +2409,15 @@ mod tests {
     fn the_end_of_a_pause_starts_the_settle_timer_again() {
         let now = sys::now_secs();
         let mut state = state_with(JobState::Queued, Some(60), 100);
-        let record = crate::pause::PauseRecord::new(1, None, None);
+        let end = crate::pause::QueueEnd {
+            since: now,
+            ended_at: now,
+        };
 
         // A queue that has been idle since long ago. That is the state at the
         // end of a pause, and it is the state that must not survive.
         state.idle_since = Some(Instant::now() - Duration::from_secs(3600));
-        crate::pause::end_queue_pause(&mut state, &record, now);
+        crate::pause::end_queue_pause(&mut state, end);
 
         let waited = state.idle_since.expect("the timer must exist").elapsed();
         assert!(
@@ -2439,14 +2445,15 @@ mod tests {
         // A pause that began 30 seconds ago and ends now.
         let mut record = crate::pause::PauseRecord::new(1, None, Some(now));
         record.paused_at = now.saturating_sub(30);
-        state.paused.queue = Some(record.clone());
+        state.paused.add_queue(record);
 
-        assert!(
-            state.paused.expire(now),
-            "a pause with a time in the past must end"
-        );
-        assert!(state.paused.queue.is_none());
-        crate::pause::end_queue_pause(&mut state, &record, now);
+        let expired = state.paused.expire(now);
+        assert!(expired.changed, "a pause with a time in the past must end");
+        assert!(!state.paused.queue_paused());
+        let end = expired
+            .queue_end
+            .expect("the last request ended, so the pause of the queue ended");
+        crate::pause::end_queue_pause(&mut state, end);
 
         assert_eq!(
             state.jobs[&id].status.queue_pause_secs, 30,

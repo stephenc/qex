@@ -112,16 +112,30 @@ pub enum Request {
         reason: Option<String>,
         /// The moment when the pause ends by itself, in seconds since the epoch.
         until: Option<u64>,
-        /// The process that asked. The CLI writes its own process id here.
+        /// The process id that the CLI reports for itself.
         ///
-        /// The coordinator cannot learn this value from the socket, and a
-        /// record that named the coordinator would name the same process for
-        /// every pause and would explain nothing.
+        /// NOBODY VERIFIES THIS NUMBER. It is a number in the pid namespace of
+        /// the caller, so the coordinator keeps it for the forensic output
+        /// only, and it learns who asked from the credential of the socket.
+        /// See `pause::PauseRecord::by_pid`.
         #[serde(default)]
         by_pid: i32,
     },
-    /// Starts the queue again, or gives a lock back.
-    Resume { target: PauseTarget },
+    /// Ends ONE pause request, or every request of one target.
+    Resume {
+        target: PauseTarget,
+        /// The request to end. The answer of `Pause` gave this id.
+        ///
+        /// A request with no id and no `all` REMOVES NOTHING, and the
+        /// coordinator refuses it with the status lines. An earlier CLI sends
+        /// exactly that form, and a silent "remove everything" is the harm
+        /// that the ids exist to prevent.
+        #[serde(default)]
+        pause_id: Option<String>,
+        /// True to end every request of the target.
+        #[serde(default)]
+        all: bool,
+    },
     /// Gives what is paused now.
     PauseState,
     /// Stops the jobs of one scope and empties their part of the queue.
@@ -142,7 +156,7 @@ pub enum Request {
         keep_running: bool,
         /// The time before qex sends KILL to a job that TERM did not stop.
         grace_secs: u64,
-        /// The process that asked. The pause record names it.
+        /// The process id that the CLI reports for itself. See `Pause`.
         by_pid: i32,
     },
 }
@@ -185,11 +199,27 @@ pub enum PauseTarget {
     Lock { name: String },
 }
 
+/// The receipt of one new pause request. The id is the proof of ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseReceipt {
+    pub pause_id: String,
+    /// True exactly when this request moved the target from running to
+    /// paused. It says nothing about ownership; the id does.
+    pub created: bool,
+    #[serde(default)]
+    pub until: Option<u64>,
+}
+
 /// One lock that a person holds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockPause {
     pub name: String,
+    /// The oldest standing request, for an earlier CLI. It holds no process
+    /// id. This CLI reads `pauses`.
     pub record: crate::pause::PauseRecord,
+    /// Every standing request for this lock, as this reader sees it.
+    #[serde(default)]
+    pub pauses: Vec<crate::pause::PauseView>,
     /// The job that still holds the lock, as `a1b2c3d4 (train)`.
     ///
     /// The person receives the lock when that job stops. No other job takes it
@@ -302,19 +332,14 @@ pub enum Response {
         /// The moment when a person paused the queue.
         #[serde(default)]
         paused_at: Option<u64>,
-        /// The pid of the process that asked for the pause.
+        /// Every standing pause request of the queue, as this reader sees it.
         ///
-        /// A queue is shared, so a report of a pause must say WHO. Without this
-        /// field the two readers of this answer had to invent a pid: `qex top`
-        /// gave 0, and `qex info` gave the pid of the COORDINATOR. The second
-        /// one is the dangerous invention — a person who reads it and runs
-        /// `kill <pid>` stops the coordinator, which is the one process that
-        /// must not be stopped to end a pause.
-        ///
-        /// `None` means that this coordinator does not say. Every command
-        /// prints `unknown` for it, and never a number.
+        /// A queue is shared, so a report of a pause must say WHO. This list
+        /// says it with the session of each request, and with no process id:
+        /// see `pause::PauseRecord::by_pid`. `None` means that this
+        /// coordinator does not say.
         #[serde(default)]
-        paused_by_pid: Option<i32>,
+        pauses: Option<Vec<crate::pause::PauseView>>,
         /// The text that the person gave with `--reason`.
         #[serde(default)]
         paused_reason: Option<String>,
@@ -357,8 +382,23 @@ pub enum Response {
     Event { event: Box<crate::events::Event> },
     /// What is paused now.
     PauseState {
+        /// The oldest standing request of the queue, for an earlier CLI. It
+        /// holds no process id. This CLI reads `pauses`.
         queue: Option<crate::pause::PauseRecord>,
         locks: Vec<LockPause>,
+        /// Every standing request of the queue, as this reader sees it.
+        /// `None` comes from a coordinator that holds one record and no set.
+        #[serde(default)]
+        pauses: Option<Vec<crate::pause::PauseView>>,
+        /// The moment when the queue stopped running.
+        #[serde(default)]
+        since: Option<u64>,
+        /// The answer to a `Pause`: the receipt of the new request.
+        #[serde(default)]
+        receipt: Option<PauseReceipt>,
+        /// The answer to a `Resume`: the requests that it ended.
+        #[serde(default)]
+        resumed: Option<Vec<crate::pause::PauseView>>,
     },
     /// What an `Abort` request did.
     ///
@@ -386,6 +426,12 @@ pub enum Response {
         /// not touch them, and a reader who expected an empty queue must
         /// learn that they exist.
         outside: usize,
+        /// The receipt of the pause request that this abort added.
+        #[serde(default)]
+        pause: Option<PauseReceipt>,
+        /// Every standing request of the queue after the abort.
+        #[serde(default)]
+        pauses: Vec<crate::pause::PauseView>,
     },
     /// The command failed.
     Error { message: String, kind: ErrorKind },
@@ -444,6 +490,19 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resume of an earlier CLI names no request, and it must read as
+    /// exactly that: no id, and NOT "all". The coordinator refuses that form,
+    /// and a default of "all" would end the pause of every session in silence.
+    #[test]
+    fn the_resume_of_an_earlier_cli_names_no_request() {
+        let earlier = r#"{"op":"resume","target":{"kind":"queue"}}"#;
+        let Request::Resume { pause_id, all, .. } = serde_json::from_str(earlier).unwrap() else {
+            panic!("expected a resume")
+        };
+        assert_eq!(pause_id, None);
+        assert!(!all);
+    }
 
     /// An older CLI must read a message from a newer coordinator.
     ///
@@ -579,6 +638,8 @@ mod tests {
             },
             Request::Resume {
                 target: PauseTarget::Queue,
+                pause_id: Some("4b1d22c0".into()),
+                all: false,
             },
             Request::PauseState,
             Request::Abort {

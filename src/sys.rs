@@ -432,8 +432,16 @@ pub fn process_info(pid: i32) -> Option<ProcessInfo> {
 /// session ends when it compares two chains, so a change to that rule reads
 /// the records that exist.
 pub fn submitter_chain() -> Vec<crate::job::Ancestor> {
+    chain_from(unsafe { libc::getppid() })
+}
+
+/// Gives the chain of processes from `pid` upward, `pid` included.
+///
+/// The coordinator uses this walk for the process at the other end of a
+/// socket, so the numbers are the numbers of the machine of the coordinator,
+/// whatever pid namespace the caller lives in.
+pub fn chain_from(mut pid: i32) -> Vec<crate::job::Ancestor> {
     let mut out = Vec::new();
-    let mut pid = unsafe { libc::getppid() };
     // A limit, so a strange process table cannot make an endless loop.
     for _ in 0..64 {
         if pid <= 0 {
@@ -455,6 +463,98 @@ pub fn submitter_chain() -> Vec<crate::job::Ancestor> {
         pid = info.ppid;
     }
     out
+}
+
+/// Gives the process id at the other end of a socket, as THIS machine
+/// numbers it.
+///
+/// The kernel wrote this number when the caller connected, so a caller cannot
+/// choose it, and a caller in a container gets the number that the machine of
+/// the coordinator gives it. `None` says that the system gave no number, or
+/// gave 0: a process that this pid namespace cannot see.
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    let pid = {
+        let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        unsafe { cred.assume_init() }.pid
+    };
+    #[cfg(target_os = "macos")]
+    let pid = {
+        let mut pid: libc::pid_t = 0;
+        let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut pid as *mut libc::pid_t).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        pid
+    };
+    (pid > 0).then_some(pid)
+}
+
+/// Gives the program file of a process, when the system says.
+pub fn process_exe(pid: i32) -> Option<std::path::PathBuf> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let rc = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+        if rc <= 0 {
+            return None;
+        }
+        buf.truncate(rc as usize);
+        Some(std::path::PathBuf::from(
+            String::from_utf8_lossy(&buf).into_owned(),
+        ))
+    }
+}
+
+/// Names the pid namespace of this process.
+///
+/// A process id has a meaning in one pid namespace only. A record that holds
+/// process ids also holds this name, and a reader with a different name must
+/// not test those ids: it would find a stranger, or nothing, and report a
+/// state that is not true. `None` is a system with one namespace (macOS), or
+/// a system that refused to say; two `None` values are the same namespace.
+pub fn pid_namespace() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// Gives the number of seconds after the Unix epoch.
@@ -668,6 +768,74 @@ fn parse_ps_time(text: &str) -> f64 {
         seconds = seconds * 60.0 + part.parse::<f64>().unwrap_or(0.0);
     }
     seconds
+}
+
+/// Reads a moment in the time zone of the machine.
+fn local_parts(epoch_secs: u64) -> libc::tm {
+    // The type comes from `localtime_r`. Do not name it: on musl the name
+    // `libc::time_t` is deprecated, because that type becomes 64 bits.
+    let t = epoch_secs as _;
+    let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&t, &mut parts);
+    }
+    parts
+}
+
+/// Gives the offset of a moment from UTC, as `+01:00`.
+fn offset_text(parts: &libc::tm) -> String {
+    // The type is `c_long`, which has 32 bits on some systems.
+    #[allow(clippy::unnecessary_cast)]
+    let offset = parts.tm_gmtoff as i64;
+    let sign = if offset < 0 { '-' } else { '+' };
+    let minutes = offset.abs() / 60;
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// Gives a moment as `2026-09-05 08:10 +01:00`: the date, the minute and the
+/// offset from UTC.
+///
+/// A reader of a pause can be on a different machine, or read the line a day
+/// later. A time of day with no date and no offset names a different moment
+/// to each such reader.
+pub fn stamp_text(epoch_secs: u64) -> String {
+    let p = local_parts(epoch_secs);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} {}",
+        p.tm_year + 1900,
+        p.tm_mon + 1,
+        p.tm_mday,
+        p.tm_hour,
+        p.tm_min,
+        offset_text(&p)
+    )
+}
+
+/// Gives a moment as `08:10 +01:00` when it is on the same day as `now`, and
+/// as `stamp_text` gives it when it is not.
+pub fn near_stamp_text(epoch_secs: u64, now: u64) -> String {
+    let p = local_parts(epoch_secs);
+    let n = local_parts(now);
+    if (p.tm_year, p.tm_yday) != (n.tm_year, n.tm_yday) {
+        return stamp_text(epoch_secs);
+    }
+    format!("{:02}:{:02} {}", p.tm_hour, p.tm_min, offset_text(&p))
+}
+
+/// Gives a moment in the form of RFC 3339, with the offset of the machine:
+/// `2026-09-05T08:10:00+01:00`.
+pub fn rfc3339(epoch_secs: u64) -> String {
+    let p = local_parts(epoch_secs);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
+        p.tm_year + 1900,
+        p.tm_mon + 1,
+        p.tm_mday,
+        p.tm_hour,
+        p.tm_min,
+        p.tm_sec,
+        offset_text(&p)
+    )
 }
 
 /// Gives the time of day as `HH:MM:SS`, in the time zone of the machine.

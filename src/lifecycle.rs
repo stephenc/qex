@@ -382,6 +382,8 @@ pub struct AbortPlan {
     pub running: Vec<(uuid::Uuid, String)>,
     /// The jobs that wait or operate outside the scope.
     pub outside: usize,
+    /// The receipt of the pause request that the plan added.
+    pub pause: Option<crate::proto::PauseReceipt>,
 }
 
 /// Tests one job against the scope of an abort.
@@ -432,6 +434,7 @@ pub fn plan_abort(
     state: &mut State,
     scope: &crate::proto::AbortScope,
     by_pid: i32,
+    issuer: Option<Vec<crate::job::Ancestor>>,
     boot: &str,
 ) -> AbortPlan {
     // The process id of each job that operates comes from the disk. Without
@@ -439,15 +442,23 @@ pub fn plan_abort(
     // reaches it.
     state.refresh_active();
 
-    // The pause comes FIRST. A pause that a person made earlier keeps its end
-    // and its reason; see `keep_the_end`.
-    let reason = state
+    // The pause comes FIRST. It is a request of its own, with no end, and it
+    // changes no request that stood before: see `pause::PauseRecord`.
+    let created = state.paused.add_queue(crate::daemon::new_request(
+        by_pid,
+        Some(String::from("qex abort")),
+        None,
+        issuer,
+    ));
+    let pause = state
         .paused
         .queue
-        .is_none()
-        .then(|| String::from("qex abort"));
-    let record = crate::daemon::keep_the_end(state.paused.queue.take(), by_pid, reason, None);
-    state.paused.queue = Some(record);
+        .last()
+        .map(|r| crate::proto::PauseReceipt {
+            pause_id: r.id.clone(),
+            created,
+            until: None,
+        });
     state.save_pause();
 
     let now = crate::sys::now_secs();
@@ -529,6 +540,7 @@ pub fn plan_abort(
         not_cancelled,
         running,
         outside,
+        pause,
     }
 }
 
@@ -568,11 +580,15 @@ pub fn abort(
     keep_running: bool,
     grace_secs: u64,
     by_pid: i32,
+    peer: Option<i32>,
 ) -> Response {
     let boot = crate::sys::boot_id();
+    // Before the lock, and long before the answer: the command still waits,
+    // so its chain is still there to read. See `daemon::issuer_chain`.
+    let issuer = crate::daemon::issuer_chain(coord, peer);
     let plan = {
         let mut state = coord.state.lock().unwrap();
-        plan_abort(&mut state, &scope, by_pid, &boot)
+        plan_abort(&mut state, &scope, by_pid, issuer.clone(), &boot)
     };
     // Wake the scheduler, so the jobs that wait get the pause as their reason.
     coord.notify();
@@ -655,6 +671,8 @@ pub fn abort(
         not_stopped,
         continues,
         outside: plan.outside,
+        pause: plan.pause,
+        pauses: crate::pause::views(&coord.state.lock().unwrap().paused.queue, issuer.as_deref()),
     }
 }
 
@@ -769,7 +787,7 @@ mod tests {
             submitter: Some(chain()),
             tags: vec![],
         };
-        let plan = plan_abort(&mut state, &scope, 1, "boot-now");
+        let plan = plan_abort(&mut state, &scope, 1, None, "boot-now");
 
         assert_eq!(plan.cancelled.len(), 1);
         assert_eq!(plan.cancelled[0].0, ids[0]);
@@ -820,7 +838,14 @@ mod tests {
             }
         });
 
-        let answer = abort(&coord, crate::proto::AbortScope::default(), false, 0, 1);
+        let answer = abort(
+            &coord,
+            crate::proto::AbortScope::default(),
+            false,
+            0,
+            1,
+            None,
+        );
         writer.join().unwrap();
 
         let (signalled, not_stopped) = match answer {
