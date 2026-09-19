@@ -21,84 +21,333 @@
 //! still operates. The file is for the coordinator, including one that starts
 //! again.
 
+use crate::job::Ancestor;
 use crate::paths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// One pause: when it started, who asked for it, and when it ends.
+/// One pause request: when it was made, who made it, and when it ends.
+///
+/// # Why a queue holds a SET of these, and not one
+///
+/// One record for each queue let a second command change what the first one
+/// asked for. Every rule for that change had a sequence of events in which one
+/// session shortened the pause of a different session. With a set, no request
+/// changes or removes a different request: the queue is paused while at least
+/// one request stands, and each request ends only by its own end or by a
+/// resume that names it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PauseRecord {
+    /// The name of this request. The coordinator makes it, and the answer of
+    /// `qex pause` gives it to the caller as a receipt.
+    ///
+    /// A record of an earlier version of qex has none. `Paused::normalize`
+    /// gives it one.
+    #[serde(default)]
+    pub id: String,
     /// The moment of the request, in seconds since the epoch.
     pub paused_at: u64,
-    /// The process that asked for the pause.
+    /// The process id that the CLI reported for itself.
     ///
-    /// This value says WHO to a person who reads the file after the command
-    /// went away. A pause with no owner is a pause that nobody can explain.
+    /// NOBODY VERIFIED THIS NUMBER, and no default output shows it. It is a
+    /// number in the pid namespace of the caller: a `qex abort` that was the
+    /// first process of a container reported 1, a reader ran `ps -p 1`, found
+    /// the first process of the machine alive, and believed for six hours that
+    /// the pauser still operated. The forensic output gives it as
+    /// `caller_reported_pid`. `issuer_chain` is what qex reads.
+    #[serde(default)]
     pub by_pid: i32,
     /// The text that the person gave with `--reason`.
     #[serde(default)]
     pub reason: Option<String>,
-    /// The moment when the pause ends by itself, in seconds since the epoch.
+    /// The moment when the request ends by itself, in seconds since the epoch.
     ///
-    /// `None` means that the pause has no end. Such a pause needs a loud
+    /// `None` means that the request has no end. Such a request needs a loud
     /// report, because a user who forgets it comes back to an empty queue.
     #[serde(default)]
     pub until: Option<u64>,
-    /// True when qex made this pause because it could not read the file.
+    /// True when qex made this request because it could not read the file.
     ///
     /// No person asked for such a pause, so each message about it must say
     /// what happened and must not say that a person paused the queue.
     #[serde(default)]
     pub fault: bool,
+    /// The processes above the command that asked, as the COORDINATOR read
+    /// them from the credential of the socket, from the parent of the command
+    /// upward. The numbers are thus numbers of the machine of the coordinator.
+    ///
+    /// `None` says that qex could not learn who asked. qex never stores a
+    /// guess here. See `daemon::issuer_chain`.
+    #[serde(default)]
+    pub issuer_chain: Option<Vec<Ancestor>>,
+    /// The pid namespace in which `issuer_chain` was read. A reader in a
+    /// different namespace cannot test those numbers, and it must say
+    /// `unknown`. See `sys::pid_namespace`.
+    #[serde(default)]
+    pub issuer_ns: Option<String>,
+}
+
+/// The id of the request that qex makes when it cannot read the file.
+///
+/// It is a fixed word, because that request is made again at each read, and
+/// the id that one command printed must name the request that the next
+/// command finds.
+pub const FAULT_ID: &str = "fault";
+
+/// Makes the id of a new request: short, opaque, and unique in `taken`.
+pub fn new_id<'a>(taken: impl IntoIterator<Item = &'a str> + Clone) -> String {
+    loop {
+        let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        if !taken.clone().into_iter().any(|t| t == id) {
+            return id;
+        }
+    }
 }
 
 impl PauseRecord {
     pub fn new(by_pid: i32, reason: Option<String>, until: Option<u64>) -> Self {
         Self {
+            id: new_id(std::iter::empty()),
             paused_at: crate::sys::now_secs(),
             by_pid,
             reason,
             until,
             fault: false,
+            issuer_chain: None,
+            issuer_ns: None,
         }
     }
 
-    /// Tests if this pause reached its end.
+    /// Tests if this request reached its end.
     pub fn expired(&self, now: u64) -> bool {
         matches!(self.until, Some(end) if now >= end)
     }
 }
 
+/// The end of a pause of the queue: the last request of the set went away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueEnd {
+    /// The moment when the queue stopped running.
+    pub since: u64,
+    /// The moment when the last request ended.
+    pub ended_at: u64,
+}
+
+/// Reads one record, a list of records, or nothing.
+///
+/// An earlier version of qex wrote ONE record for the queue and one for each
+/// lock. A coordinator that replaces that version must keep the pause that the
+/// file holds, so it reads both forms.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    Many(Vec<PauseRecord>),
+    One(Box<PauseRecord>),
+}
+
+impl OneOrMany {
+    fn list(self) -> Vec<PauseRecord> {
+        match self {
+            Self::Many(list) => list,
+            Self::One(record) => vec![*record],
+        }
+    }
+}
+
+fn read_requests<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PauseRecord>, D::Error> {
+    Ok(Option::<OneOrMany>::deserialize(d)?
+        .map(OneOrMany::list)
+        .unwrap_or_default())
+}
+
+fn read_lock_requests<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, Vec<PauseRecord>>, D::Error> {
+    Ok(BTreeMap::<String, OneOrMany>::deserialize(d)?
+        .into_iter()
+        .map(|(name, records)| (name, records.list()))
+        .collect())
+}
+
 /// Everything that a person paused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Paused {
-    /// The pause of the whole queue. A paused queue starts no job.
+    /// The requests that pause the whole queue. A paused queue starts no job.
+    #[serde(default, deserialize_with = "read_requests")]
+    pub queue: Vec<PauseRecord>,
+    /// The moment when the queue stopped running: the time of the FIRST
+    /// request of this unbroken pause. A request that ended since then does
+    /// not move it, and the time that `--max-queue-time` gives back counts
+    /// from it.
     #[serde(default)]
-    pub queue: Option<PauseRecord>,
-    /// The locks that a person holds. The key is the name of the lock.
-    #[serde(default)]
-    pub locks: BTreeMap<String, PauseRecord>,
+    pub queue_since: Option<u64>,
+    /// The locks that a person holds. The key is the name of the lock. No
+    /// list is empty: a lock with no request is not in the map.
+    #[serde(default, deserialize_with = "read_lock_requests")]
+    pub locks: BTreeMap<String, Vec<PauseRecord>>,
 }
 
 impl Paused {
     pub fn is_empty(&self) -> bool {
-        self.queue.is_none() && self.locks.is_empty()
+        self.queue.is_empty() && self.locks.is_empty()
     }
 
-    /// Removes each pause that reached its end. Gives `true` if one went away.
-    pub fn expire(&mut self, now: u64) -> bool {
-        let mut changed = false;
-        if let Some(record) = &self.queue {
-            if record.expired(now) {
-                self.queue = None;
-                changed = true;
+    /// True while at least one request for the queue stands.
+    pub fn queue_paused(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Gives the moment when the queue stopped running.
+    pub fn since(&self) -> Option<u64> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        self.queue_since
+            .or_else(|| self.queue.iter().map(|r| r.paused_at).min())
+    }
+
+    /// Gives every id of the set, so a new id differs from each.
+    fn ids(&self) -> Vec<String> {
+        self.queue
+            .iter()
+            .chain(self.locks.values().flatten())
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    /// Gives the target that the request `id` stands for: `Some(None)` is
+    /// the queue, `Some(Some(name))` is a lock, and `None` says that no
+    /// request with this id stands.
+    pub fn home_of(&self, id: &str) -> Option<Option<String>> {
+        if self.queue.iter().any(|r| r.id == id) {
+            return Some(None);
+        }
+        self.locks
+            .iter()
+            .find(|(_, list)| list.iter().any(|r| r.id == id))
+            .map(|(name, _)| Some(name.clone()))
+    }
+
+    /// Puts the set in its correct form after a read or a change: each request
+    /// has an id, no lock has an empty list, and `queue_since` is set exactly
+    /// while the queue is paused.
+    pub fn normalize(&mut self) {
+        let mut taken = self.ids();
+        for record in self
+            .queue
+            .iter_mut()
+            .chain(self.locks.values_mut().flatten())
+        {
+            if record.id.is_empty() {
+                record.id = new_id(taken.iter().map(String::as_str));
+                taken.push(record.id.clone());
             }
         }
-        let before = self.locks.len();
-        self.locks.retain(|_, record| !record.expired(now));
-        changed |= self.locks.len() != before;
-        changed
+        self.locks.retain(|_, list| !list.is_empty());
+        self.queue_since = self.since();
+    }
+
+    /// Adds a request for the queue. Gives `true` when this request moved the
+    /// queue from running to paused.
+    ///
+    /// A request that qex made because it could not read the file is not a
+    /// request of a person. A real request replaces it: the new file that
+    /// this change writes is a file that qex can read.
+    ///
+    /// The fault request HELD the queue, so the request that replaces it did
+    /// not stop the queue: the answer is `false`, and `queue_since` stays at
+    /// the moment of the fault. The time that `--max-queue-time` gives back
+    /// then covers the whole hold, and not only the part after this request.
+    pub fn add_queue(&mut self, mut record: PauseRecord) -> bool {
+        let created = self.queue.is_empty();
+        self.queue.retain(|r| !r.fault);
+        if created {
+            self.queue_since = Some(record.paused_at);
+        }
+        record.id = new_id(self.ids().iter().map(String::as_str));
+        self.queue.push(record);
+        created
+    }
+
+    /// Adds a request for one lock. Gives `true` when nobody held the lock
+    /// for a person before.
+    pub fn add_lock(&mut self, name: &str, mut record: PauseRecord) -> bool {
+        record.id = new_id(self.ids().iter().map(String::as_str));
+        let list = self.locks.entry(name.to_string()).or_default();
+        let created = list.is_empty();
+        list.push(record);
+        created
+    }
+
+    /// Removes the requests of the queue that `which` names. Gives them, and
+    /// the end of the pause when none stands after that.
+    pub fn remove_queue(
+        &mut self,
+        which: impl Fn(&PauseRecord) -> bool,
+        now: u64,
+    ) -> (Vec<PauseRecord>, Option<QueueEnd>) {
+        let since = self.since();
+        let (removed, kept): (Vec<_>, Vec<_>) = self.queue.drain(..).partition(|r| which(r));
+        self.queue = kept;
+        let end = match since {
+            Some(since) if self.queue.is_empty() && !removed.is_empty() => Some(QueueEnd {
+                since,
+                ended_at: now,
+            }),
+            _ => None,
+        };
+        self.normalize();
+        (removed, end)
+    }
+
+    /// Removes the requests of one lock that `which` names, and gives them.
+    pub fn remove_lock(
+        &mut self,
+        name: &str,
+        which: impl Fn(&PauseRecord) -> bool,
+    ) -> Vec<PauseRecord> {
+        let Some(list) = self.locks.get_mut(name) else {
+            return Vec::new();
+        };
+        let (removed, kept): (Vec<_>, Vec<_>) = list.drain(..).partition(|r| which(r));
+        *list = kept;
+        self.normalize();
+        removed
+    }
+
+    /// Removes each request that reached its end.
+    ///
+    /// `changed` says that a request went away. `queue_end` says that the
+    /// LAST request of the queue went away, so the queue runs again; its
+    /// `ended_at` is the latest end of the requests that went away, and never
+    /// a moment after `now`.
+    pub fn expire(&mut self, now: u64) -> Expired {
+        let before = self.queue.len() + self.locks.values().map(Vec::len).sum::<usize>();
+        let since = self.since();
+        let last_end = self
+            .queue
+            .iter()
+            .filter(|r| r.expired(now))
+            .filter_map(|r| r.until)
+            .max();
+        self.queue.retain(|r| !r.expired(now));
+        for list in self.locks.values_mut() {
+            list.retain(|r| !r.expired(now));
+        }
+        let queue_end = match (since, last_end) {
+            (Some(since), Some(end)) if self.queue.is_empty() => Some(QueueEnd {
+                since,
+                ended_at: end.min(now),
+            }),
+            _ => None,
+        };
+        self.normalize();
+        let after = self.queue.len() + self.locks.values().map(Vec::len).sum::<usize>();
+        Expired {
+            changed: after != before,
+            queue_end,
+        }
     }
 
     /// Reads the file.
@@ -110,10 +359,11 @@ impl Paused {
     /// hold a pause, and qex does not know.
     ///
     /// The two directions are not equal in cost. A queue that qex holds by
-    /// mistake costs latency, and one command corrects it: `qex resume queue`
-    /// writes a new file. A queue that operates by mistake gives the person the
-    /// opposite of the one thing that person asked for, and no command corrects
-    /// that after the work started. So qex holds the queue, and it says why.
+    /// mistake costs latency, and one command corrects it: a resume of that
+    /// request writes a new file. A queue that operates by mistake gives the
+    /// person the opposite of the one thing that person asked for, and no
+    /// command corrects that after the work started. So qex holds the queue,
+    /// and it says why.
     ///
     /// A file that a later version of qex writes is safe: an unknown FIELD is
     /// ignored, in the same way as every other record of qex. This rule covers
@@ -129,22 +379,30 @@ impl Paused {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
             Err(e) => return Self::held_by_fault(&path, &e.to_string()),
         };
-        match serde_json::from_str(&text) {
-            Ok(paused) => paused,
+        match serde_json::from_str::<Self>(&text) {
+            Ok(mut paused) => {
+                paused.normalize();
+                paused
+            }
             Err(e) => Self::held_by_fault(&path, &e.to_string()),
         }
     }
 
     /// Gives the pause that qex holds when it cannot read the file.
     fn held_by_fault(path: &std::path::Path, fault: &str) -> Self {
+        let now = crate::sys::now_secs();
         Self {
-            queue: Some(PauseRecord {
-                paused_at: crate::sys::now_secs(),
+            queue: vec![PauseRecord {
+                id: FAULT_ID.to_string(),
+                paused_at: now,
                 by_pid: 0,
                 reason: Some(format!("{}: {fault}", path.display())),
                 until: None,
                 fault: true,
-            }),
+                issuer_chain: None,
+                issuer_ns: None,
+            }],
+            queue_since: Some(now),
             locks: BTreeMap::new(),
         }
     }
@@ -162,6 +420,13 @@ impl Paused {
     }
 }
 
+/// What `Paused::expire` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expired {
+    pub changed: bool,
+    pub queue_end: Option<QueueEnd>,
+}
+
 /// Ends a pause of the QUEUE, whatever ended it.
 ///
 /// A pause of the queue ends in THREE places, and all three are the same event:
@@ -177,8 +442,9 @@ impl Paused {
 /// `recover` calls it LAST, after the job records are read: the queue is empty
 /// until then, so there is nobody to credit.
 ///
-/// The caller has ALREADY removed the record from `state.paused`, and it gives
-/// the record here. `now` is the moment when the pause ended.
+/// The caller has ALREADY removed the last request from `state.paused`, and it
+/// gives the end here: the moment when the queue stopped running, and the
+/// moment when the pause ended.
 ///
 /// The two things:
 ///
@@ -190,8 +456,8 @@ impl Paused {
 ///      to start would be an OVERSIZED job, alone, in front of everything that
 ///      waited. The person who ends a pause asked for the queue, and not for
 ///      that.
-pub fn end_queue_pause(state: &mut crate::daemon::State, record: &PauseRecord, now: u64) {
-    credit_paused_wait(state, record.paused_at, now);
+pub fn end_queue_pause(state: &mut crate::daemon::State, end: QueueEnd) {
+    credit_paused_wait(state, end.since, end.ended_at);
     state.idle_since = Some(std::time::Instant::now());
 }
 
@@ -252,19 +518,484 @@ pub fn path() -> Result<std::path::PathBuf> {
     Ok(paths::runtime_dir()?.join("paused.json"))
 }
 
-/// Names the process that asked for a pause.
+/// What qex knows about the session that made a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssuerState {
+    /// A recorded process of the session still exists. This says that a
+    /// process exists, and not that anybody remembers the pause.
+    Running,
+    /// No recorded process of the session exists.
+    Gone,
+    /// qex could not learn who asked, or cannot test the processes. Every
+    /// reader treats this state as `Running`, and never as less.
+    #[serde(other)]
+    Unknown,
+}
+
+/// If the reader of a request is in the session that made it.
 ///
-/// A pid of 0 means "this answer does not say". No process has the pid 0, and
-/// an earlier coordinator gives no pid at all in `Response::Info`, so the two
-/// readers of that answer must be able to say so. They must NEVER print a pid
-/// that they invented: `qex info` printed the pid of the COORDINATOR, and a
-/// person who read it and ran `kill <pid>` stopped the one process that must
-/// keep operating.
-fn who(by_pid: i32) -> String {
-    if by_pid <= 0 {
-        return "an unknown process".to_string();
+/// This value is a hint for a reader that lost its receipt. Sibling agents
+/// share one session, so the id is the proof and this value is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Relation {
+    Yes,
+    No,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One process of `issuer_chain`, in the forensic output.
+///
+/// The field is `host_pid`, and never `pid`: the number has a meaning on the
+/// machine of the coordinator only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainEntry {
+    pub host_pid: i32,
+    #[serde(default)]
+    pub start: Option<u64>,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// One standing request, as the coordinator shows it to ONE reader.
+///
+/// The coordinator makes this value, because it alone can test the processes
+/// of the issuer and walk the chain of the reader on its own machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseView {
+    pub pause_id: String,
+    pub made_at: u64,
+    #[serde(default)]
+    pub until: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub fault: bool,
+    pub issuer_session_state: IssuerState,
+    /// `None` exactly when the state is `Unknown`.
+    #[serde(default)]
+    pub issuer_program: Option<String>,
+    pub issuer_is_this_session: Relation,
+    /// For the forensic output only.
+    #[serde(default)]
+    pub issuer_chain: Option<Vec<ChainEntry>>,
+    /// For the forensic output only. See `PauseRecord::by_pid`.
+    #[serde(default)]
+    pub caller_reported_pid: Option<i32>,
+}
+
+/// The programs that never count as a process of a session: the first
+/// process of a machine, and a container runtime or its shim. Each one lives
+/// as long as the machine or the container, so it says nothing about the
+/// session that made a request. The names have the safe form of
+/// `job::safe_name`.
+const NEVER_A_SESSION: &[&str] = &[
+    "init",
+    "systemd",
+    "launchd",
+    "tini",
+    "dumb-init",
+    "docker-init",
+    "conmon",
+    "containerd-shim",
+];
+
+/// The shells. A shell is a process of a session, but its name tells a reader
+/// nothing, so the output prefers the name of a different process.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "nu", "pwsh",
+];
+
+/// Gives the processes of a chain that count for the state of a session:
+/// those at or below the point where the session ends, without the first
+/// process of the machine and without a container runtime.
+///
+/// The boundary process counts here, although `context::shared` leaves it
+/// out. An agent that a service started is itself the boundary of its chain,
+/// and without it the only process below is the `qex` command, which stops in
+/// milliseconds: every such pause would read `gone`.
+pub fn session_processes(chain: &[Ancestor]) -> Vec<&Ancestor> {
+    let Some(index) = crate::context::boundary_index(chain) else {
+        return Vec::new();
+    };
+    chain
+        .iter()
+        .take(index + 1)
+        .filter(|p| p.pid != 1 && !NEVER_A_SESSION.contains(&p.name.as_str()))
+        .collect()
+}
+
+/// Chooses the name that the output gives for a session: the lowest process
+/// that is not a shell, or the highest process when each one is a shell.
+fn program_of(processes: &[&Ancestor]) -> Option<String> {
+    processes
+        .iter()
+        .find(|p| !SHELLS.contains(&p.name.as_str()))
+        .or(processes.last())
+        .map(|p| p.name.clone())
+}
+
+/// Tests if the process that a record names still exists: the number AND the
+/// start time. The machine gives the number of a stopped process to a later
+/// one, so the number alone proves nothing, and a record with no start time
+/// proves nothing either.
+pub fn still_exists(process: &Ancestor) -> bool {
+    process.start.is_some() && crate::sys::process_start_token(process.pid) == process.start
+}
+
+/// Gives the state of the session that made a request, and the name to show.
+///
+/// `exists` tests one recorded process. `same_namespace` is false when the
+/// record was made in a pid namespace that this process is not in.
+pub fn issuer_state(
+    record: &PauseRecord,
+    same_namespace: bool,
+    exists: &dyn Fn(&Ancestor) -> bool,
+) -> (IssuerState, Option<String>) {
+    let unknown = (IssuerState::Unknown, None);
+    if record.fault || !same_namespace {
+        return unknown;
     }
-    format!("pid {by_pid}")
+    let Some(chain) = &record.issuer_chain else {
+        return unknown;
+    };
+    let session = session_processes(chain);
+    if session.is_empty() {
+        return unknown;
+    }
+    let alive: Vec<&Ancestor> = session.iter().copied().filter(|p| exists(p)).collect();
+    if !alive.is_empty() {
+        return (IssuerState::Running, program_of(&alive));
+    }
+    // A process with no start time can never be shown to exist, so qex
+    // cannot say that a session with such a process is gone.
+    if session.iter().any(|p| p.start.is_none()) {
+        return unknown;
+    }
+    (IssuerState::Gone, program_of(&session))
+}
+
+/// Says if the reader is in the session that made a request.
+///
+/// `Yes` needs a shared process BELOW the boundary, which is the rule of
+/// `context::shared`. Two agents in two panes of one multiplexer share the
+/// multiplexer only; that is not one session, and qex cannot say that it is
+/// two, because an agent that IS its boundary shares nothing else with its
+/// own commands. The answer is then `Unknown`.
+pub fn relation(issuer: Option<&[Ancestor]>, reader: Option<&[Ancestor]>) -> Relation {
+    let (Some(issuer), Some(reader)) = (issuer, reader) else {
+        return Relation::Unknown;
+    };
+    if crate::context::shared(issuer, reader) {
+        return Relation::Yes;
+    }
+    let (ours, theirs) = (session_processes(issuer), session_processes(reader));
+    if ours.is_empty() || theirs.is_empty() {
+        return Relation::Unknown;
+    }
+    let boundary_only = ours
+        .iter()
+        .any(|a| a.start.is_some() && theirs.iter().any(|b| b.pid == a.pid && b.start == a.start));
+    if boundary_only {
+        Relation::Unknown
+    } else {
+        Relation::No
+    }
+}
+
+/// Makes the view of one request for one reader.
+///
+/// `reader` is the chain above the command that reads, as the coordinator
+/// walked it, or `None` when qex could not learn it.
+pub fn view(
+    record: &PauseRecord,
+    reader: Option<&[Ancestor]>,
+    same_namespace: bool,
+    exists: &dyn Fn(&Ancestor) -> bool,
+) -> PauseView {
+    let (state, program) = issuer_state(record, same_namespace, exists);
+    // `Unknown` on either side gives `Unknown`.
+    let relation = match state {
+        IssuerState::Unknown => Relation::Unknown,
+        _ => relation(record.issuer_chain.as_deref(), reader),
+    };
+    PauseView {
+        pause_id: record.id.clone(),
+        made_at: record.paused_at,
+        until: record.until,
+        reason: record.reason.clone(),
+        fault: record.fault,
+        issuer_session_state: state,
+        issuer_program: program,
+        issuer_is_this_session: relation,
+        issuer_chain: record.issuer_chain.as_ref().map(|chain| {
+            chain
+                .iter()
+                .map(|p| ChainEntry {
+                    host_pid: p.pid,
+                    start: p.start,
+                    name: p.name.clone(),
+                })
+                .collect()
+        }),
+        caller_reported_pid: (record.by_pid > 0).then_some(record.by_pid),
+    }
+}
+
+/// Makes the views of a list of requests, for a reader on THIS machine.
+pub fn views(records: &[PauseRecord], reader: Option<&[Ancestor]>) -> Vec<PauseView> {
+    let here = crate::sys::pid_namespace();
+    records
+        .iter()
+        .map(|r| view(r, reader, r.issuer_ns == here, &still_exists))
+        .collect()
+}
+
+/// Gives ONE record that stands for a set, for a CLI of an earlier version,
+/// which reads one record and prints its pid. The record holds NO process id,
+/// so that CLI prints "an unknown process". It starts at the oldest request,
+/// and it has an end only when every request has one.
+pub fn for_an_earlier_cli(records: &[PauseRecord]) -> Option<PauseRecord> {
+    let oldest = records.iter().min_by_key(|r| r.paused_at)?;
+    Some(PauseRecord {
+        by_pid: 0,
+        until: records
+            .iter()
+            .map(|r| r.until)
+            .collect::<Option<Vec<u64>>>()
+            .and_then(|ends| ends.into_iter().max()),
+        issuer_chain: None,
+        issuer_ns: None,
+        ..oldest.clone()
+    })
+}
+
+/// Gives the view of a record that came from a coordinator of an earlier
+/// version. That coordinator read no issuer, so the state is `Unknown`.
+pub fn unknown_view(record: &PauseRecord) -> PauseView {
+    PauseView {
+        caller_reported_pid: None,
+        ..view(record, None, false, &|_| false)
+    }
+}
+
+/// The thing that a request pauses, for the words of a command.
+#[derive(Debug, Clone, Copy)]
+pub enum Target<'a> {
+    Queue,
+    Lock(&'a str),
+}
+
+/// Gives the guarded command that ends ONE request.
+pub fn guarded_command(target: Target, id: &str) -> String {
+    match target {
+        Target::Queue => format!("qex resume queue --pause {id}"),
+        Target::Lock(name) => format!("qex resume lock {} --pause {id}", shown_lock(name)),
+    }
+}
+
+/// Gives the refusal for a resume that names an id of a DIFFERENT target.
+/// `home` is the lock that the request stands for, or `None` for the queue.
+///
+/// The command is there for every reader: the person who typed the id holds
+/// it, and the guarded command is the only one that qex ever prints.
+pub fn stands_elsewhere(id: &str, home: Option<&str>) -> String {
+    let id = crate::job::safe_name(id);
+    let (place, target) = match home {
+        None => ("the queue".to_string(), Target::Queue),
+        Some(name) => (
+            format!("the lock `{}`", shown_lock(name)),
+            Target::Lock(name),
+        ),
+    };
+    format!(
+        "pause {id} stands for {place}, and not for the target of this command. qex resumed \
+         nothing, and the request still stands. To end it: `{}`",
+        guarded_command(target, &id)
+    )
+}
+
+/// Gives the command that resumes ONE request, or `None` when the rules for
+/// the advice allow no command.
+///
+/// THE RULES. qex prints a command that is ready to run ONLY for a request of
+/// the session of the reader, and for a request of a session that is gone. It
+/// never prints one for a different session that still runs, and never for
+/// `Unknown`, which must not read more permissively than `Running`. The
+/// command is always the guarded one. The text and the JSON both take their
+/// answer from this function, so they cannot disagree.
+///
+/// A request that qex made because it could not read the file is the request
+/// of nobody. The command is the remedy, so qex prints it.
+pub fn resume_command(view: &PauseView, target: Target) -> Option<String> {
+    // A coordinator of an earlier version gives no id, so no guarded command
+    // exists.
+    if view.pause_id.is_empty() {
+        return None;
+    }
+    let allowed = view.fault
+        || match (view.issuer_session_state, view.issuer_is_this_session) {
+            (IssuerState::Unknown, _) => false,
+            (IssuerState::Gone, _) => true,
+            (IssuerState::Running, Relation::Yes) => true,
+            (IssuerState::Running, _) => false,
+        };
+    allowed.then(|| guarded_command(target, &view.pause_id))
+}
+
+/// The one exception that each "do not resume" sentence names beside the
+/// user: the holder of the id.
+const DO_NOT_RESUME: &str = "Do not resume it unless you hold this id from your own `pause` \
+     answer or your user tells you to.";
+
+fn ago(then: u64, now: u64) -> String {
+    format!(
+        "{} ago",
+        crate::units::format_duration(std::time::Duration::from_secs(now.saturating_sub(then)))
+    )
+}
+
+fn end_text(until: Option<u64>, now: u64) -> String {
+    match until {
+        Some(end) => format!(
+            "until {} (in {})",
+            crate::sys::near_stamp_text(end, now),
+            crate::units::format_duration(std::time::Duration::from_secs(end.saturating_sub(now)))
+        ),
+        None => "until somebody resumes it".to_string(),
+    }
+}
+
+/// Gives the facts of one request with no advice: its id, its age, its end,
+/// the session that made it, and its reason. A report of a request that a
+/// resume ended uses this form, because advice about a request that no longer
+/// stands has no reader.
+pub fn request_head(view: &PauseView, now: u64) -> String {
+    let program = view
+        .issuer_program
+        .as_deref()
+        .map(crate::job::safe_name)
+        .unwrap_or_else(|| "unknown".into());
+    let from = match (view.issuer_session_state, view.issuer_is_this_session) {
+        (IssuerState::Unknown, _) => None,
+        (IssuerState::Running, Relation::Yes) => {
+            Some(format!("from THIS session ({program}, still running)"))
+        }
+        (IssuerState::Running, Relation::No) => Some(format!(
+            "from another session that is still running ({program})"
+        )),
+        (IssuerState::Running, Relation::Unknown) => {
+            Some(format!("from a session that is still running ({program})"))
+        }
+        (IssuerState::Gone, _) => Some(format!("from a session that is gone ({program})")),
+    };
+
+    let name = if view.pause_id.is_empty() {
+        // A coordinator of an earlier version holds one record with no id.
+        String::from("a pause with no id (this coordinator is an earlier version)")
+    } else {
+        format!("pause {}", view.pause_id)
+    };
+    let mut text = format!(
+        "{name}, made {} ({}), {}",
+        crate::sys::near_stamp_text(view.made_at, now),
+        ago(view.made_at, now),
+        end_text(view.until, now)
+    );
+    if let Some(from) = from {
+        text.push_str(&format!(", {from}"));
+    }
+    match &view.reason {
+        Some(reason) => text.push_str(&format!(", reason: {}.", shown_reason(reason))),
+        None => text.push_str(", no reason given."),
+    }
+
+    text
+}
+
+/// Gives the line of ONE standing request: its id, its age, its end, the
+/// session that made it, its reason, and one sentence of advice.
+///
+/// The line holds no process id. See `PauseRecord::by_pid`.
+pub fn request_line(view: &PauseView, target: Target, now: u64) -> String {
+    if view.fault {
+        let fault = view
+            .reason
+            .as_deref()
+            .map(shown_reason)
+            .unwrap_or_else(|| "unknown".into());
+        let remedy = match resume_command(view, target) {
+            Some(command) => format!("Correct that file, or write a new one: {command}"),
+            None => String::from("Correct that file."),
+        };
+        return format!(
+            "pause {}: PAUSED BY A FAULT. qex could not read its pause record, and a record \
+             that qex cannot read can hold a pause, so qex holds the queue. The fault: {fault}. \
+             {remedy}",
+            view.pause_id
+        );
+    }
+
+    let text = request_head(view, now);
+
+    let command = resume_command(view, target);
+    let advice = match (view.issuer_session_state, &command) {
+        (IssuerState::Unknown, _) if view.pause_id.is_empty() => String::from(
+            "qex cannot tell which session set it or whether that session is still there, so \
+             treat it as still there. Do not resume it unless your user tells you to.",
+        ),
+        (IssuerState::Unknown, _) => format!(
+            "qex cannot tell which session set it or whether that session is still there, so \
+             treat it as still there. {DO_NOT_RESUME}"
+        ),
+        (IssuerState::Running, Some(command)) => format!(
+            "If a request of yours (not of a sibling agent) set it and its work is done: {command}"
+        ),
+        (IssuerState::Running, None) => format!("That session can resume it. {DO_NOT_RESUME}"),
+        (IssuerState::Gone, command) => {
+            let first = match view.until {
+                Some(end) => format!(
+                    "It ends by itself at {}, so waiting is the default.",
+                    crate::sys::near_stamp_text(end, now)
+                ),
+                None => "It still stands, and the processes of the session that set it have \
+                         exited, so expect nobody to resume it."
+                    .to_string(),
+            };
+            format!(
+                "{first} Ask your user, or resume it if the reason no longer applies: {}",
+                command.as_deref().unwrap_or_default()
+            )
+        }
+    };
+    format!("{text} {advice}")
+}
+
+/// Gives the latest end of a set, or `None` when one request has no end.
+pub fn last_end(views: &[PauseView]) -> Option<u64> {
+    views
+        .iter()
+        .map(|v| v.until)
+        .collect::<Option<Vec<u64>>>()
+        .and_then(|ends| ends.into_iter().max())
+}
+
+/// Gives the words "N requests stand; it runs again when ..." for a set.
+///
+/// `again` says what the target does after that: "it runs again", or "it is
+/// free again".
+fn standing_text(views: &[PauseView], again: &str, now: u64) -> String {
+    let end = end_text(last_end(views), now);
+    if views.len() == 1 {
+        format!("1 request stands; {again} when that request ends (its end is: {end})")
+    } else {
+        format!(
+            "{} requests stand; {again} when all of them end (the last end is: {end})",
+            views.len()
+        )
+    }
 }
 
 /// Gives the form of a `--reason` that a terminal may print.
@@ -343,46 +1074,50 @@ pub fn resolve_lock_name<'a>(
 
 /// Gives the reason that a job in the queue waits, while the queue is paused.
 ///
-/// # Why this text holds no elapsed time
+/// # Why this text holds no elapsed time, and no session
 ///
 /// The scheduler writes `status.json` for every job whose reason changed, and
 /// each write does two `fsync` calls. The scheduler tests the queue every
-/// 500ms. A reason that said "6 minutes ago" would thus change and write the
-/// record of every job in the queue, for the whole length of the pause.
+/// 500ms. A reason that said "6 minutes ago", or that gave the state of a
+/// session, would thus change and write the record of every job in the queue,
+/// for the whole length of the pause.
 ///
-/// The clock time does not change, so this text is written one time. The
-/// elapsed time belongs to `qex info` and `qex top`, which calculate it when a
-/// person reads them.
-pub fn queue_reason(record: &PauseRecord) -> String {
-    if record.fault {
+/// This text changes only when the set of requests changes. `qex pause`
+/// calculates the rest when a person reads it, and it is the command that
+/// this text names: it gives each request with its id, and a bare
+/// `qex resume queue` removes nothing.
+pub fn queue_reason(paused: &Paused) -> String {
+    if let Some(record) = paused.queue.iter().find(|r| r.fault) {
         return format!(
             "the queue is paused, so qex starts no job. qex could not read its pause record, and \
              a record that qex cannot read can hold a pause, so qex holds the queue. The fault: \
-             {}. Correct that file, or run `qex resume queue` to write a new one.",
+             {}. Correct that file, or run `{}` to write a new one.",
             record
                 .reason
                 .as_deref()
                 .map(shown_reason)
-                .unwrap_or_else(|| "unknown".into())
+                .unwrap_or_else(|| "unknown".into()),
+            guarded_command(Target::Queue, &record.id)
         );
     }
 
     let mut text = String::from("the queue is paused, so qex starts no job.");
-    if let Some(reason) = &record.reason {
-        text.push_str(&format!(" Reason: {}.", shown_reason(reason)));
-    }
-    text.push_str(&format!(
-        " {} paused it at {}. Run `qex resume queue` to start the queue again.",
-        {
-            let w = who(record.by_pid);
-            let mut c = w.chars();
-            match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                None => w,
+    match paused.queue.as_slice() {
+        [one] => {
+            text.push_str(" 1 pause request stands.");
+            if let Some(reason) = &one.reason {
+                text.push_str(&format!(" Reason: {}.", shown_reason(reason)));
             }
-        },
-        crate::sys::clock_text(record.paused_at)
-    ));
+        }
+        many => text.push_str(&format!(" {} pause requests stand.", many.len())),
+    }
+    if let Some(since) = paused.since() {
+        text.push_str(&format!(
+            " The queue stopped at {}.",
+            crate::sys::stamp_text(since)
+        ));
+    }
+    text.push_str(" Run `qex pause` to read each request, who made it and how it ends.");
     text
 }
 
@@ -394,73 +1129,80 @@ pub fn lock_reason(name: &str) -> String {
     )
 }
 
-/// Gives one line that says how long the queue has been paused.
+/// Gives the lines that say how the queue is paused: one summary line, and
+/// then one line for each standing request.
 ///
 /// Every command that shows the pause uses this function, so `qex info`,
-/// `qex top` and `qex list` never disagree.
-pub fn queue_line(record: &PauseRecord, now: u64) -> String {
-    if record.fault {
-        return format!(
-            "PAUSED BY A FAULT: qex could not read its pause record, so it holds the queue · {} · \
-             correct that file, or run `qex resume queue` to write a new one",
-            record
-                .reason
-                .as_deref()
-                .map(shown_reason)
-                .unwrap_or_else(|| "unknown".into())
-        );
+/// `qex top`, `qex list` and `qex pause` never disagree.
+///
+/// `since` is the moment when the queue stopped running. It is NOT the time
+/// of the newest request: a reader who sees "4m ago" on a queue that has been
+/// quiet for six hours looks for the wrong cause.
+pub fn queue_lines(views: &[PauseView], since: Option<u64>, now: u64) -> Vec<String> {
+    if views.is_empty() {
+        return Vec::new();
     }
-
-    // Name WHO asked. A second person who finds a paused queue must be able to
-    // tell an agent that paused it from a colleague who paused it, before that
-    // person types `qex resume queue` over the work of somebody else. The pid
-    // is the only "who" that qex holds, and a pid that no longer exists is
-    // itself an answer: the command that paused the queue has gone away.
-    let mut text = format!(
-        "paused since {} ({}) by {}",
-        crate::sys::clock_text(record.paused_at),
-        crate::units::format_duration(std::time::Duration::from_secs(
-            now.saturating_sub(record.paused_at)
-        )),
-        who(record.by_pid)
-    );
-    match record.until {
-        Some(end) => text.push_str(&format!(
-            " · ends at {} (in {})",
-            crate::sys::clock_text(end),
-            crate::units::format_duration(std::time::Duration::from_secs(end.saturating_sub(now)))
-        )),
-        // Say this loudly. A pause with no end is the pause that a person
-        // forgets, and an empty queue in the morning is the result.
-        None => text.push_str(" · NO END: it continues until `qex resume queue`"),
-    }
-    if let Some(reason) = &record.reason {
-        text.push_str(&format!(" · reason: {}", shown_reason(reason)));
-    }
-    text
+    let since = since.unwrap_or_else(|| views.iter().map(|v| v.made_at).min().unwrap_or(now));
+    let mut lines = vec![format!(
+        "the queue is paused since {} ({}): {}",
+        crate::sys::stamp_text(since),
+        ago(since, now),
+        standing_text(views, "it runs again", now)
+    )];
+    lines.extend(views.iter().map(|v| request_line(v, Target::Queue, now)));
+    lines
 }
 
-/// Gives one line for a lock that a person holds.
-pub fn lock_line(name: &str, record: &PauseRecord, held_by: Option<&str>, now: u64) -> String {
+/// Gives the lines for a lock that a person holds: one summary line, and then
+/// one line for each standing request.
+pub fn lock_lines(name: &str, views: &[PauseView], held_by: Option<&str>, now: u64) -> Vec<String> {
+    let since = views.iter().map(|v| v.made_at).min().unwrap_or(now);
     let mut text = format!(
-        "lock `{}`: paused since {} ({}) by {}",
+        "lock `{}`: a person holds it since {} ({}): {}",
         shown_lock(name),
-        crate::sys::clock_text(record.paused_at),
-        crate::units::format_duration(std::time::Duration::from_secs(
-            now.saturating_sub(record.paused_at)
-        )),
-        who(record.by_pid)
+        crate::sys::stamp_text(since),
+        ago(since, now),
+        standing_text(views, "it is free again", now)
     );
     match held_by {
         Some(job) => text.push_str(&format!(
-            " · the job {job} still holds it · qex gives it to you when that job stops"
+            " · the job {job} still holds it · qex gives it to the person when that job stops"
         )),
-        None => text.push_str(" · it is yours now"),
+        None => text.push_str(" · no job holds it"),
     }
-    if let Some(reason) = &record.reason {
-        text.push_str(&format!(" · reason: {}", shown_reason(reason)));
+    let mut lines = vec![text];
+    lines.extend(
+        views
+            .iter()
+            .map(|v| request_line(v, Target::Lock(name), now)),
+    );
+    lines
+}
+
+/// Gives one request as the default JSON shows it. It holds NO process id of
+/// any kind. `forensic` adds the chain that the coordinator read and the
+/// number that the caller reported.
+pub fn view_json(view: &PauseView, target: Target, forensic: bool) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "pause_id": view.pause_id,
+        "made_at": crate::sys::rfc3339(view.made_at),
+        "until": view.until.map(crate::sys::rfc3339),
+        "reason": view.reason,
+        "fault": view.fault,
+        "issuer_session_state": view.issuer_session_state,
+        "issuer_program": view.issuer_program,
+        "issuer_is_this_session": match view.issuer_is_this_session {
+            Relation::Yes => "yes",
+            Relation::No => "no",
+            Relation::Unknown => "unknown",
+        },
+        "resume_command": resume_command(view, target),
+    });
+    if forensic {
+        value["issuer_chain"] = serde_json::json!(view.issuer_chain);
+        value["caller_reported_pid"] = serde_json::json!(view.caller_reported_pid);
     }
-    text
+    value
 }
 
 #[cfg(test)]
@@ -487,56 +1229,286 @@ mod tests {
 
     fn record() -> PauseRecord {
         PauseRecord {
+            id: "7f3c9a1e".into(),
             paused_at: 1_000,
             by_pid: 42,
             reason: None,
             until: None,
             fault: false,
+            issuer_chain: None,
+            issuer_ns: None,
         }
+    }
+
+    fn process(pid: i32, ppid: i32, name: &str, terminal: bool) -> Ancestor {
+        Ancestor {
+            pid,
+            ppid,
+            start: Some(1000 + pid as u64),
+            name: name.into(),
+            cwd: None,
+            terminal,
+        }
+    }
+
+    /// The chain above a `qex` command of an agent in one pane of a
+    /// multiplexer, from the shell of the agent upward.
+    fn agent(shell: i32, agent: i32, pane: i32) -> Vec<Ancestor> {
+        vec![
+            process(shell, agent, "bash", false),
+            process(agent, pane, "claude", true),
+            process(pane, 6152, "bash", true),
+            process(6152, 1, "tmux_server", false),
+            process(1, 0, "systemd", false),
+        ]
+    }
+
+    fn from(chain: Vec<Ancestor>) -> PauseRecord {
+        PauseRecord {
+            issuer_chain: Some(chain),
+            ..record()
+        }
+    }
+
+    /// Every process exists, or none does.
+    fn all(_: &Ancestor) -> bool {
+        true
+    }
+    fn none(_: &Ancestor) -> bool {
+        false
+    }
+
+    /// The four views that the four advice lines come from.
+    fn this_session() -> PauseView {
+        view(
+            &from(agent(100, 50, 40)),
+            Some(&agent(101, 50, 40)),
+            true,
+            &all,
+        )
+    }
+    fn another_session() -> PauseView {
+        let other = vec![
+            process(200, 60, "bash", false),
+            process(60, 41, "claude", true),
+            process(41, 7000, "zsh", true),
+            process(7000, 1, "sshd", false),
+        ];
+        view(&from(agent(100, 50, 40)), Some(&other), true, &all)
+    }
+    fn gone_session() -> PauseView {
+        view(
+            &from(agent(100, 50, 40)),
+            Some(&agent(201, 60, 41)),
+            true,
+            &none,
+        )
+    }
+    fn unknown_session() -> PauseView {
+        view(&record(), Some(&agent(101, 50, 40)), true, &all)
+    }
+
+    /// Two requests, in each order, with and without an end: no request
+    /// changes or removes the other one, and the queue is paused while one
+    /// stands.
+    ///
+    /// # The fault that this test prevents
+    ///
+    /// With ONE record for each queue, a second `qex pause queue` had to
+    /// change the first. Each rule for that change had a sequence in which
+    /// one session shortened or ended what a different session asked for.
+    #[test]
+    fn no_request_changes_or_removes_a_different_request() {
+        for timed_first in [true, false] {
+            let timed = PauseRecord {
+                until: Some(2_800),
+                reason: Some("recording a demo".into()),
+                ..record()
+            };
+            let endless = PauseRecord {
+                reason: Some("bulk abort".into()),
+                ..record()
+            };
+            let (first, second) = if timed_first {
+                (timed.clone(), endless.clone())
+            } else {
+                (endless.clone(), timed.clone())
+            };
+
+            let mut p = Paused::default();
+            assert!(p.add_queue(first), "the first request pauses the queue");
+            assert!(
+                !p.add_queue(second),
+                "the second request did not move the queue from running to paused"
+            );
+            assert_eq!(p.queue.len(), 2);
+            assert_ne!(p.queue[0].id, p.queue[1].id, "each request has its own id");
+            let id_of = |p: &Paused, timed: bool| {
+                p.queue
+                    .iter()
+                    .find(|r| r.until.is_some() == timed)
+                    .map(|r| r.id.clone())
+                    .unwrap()
+            };
+
+            // A resume of the request with no end leaves the timed one as it
+            // was, and the queue stays paused.
+            let mut a = p.clone();
+            let id = id_of(&a, false);
+            let (removed, end) = a.remove_queue(|r| r.id == id, 1_500);
+            assert_eq!(removed.len(), 1);
+            assert_eq!(end, None, "one request stands, so the pause did not end");
+            assert_eq!(a.queue.len(), 1);
+            assert_eq!(a.queue[0].until, Some(2_800));
+            assert_eq!(a.queue[0].reason.as_deref(), Some("recording a demo"));
+
+            // A resume of the timed request leaves the request with no end.
+            let mut b = p.clone();
+            let id = id_of(&b, true);
+            let (_, end) = b.remove_queue(|r| r.id == id, 1_500);
+            assert_eq!(end, None);
+            assert_eq!(b.queue[0].until, None, "no request got the end of another");
+            assert_eq!(b.queue[0].reason.as_deref(), Some("bulk abort"));
+
+            // The end of the timed request by itself does the same.
+            let mut c = p.clone();
+            let expired = c.expire(2_800);
+            assert!(expired.changed);
+            assert_eq!(expired.queue_end, None);
+            assert!(c.queue_paused());
+
+            // The resume of the last request ends the pause, and the pause
+            // began at the FIRST request.
+            let id = a.queue[0].id.clone();
+            let (_, end) = a.remove_queue(|r| r.id == id, 1_700);
+            assert_eq!(
+                end,
+                Some(QueueEnd {
+                    since: 1_000,
+                    ended_at: 1_700
+                })
+            );
+            assert!(!a.queue_paused());
+            assert!(a.is_empty());
+        }
+    }
+
+    /// An id that stands no more, and an id that never existed, remove
+    /// nothing and end nothing.
+    #[test]
+    fn an_id_that_does_not_stand_removes_nothing() {
+        let mut p = Paused::default();
+        p.add_queue(record());
+        let id = p.queue[0].id.clone();
+
+        let (removed, end) = p.remove_queue(|r| r.id == "00000000", 1_100);
+        assert!(removed.is_empty(), "an id that never existed");
+        assert_eq!(end, None);
+        assert!(p.queue_paused());
+
+        let (removed, end) = p.remove_queue(|r| r.id == id, 1_100);
+        assert_eq!(removed.len(), 1);
+        assert!(end.is_some());
+
+        let (removed, end) = p.remove_queue(|r| r.id == id, 1_200);
+        assert!(removed.is_empty(), "an id that stands no more");
+        assert_eq!(end, None, "a pause that ended must not end a second time");
+    }
+
+    /// `since` is the moment when the queue stopped running, and not the time
+    /// of the newest request or of the oldest request that still stands.
+    #[test]
+    fn the_pause_began_when_the_queue_stopped() {
+        let mut p = Paused::default();
+        p.add_queue(PauseRecord {
+            until: Some(1_500),
+            ..record()
+        });
+        p.add_queue(PauseRecord {
+            paused_at: 1_200,
+            ..record()
+        });
+        assert_eq!(p.since(), Some(1_000));
+
+        // The first request ends. The queue did not run in between.
+        assert!(p.expire(1_500).changed);
+        assert_eq!(p.queue.len(), 1);
+        assert_eq!(p.since(), Some(1_000), "the pause is unbroken");
+
+        // The value survives the file, so a new coordinator gives back the
+        // whole of the pause to `--max-queue-time`.
+        let back: Paused = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.since(), Some(1_000));
+
+        // After the queue ran, a new pause begins at its own first request.
+        let id = p.queue[0].id.clone();
+        p.remove_queue(|r| r.id == id, 1_600);
+        assert_eq!(p.since(), None);
+        p.add_queue(PauseRecord {
+            paused_at: 1_700,
+            ..record()
+        });
+        assert_eq!(p.since(), Some(1_700));
     }
 
     /// A pause with `--for` must end by itself. Without this test a queue that
     /// a person paused for 30 minutes would stay paused for ever.
     #[test]
     fn a_pause_with_an_end_goes_away_by_itself() {
-        let mut p = Paused {
-            queue: Some(PauseRecord {
-                until: Some(1_100),
-                ..record()
-            }),
-            ..Default::default()
-        };
-        p.locks.insert(
-            "gpu0".into(),
+        let mut p = Paused::default();
+        p.add_queue(PauseRecord {
+            until: Some(1_100),
+            ..record()
+        });
+        p.add_lock(
+            "gpu0",
             PauseRecord {
                 until: Some(2_000),
                 ..record()
             },
         );
 
-        assert!(!p.expire(1_099), "the pause must stay before its end");
-        assert!(p.queue.is_some());
-
-        assert!(p.expire(1_100), "the pause must go away at its end");
-        assert!(p.queue.is_none(), "the queue must operate again");
         assert!(
-            p.locks.contains_key("gpu0"),
-            "a lock with a later end must stay"
+            !p.expire(1_099).changed,
+            "the pause must stay before its end"
         );
+        assert!(p.queue_paused());
 
-        assert!(p.expire(2_000));
-        assert!(p.is_empty());
+        let expired = p.expire(9_000_000);
+        assert!(expired.changed, "the pause must go away at its end");
+        assert!(!p.queue_paused(), "the queue must operate again");
+        assert_eq!(
+            expired.queue_end,
+            Some(QueueEnd {
+                since: 1_000,
+                ended_at: 1_100
+            }),
+            "the pause ended at ITS end, and not at the moment of the test"
+        );
+        assert!(p.is_empty(), "a lock whose last request ended is free");
     }
 
     /// A pause with no end never goes away by itself.
     #[test]
     fn a_pause_with_no_end_stays() {
-        let mut p = Paused {
-            queue: Some(record()),
-            ..Default::default()
-        };
-        assert!(!p.expire(9_999_999));
-        assert!(p.queue.is_some());
+        let mut p = Paused::default();
+        p.add_queue(record());
+        assert!(!p.expire(9_999_999).changed);
+        assert!(p.queue_paused());
+    }
+
+    /// A lock is held for a person while at least one request for it stands.
+    #[test]
+    fn a_lock_is_held_while_one_request_stands() {
+        let mut p = Paused::default();
+        assert!(p.add_lock("gpu0", record()));
+        assert!(!p.add_lock("gpu0", record()));
+        let first = p.locks["gpu0"][0].id.clone();
+        assert_eq!(p.remove_lock("gpu0", |r| r.id == first).len(), 1);
+        assert!(p.locks.contains_key("gpu0"), "one request stands");
+        assert_eq!(p.remove_lock("gpu0", |_| true).len(), 1);
+        assert!(!p.locks.contains_key("gpu0"), "no empty list stays");
+        assert!(p.remove_lock("gpu0", |_| true).is_empty());
     }
 
     /// The reason of a queued job must not hold a number that changes.
@@ -547,62 +1519,346 @@ mod tests {
     /// for the whole length of the pause.
     #[test]
     fn the_reason_of_a_paused_job_does_not_change_with_time() {
-        let r = record();
-        assert_eq!(queue_reason(&r), queue_reason(&r));
-        assert!(queue_reason(&r).contains("the queue is paused"));
+        let mut p = Paused::default();
+        p.add_queue(from(agent(100, 50, 40)));
+        let reason = queue_reason(&p);
+        assert_eq!(reason, queue_reason(&p));
+        assert!(reason.contains("the queue is paused"));
         assert!(
-            queue_reason(&r).contains("qex resume queue"),
-            "the reason must give the remedy"
+            reason.contains("`qex pause`"),
+            "the reason must give the command that shows each request: {reason}"
         );
         assert!(
-            !queue_reason(&r).contains("ago"),
-            "the reason must hold no elapsed time"
+            !reason.contains("qex resume"),
+            "a resume with no id removes nothing, so the reason must not name it: {reason}"
+        );
+        assert!(
+            !reason.contains("ago") && !reason.contains("running") && !reason.contains("gone"),
+            "the reason must hold no elapsed time and no state of a session: {reason}"
         );
     }
 
     /// A pause with no end must say so wherever a person reads it.
     #[test]
     fn a_pause_with_no_end_says_so() {
-        let line = queue_line(&record(), 1_360);
-        assert!(line.contains("NO END"), "got: {line}");
-        assert!(line.contains("6m"), "the line must give the length: {line}");
+        let lines = queue_lines(&[unknown_session()], Some(1_000), 1_360);
+        assert_eq!(lines.len(), 2, "one summary line and one request line");
+        assert!(
+            lines[0].contains("until somebody resumes it"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("6m"),
+            "the line must give the length: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("1 request stands"), "got: {}", lines[0]);
+
+        let timed = PauseView {
+            until: Some(2_000),
+            ..unknown_session()
+        };
+        let lines = queue_lines(&[timed.clone(), unknown_session()], Some(1_000), 1_360);
+        assert!(
+            lines[0].contains("2 requests stand")
+                && lines[0].contains("the last end is: until somebody resumes it"),
+            "one request with no end gives the set no end: {}",
+            lines[0]
+        );
+        assert_eq!(last_end(std::slice::from_ref(&timed)), Some(2_000));
+        assert_eq!(last_end(&[timed, unknown_session()]), None);
     }
 
-    /// Every place that reports a pause must name WHO asked for it.
+    /// NO LINE OF A PAUSE HOLDS A PROCESS ID.
     ///
     /// # The fault that this test prevents
     ///
-    /// A queue is shared. The second person finds a queue that starts nothing,
-    /// and the only safe next step is to find the person or the agent that
-    /// paused it — a colleague on a call needs the machine, and an agent that
-    /// paused itself does not. A line that gave no owner leaves one choice:
-    /// type `qex resume queue` over the work of somebody else, and learn
-    /// nothing either way.
-    ///
-    /// The pid is the only "who" that qex holds, and it is in the record for
-    /// this purpose. It was in the record and in no output.
+    /// A `qex abort` that was the first process of a container reported its
+    /// own pid, which was 1. The line said "by pid 1", a reader ran `ps -p 1`
+    /// on the machine, found the first process alive, and believed for six
+    /// hours that the pauser still operated. A reader takes a pid in a line
+    /// for a pid of ITS machine, so the lines give the session and no number.
     #[test]
-    fn every_report_of_a_pause_names_who_asked_for_it() {
-        let r = record();
-        assert_eq!(r.by_pid, 42, "the helper must give a pid to look for");
+    fn no_line_of_a_pause_holds_a_process_id() {
+        let mut p = Paused::default();
+        p.add_queue(PauseRecord {
+            by_pid: 31_337,
+            ..from(agent(100, 50, 40))
+        });
+        let mut texts = vec![queue_reason(&p)];
+        for v in [
+            this_session(),
+            another_session(),
+            gone_session(),
+            unknown_session(),
+        ] {
+            let v = PauseView {
+                caller_reported_pid: Some(31_337),
+                ..v
+            };
+            texts.extend(queue_lines(std::slice::from_ref(&v), Some(1_000), 1_360));
+            texts.extend(lock_lines("gpu0", &[v], None, 1_360));
+        }
+        for text in texts {
+            assert!(!text.contains("pid"), "a line names a pid: {text}");
+            for number in ["31337", " 50", "(50", " 6152"] {
+                assert!(!text.contains(number), "a line holds {number}: {text}");
+            }
+        }
+    }
 
-        let line = queue_line(&r, 1_360);
+    /// The four advice lines, each against the rules.
+    #[test]
+    fn the_advice_obeys_its_rules() {
+        let now = 1_240;
+        let q = Target::Queue;
+        let guarded = "qex resume queue --pause 7f3c9a1e";
+        let exception = "unless you hold this id from your own `pause` answer or your user";
+
+        // A request of this session: the guarded command, for the holder.
+        let v = this_session();
+        assert_eq!(v.issuer_session_state, IssuerState::Running);
+        assert_eq!(v.issuer_is_this_session, Relation::Yes);
+        assert_eq!(v.issuer_program.as_deref(), Some("claude"));
+        let line = request_line(&v, q, now);
         assert!(
-            line.contains("pid 42"),
-            "the queue line must say who: {line}"
+            line.contains("from THIS session (claude, still running)"),
+            "{line}"
+        );
+        assert!(line.ends_with(guarded), "{line}");
+        assert!(line.contains("not of a sibling agent"), "{line}");
+
+        // A request of a different session that still runs: NO command.
+        let v = another_session();
+        assert_eq!(v.issuer_is_this_session, Relation::No);
+        let line = request_line(&v, q, now);
+        assert!(
+            line.contains("from another session that is still running (claude)"),
+            "{line}"
+        );
+        assert!(!line.contains("qex resume"), "{line}");
+        assert!(line.contains(exception), "{line}");
+        assert_eq!(resume_command(&v, q), None);
+
+        // A request of a session that is gone: the guarded command.
+        let v = gone_session();
+        assert_eq!(v.issuer_session_state, IssuerState::Gone);
+        assert_eq!(
+            v.issuer_program.as_deref(),
+            Some("claude"),
+            "the name stays"
+        );
+        let line = request_line(&v, q, now);
+        assert!(
+            line.contains("from a session that is gone (claude)"),
+            "{line}"
+        );
+        assert!(line.contains("expect nobody to resume it"), "{line}");
+        assert!(line.ends_with(guarded), "{line}");
+        let timed = PauseView {
+            until: Some(4_000),
+            ..v
+        };
+        let line = request_line(&timed, q, now);
+        assert!(line.contains("It ends by itself at"), "{line}");
+        assert!(line.contains("so waiting is the default"), "{line}");
+
+        // Unknown: never more permissive than `running`, no command, and no
+        // "this" or "another".
+        let v = unknown_session();
+        assert_eq!(v.issuer_session_state, IssuerState::Unknown);
+        assert_eq!(v.issuer_is_this_session, Relation::Unknown);
+        assert_eq!(v.issuer_program, None, "null exactly when unknown");
+        let line = request_line(&v, q, now);
+        assert!(line.contains("treat it as still there"), "{line}");
+        assert!(!line.contains("qex resume"), "{line}");
+        assert!(line.contains(exception), "{line}");
+        assert!(
+            !line.contains("THIS") && !line.contains("another"),
+            "{line}"
         );
 
-        let reason = queue_reason(&r);
+        // A session that runs, read by a command whose own chain is unknown:
+        // no command, and no "this" or "another".
+        let v = view(&from(agent(100, 50, 40)), None, true, &all);
+        assert_eq!(v.issuer_is_this_session, Relation::Unknown);
+        let line = request_line(&v, q, now);
+        assert!(!line.contains("qex resume"), "{line}");
         assert!(
-            reason.contains("42"),
-            "the reason of each queued job must say who: {reason}"
+            !line.contains("THIS") && !line.contains("another"),
+            "{line}"
         );
+        assert!(line.contains(exception), "{line}");
 
-        let lock = lock_line("gpu0", &r, None, 1_360);
-        assert!(
-            lock.contains("pid 42"),
-            "the lock line must say who: {lock}"
+        // No message names `--all`. Only the help does.
+        for v in [
+            this_session(),
+            another_session(),
+            gone_session(),
+            unknown_session(),
+        ] {
+            assert!(!request_line(&v, q, now).contains("--all"));
+        }
+    }
+
+    /// The text and the JSON agree on the command, and the default JSON holds
+    /// no field whose name holds `pid`.
+    #[test]
+    fn the_text_and_the_json_agree_and_the_json_holds_no_pid() {
+        for v in [
+            this_session(),
+            another_session(),
+            gone_session(),
+            unknown_session(),
+        ] {
+            let v = PauseView {
+                caller_reported_pid: Some(1),
+                ..v
+            };
+            for target in [Target::Queue, Target::Lock("gpu0")] {
+                let json = view_json(&v, target, false);
+                let line = request_line(&v, target, 1_240);
+                match json["resume_command"].as_str() {
+                    Some(command) => {
+                        assert!(line.ends_with(command), "{line} / {command}");
+                        assert!(command.contains("--pause 7f3c9a1e"), "{command}");
+                    }
+                    None => assert!(!line.contains("qex resume"), "{line}"),
+                }
+                assert_eq!(
+                    json["issuer_program"].is_null(),
+                    json["issuer_session_state"] == "unknown",
+                    "the program is null exactly when the state is unknown"
+                );
+                let text = json.to_string();
+                assert!(
+                    !text.contains("pid"),
+                    "the default JSON names a pid: {text}"
+                );
+                assert!(!text.contains("holder"), "{text}");
+
+                // The forensic form names each number for what it is, and has
+                // no field that is called `pid`.
+                let forensic = view_json(&v, target, true);
+                assert_eq!(forensic["caller_reported_pid"], 1);
+                assert!(!forensic.to_string().contains("\"pid\""));
+                if let Some(chain) = forensic["issuer_chain"].as_array() {
+                    assert!(chain.iter().all(|p| p["host_pid"].is_number()));
+                }
+            }
+        }
+        assert_eq!(
+            resume_command(&this_session(), Target::Lock("gpu0")).as_deref(),
+            Some("qex resume lock gpu0 --pause 7f3c9a1e")
         );
+    }
+
+    /// A process of a session exists when its number AND its start time are
+    /// those of the record.
+    #[test]
+    fn a_process_exists_by_its_number_and_its_start_time() {
+        let me = std::process::id() as i32;
+        let mut process = process(me, 1, "test", false);
+        process.start = crate::sys::process_start_token(me);
+        assert!(still_exists(&process), "this process exists");
+
+        // The machine gave the number to a later process.
+        process.start = process.start.map(|s| s + 1);
+        assert!(!still_exists(&process), "the start time differs");
+
+        // A record with no start time proves nothing.
+        process.start = None;
+        assert!(!still_exists(&process));
+    }
+
+    /// What counts as a process of a session.
+    #[test]
+    fn the_first_process_and_a_runtime_never_count() {
+        // The multiplexer is the boundary, and it counts. The first process
+        // of the machine is above it, and it never counts.
+        let chain = agent(100, 50, 40);
+        let names: Vec<&str> = session_processes(&chain)
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["bash", "claude", "bash", "tmux_server"]);
+
+        // A container: the shim is the boundary, and it does not count. The
+        // agent that is the first process INSIDE the container is an ordinary
+        // process of the machine, and it counts.
+        let container = vec![
+            process(900, 800, "bash", false),
+            process(800, 700, "claude", false),
+            process(700, 1, "containerd-shim", false),
+            process(1, 0, "systemd", false),
+        ];
+        let names: Vec<&str> = session_processes(&container)
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["bash", "claude"]);
+
+        // Only the first process and a runtime: qex cannot say, and it never
+        // says `running` for such a chain.
+        let bare = vec![process(1, 0, "systemd", false)];
+        assert!(session_processes(&bare).is_empty());
+        let v = view(&from(bare), None, true, &all);
+        assert_eq!(v.issuer_session_state, IssuerState::Unknown);
+
+        // An agent that a service started is the boundary of its own chain
+        // (its parent cannot be read). It counts, so its pause does not read
+        // `gone` while the agent operates.
+        let service = vec![
+            process(100, 50, "bash", false),
+            process(50, 40, "claude", false),
+        ];
+        let only_agent = |p: &Ancestor| p.pid == 50;
+        let v = view(&from(service), None, true, &only_agent);
+        assert_eq!(v.issuer_session_state, IssuerState::Running);
+        assert_eq!(v.issuer_program.as_deref(), Some("claude"));
+    }
+
+    /// Two agents in two panes of one multiplexer share the multiplexer only.
+    /// qex must not say `this session`, which prints a command that ends the
+    /// request of the other agent, and it cannot say `another`.
+    #[test]
+    fn a_shared_boundary_is_not_a_shared_session() {
+        let v = view(
+            &from(agent(100, 50, 40)),
+            Some(&agent(200, 60, 41)),
+            true,
+            &all,
+        );
+        assert_eq!(v.issuer_is_this_session, Relation::Unknown);
+        assert_eq!(resume_command(&v, Target::Queue), None);
+    }
+
+    /// A record that was made in a different pid namespace holds numbers that
+    /// this process cannot test.
+    #[test]
+    fn a_record_of_a_different_pid_namespace_is_unknown() {
+        let v = view(
+            &from(agent(100, 50, 40)),
+            Some(&agent(101, 50, 40)),
+            false,
+            &all,
+        );
+        assert_eq!(v.issuer_session_state, IssuerState::Unknown);
+        assert_eq!(v.issuer_is_this_session, Relation::Unknown);
+        assert_eq!(v.issuer_program, None);
+    }
+
+    /// A process with no start time can never be shown to exist, so qex must
+    /// not say that its session is gone.
+    #[test]
+    fn a_session_with_no_start_time_is_never_gone() {
+        let mut chain = agent(100, 50, 40);
+        for p in &mut chain {
+            p.start = None;
+        }
+        let v = view(&from(chain), None, true, &none);
+        assert_eq!(v.issuer_session_state, IssuerState::Unknown);
     }
 
     /// A file that qex cannot read must PAUSE the queue, and say why.
@@ -612,63 +1868,162 @@ mod tests {
     /// A parse fault that gave "nothing is paused" would start the work while
     /// the person believes that the machine is quiet, with no line in any log
     /// and no word in any command. The two directions are not equal: a queue
-    /// that qex holds by mistake costs latency and `qex resume queue` corrects
-    /// it, and a queue that operates by mistake cannot be corrected after the
+    /// that qex holds by mistake costs latency and one command corrects it,
+    /// and a queue that operates by mistake cannot be corrected after the
     /// work started.
     #[test]
     fn a_record_that_qex_cannot_read_holds_the_queue() {
         let paused =
             Paused::held_by_fault(std::path::Path::new("/x/paused.json"), "expected value");
 
-        let record = paused.queue.as_ref().expect("the queue must be paused");
+        let record = paused.queue.first().expect("the queue must be paused");
         assert!(record.fault);
+        assert_eq!(record.id, FAULT_ID, "the id is the same at each read");
         assert!(!record.expired(9_999_999), "such a pause has no end");
 
-        // The words must say what happened, and must not say that a person
-        // paused the queue.
-        let reason = queue_reason(record);
+        // The words must say what happened, must not say that a person paused
+        // the queue, and must give a remedy that WORKS: a resume with no id
+        // removes nothing.
+        let reason = queue_reason(&paused);
         assert!(reason.contains("could not read"), "got: {reason}");
         assert!(reason.contains("/x/paused.json"), "got: {reason}");
-        assert!(reason.contains("qex resume queue"), "got: {reason}");
         assert!(
-            !reason.contains("A person or an agent paused it"),
-            "no person asked for this pause: {reason}"
+            reason.contains("qex resume queue --pause fault"),
+            "got: {reason}"
         );
 
-        let line = queue_line(record, 0);
-        assert!(line.contains("PAUSED BY A FAULT"), "got: {line}");
+        let v = view(record, None, true, &all);
+        let lines = queue_lines(&[v], paused.since(), record.paused_at);
+        assert!(lines[1].contains("PAUSED BY A FAULT"), "got: {}", lines[1]);
+        assert!(
+            lines[1].ends_with("qex resume queue --pause fault"),
+            "got: {}",
+            lines[1]
+        );
+
+        // A real request replaces it: the file that this change writes is a
+        // file that qex can read.
+        //
+        // The fault held the queue already, so the new request did not stop
+        // it, and the queue stopped at the moment of the fault. A later
+        // `since` would take the hours of the fault away from the time that
+        // `--max-queue-time` gives back.
+        let fault_at = record.paused_at;
+        let mut paused = paused;
+        let fault_since = paused.since();
+        let mut later = super::PauseRecord::new(7, None, None);
+        later.paused_at = fault_at + 3600;
+        assert!(
+            !paused.add_queue(later),
+            "the queue was held already, so this request did not stop it"
+        );
+        assert_eq!(paused.queue.len(), 1);
+        assert!(!paused.queue[0].fault);
+        assert_eq!(paused.since(), fault_since);
+        let (_, end) = paused.remove_queue(|_| true, fault_at + 7200);
+        assert_eq!(end.map(|e| e.since), fault_since);
     }
 
-    /// An unknown field must not stop the file from parsing.
+    /// An id is unique across the queue and all the locks, so qex can say
+    /// where a request stands. A resume that names the wrong target must get
+    /// that place and the command, and never "does not stand".
+    #[test]
+    fn qex_knows_the_target_that_an_id_stands_for() {
+        let mut paused = Paused::default();
+        paused.add_queue(super::PauseRecord::new(7, None, None));
+        paused.add_lock("gpu0", super::PauseRecord::new(7, None, None));
+        let queue_id = paused.queue[0].id.clone();
+        let lock_id = paused.locks["gpu0"][0].id.clone();
+
+        assert_eq!(paused.home_of(&queue_id), Some(None));
+        assert_eq!(paused.home_of(&lock_id), Some(Some("gpu0".to_string())));
+        assert_eq!(paused.home_of("00000000"), None);
+
+        let words = stands_elsewhere(&lock_id, Some("gpu0"));
+        assert!(words.contains("stands for the lock `gpu0`"), "{words}");
+        assert!(
+            words.contains(&format!("`qex resume lock gpu0 --pause {lock_id}`")),
+            "{words}"
+        );
+        assert!(!words.contains("does not stand"), "{words}");
+        let words = stands_elsewhere(&queue_id, None);
+        assert!(
+            words.contains(&format!("`qex resume queue --pause {queue_id}`")),
+            "{words}"
+        );
+    }
+
+    /// An unknown field must not stop the file from parsing, and the file of
+    /// an earlier version, with ONE record for the queue and one for each
+    /// lock, must keep its pause.
     ///
-    /// A later version of qex adds fields to this record. A parse that refused
-    /// them would turn every such file into a fault, and the two versions could
-    /// not share one machine.
+    /// A parse that refused either one would turn the file into a fault, and
+    /// an upgrade would change a pause of a person into a pause of nobody.
     #[test]
-    fn a_field_that_this_version_does_not_know_is_ignored() {
-        let text = r#"{"queue":{"paused_at":10,"by_pid":7,"reason":null,"until":null,
-                       "paused_by_user":"someone"},"locks":{},"maintenance":true}"#;
-        let back: Paused = serde_json::from_str(text).expect("an unknown field must be ignored");
-        let record = back.queue.expect("the pause must hold");
+    fn the_file_of_an_earlier_version_keeps_its_pause() {
+        let text = r#"{"queue":{"paused_at":10,"by_pid":7,"reason":"a demo","until":null,
+                       "paused_by_user":"someone"},
+                       "locks":{"gpu0":{"paused_at":20,"by_pid":7}},"maintenance":true}"#;
+        let mut back: Paused = serde_json::from_str(text).expect("the file must parse");
+        back.normalize();
+        assert_eq!(back.queue.len(), 1);
+        let record = &back.queue[0];
         assert_eq!(record.paused_at, 10);
+        assert_eq!(record.reason.as_deref(), Some("a demo"));
         assert!(!record.fault);
+        assert_eq!(
+            record.id.len(),
+            8,
+            "an old record gets an id: {}",
+            record.id
+        );
+        assert_eq!(back.since(), Some(10));
+        assert_eq!(back.locks["gpu0"].len(), 1);
+        assert_ne!(back.locks["gpu0"][0].id, record.id);
+
+        // Nobody read the issuer of such a record.
+        let v = view(record, None, true, &all);
+        assert_eq!(v.issuer_session_state, IssuerState::Unknown);
+
+        let none: Paused = serde_json::from_str(r#"{"queue":null,"locks":{}}"#).unwrap();
+        assert!(none.is_empty());
     }
 
-    /// The record must survive the JSON, or a pause is lost at a restart.
+    /// The set must survive the JSON, with the chain of each issuer, or a
+    /// restart of the coordinator loses a pause or the state of its issuer.
     #[test]
-    fn the_record_survives_the_json() {
-        let mut p = Paused {
-            queue: Some(PauseRecord {
-                reason: Some("recording a demo".into()),
-                until: Some(2_000),
-                ..record()
-            }),
-            ..Default::default()
-        };
-        p.locks.insert("gpu0".into(), record());
+    fn the_requests_survive_the_json() {
+        let mut p = Paused::default();
+        p.add_queue(PauseRecord {
+            reason: Some("recording a demo".into()),
+            until: Some(2_000),
+            issuer_ns: Some("pid:[4026531836]".into()),
+            ..from(agent(100, 50, 40))
+        });
+        p.add_queue(record());
+        p.add_lock("gpu0", record());
 
         let text = serde_json::to_string(&p).unwrap();
         let back: Paused = serde_json::from_str(&text).unwrap();
         assert_eq!(back, p);
+        assert_eq!(back.queue[0].issuer_chain, Some(agent(100, 50, 40)));
+    }
+
+    /// A CLI of an earlier version reads ONE record and prints its pid. The
+    /// record that the coordinator gives it holds no pid.
+    #[test]
+    fn the_record_for_an_earlier_cli_holds_no_pid() {
+        let timed = PauseRecord {
+            paused_at: 900,
+            until: Some(2_000),
+            ..from(agent(100, 50, 40))
+        };
+        let one = for_an_earlier_cli(&[record(), timed.clone()]).unwrap();
+        assert_eq!(one.by_pid, 0);
+        assert_eq!(one.issuer_chain, None);
+        assert_eq!(one.paused_at, 900, "the oldest request");
+        assert_eq!(one.until, None, "one request has no end");
+        assert_eq!(for_an_earlier_cli(&[timed]).unwrap().until, Some(2_000));
+        assert!(for_an_earlier_cli(&[]).is_none());
     }
 }

@@ -2968,7 +2968,7 @@ fn a_follower_that_makes_the_log_file_makes_it_private() {
         );
     }
 
-    h.ok(&["resume", "queue"]);
+    h.ok(&["resume", "queue", "--all"]);
     h.ok(&["wait", &id, "--timeout", "30s"]);
 
     for path in [&stdout_log, &stderr_log] {
@@ -10545,7 +10545,7 @@ fn a_safe_lock_word_pauses_and_resumes_the_stored_lock() {
             .as_str()
             .is_some_and(|r| r.contains("person holds"))
     });
-    h.ok(&["resume", "lock", &shown]);
+    h.ok(&["resume", "lock", &shown, "--all"]);
     h.until(
         "the waiter starts after the resume",
         Duration::from_secs(45),
@@ -12499,7 +12499,7 @@ fn a_paused_queue_starts_no_job_and_the_jobs_that_operate_continue() {
         "a pause must not stop the job that already operates"
     );
 
-    h.ok(&["resume", "queue"]);
+    h.ok(&["resume", "queue", "--all"]);
     h.until("the job starts again", Duration::from_secs(45), || {
         h.has_started(&waiter)
     });
@@ -12521,7 +12521,8 @@ fn a_paused_queue_starts_no_job_and_the_jobs_that_operate_continue() {
 fn the_pause_survives_a_coordinator_that_stops() {
     let h = Harness::with_default_config("pausesurvives");
 
-    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
+    let receipt = h.ok(&["pause", "queue", "--reason", "recording a demo", "--json"]);
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
 
     // Take the pid from the coordinator itself. A search of the process list
     // also matches the command that holds those letters.
@@ -12543,7 +12544,15 @@ fn the_pause_survives_a_coordinator_that_stops() {
     let second = h.ok(&["info", "--no-start", "--json"]);
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(second["queue_state"], "paused", "the pause did not survive");
-    assert_eq!(second["paused_reason"], "recording a demo");
+    assert_eq!(second["pauses"][0]["reason"], "recording a demo");
+    assert_eq!(
+        second["pauses"][0]["pause_id"], receipt["pause_id"],
+        "the request must keep its id, or the receipt of its holder names nothing"
+    );
+    assert_eq!(
+        second["pauses"][0]["issuer_session_state"], "running",
+        "the new coordinator must still know the session that asked: the chain is in the file"
+    );
     assert_ne!(
         second["pid"].as_i64().unwrap() as i32,
         first,
@@ -12560,7 +12569,7 @@ fn the_pause_survives_a_coordinator_that_stops() {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
     h.until("the job starts again", Duration::from_secs(45), || {
         h.has_started(&id)
     });
@@ -12605,7 +12614,7 @@ fn a_person_gets_a_lock_when_the_job_that_holds_it_stops() {
     h.until(
         "the lock belongs to the person",
         Duration::from_secs(30),
-        || h.ok(&["pause"]).contains("it is yours now"),
+        || h.ok(&["pause"]).contains("no job holds it"),
     );
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -12626,7 +12635,7 @@ fn a_person_gets_a_lock_when_the_job_that_holds_it_stops() {
         "the reason must name the person: {reason}"
     );
 
-    h.ok(&["resume", "lock", "gpu0"]);
+    h.ok(&["resume", "lock", "gpu0", "--all"]);
     h.until("the job takes the lock", Duration::from_secs(45), || {
         h.has_started(&waiter)
     });
@@ -12674,7 +12683,7 @@ fn a_job_that_waits_for_a_pause_says_the_pause() {
         "the pause replaces the capacity reason, and does not stand beside it: {reason}"
     );
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
 }
 
 /// A pause with `--for` must end by itself.
@@ -12742,7 +12751,7 @@ fn a_failed_dependency_is_still_skipped_while_the_queue_is_paused() {
         "`qex wait` must give an answer while the queue is paused"
     );
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
 }
 
 /// A retry continues while the queue is paused. The job already started.
@@ -12801,7 +12810,7 @@ fn a_retry_continues_while_the_queue_is_paused() {
     // Between attempts the record is `running` with no pid, so `qex kill` can
     // refuse. The job stops by itself when the retries run out.
     h.qex(&["kill", &id, "--grace", "1s"]);
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
 }
 
 /// A retry keeps the lock of the job until the job itself stops.
@@ -12872,7 +12881,7 @@ fn a_retry_keeps_its_lock_until_the_job_stops() {
         "the lock goes to the person when the job stops, not to the next job"
     );
 
-    h.ok(&["resume", "lock", "gpu0"]);
+    h.ok(&["resume", "lock", "gpu0", "--all"]);
     h.until("the waiter takes the lock", Duration::from_secs(45), || {
         h.has_started(&waiter)
     });
@@ -12896,7 +12905,7 @@ fn a_pause_record_that_qex_cannot_read_holds_the_queue() {
     h.ok(&["pause", "queue"]);
     let file = h.root.join("state/qex/run/paused.json");
     assert!(file.exists(), "the pause must be a file");
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
 
     // Stop the coordinator, so the next command reads the file from the start.
     let text = h.ok(&["info", "--no-start", "--json"]);
@@ -12949,7 +12958,7 @@ fn a_pause_record_that_qex_cannot_read_holds_the_queue() {
     );
 
     // The remedy must operate.
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
     h.until("the job starts again", Duration::from_secs(45), || {
         h.has_started(&id)
     });
@@ -12973,25 +12982,457 @@ fn a_pause_for_zero_is_refused() {
     assert!(h.ok(&["pause"]).contains("nothing is paused"));
 }
 
-/// A second `qex pause queue` must keep the end that the first one gave.
+/// Reads the JSON that a command wrote.
+fn json_of(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("not valid JSON ({e}): {text}"))
+}
+
+/// Two pause requests stand apart: no one changes the other, each resume ends
+/// its own request, and a resume with no id ends nothing.
+///
+/// # The fault that this test prevents
+///
+/// A queue held ONE pause record. A second `qex pause queue` had to change
+/// it, and `qex resume` removed it whoever made it: an agent that finished
+/// its own work started the queue under a person who had paused it for a
+/// call. Every rule that merged two pauses into one record had a sequence in
+/// which one session shortened what a different session asked for.
 #[test]
-fn a_second_pause_keeps_the_end_of_the_first() {
+fn two_pause_requests_stand_apart_and_a_bare_resume_ends_nothing() {
     let h = Harness::with_default_config("pausetwice");
 
-    h.ok(&["pause", "queue", "--for", "30m", "--reason", "a video call"]);
-    h.ok(&["pause", "queue"]);
+    let first = json_of(&h.ok(&[
+        "pause",
+        "queue",
+        "--for",
+        "30m",
+        "--reason",
+        "a video call",
+        "--json",
+    ]));
+    let second = json_of(&h.ok(&["pause", "queue", "--reason", "bulk work", "--json"]));
+    let (timed, endless) = (
+        first["pause_id"].as_str().unwrap().to_string(),
+        second["pause_id"].as_str().unwrap().to_string(),
+    );
+    assert_ne!(timed, endless);
+    assert_eq!(first["created"], true);
+    assert_eq!(second["created"], false, "the queue was paused already");
+    assert_eq!(second["other_pauses"][0]["pause_id"], timed.as_str());
+    assert!(first["until"].is_string() && second["until"].is_null());
+
+    let job = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    assert_eq!(status["pauses"].as_array().unwrap().len(), 2);
+    assert!(
+        status["paused_until"].is_null(),
+        "one request has no end, so the set has none: {status}"
+    );
+    let words = h.ok(&["pause"]);
+    assert!(words.contains("2 requests stand"), "{words}");
+    assert!(
+        words.contains("a video call") && words.contains("bulk work"),
+        "{words}"
+    );
+
+    // A resume with no id removes NOTHING, says so, gives each id, fails, and
+    // never names `--all`.
+    for args in [vec!["resume"], vec!["resume", "queue"]] {
+        let out = h.qex(&args);
+        let text = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "a bare resume must fail: {text}");
+        assert!(
+            text.contains("qex resumed nothing: say which request. 2 requests stand"),
+            "{text}"
+        );
+        assert!(text.contains(&timed) && text.contains(&endless), "{text}");
+        assert!(!text.contains("--all"), "only the help names --all: {text}");
+    }
+    assert_eq!(
+        json_of(&h.ok(&["pause", "--json"]))["pauses"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // The end of the request with no end leaves the timed one as it was.
+    let words = h.ok(&["resume", "queue", "--pause", &endless]);
+    assert!(
+        words.contains(&format!(
+            "pause {endless} is ended; the queue stays paused: 1 other"
+        )) && words.contains(&timed),
+        "{words}"
+    );
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    assert_eq!(status["pauses"][0]["pause_id"], timed.as_str());
+    assert_eq!(
+        status["paused_until"], first["until"],
+        "nobody moved the end"
+    );
+    assert_eq!(status["pauses"][0]["reason"], "a video call");
+    assert_eq!(h.state_of(&job), "queued");
+
+    // An id that stands no more, and an id that never existed: a clear
+    // message, no change, and the code 0.
+    for id in [endless.as_str(), "00000000"] {
+        let words = h.ok(&["resume", "queue", "--pause", id]);
+        assert!(words.contains("does not stand"), "{words}");
+        assert!(words.contains(&timed), "the current status: {words}");
+    }
+    assert_eq!(h.state_of(&job), "queued");
+
+    let words = h.ok(&["resume", "queue", "--pause", &timed]);
+    assert!(words.contains("is ended; the queue runs"), "{words}");
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&job)
+    });
+    assert!(h.ok(&["resume"]).contains("the queue runs already"));
+}
+
+/// The same two requests in the OTHER order, and `--all`.
+#[test]
+fn a_timed_request_after_one_with_no_end_shortens_nothing() {
+    let h = Harness::with_default_config("pauseorder");
+
+    let endless = json_of(&h.ok(&["pause", "queue", "--reason", "bulk work", "--json"]));
+    let timed = json_of(&h.ok(&["pause", "queue", "--for", "30m", "--json"]));
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    assert!(
+        status["paused_until"].is_null(),
+        "a later request with an end must not give an end to the pause: {status}"
+    );
+
+    let words = h.ok(&[
+        "resume",
+        "queue",
+        "--pause",
+        timed["pause_id"].as_str().unwrap(),
+    ]);
+    assert!(words.contains("stays paused"), "{words}");
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    assert_eq!(status["pauses"][0]["pause_id"], endless["pause_id"]);
+    assert!(status["pauses"][0]["until"].is_null());
+
+    // `--all` ends every request, and reports each with its reason.
+    h.ok(&["pause", "queue", "--reason", "second"]);
+    let words = h.ok(&["resume", "queue", "--all"]);
+    assert!(
+        words.contains("2 in all") && words.contains("bulk work") && words.contains("second"),
+        "{words}"
+    );
+    assert!(words.contains("the queue runs"), "{words}");
+    assert_eq!(json_of(&h.ok(&["pause", "--json"]))["paused"], false);
+}
+
+/// `qex abort` adds a request of its own and gives the receipt; it changes no
+/// request that stood before.
+#[test]
+fn an_abort_gives_the_receipt_of_its_own_pause_request() {
+    let h = Harness::with_default_config("abortreceipt");
+
+    let person = json_of(&h.ok(&["pause", "queue", "--for", "30m", "--json"]));
+    let out = h.qex(&["abort", "--all", "--json"]);
+    assert!(out.status.success());
+    let abort = json_of(&String::from_utf8_lossy(&out.stdout));
+    let id = abort["pause_id"].as_str().expect("the abort gives an id");
+    assert_eq!(abort["created"], false);
+    assert_eq!(
+        abort["resume_command"],
+        format!("qex resume queue --pause {id}")
+    );
+    assert_eq!(abort["other_pauses"][0]["pause_id"], person["pause_id"]);
+    assert!(!abort.to_string().contains("pid"), "{abort}");
+
+    h.ok(&["resume", "queue", "--pause", id]);
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    assert_eq!(status["paused_until"], person["until"]);
+    h.ok(&["resume", "--all"]);
+}
+
+/// A peer that is not the qex command gives an issuer of `unknown`, and the
+/// pause is NOT refused.
+///
+/// The instrument: a copy of the program under a different name. The
+/// coordinator runs from the real file, so the copy has neither the name of
+/// the command nor the program file of the coordinator, exactly as a socket
+/// relay or the proxy of a container engine has.
+#[test]
+fn a_peer_that_is_not_the_qex_command_has_an_unknown_issuer() {
+    let h = Harness::with_default_config("pausepeer");
+    // The real program starts the coordinator.
+    h.ok(&["info"]);
+
+    let relay = h.root.join("relay");
+    copy_for_a_start(Path::new(env!("CARGO_BIN_EXE_qex")), &relay);
+    let mut cmd = Command::new(&relay);
+    cmd.args(["pause", "queue", "--reason", "through a relay", "--json"]);
+    isolate(&mut cmd, &h.root, &h.peers_dir);
+    let out = cmd.output().expect("the copy did not start");
+    assert!(
+        out.status.success(),
+        "a peer that qex cannot name must not be refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let receipt = json_of(&String::from_utf8_lossy(&out.stdout));
+    let id = receipt["pause_id"].as_str().unwrap();
+    // The receipt speaks to the holder of the id, whatever qex knows.
+    assert_eq!(
+        receipt["resume_command"],
+        format!("qex resume queue --pause {id}")
+    );
+
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    let request = &status["pauses"][0];
+    assert_eq!(request["issuer_session_state"], "unknown");
+    assert_eq!(request["issuer_is_this_session"], "unknown");
+    assert!(request["issuer_program"].is_null());
+    assert!(request["resume_command"].is_null());
 
     let words = h.ok(&["pause"]);
+    assert!(words.contains("treat it as still there"), "{words}");
     assert!(
-        !words.contains("NO END"),
-        "the second command must not remove the end: {words}"
-    );
-    assert!(
-        words.contains("a video call"),
-        "the second command must not remove the reason: {words}"
+        !words.contains("qex resume") && !words.contains("THIS") && !words.contains("another"),
+        "{words}"
     );
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "queue", "--pause", id]);
+}
+
+/// A pause from inside a job has a chain that runs up through the
+/// coordinator, which lives as long as the queue. The issuer is `unknown`.
+#[test]
+fn a_pause_from_inside_a_job_has_an_unknown_issuer() {
+    let h = Harness::with_default_config("pauseinjob");
+
+    let job = h.submit(&[
+        "submit",
+        "--cpu",
+        "1",
+        "--mem",
+        "64MB",
+        "--",
+        env!("CARGO_BIN_EXE_qex"),
+        "pause",
+        "queue",
+        "--reason",
+        "from a job",
+    ]);
+    h.until("the job stopped", Duration::from_secs(60), || {
+        h.state_of(&job) == "completed"
+    });
+
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    let request = &status["pauses"][0];
+    assert_eq!(request["reason"], "from a job");
+    assert_eq!(request["issuer_session_state"], "unknown", "{status}");
+    assert!(request["resume_command"].is_null());
+
+    h.ok(&["resume", "--all"]);
+}
+
+/// The same rule after the coordinator stopped and started again while the
+/// job operates. The supervisor of the job is then no child of the new
+/// coordinator, and the chain holds no coordinator at all, but the command
+/// still runs inside a job.
+#[test]
+fn a_pause_from_inside_a_job_is_unknown_after_a_coordinator_restart() {
+    let h = Harness::with_default_config("pauseinjobrestart");
+    let flag = h.root.join("go");
+
+    let script = format!(
+        "while [ ! -e '{}' ]; do sleep 0.2; done; '{}' pause queue --reason 'after a restart'",
+        flag.display(),
+        env!("CARGO_BIN_EXE_qex")
+    );
+    let job = h.submit(&[
+        "submit", "--cpu", "1", "--mem", "64MB", "--", "sh", "-c", &script,
+    ]);
+    h.until("the job starts", Duration::from_secs(45), || {
+        h.has_started(&job)
+    });
+
+    let pid = h.coordinator_pid();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    h.until("the coordinator stops", Duration::from_secs(30), || {
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        !alive
+    });
+    // A submission starts the new coordinator, which finds the job again.
+    let other = h.submit(&["submit", "--cpu", "1", "--mem", "64MB", "--", "true"]);
+    assert_ne!(h.coordinator_pid(), pid);
+
+    std::fs::write(&flag, b"").unwrap();
+    h.until("the job stopped", Duration::from_secs(60), || {
+        h.state_of(&job) == "completed"
+    });
+
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    let request = &status["pauses"][0];
+    assert_eq!(request["reason"], "after a restart");
+    assert_eq!(request["issuer_session_state"], "unknown", "{status}");
+    assert!(request["resume_command"].is_null(), "{status}");
+
+    h.ok(&["resume", "--all"]);
+    h.ok(&["wait", &other]);
+}
+
+/// An id is unique across the queue and all the locks. A resume that names
+/// the id of a DIFFERENT target must not say "does not stand" with the code
+/// 0: the reader would believe that the lock is free while the request holds
+/// it with no end.
+#[test]
+fn a_resume_with_the_id_of_a_different_target_says_where_it_stands() {
+    let h = Harness::with_default_config("pauseelsewhere");
+
+    let lock = json_of(&h.ok(&["pause", "lock", "gpu0", "--json"]));
+    let lock_id = lock["pause_id"].as_str().unwrap().to_string();
+    let queue = json_of(&h.ok(&["pause", "queue", "--json"]));
+    let queue_id = queue["pause_id"].as_str().unwrap().to_string();
+
+    let lock_command = format!("qex resume lock gpu0 --pause {lock_id}");
+    let queue_command = format!("qex resume queue --pause {queue_id}");
+    let cases: [(Vec<&str>, &str, &str); 4] = [
+        (
+            vec!["resume", "--pause", &lock_id],
+            "the lock `gpu0`",
+            &lock_command,
+        ),
+        (
+            vec!["resume", "queue", "--pause", &lock_id],
+            "the lock `gpu0`",
+            &lock_command,
+        ),
+        (
+            vec!["resume", "lock", "gpu0", "--pause", &queue_id],
+            "the queue",
+            &queue_command,
+        ),
+        (
+            vec!["resume", "lock", "gpu1", "--pause", &queue_id],
+            "the queue",
+            &queue_command,
+        ),
+    ];
+    for (args, place, command) in cases {
+        let out = h.qex(&args);
+        let text = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "{args:?} must fail: {text}");
+        assert!(text.contains(&format!("stands for {place}")), "{text}");
+        assert!(text.contains(command), "{text}");
+        assert!(!text.contains("does not stand"), "{text}");
+    }
+
+    // Nothing changed, and the commands that qex gave end both.
+    let status = json_of(&h.ok(&["pause", "--json"]));
+    assert_eq!(status["pauses"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["locks"].as_array().unwrap().len(), 1, "{status}");
+    h.ok(&["resume", "lock", "gpu0", "--pause", &lock_id]);
+    h.ok(&["resume", "queue", "--pause", &queue_id]);
+    assert_eq!(json_of(&h.ok(&["pause", "--json"]))["paused"], false);
+}
+
+/// A CLI of an earlier version sends a resume with no id. The coordinator
+/// REFUSES it, with the status lines, as an error that every CLI prints. A
+/// silent "remove everything" is the harm that the ids exist to prevent.
+#[test]
+fn the_resume_of_an_earlier_cli_is_refused_with_the_status_lines() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let h = Harness::with_default_config("oldcli");
+    let receipt = json_of(&h.ok(&["pause", "queue", "--reason", "a call", "--json"]));
+    let id = receipt["pause_id"].as_str().unwrap();
+
+    let socket = h.root.join("state/qex/run/s");
+    let stream = std::os::unix::net::UnixStream::connect(&socket)
+        .unwrap_or_else(|e| panic!("no socket at {}: {e}", socket.display()));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    // The exact bytes that an earlier CLI sends.
+    writer
+        .write_all(b"{\"op\":\"resume\",\"target\":{\"kind\":\"queue\"}}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let answer = json_of(&line);
+    assert_eq!(answer["result"], "error", "{answer}");
+    let message = answer["message"].as_str().unwrap();
+    assert!(message.contains("qex resumed nothing"), "{message}");
+    assert!(message.contains(&format!("pause {id}")), "{message}");
+    // This test is not the qex command, so qex cannot say who reads.
+    assert!(!message.contains("--all"), "{message}");
+
+    assert_eq!(json_of(&h.ok(&["pause", "--json"]))["paused"], true);
+
+    // An earlier CLI that PAUSES still works: it sends its pid and no more.
+    let stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    writer
+        .write_all(b"{\"op\":\"pause\",\"target\":{\"kind\":\"queue\"},\"reason\":null,\"until\":null,\"by_pid\":1}\n")
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let answer = json_of(&line);
+    assert_eq!(answer["result"], "pause_state", "{answer}");
+    assert_eq!(
+        answer["queue"]["by_pid"], 0,
+        "the record for an earlier CLI holds no pid, so it prints none: {answer}"
+    );
+    let status = h.ok(&["pause"]);
+    assert!(!status.contains("pid 1"), "{status}");
+    assert_eq!(
+        json_of(&h.ok(&["pause", "--json", "--verbose"]))["pauses"][1]["caller_reported_pid"],
+        1,
+        "the number survives in the forensic form only"
+    );
+
+    h.ok(&["resume", "--all"]);
+}
+
+/// The same model holds for a lock.
+#[test]
+fn two_requests_for_one_lock_stand_apart() {
+    let h = Harness::with_default_config("locktwice");
+
+    let one = json_of(&h.ok(&["pause", "lock", "gpu0", "--json"]));
+    let two = json_of(&h.ok(&["pause", "lock", "gpu0", "--for", "30m", "--json"]));
+    assert_eq!(one["created"], true);
+    assert_eq!(two["created"], false);
+    let (one, two) = (
+        one["pause_id"].as_str().unwrap().to_string(),
+        two["pause_id"].as_str().unwrap().to_string(),
+    );
+
+    let job = h.submit(&[
+        "submit", "--lock", "gpu0", "--cpu", "1", "--mem", "64MB", "--", "true",
+    ]);
+
+    let out = h.qex(&["resume", "lock", "gpu0"]);
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(text.contains("qex resumed nothing"), "{text}");
+    assert!(
+        text.contains(&format!("qex resume lock gpu0 --pause {one}")),
+        "{text}"
+    );
+
+    let words = h.ok(&["resume", "lock", "gpu0", "--pause", &one]);
+    assert!(words.contains("still holds the lock"), "{words}");
+    assert_eq!(h.state_of(&job), "queued");
+
+    let words = h.ok(&["resume", "lock", "gpu0", "--pause", &two]);
+    assert!(words.contains("the lock `gpu0` is free"), "{words}");
+    h.until("the job takes the lock", Duration::from_secs(45), || {
+        h.has_started(&job)
+    });
 }
 
 /// A pause must NOT expire a job that carries `--max-queue-time`.
@@ -13048,7 +13489,7 @@ fn a_pause_does_not_expire_a_job_that_has_a_queue_limit() {
         "the credit belongs to the END of the pause, not to each second of it"
     );
 
-    h.ok(&["resume", "queue"]);
+    h.ok(&["resume", "queue", "--all"]);
 
     let credited = h.status_json(&id)["queue_pause_secs"].as_u64().unwrap_or(0);
     assert!(
@@ -13113,7 +13554,7 @@ fn the_limit_still_expires_a_job_after_the_pause_ends() {
         "the pause must hold the clock of the limit"
     );
 
-    h.ok(&["resume", "queue"]);
+    h.ok(&["resume", "queue", "--all"]);
 
     // The clock runs again from the resume. The job still waits for a job that
     // does not stop, so it reaches its limit and gives up.
@@ -13168,7 +13609,7 @@ fn a_wait_behind_a_pause_says_the_pause() {
         "the pause belongs on stderr: {stdout}"
     );
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
 }
 
 /// A pause reason and a lock name are user text. No control byte of either may
@@ -13234,8 +13675,8 @@ fn a_pause_shows_no_control_byte_of_a_reason_or_a_lock_name() {
         "`qex pause` must keep the lock name, in its safe form: {shown}"
     );
 
-    h.ok(&["resume", "lock", "esc\x1b[2Jlock"]);
-    h.ok(&["resume"]);
+    h.ok(&["resume", "lock", "esc\x1b[2Jlock", "--all"]);
+    h.ok(&["resume", "--all"]);
 }
 
 /// An oversized job in a paused queue must say the PAUSE, and not the budget.
@@ -13289,50 +13730,79 @@ fn an_oversized_job_in_a_paused_queue_says_the_pause() {
         "the submission must still name the claim: {err}"
     );
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
 }
 
-/// Every command that reports a pause must name the SAME pid, and it must be
-/// the pid of the process that paused.
+/// `qex pause`, `qex info`, `qex top` and `qex list` must all give the same
+/// requests, by id and by session, and NO process id of a pauser.
 ///
 /// # The fault that this test prevents
 ///
-/// `Response::Info` carried the moment, the reason and the end of a pause, and
-/// no pauser pid. The two readers of that answer therefore invented one: `qex
-/// top` gave 0, and `qex info` gave the pid of the COORDINATOR. One paused
-/// queue thus gave three answers to "who paused this".
-///
-/// The `qex info` invention is the dangerous one. Each pause message tells the
-/// reader that a pid can be killed, so a second person reads `qex info`,
-/// believes that the coordinator is the pauser, and runs `kill <pid>` on the
+/// The reports gave "by pid N", where N was the number that the CLI reported
+/// for itself. A `qex abort` that was the first process of a container
+/// reported 1. A reader takes such a number for a process of ITS machine: it
+/// ran `ps -p 1`, found the first process alive, and believed for six hours
+/// that the pauser still operated. An earlier `qex info` gave the pid of the
+/// COORDINATOR in that place, and a reader who kills that number stops the
 /// one process that must keep operating.
 ///
-/// A unit test on `pause::queue_line` cannot see this: it builds the record
-/// itself, so it measures the formatter and never the caller. This test goes
-/// through the commands.
+/// A unit test on the lines cannot see this: it builds the view itself, so it
+/// measures the formatter and never the caller. This test goes through the
+/// commands.
 #[test]
-fn every_command_names_the_same_pauser_and_not_the_coordinator() {
+fn every_command_names_the_same_request_and_no_process_id() {
     let h = Harness::with_default_config("pausewho");
 
-    h.ok(&["pause", "queue", "--reason", "recording a demo"]);
-
-    // The pid of the coordinator. No report of the pause may give this number.
-    let coordinator = h.ok(&["info", "--no-start", "--json"]);
-    let coordinator: serde_json::Value = serde_json::from_str(&coordinator).unwrap();
-    let coordinator_pid = coordinator["pid"].as_i64().expect("the coordinator pid");
-
-    let pauser = coordinator["paused_by_pid"]
-        .as_i64()
-        .expect("`qex info --json` must give the pid that asked for the pause");
-    assert_ne!(
-        pauser, coordinator_pid,
-        "the pauser is the CLI process, and never the coordinator"
+    let receipt = h.ok(&["pause", "queue", "--reason", "recording a demo", "--json"]);
+    let receipt: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    let id = receipt["pause_id"]
+        .as_str()
+        .expect("the receipt gives the id");
+    assert_eq!(receipt["created"], true);
+    assert_eq!(
+        receipt["resume_command"],
+        format!("qex resume queue --pause {id}")
     );
-    assert!(pauser > 0, "a pid of 0 is not a process: {pauser}");
 
-    // Every text report must name that same pid, and none of them may name the
-    // coordinator. `qex list` and `qex wait` write the pause to STDERR, so this
-    // loop reads both streams.
+    let info = h.ok(&["info", "--no-start", "--json"]);
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let coordinator_pid = info["pid"].as_i64().expect("the coordinator pid");
+    assert!(
+        info.get("paused_by_pid").is_none(),
+        "no default output gives a pid of a pauser: {info}"
+    );
+    assert_eq!(info["pauses"][0]["pause_id"], id);
+
+    // The default JSON of the status holds no field whose name holds `pid`.
+    let status = h.ok(&["pause", "--json"]);
+    assert!(!status.contains("pid"), "{status}");
+    let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(status["paused"], true);
+    assert_eq!(status["paused_until"], serde_json::Value::Null);
+    assert_eq!(status["pauses"][0]["pause_id"], id);
+    // The test process started both commands, so they share a session.
+    assert_eq!(status["pauses"][0]["issuer_session_state"], "running");
+    assert_eq!(status["pauses"][0]["issuer_is_this_session"], "yes");
+    assert_eq!(
+        status["pauses"][0]["resume_command"],
+        receipt["resume_command"]
+    );
+
+    // The forensic form names each number for what it is.
+    let forensic = h.ok(&["pause", "--json", "--verbose"]);
+    let forensic: serde_json::Value = serde_json::from_str(&forensic).unwrap();
+    let request = &forensic["pauses"][0];
+    assert!(request["caller_reported_pid"].as_i64().unwrap_or(0) > 0);
+    let chain = request["issuer_chain"].as_array().expect("the chain");
+    assert_eq!(
+        chain[0]["host_pid"].as_i64(),
+        Some(std::process::id() as i64),
+        "the chain starts at the parent of the command, which is this test"
+    );
+    assert!(chain.iter().all(|p| p.get("pid").is_none()));
+
+    // `qex list` and `qex wait` write the pause to STDERR, so this loop reads
+    // both streams.
     for args in [
         vec!["pause"],
         vec!["info"],
@@ -13346,22 +13816,29 @@ fn every_command_names_the_same_pauser_and_not_the_coordinator() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            text.contains(&format!("pid {pauser}")),
-            "`qex {}` must name the process that paused: {text}",
+            text.contains(&format!("pause {id}")),
+            "`qex {}` must give the request by its id: {text}",
             args.join(" ")
         );
         assert!(
-            !text.contains(&format!("by pid {coordinator_pid}")),
-            "`qex {}` must not name the coordinator as the pauser: {text}",
+            text.contains("from THIS session"),
+            "`qex {}` must give the session that asked: {text}",
             args.join(" ")
         );
+        let pause_part = text
+            .lines()
+            .filter(|l| l.contains("pause") && !l.contains("coordinator pid"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !text.contains("by an unknown process"),
-            "this coordinator reports the pid, so no report may say unknown: {text}",
+            !pause_part.contains("pid") && !pause_part.contains(&coordinator_pid.to_string()),
+            "`qex {}` must give no process id for a pause: {pause_part}",
+            args.join(" ")
         );
     }
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "queue", "--pause", id]);
+    assert_eq!(h.ok(&["pause"]).lines().next(), Some("queue: running"));
 }
 
 /// A pause that reaches its `--for` while NO coordinator operates must still
@@ -13508,12 +13985,14 @@ max_pressure = 100
         .as_str()
         .unwrap_or("")
         .to_string();
+    // A resume with no id removes nothing, so the remedy is the command that
+    // gives each request and its id.
     assert!(
-        after.contains("qex resume queue"),
+        after.contains("`qex pause`"),
         "the reason must give the remedy: {after}"
     );
 
-    h.ok(&["resume"]);
+    h.ok(&["resume", "--all"]);
     h.ok(&["kill", &holder, "--grace", "1s"]);
 }
 
@@ -17281,7 +17760,7 @@ fn abort_stops_the_running_job_and_empties_the_queue() {
     let pause: serde_json::Value = serde_json::from_str(&pause).unwrap();
     assert_eq!(pause["paused"], true, "the queue must be paused: {pause}");
 
-    h.ok(&["resume", "queue"]);
+    h.ok(&["resume", "queue", "--all"]);
     h.until("the later job starts", Duration::from_secs(45), || {
         h.has_started(&later)
     });
@@ -17751,7 +18230,7 @@ fn an_abort_at_the_moment_of_a_resume_accounts_for_every_job() {
         for _ in 0..20 {
             h.submit(&["submit", "--cpu", "1", "--mem", "1MB", "--", "sleep", "5"]);
         }
-        h.ok(&["resume", "queue"]);
+        h.ok(&["resume", "queue", "--all"]);
         let report = h.abort_json(&["--all"]);
         assert_eq!(
             report["not_stopped"],

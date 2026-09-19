@@ -2970,10 +2970,24 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
         not_stopped,
         continues,
         outside,
+        pause,
+        pauses,
     } = response
     else {
         return report(response);
     };
+    // A coordinator of an earlier version gives no receipt. Its pause has no
+    // id, and `qex pause` says what stands.
+    let next = match &pause {
+        Some(receipt) => {
+            crate::pause::guarded_command(crate::pause::Target::Queue, &receipt.pause_id)
+        }
+        None => String::from("qex pause"),
+    };
+    let others: Vec<&crate::pause::PauseView> = pauses
+        .iter()
+        .filter(|v| Some(&v.pause_id) != pause.as_ref().map(|r| &r.pause_id))
+        .collect();
 
     // A job that qex could not stop, or could not cancel, is work that can
     // still happen, so the code says that the reader must act.
@@ -2995,7 +3009,17 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
                 "continues": continues,
                 "outside": outside,
                 "queue_paused": true,
-                "next": "qex resume queue",
+                "pause_id": pause.as_ref().map(|r| &r.pause_id),
+                "created": pause.as_ref().map(|r| r.created),
+                "until": serde_json::Value::Null,
+                // The guarded command for the request of THIS abort. It
+                // speaks to the holder of the id, whatever the issuer state.
+                "resume_command": pause.as_ref().map(|_| &next),
+                "other_pauses": others
+                    .iter()
+                    .map(|v| crate::pause::view_json(v, crate::pause::Target::Queue, false))
+                    .collect::<Vec<_>>(),
+                "next": next,
                 "clean": "qex clean cancelled",
             }))?
         );
@@ -3111,15 +3135,46 @@ pub fn abort(args: cli::AbortArgs) -> Result<i32> {
             count_of(outside, "job")
         );
     }
-    println!(
-        "The queue is paused. Run `qex resume queue` to start new work{}",
-        if cancelled == 0 {
-            String::from(".")
-        } else {
-            String::from(", and `qex clean cancelled` to delete the cancelled records.")
-        }
-    );
+    let clean = if cancelled == 0 {
+        ""
+    } else {
+        " Run `qex clean cancelled` to delete the cancelled records."
+    };
+    match &pause {
+        Some(receipt) => println!(
+            "The queue is paused: this abort made the pause request {}, which has no end. Keep \
+             this id. To end YOUR request when your work is done: {next}{clean}",
+            receipt.pause_id
+        ),
+        None => println!(
+            "The queue is paused. Run `qex pause` to read each pause request and how it \
+             ends.{clean}"
+        ),
+    }
+    print_other_pauses(&others, crate::pause::Target::Queue);
     Ok(code)
+}
+
+/// Writes the requests that stand beside the one that a command made.
+///
+/// A reader who ends its own request must learn that the queue stays paused,
+/// and why, before it looks at the budget for a cause that is not there.
+fn print_other_pauses(others: &[&crate::pause::PauseView], target: crate::pause::Target) {
+    if others.is_empty() {
+        return;
+    }
+    let now = crate::sys::now_secs();
+    if others.len() == 1 {
+        println!("1 other request stands, so the end of yours does not start the queue:");
+    } else {
+        println!(
+            "{} other requests stand, so the end of yours does not start the queue:",
+            others.len()
+        );
+    }
+    for view in others {
+        println!("  {}", crate::pause::request_line(view, target, now));
+    }
 }
 
 /// Tells whether this job already stopped.
@@ -4354,25 +4409,36 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             mem_claimed,
             queue_state,
             paused_at,
-            paused_by_pid,
+            pauses,
             paused_reason,
             paused_until,
             paused_locks,
             health,
             pools,
         } => {
-            let now = crate::sys::now_secs();
+            let picture = PausePicture::from_info(
+                queue_state.as_deref(),
+                paused_at,
+                pauses,
+                paused_reason,
+                paused_until,
+                paused_locks.unwrap_or_default(),
+            );
+            let pause_json = picture.json(false);
             if args.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "pid": pid,
                         "queue_state": queue_state,
-                        "paused_at": paused_at,
-                        "paused_by_pid": paused_by_pid,
-                        "paused_reason": paused_reason,
-                        "paused_until": paused_until,
-                        "paused_locks": paused_locks,
+                        // The same values as `qex pause --json` gives, and
+                        // no process id of a pauser under any name.
+                        "paused": pause_json["paused"],
+                        "paused_at": pause_json["paused_at"],
+                        "paused_for_seconds": pause_json["paused_for_seconds"],
+                        "paused_until": pause_json["paused_until"],
+                        "pauses": pause_json["pauses"],
+                        "paused_locks": pause_json["locks"],
                         "version": version,
                         "started_at": started_at,
                         "program_replaced": program_replaced,
@@ -4466,38 +4532,26 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
             // An earlier coordinator gives no value here. Write `unknown`, and
             // do not write `running`: a guess in this place is a lie, and this
             // is the one place where the honest answer matters most.
-            let state_line = match (queue_state.as_deref(), paused_at) {
-                (Some(state @ ("paused" | "paused-by-fault")), Some(at)) => {
-                    let record = crate::pause::PauseRecord {
-                        paused_at: at,
-                        // The pid of the PAUSER, and never the pid of the
-                        // coordinator. `0` says "this coordinator does not
-                        // report it", and `pause::who` prints that as words.
-                        by_pid: paused_by_pid.unwrap_or(0),
-                        reason: paused_reason,
-                        until: paused_until,
-                        fault: state == "paused-by-fault",
-                    };
-                    format!(
-                        "{} · other users are not paused",
-                        crate::pause::queue_line(&record, now)
-                    )
+            let mut pause_lines = picture.lines(false).into_iter();
+            let first = pause_lines.next().unwrap_or_default();
+            let state_line = match queue_state.as_deref() {
+                Some("paused" | "paused-by-fault") => {
+                    first.strip_prefix("queue: ").unwrap_or(&first).to_string()
                 }
                 // Not a pause. `queue_line` gives the full sentence: what holds
                 // the queue, and when a job last started. It writes its own
                 // `queue: ` prefix, so this arm removes it.
-                (Some(state), _) => line
+                Some(state) => line
                     .strip_prefix("queue: ")
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| state.to_string()),
-                (None, _) => "unknown; this coordinator does not report it".to_string(),
+                None => "unknown; this coordinator does not report it".to_string(),
             };
             println!("queue:           {state_line}");
-            for lock in paused_locks.unwrap_or_default() {
-                println!(
-                    "                 {}",
-                    crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
-                );
+            // One line for each standing request, and the lines of each lock
+            // that a person holds.
+            for line in pause_lines {
+                println!("                 {line}");
             }
             match pools {
                 // Say `unknown`, and never `none`. An earlier coordinator
@@ -4548,23 +4602,29 @@ pub fn info(args: cli::InfoArgs) -> Result<i32> {
 /// the pause that a person forgets, and an empty queue in the morning is the
 /// result, so qex says it every time and not one time.
 fn warn_if_paused(client: &mut Client) {
-    let Ok(Response::PauseState { queue, locks }) = client.call(&Request::PauseState) else {
+    let Ok(Response::PauseState {
+        queue,
+        locks,
+        pauses,
+        since,
+        ..
+    }) = client.call(&Request::PauseState)
+    else {
         // An earlier coordinator cannot answer this request, and it cannot
         // pause either, so there is nothing to report.
         return;
     };
-    let now = crate::sys::now_secs();
-    if let Some(record) = &queue {
-        eprintln!(
-            "qex: THE QUEUE IS PAUSED, so qex starts no job. {}",
-            crate::pause::queue_line(record, now)
-        );
+    let picture = PausePicture::new(queue, pauses, since, locks);
+    if picture.pauses.is_empty() && picture.locks.is_empty() {
+        return;
     }
-    for lock in &locks {
-        eprintln!(
-            "qex: {}",
-            crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
-        );
+    if !picture.pauses.is_empty() {
+        eprintln!("qex: THE QUEUE IS PAUSED, so qex starts no job.");
+    }
+    for line in picture.lines(false) {
+        if line != "queue: running" {
+            eprintln!("qex: {line}");
+        }
     }
 }
 
@@ -4582,7 +4642,8 @@ fn end_of_pause(duration: Option<&str>) -> Result<Option<u64>> {
         Some(d) => Ok(Some(crate::sys::now_secs() + d.as_secs())),
         None => bail!(
             "--for: give a time that is longer than zero, such as `30m`.\n\
-             To end a pause now, run `qex resume queue`."
+             To end a pause now, run `qex resume queue --pause ID`. `qex pause` gives the id \
+             of each request."
         ),
     }
 }
@@ -4615,43 +4676,239 @@ const PAUSE_DANGER: &str = "The coordinator would start the jobs of the queue, a
 const RESUME_DANGER: &str = "That coordinator does not read the pause record, so it already \
      starts the jobs of the queue. This command would change nothing.";
 
-/// Writes what is paused now, as text or as JSON.
-fn print_pause_state(
-    queue: Option<&crate::pause::PauseRecord>,
-    locks: &[crate::proto::LockPause],
-    json: bool,
-) -> Result<i32> {
-    let now = crate::sys::now_secs();
+/// Why a refused `qex resume --pause` or `qex pause` matters, for a
+/// coordinator that holds one pause record and no set of requests.
+const REQUESTS_DANGER: &str = "That coordinator holds ONE pause record for the queue, with no id \
+     for each request. A pause would change the pause of a different session, and a resume \
+     would end every pause at once, of every session.";
 
+/// What is paused now, as one reader sees it.
+pub(crate) struct PausePicture {
+    /// The standing requests of the queue.
+    pauses: Vec<crate::pause::PauseView>,
+    /// The moment when the queue stopped running.
+    since: Option<u64>,
+    /// Each lock that a person holds, with its standing requests.
+    locks: Vec<(crate::proto::LockPause, Vec<crate::pause::PauseView>)>,
+}
+
+impl PausePicture {
+    /// Reads the answer of a coordinator. A coordinator of an earlier version
+    /// gives one record and no set; that record becomes one request whose
+    /// issuer is unknown.
+    fn new(
+        queue: Option<crate::pause::PauseRecord>,
+        pauses: Option<Vec<crate::pause::PauseView>>,
+        since: Option<u64>,
+        locks: Vec<crate::proto::LockPause>,
+    ) -> Self {
+        let pauses = pauses.unwrap_or_else(|| {
+            queue
+                .iter()
+                .map(crate::pause::unknown_view)
+                .collect::<Vec<_>>()
+        });
+        let locks = locks
+            .into_iter()
+            .map(|lock| {
+                let views = if lock.pauses.is_empty() {
+                    vec![crate::pause::unknown_view(&lock.record)]
+                } else {
+                    lock.pauses.clone()
+                };
+                (lock, views)
+            })
+            .collect();
+        Self {
+            pauses,
+            since,
+            locks,
+        }
+    }
+
+    /// Reads the pause fields of a `Response::Info`.
+    ///
+    /// A coordinator of an earlier version gives the values of one record and
+    /// no set; they become one request with no id, whose issuer is unknown.
+    pub(crate) fn from_info(
+        queue_state: Option<&str>,
+        paused_at: Option<u64>,
+        pauses: Option<Vec<crate::pause::PauseView>>,
+        paused_reason: Option<String>,
+        paused_until: Option<u64>,
+        locks: Vec<crate::proto::LockPause>,
+    ) -> Self {
+        let is_paused = matches!(queue_state, Some("paused" | "paused-by-fault"));
+        let earlier = paused_at.filter(|_| is_paused).map(|at| {
+            let mut record = crate::pause::PauseRecord::new(0, paused_reason, paused_until);
+            record.id = String::new();
+            record.paused_at = at;
+            record.fault = queue_state == Some("paused-by-fault");
+            record
+        });
+        Self::new(earlier, pauses, paused_at, locks)
+    }
+
+    /// Gives the status as the default JSON shows it: no process id of any
+    /// kind. `forensic` adds what qex recorded about each issuer.
+    fn json(&self, forensic: bool) -> serde_json::Value {
+        use crate::pause::Target;
+        let now = crate::sys::now_secs();
+        let paused = !self.pauses.is_empty();
+        let since = paused.then(|| {
+            self.since
+                .unwrap_or_else(|| self.pauses.iter().map(|v| v.made_at).min().unwrap_or(now))
+        });
+        serde_json::json!({
+            "paused": paused,
+            "paused_at": since.map(crate::sys::rfc3339),
+            "paused_for_seconds": since.map(|s| now.saturating_sub(s)),
+            // The latest end. `null` when a request has no end, and also when
+            // nothing is paused: `paused` tells the two apart.
+            "paused_until": crate::pause::last_end(&self.pauses).map(crate::sys::rfc3339),
+            "pauses": self
+                .pauses
+                .iter()
+                .map(|v| crate::pause::view_json(v, Target::Queue, forensic))
+                .collect::<Vec<_>>(),
+            "locks": self
+                .locks
+                .iter()
+                .map(|(lock, views)| serde_json::json!({
+                    "name": lock.name,
+                    "held_by": lock.held_by,
+                    "pauses": views
+                        .iter()
+                        .map(|v| crate::pause::view_json(v, Target::Lock(&lock.name), forensic))
+                        .collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Gives the status lines: for the queue, and then for each lock.
+    pub(crate) fn lines(&self, forensic: bool) -> Vec<String> {
+        let now = crate::sys::now_secs();
+        let mut lines = Vec::new();
+        let queue = crate::pause::queue_lines(&self.pauses, self.since, now);
+        if queue.is_empty() {
+            lines.push("queue: running".to_string());
+        } else {
+            let mut queue = queue.into_iter();
+            lines.extend(
+                queue
+                    .next()
+                    .map(|summary| format!("queue: {summary} · other users are not paused")),
+            );
+            for (line, view) in queue.zip(&self.pauses) {
+                lines.push(format!("  {line}"));
+                lines.extend(forensic_line(view, forensic));
+            }
+        }
+        for (lock, views) in &self.locks {
+            let mut lock_lines =
+                crate::pause::lock_lines(&lock.name, views, lock.held_by.as_deref(), now)
+                    .into_iter();
+            lines.extend(lock_lines.next());
+            for (line, view) in lock_lines.zip(views) {
+                lines.push(format!("  {line}"));
+                lines.extend(forensic_line(view, forensic));
+            }
+        }
+        lines
+    }
+}
+
+/// Gives what qex recorded about the issuer of one request, for `--verbose`.
+///
+/// The words say what each number is. A reader who takes the reported number
+/// for a process of this machine, and tests it with `ps`, finds a stranger.
+fn forensic_line(view: &crate::pause::PauseView, forensic: bool) -> Option<String> {
+    if !forensic {
+        return None;
+    }
+    let chain = match &view.issuer_chain {
+        Some(chain) => chain
+            .iter()
+            .map(|p| format!("{} {}", p.host_pid, safe_name(&p.name)))
+            .collect::<Vec<_>>()
+            .join(" < "),
+        None => "not recorded".to_string(),
+    };
+    let reported = match view.caller_reported_pid {
+        Some(pid) => format!(
+            "{pid} (the caller said this about itself; nobody verified it, and it is not a \
+             process id of this machine)"
+        ),
+        None => "none".to_string(),
+    };
+    Some(format!(
+        "    issuer chain, as the machine of the coordinator numbers it: {chain} · \
+         caller-reported pid: {reported}"
+    ))
+}
+
+/// Writes what is paused now, as text or as JSON.
+fn print_pause_state(picture: &PausePicture, json: bool, forensic: bool) -> Result<i32> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&picture.json(forensic))?);
+        return Ok(0);
+    }
+    for line in picture.lines(forensic) {
+        println!("{line}");
+    }
+    if picture.pauses.is_empty() && picture.locks.is_empty() {
+        println!("nothing is paused. To pause the queue, run `qex pause queue`.");
+    }
+    Ok(0)
+}
+
+/// Writes the answer of a `qex pause queue` or a `qex pause lock`: the receipt
+/// of the new request, and the other requests that stand.
+///
+/// The `resume_command` of a receipt is ALWAYS the guarded command for its own
+/// id, whatever qex knows about the issuer: it speaks to the holder of the id.
+fn print_receipt(
+    receipt: &crate::proto::PauseReceipt,
+    target: crate::pause::Target,
+    views: &[crate::pause::PauseView],
+    json: bool,
+) -> Result<()> {
+    let command = crate::pause::guarded_command(target, &receipt.pause_id);
+    let others: Vec<&crate::pause::PauseView> = views
+        .iter()
+        .filter(|v| v.pause_id != receipt.pause_id)
+        .collect();
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "paused": queue.is_some(),
-                "queue": queue,
-                "locks": locks,
+                "pause_id": receipt.pause_id,
+                "created": receipt.created,
+                "until": receipt.until.map(crate::sys::rfc3339),
+                "resume_command": command,
+                "other_pauses": others
+                    .iter()
+                    .map(|v| crate::pause::view_json(v, target, false))
+                    .collect::<Vec<_>>(),
             }))?
         );
-        return Ok(0);
+        return Ok(());
     }
-
-    match queue {
-        Some(record) => println!(
-            "queue: {} · other users are not paused",
-            crate::pause::queue_line(record, now)
+    let now = crate::sys::now_secs();
+    let end = match receipt.until {
+        Some(end) => format!(
+            "it ends by itself at {}",
+            crate::sys::near_stamp_text(end, now)
         ),
-        None => println!("queue: running"),
-    }
-    for lock in locks {
-        println!(
-            "{}",
-            crate::pause::lock_line(&lock.name, &lock.record, lock.held_by.as_deref(), now)
-        );
-    }
-    if queue.is_none() && locks.is_empty() {
-        println!("nothing is paused. To pause the queue, run `qex pause queue`.");
-    }
-    Ok(0)
+        None => "it has NO END: it stands until somebody resumes it".to_string(),
+    };
+    println!(
+        "pause {} is made; {end}. Keep this id. It ends YOUR request, and no other: {command}",
+        receipt.pause_id
+    );
+    print_other_pauses(&others, target);
+    Ok(())
 }
 
 /// Stops qex from starting work, or takes a lock for the person.
@@ -4659,7 +4916,7 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
     use crate::proto::PauseTarget;
 
     let Some(target) = args.target else {
-        return pause_report(args.json);
+        return pause_report(args.json, args.verbose);
     };
 
     match target {
@@ -4672,6 +4929,7 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
             let until = end_of_pause(duration.as_deref())?;
             let mut client = Client::connect()?;
             require_command(&mut client, "pause", "qex pause", PAUSE_DANGER)?;
+            require_command(&mut client, "pause-requests", "qex pause", REQUESTS_DANGER)?;
 
             let response = client.call(&Request::Pause {
                 target: PauseTarget::Queue,
@@ -4679,11 +4937,21 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
                 until,
                 by_pid: std::process::id() as i32,
             })?;
-            let Response::PauseState { queue, locks } = response else {
+            let Response::PauseState {
+                pauses: Some(pauses),
+                receipt: Some(receipt),
+                ..
+            } = response
+            else {
                 return report(response);
             };
 
-            let code = print_pause_state(queue.as_ref(), &locks, json || args.json)?;
+            print_receipt(
+                &receipt,
+                crate::pause::Target::Queue,
+                &pauses,
+                json || args.json,
+            )?;
             if drain {
                 return drain_queue(&mut client);
             }
@@ -4709,7 +4977,7 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
                     }
                 }
             }
-            Ok(code)
+            Ok(0)
         }
 
         cli::PauseTarget::Lock {
@@ -4721,6 +4989,7 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
             let until = end_of_pause(duration.as_deref())?;
             let mut client = Client::connect()?;
             require_command(&mut client, "pause", "qex pause", PAUSE_DANGER)?;
+            require_command(&mut client, "pause-requests", "qex pause", REQUESTS_DANGER)?;
 
             let response = client.call(&Request::Pause {
                 target: PauseTarget::Lock { name: name.clone() },
@@ -4728,46 +4997,60 @@ pub fn pause(args: cli::PauseArgs) -> Result<i32> {
                 until,
                 by_pid: std::process::id() as i32,
             })?;
-            let Response::PauseState { queue, locks } = response else {
+            let Response::PauseState {
+                locks,
+                receipt: Some(receipt),
+                ..
+            } = response
+            else {
                 return report(response);
             };
 
+            let lock = locks
+                .iter()
+                .find(|l| l.pauses.iter().any(|v| v.pause_id == receipt.pause_id));
+            // The stored name of the lock can differ from the word that the
+            // person typed. The guarded command must name the stored lock.
+            let stored = lock.map(|l| l.name.as_str()).unwrap_or(&name);
+            let views = lock.map(|l| l.pauses.as_slice()).unwrap_or(&[]);
+            print_receipt(
+                &receipt,
+                crate::pause::Target::Lock(stored),
+                views,
+                json || args.json,
+            )?;
             if json || args.json {
-                return print_pause_state(queue.as_ref(), &locks, true);
+                return Ok(0);
             }
 
             // A lock name is text that the person typed, and these lines go
             // to a terminal. Show the safe form of the name. See
             // `job::safe_name`.
             let shown = crate::job::safe_name(&name);
-            match locks
-                .iter()
-                .find(|l| crate::pause::lock_matches(&l.name, &name))
-            {
-                Some(lock) => match &lock.held_by {
-                    Some(job) => println!(
-                        "the job {job} holds the lock `{shown}` now. qex gives it to you when \
-                         that job stops, and no other job takes it. Use `qex list` to watch \
-                         that job."
-                    ),
-                    None => println!(
-                        "the lock `{shown}` is yours. Every job that needs it waits until you \
-                         run `qex resume lock {shown}`."
-                    ),
-                },
-                None => println!("the lock `{shown}` is yours"),
+            match lock.and_then(|l| l.held_by.as_ref()) {
+                Some(job) => println!(
+                    "the job {job} holds the lock `{shown}` now. qex gives it to you when \
+                     that job stops, and no other job takes it. Use `qex list` to watch \
+                     that job."
+                ),
+                None => println!(
+                    "the lock `{shown}` is yours. Every job that needs it waits until each \
+                     request for it ends."
+                ),
             }
             Ok(0)
         }
     }
 }
 
-/// Starts the queue again, or gives a lock back.
+/// Ends ONE pause request, or every request of one target.
+///
+/// `qex resume` with no `--pause` removes nothing. The coordinator refuses
+/// that form with the status lines; see `daemon::handle_resume` for the
+/// reason.
 pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
     use crate::proto::PauseTarget;
 
-    // `qex resume` with no word starts the queue. That is the usual need, and
-    // it is the command that every pause message names.
     let (target, json) = match args.target {
         None => (PauseTarget::Queue, args.json),
         Some(cli::ResumeTarget::Queue { json }) => (PauseTarget::Queue, json || args.json),
@@ -4775,26 +5058,133 @@ pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
             (PauseTarget::Lock { name }, json || args.json)
         }
     };
-    let words = match &target {
-        PauseTarget::Queue => "the queue operates again".to_string(),
-        PauseTarget::Lock { name } => format!(
-            "the lock `{}` is free. The next job that needs it takes it.",
-            crate::job::safe_name(name)
-        ),
-    };
+    let pause_id = args.which.pause.clone();
+    let all = args.which.all;
 
     let mut client = Client::connect()?;
     require_command(&mut client, "pause", "qex resume", RESUME_DANGER)?;
+    require_command(&mut client, "pause-requests", "qex resume", REQUESTS_DANGER)?;
 
-    let response = client.call(&Request::Resume { target })?;
-    let Response::PauseState { queue, locks } = response else {
+    let response = client.call(&Request::Resume {
+        target: target.clone(),
+        pause_id: pause_id.clone(),
+        all,
+    })?;
+    let Response::PauseState {
+        queue,
+        locks,
+        pauses,
+        since,
+        resumed: Some(resumed),
+        ..
+    } = response
+    else {
         return report(response);
     };
+    let picture = PausePicture::new(queue, pauses, since, locks);
 
     if json {
-        return print_pause_state(queue.as_ref(), &locks, true);
+        let mut value = picture.json(false);
+        let shown_target = match &target {
+            PauseTarget::Queue => crate::pause::Target::Queue,
+            PauseTarget::Lock { name } => crate::pause::Target::Lock(name),
+        };
+        value["resumed"] = serde_json::json!(resumed
+            .iter()
+            .map(|v| {
+                let mut v = crate::pause::view_json(v, shown_target, false);
+                // A request that no longer stands has no command that ends it.
+                v["resume_command"] = serde_json::Value::Null;
+                v
+            })
+            .collect::<Vec<_>>());
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
     }
-    println!("{words}");
+
+    // What the target does now, and the requests that still stand for it.
+    // "Other" is true only when this command ended a request.
+    let others_stand = |n: usize| match (resumed.is_empty(), n) {
+        (false, 1) => "1 other request stands".to_string(),
+        (false, n) => format!("{n} other requests stand"),
+        (true, 1) => "1 request stands".to_string(),
+        (true, n) => format!("{n} requests stand"),
+    };
+    let (now_words, standing): (String, Vec<String>) = match &target {
+        PauseTarget::Queue => {
+            let lines = picture.lines(false);
+            if picture.pauses.is_empty() {
+                ("the queue runs".to_string(), Vec::new())
+            } else {
+                (
+                    format!(
+                        "the queue stays paused: {}",
+                        others_stand(picture.pauses.len())
+                    ),
+                    lines
+                        .into_iter()
+                        .take(1 + picture.pauses.len())
+                        .collect::<Vec<_>>(),
+                )
+            }
+        }
+        PauseTarget::Lock { name } => {
+            let shown = crate::job::safe_name(name);
+            match picture
+                .locks
+                .iter()
+                .find(|(l, _)| crate::pause::lock_matches(&l.name, name))
+            {
+                None => (
+                    format!("the lock `{shown}` is free. The next job that needs it takes it."),
+                    Vec::new(),
+                ),
+                Some((lock, views)) => (
+                    format!(
+                        "a person still holds the lock `{shown}`: {}",
+                        others_stand(views.len())
+                    ),
+                    crate::pause::lock_lines(
+                        &lock.name,
+                        views,
+                        lock.held_by.as_deref(),
+                        crate::sys::now_secs(),
+                    ),
+                ),
+            }
+        }
+    };
+
+    let now = crate::sys::now_secs();
+    match (&pause_id, resumed.is_empty()) {
+        // No id, no `--all`, and an answer: nothing stood.
+        (None, true) if !all => match &target {
+            PauseTarget::Queue => println!("the queue runs already; no pause request stands"),
+            PauseTarget::Lock { name } => println!(
+                "no person holds the lock `{}`; no pause request stands for it",
+                crate::job::safe_name(name)
+            ),
+        },
+        (None, true) => println!("no pause request stood, so qex ended none; {now_words}"),
+        (Some(id), true) => println!(
+            "pause {} does not stand: it reached its end, somebody resumed it, or it never \
+             existed. qex changed nothing; {now_words}",
+            safe_name(id)
+        ),
+        (Some(id), false) => println!("pause {} is ended; {now_words}", safe_name(id)),
+        (None, false) => {
+            println!(
+                "qex ended every pause request, {} in all; {now_words}",
+                resumed.len()
+            );
+            for view in &resumed {
+                println!("  ended: {}", crate::pause::request_head(view, now));
+            }
+        }
+    }
+    for line in standing {
+        println!("{line}");
+    }
     Ok(0)
 }
 
@@ -4803,14 +5193,22 @@ pub fn resume(args: cli::ResumeArgs) -> Result<i32> {
 /// This command does not start a coordinator. A command that asks a question
 /// must not make the thing that it asks about. When no coordinator operates,
 /// the file on the disk holds the answer.
-fn pause_report(json: bool) -> Result<i32> {
+fn pause_report(json: bool, forensic: bool) -> Result<i32> {
     // A coordinator that did not answer must not read as no coordinator: this
     // command reports what is paused NOW, and the file alone is that answer
     // only when nothing operates.
     if let Some(mut client) = Client::connect_existing_result()? {
         let response = client.call(&Request::PauseState)?;
-        if let Response::PauseState { queue, locks } = response {
-            return print_pause_state(queue.as_ref(), &locks, json);
+        if let Response::PauseState {
+            queue,
+            locks,
+            pauses,
+            since,
+            ..
+        } = response
+        {
+            let picture = PausePicture::new(queue, pauses, since, locks);
+            return print_pause_state(&picture, json, forensic);
         }
         // An earlier coordinator cannot answer. It also cannot pause, so the
         // file is the whole truth.
@@ -4824,20 +5222,35 @@ fn pause_report(json: bool) -> Result<i32> {
     // that the machine stays quiet.
     let mut paused = crate::pause::Paused::read();
     paused.expire(crate::sys::now_secs());
+
+    // No coordinator walks the chain of this command, so this command walks
+    // its own. `pause::views` gives `unknown` for a request that was recorded
+    // in a different pid namespace, where these numbers mean nothing.
+    let reader = crate::sys::submitter_chain();
+    let reader = (!reader.is_empty()).then_some(reader);
     let jobs = crate::job::read_all_from_disk();
     let locks: Vec<crate::proto::LockPause> = paused
         .locks
         .iter()
-        .map(|(name, record)| crate::proto::LockPause {
-            name: name.clone(),
-            record: record.clone(),
-            held_by: jobs
-                .iter()
-                .find(|j| j.state.is_active() && j.locks.iter().any(|l| l == name))
-                .map(|j| format!("{} ({})", short_id(&j.id), j.display_name())),
+        .filter_map(|(name, records)| {
+            Some(crate::proto::LockPause {
+                name: name.clone(),
+                record: crate::pause::for_an_earlier_cli(records)?,
+                pauses: crate::pause::views(records, reader.as_deref()),
+                held_by: jobs
+                    .iter()
+                    .find(|j| j.state.is_active() && j.locks.iter().any(|l| l == name))
+                    .map(|j| format!("{} ({})", short_id(&j.id), j.display_name())),
+            })
         })
         .collect();
-    print_pause_state(paused.queue.as_ref(), &locks, json)
+    let picture = PausePicture::new(
+        None,
+        Some(crate::pause::views(&paused.queue, reader.as_deref())),
+        paused.since(),
+        locks,
+    );
+    print_pause_state(&picture, json, forensic)
 }
 
 /// Gives the number of jobs that operate now.
