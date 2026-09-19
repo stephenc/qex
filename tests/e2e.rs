@@ -33,6 +33,14 @@ struct Harness {
     /// The peer directory of this test. Every command sets `QEX_PEERS_DIR` to
     /// this path, so a suite run cannot write into `/tmp/qex`.
     peers_dir: PathBuf,
+    /// The signal that Drop sends to each process that holds a file of this
+    /// test, and the time that Drop gives those processes to stop.
+    ///
+    /// SIGKILL in every test but one. The signal 0 stops nothing, so the test
+    /// of Drop can make the state "a process stayed" with no process that
+    /// resists SIGKILL.
+    stop_signal: i32,
+    stop_limit: Duration,
 }
 
 /// The name of the variable that moves the peer directory. It must match
@@ -111,6 +119,9 @@ fn describe_stream(name: &str, bytes: &[u8]) -> String {
     )
 }
 
+/// The time that the harness gives the processes of a test to stop.
+const STOP_LIMIT: Duration = Duration::from_secs(5);
+
 impl Harness {
     /// Makes a new installation with the given config file.
     fn new(name: &str, config: &str) -> Self {
@@ -142,6 +153,8 @@ impl Harness {
             root,
             extra_env: Vec::new(),
             peers_dir,
+            stop_signal: libc::SIGKILL,
+            stop_limit: STOP_LIMIT,
         }
     }
 
@@ -539,25 +552,67 @@ impl Harness {
         }
     }
 
-    /// Stops every process that still holds a file of this test.
+    /// Stops every process that still holds a file of this test, and gives the
+    /// processes that stayed.
     ///
     /// Do not ask the socket, and do not trust the pid file alone. A test can
     /// hide the socket, delete the pid file, or force the short socket path.
     /// The coordinator still holds `daemon.log` under this root. A number in
     /// a file is not enough: the system gives that number to a new process.
+    ///
+    /// ONE LOOK IS NOT ENOUGH. A coordinator can start a supervisor after the
+    /// look and before its own end, and that supervisor then stays with a job
+    /// that nobody can see. This function looks again until it finds nothing,
+    /// or until the limit.
+    ///
+    /// The signal is a parameter for one reason: the signal 0 stops nothing, so
+    /// a test can make the state "a process stayed" with no process that
+    /// resists SIGKILL.
+    ///
+    /// THE SIGNAL COMES BEFORE THE TEST OF THE LIMIT. One look can be slow: a
+    /// system with no `/proc` starts `lsof` for it, and on a machine under load
+    /// that one look can use the whole limit. A function that tests the limit
+    /// first then reports a process that it never tried to stop. Each process
+    /// that this function gives received the signal, and the function looked
+    /// again after it.
+    fn stop_holders(&self, signal: i32, limit: Duration) -> Vec<i32> {
+        let deadline = Instant::now() + limit;
+        let mut sent = false;
+        loop {
+            let pids = self.pids_holding_this_root();
+            if pids.is_empty() || (sent && Instant::now() >= deadline) {
+                return pids;
+            }
+            for pid in &pids {
+                unsafe {
+                    libc::kill(*pid, signal);
+                }
+            }
+            sent = true;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Stops the coordinator of this test in the middle of the test.
     fn stop_coordinator(&self) {
-        let pids = self.pids_holding_this_root();
-        for pid in &pids {
-            unsafe {
-                libc::kill(*pid, libc::SIGKILL);
-            }
-        }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        for pid in pids {
-            while Instant::now() < deadline && unsafe { libc::kill(pid, 0) } == 0 {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
+        let stayed = self.stop_holders(libc::SIGKILL, STOP_LIMIT);
+        assert!(stayed.is_empty(), "{}", self.stayed_message(&stayed));
+    }
+
+    /// The message for processes that the harness could not stop.
+    ///
+    /// The three parts: what happened, why it matters, what the reader must do.
+    fn stayed_message(&self, pids: &[i32]) -> String {
+        let list: Vec<String> = pids.iter().map(|p| p.to_string()).collect();
+        format!(
+            "the test harness could not stop the process {} that holds a file under {}. \
+             Such a process can hold a part of the budget of this machine, and no qex \
+             command of a different state directory can see it. The harness did not \
+             delete that directory, so the state that names the process is still there. \
+             Stop each process by its number, and then delete the directory.",
+            list.join(", "),
+            self.root.display()
+        )
     }
 
     fn may_stop(pid: i32) -> bool {
@@ -614,8 +669,23 @@ impl Drop for Harness {
         //
         // Do not ask the socket for the pid. A test can hide that socket or
         // replace it, and the coordinator then stays after cargo test returns.
-        self.stop_coordinator();
-        std::fs::remove_dir_all(&self.root).ok();
+        let stayed = self.stop_holders(self.stop_signal, self.stop_limit);
+        if stayed.is_empty() {
+            std::fs::remove_dir_all(&self.root).ok();
+            return;
+        }
+        // NEVER DELETE THE DIRECTORY IN SILENCE WHILE A PROCESS HOLDS IT. The
+        // directory is the only thing that names that process, and the reader
+        // is the person who must clean the machine. cargo hides the output of
+        // a test that passes, so the message must be a failure. A second panic
+        // stops the whole test program, so a test that already fails prints
+        // the message and keeps its own failure.
+        let message = self.stayed_message(&stayed);
+        if std::thread::panicking() {
+            eprintln!("{message}");
+        } else {
+            panic!("{message}");
+        }
     }
 }
 
@@ -5452,17 +5522,25 @@ fn a_second_job_of_one_command_uses_the_measurement_of_the_first() {
 }
 
 /// A claim from the user must always win over a measurement.
+///
+/// The claim of the user is 128MB and not more, because the job must start.
+/// Admission for memory asks the machine, so a large claim makes the result
+/// follow the free memory of the runner and not the code.
+///
+/// The first job has a small claim for the same reason. qex records the peak of
+/// each job that completed, whatever gave the claim, so that job is still the
+/// measurement that the second claim must win over.
 #[test]
 fn a_claim_from_the_user_wins_over_a_measurement() {
     let h = Harness::with_default_config("learnwins");
-    let first = h.submit(&["submit", "--", "true"]);
+    let first = h.submit(&["submit", "--mem", "64MB", "--", "true"]);
     h.ok(&["wait", &first, "--timeout", "45s"]);
 
-    let second = h.submit(&["submit", "--cpu", "2", "--mem", "1GB", "--", "true"]);
+    let second = h.submit(&["submit", "--cpu", "2", "--mem", "128MB", "--", "true"]);
     let s = h.status_json(&second);
     assert_eq!(s["claim_source"], "explicit");
     assert_eq!(s["cpu"], 2);
-    assert_eq!(s["mem"], 1024u64 * 1024 * 1024);
+    assert_eq!(s["mem"], 128u64 * 1024 * 1024);
     h.ok(&["wait", &second, "--timeout", "45s"]);
 }
 
@@ -5496,13 +5574,33 @@ fn a_job_that_did_not_complete_is_not_a_measurement() {
 /// `/proc/self/exe`, and a start of that name fails. Every job after the
 /// replacement failed at once with "No such file or directory", and that
 /// message named no cause.
+///
+/// THE COORDINATOR MUST HAVE A JOB WHILE THE FILE CHANGES. A coordinator with no
+/// job stops when it finds that its program file changed, and it looks one time
+/// each second. That is correct, and it made this test a race: the next command
+/// started a NEW coordinator from the new file, and that one reports
+/// `program_replaced: false`. The test failed one run in three on a machine
+/// under load. A job that waits for the test keeps the first coordinator alive
+/// until the test has read the answer, and the test proves that with the pid.
+///
+/// THE NEW FILE ARRIVES WITH ONE `rename`. `cargo install` and a package
+/// manager replace a program that way. A `remove_file` and a copy leave a
+/// moment with no file at the path, which no true replacement has.
+///
+/// Each job makes a small memory claim. Admission for memory asks the machine,
+/// so the default claim of about 1.8GB does not start on a small runner.
 #[test]
 fn a_replacement_of_the_program_does_not_stop_the_jobs() {
-    let h = Harness::with_default_config("skew");
+    let h = Harness::new(
+        "skew",
+        "[budget]\ncpu = \"4\"\nmem = \"2GB\"\n\
+         [peers]\nenabled = false\n\
+         [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n",
+    );
 
     // Start a coordinator with a copy of the program.
     let copy = h.root.join("qex-copy");
-    std::fs::copy(env!("CARGO_BIN_EXE_qex"), &copy).unwrap();
+    copy_program(&copy);
 
     let run = |args: &[&str], exe: &std::path::Path| -> Output {
         let mut cmd = Command::new(exe);
@@ -5510,19 +5608,50 @@ fn a_replacement_of_the_program_does_not_stop_the_jobs() {
         isolate(&mut cmd, &h.root, &h.peers_dir);
         cmd.output().expect("qex did not start")
     };
+    let info = || -> serde_json::Value {
+        let out = run(&["info", "--no-start", "--json"], &copy);
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "`qex info` gave no JSON: {e}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+    };
 
-    let first = run(&["submit", "--", "true"], &copy);
+    let first = run(&["submit", "--mem", "64MB", "--", "true"], &copy);
     assert!(first.status.success());
     let id = String::from_utf8_lossy(&first.stdout).trim().to_string();
     run(&["wait", &id, "--timeout", "45s"], &copy);
 
+    // The job that keeps the coordinator from stopping. See the text above.
+    let gate = h.root.join("gate");
+    let holder = run(
+        &[
+            "submit",
+            "--mem",
+            "64MB",
+            "--",
+            "sh",
+            "-c",
+            &waits_for_the_test(&gate),
+        ],
+        &copy,
+    );
+    assert!(holder.status.success());
+    let holder = String::from_utf8_lossy(&holder.stdout).trim().to_string();
+    let before = info()["pid"].as_i64().expect("a coordinator operates");
+
     // Replace the program file while the coordinator operates.
-    std::fs::remove_file(&copy).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_qex"), &copy).unwrap();
+    let new = h.root.join("qex-new");
+    copy_program(&new);
+    std::fs::rename(&new, &copy).unwrap();
 
     // A job must still start. The coordinator holds the old code, and it starts
     // the supervisor from the program that is on the disk now.
-    let after = run(&["submit", "--", "sh", "-c", "echo it-ran"], &copy);
+    let after = run(
+        &["submit", "--mem", "64MB", "--", "sh", "-c", "echo it-ran"],
+        &copy,
+    );
     assert!(
         after.status.success(),
         "the submission failed after the replacement: {}",
@@ -5544,16 +5673,60 @@ fn a_replacement_of_the_program_does_not_stop_the_jobs() {
     // and the words `(deleted)` after somebody replaces the file. macOS has no
     // equivalent, so qex cannot report the replacement there. The part above —
     // THE JOB CONTINUES — is the part that matters, and it operates on both.
-    let info = run(&["info", "--no-start", "--json"], &copy);
-    let v: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    let v = info();
+    assert_eq!(
+        v["pid"].as_i64(),
+        Some(before),
+        "the coordinator that saw the replacement must be the one that answers"
+    );
     #[cfg(target_os = "linux")]
     assert_eq!(v["program_replaced"], true);
 
-    if let Some(pid) = v["pid"].as_i64() {
-        unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-        }
-    }
+    release(&gate);
+    let ended = run(&["wait", &holder, "--timeout", "45s"], &copy);
+    assert_eq!(
+        ended.status.code(),
+        Some(0),
+        "the job that held the coordinator did not end: {}",
+        String::from_utf8_lossy(&ended.stderr)
+    );
+}
+
+/// Puts a copy of the qex program at a path, for a test that starts that copy.
+fn copy_program(to: &Path) {
+    copy_for_a_start(Path::new(env!("CARGO_BIN_EXE_qex")), to);
+}
+
+/// Copies a program file that the test starts directly after the copy.
+///
+/// A SECOND PROCESS WRITES THE FILE, and not this one. The system refuses to
+/// start a program file that some process holds open for writing ("Text file
+/// busy", ETXTBSY). A test that made the copy with `std::fs::copy` failed with
+/// that error at the start of the copy, one time, in a run of the full suite.
+/// 300 runs of that test alone did not fail.
+///
+/// THE PROBABLE CAUSE, WHICH NOBODY MEASURED. The tests are threads of one
+/// process. While this process holds the new file open for writing, a different
+/// thread can start a child, and that child receives a copy of the open file.
+/// The child keeps it until its `exec`, and `std::fs::copy` has returned by
+/// then. This agrees with the evidence, and no run has reproduced it. If the
+/// error comes back with this function in use, the cause is a different one:
+/// look for another process that opens the file, and do not trust this text.
+///
+/// `cp` opens the file in its own process, so no child of this process can
+/// receive it, and `cp` has stopped before the start.
+fn copy_for_a_start(from: &Path, to: &Path) {
+    let status = Command::new("cp")
+        .arg(from)
+        .arg(to)
+        .status()
+        .expect("cp did not start");
+    assert!(
+        status.success(),
+        "cp could not copy {} to {}",
+        from.display(),
+        to.display()
+    );
 }
 
 /// A closed pipe must not give a Rust panic.
@@ -10933,6 +11106,13 @@ fn a_politeness_value_with_a_fault_at_the_start_gives_the_default_values() {
 /// jobserver and gives the child cargo `MAKEFLAGS=--jobserver-auth=...`, so
 /// the UNMUTATED baseline fails and no mutant is ever reached. The same is
 /// true for anybody who runs `cargo test` under a `make -j` wrapper.
+///
+/// THE MEMORY CLAIM IS SMALL, AND IT MUST STAY SMALL. Each job here must START.
+/// Admission for memory asks the MACHINE how much a new program can use, and it
+/// does not ask the budget of the queue. A claim of 2GB made the result follow
+/// the free memory of the runner and not the code: on a small runner the job
+/// waited for memory until the limit of the wait. The test reads the NUMBER of
+/// the claim in the environment, and 128MB proves that as well as 2GB does.
 #[test]
 fn a_job_is_told_the_size_of_its_claim() {
     let h = Harness::new(
@@ -10971,7 +11151,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "--cpu",
         "2",
         "--mem",
-        "2GB",
+        "128MB",
         "--",
         "sh",
         "-c",
@@ -10981,7 +11161,7 @@ fn a_job_is_told_the_size_of_its_claim() {
     let out = h.ok(&["logs", &id, "--stdout"]);
     assert_eq!(
         out.trim(),
-        "2 2048 2 2",
+        "2 128 2 2",
         "the job must see its own claim: {out}"
     );
 
@@ -10994,7 +11174,7 @@ fn a_job_is_told_the_size_of_its_claim() {
     let id = h.submit(&[
         "submit",
         "--mem",
-        "2GB",
+        "128MB",
         "--",
         "sh",
         "-c",
@@ -11032,7 +11212,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "--cpu",
         "2",
         "--mem",
-        "2GB",
+        "128MB",
         "--env",
         "GOMAXPROCS=9",
         "--",
@@ -11055,7 +11235,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "--cpu",
         "2",
         "--mem",
-        "2GB",
+        "128MB",
         "--no-limit-env-hints",
         "--",
         "sh",
@@ -11075,7 +11255,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "name = \"off\"\n\
          command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
          no_limit_env_hints = true\n\n\
-         [resources]\ncpu = 2\nmem = \"2GB\"\n",
+         [resources]\ncpu = 2\nmem = \"128MB\"\n",
     )
     .unwrap();
     let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
@@ -11089,7 +11269,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         &file,
         "name = \"on\"\n\
          command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\n\
-         [resources]\ncpu = 2\nmem = \"2GB\"\n",
+         [resources]\ncpu = 2\nmem = \"128MB\"\n",
     )
     .unwrap();
     let id = h.submit(&["submit", "--job", file.to_str().unwrap()]);
@@ -11107,11 +11287,11 @@ fn a_job_is_told_the_size_of_its_claim() {
         &pipeline,
         "[[jobs]]\nname = \"stage-on\"\n\
          command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
-         [jobs.resources]\ncpu = 2\nmem = \"2GB\"\n\n\
+         [jobs.resources]\ncpu = 2\nmem = \"128MB\"\n\n\
          [[jobs]]\nname = \"stage-off\"\n\
          command = [\"sh\", \"-c\", \"echo \\\"[$QEX_CPU][$GOMAXPROCS]\\\"\"]\n\
          no_limit_env_hints = true\n\
-         [jobs.resources]\ncpu = 2\nmem = \"2GB\"\n",
+         [jobs.resources]\ncpu = 2\nmem = \"128MB\"\n",
     )
     .unwrap();
     let ids_file = h.root.join("stage-ids.json");
@@ -11143,7 +11323,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "--cpu",
         "2",
         "--mem",
-        "2GB",
+        "128MB",
         "--no-limit-env-hints",
         "--",
         "sh",
@@ -11164,7 +11344,7 @@ fn a_job_is_told_the_size_of_its_claim() {
         "--cpu",
         "2",
         "--mem",
-        "2GB",
+        "128MB",
         "--",
         "sh",
         "-c",
@@ -11190,6 +11370,10 @@ fn a_job_is_told_the_size_of_its_claim() {
 /// `env_capture = "minimal"` for the same reason as the test above: a
 /// `MAKEFLAGS` in the shell of the developer otherwise reaches the job and
 /// defeats the assertion. `cargo mutants` sets exactly that variable.
+///
+/// The memory claim is 128MB and not more, for the same reason as the test
+/// above: each job must start, and admission for memory asks the machine. A
+/// large claim makes the test fail on a runner with little free memory.
 #[test]
 fn the_config_file_controls_the_claim_in_the_environment() {
     let show = [
@@ -11205,7 +11389,7 @@ fn the_config_file_controls_the_claim_in_the_environment() {
          [submit]\nenv_capture = \"minimal\"\n\
          [claims]\nexport_env = false\n",
     );
-    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "128MB", "--"];
     args.extend_from_slice(&show);
     let id = h.submit(&args);
     h.ok(&["wait", &id, "--timeout", "45s"]);
@@ -11242,7 +11426,7 @@ fn the_config_file_controls_the_claim_in_the_environment() {
         shown.contains("claim in job: no; [submit] env_capture"),
         "`env_capture = none` must report that the claim is off: {shown}"
     );
-    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "128MB", "--"];
     args.extend_from_slice(&show);
     let id = h.submit(&args);
     h.ok(&["wait", &id, "--timeout", "45s"]);
@@ -11274,14 +11458,14 @@ fn the_config_file_controls_the_claim_in_the_environment() {
          [submit]\nenv_capture = \"minimal\"\n\
          [claims]\nalso = [\"java\", \"make\"]\n",
     );
-    let mut args = vec!["submit", "--cpu", "2", "--mem", "2GB", "--"];
+    let mut args = vec!["submit", "--cpu", "2", "--mem", "128MB", "--"];
     args.extend_from_slice(&show);
     let id = h.submit(&args);
     h.ok(&["wait", &id, "--timeout", "45s"]);
     let out = h.ok(&["logs", &id, "--stdout"]);
     assert_eq!(
         out.trim(),
-        "[2][2][-XX:ActiveProcessorCount=2 -Xmx1536m][-j2]",
+        "[2][2][-XX:ActiveProcessorCount=2 -Xmx96m][-j2]",
         "`also` must add the two variables: {out}"
     );
     let shown = h.ok(&["config", "show"]);
@@ -11301,7 +11485,7 @@ fn the_config_file_controls_the_claim_in_the_environment() {
          [system]\nreserve_mem = \"0\"\nmax_pressure = 100\n\
          [claims]\nalso = [\"jvm\"]\n",
     );
-    let out = h.qex(&["submit", "--cpu", "2", "--mem", "2GB", "--", "true"]);
+    let out = h.qex(&["submit", "--cpu", "2", "--mem", "128MB", "--", "true"]);
     assert!(
         !out.status.success(),
         "an unknown name must stop the submit"
@@ -16582,6 +16766,134 @@ fn the_harness_stops_a_coordinator_whose_socket_it_cannot_reach() {
     );
 }
 
+/// A process that the harness cannot stop must not stay in silence.
+///
+/// The harness deleted the directory of a test whether or not it stopped
+/// anything. A process then stayed with a claim that no queue could see, and
+/// nothing named it. The harness now gives the processes that stayed, and Drop
+/// reports them and keeps the directory.
+///
+/// No process resists SIGKILL, so this test sends the signal 0, which stops
+/// nothing. The coordinator then stays, exactly as one that the harness could
+/// not stop.
+#[test]
+fn the_harness_names_a_process_that_it_could_not_stop() {
+    let h = Harness::with_default_config("dropstayed");
+    let pid = h.coordinator_pid();
+
+    let stayed = h.stop_holders(0, Duration::from_millis(200));
+    assert!(
+        stayed.contains(&pid),
+        "the harness must give the coordinator {pid} that stayed: {stayed:?}"
+    );
+    let message = h.stayed_message(&stayed);
+    assert!(
+        message.contains(&pid.to_string()),
+        "the message must name the process: {message}"
+    );
+    assert!(
+        message.contains(h.root.to_str().unwrap()),
+        "the message must name the directory: {message}"
+    );
+    assert!(
+        message.contains("Stop each process"),
+        "the message must give the remedy: {message}"
+    );
+
+    // The true signal stops it, and nothing stays.
+    let stayed = h.stop_holders(libc::SIGKILL, Duration::from_secs(5));
+    assert!(stayed.is_empty(), "SIGKILL must stop it: {stayed:?}");
+    assert!(
+        unsafe { libc::kill(pid, 0) } != 0,
+        "the coordinator {pid} stayed after SIGKILL"
+    );
+}
+
+/// Drop must keep the directory and fail the test when a process stays.
+///
+/// This is the fault that the harness had: Drop deleted the directory whether
+/// or not it stopped anything, and it said nothing. The test above reads the
+/// parts. THIS test drops a harness, because correct parts that Drop does not
+/// use protect nobody.
+///
+/// The two states of Drop:
+///
+///   * the test passed, so Drop must FAIL it with the message, because cargo
+///     hides the output of a test that passes;
+///   * the test already fails, so Drop must NOT panic again. A second panic
+///     stops the whole test program, and the reader loses every other result.
+///
+/// The signal 0 makes the state, as in the test above. A second harness on the
+/// same directory, with the true signal, then cleans what the first one left.
+#[test]
+fn a_drop_with_a_process_that_stayed_keeps_the_directory_and_says_so() {
+    // The same directory with the true signal: the clean end of each part.
+    fn clean(root: &Path, pid: i32) {
+        let again = Harness {
+            root: root.to_path_buf(),
+            extra_env: Vec::new(),
+            peers_dir: root.join("peers"),
+            stop_signal: libc::SIGKILL,
+            stop_limit: STOP_LIMIT,
+        };
+        drop(again);
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the coordinator {pid} stayed after a drop with SIGKILL"
+        );
+        assert!(
+            !root.exists(),
+            "a drop that stopped every process must delete {}",
+            root.display()
+        );
+    }
+
+    // A TEST THAT PASSED.
+    let mut h = Harness::with_default_config("dropfails");
+    let pid = h.coordinator_pid();
+    let root = h.root.clone();
+    h.stop_signal = 0;
+    h.stop_limit = Duration::from_millis(200);
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(h)))
+        .expect_err("a drop that leaves a process must fail the test");
+    let message = failure
+        .downcast_ref::<String>()
+        .expect("the failure of the drop must carry a message");
+    assert!(
+        message.contains(&pid.to_string()) && message.contains(root.to_str().unwrap()),
+        "the failure must name the process {pid} and the directory: {message}"
+    );
+    assert!(
+        root.join("cfg/qex.toml").exists(),
+        "the drop deleted the directory while the process {pid} held it"
+    );
+    assert!(
+        unsafe { libc::kill(pid, 0) } == 0,
+        "the signal 0 must not stop the coordinator {pid}"
+    );
+    clean(&root, pid);
+
+    // A TEST THAT ALREADY FAILS. The drop runs while the thread panics. If the
+    // drop panics again, this whole test program stops, and that is the
+    // failure of this part.
+    let mut h = Harness::with_default_config("dropprints");
+    let pid = h.coordinator_pid();
+    let root = h.root.clone();
+    h.stop_signal = 0;
+    h.stop_limit = Duration::from_millis(200);
+    let joined = std::thread::spawn(move || {
+        let _h = h;
+        panic!("the failure of the test itself, which this test makes on purpose");
+    })
+    .join();
+    assert!(joined.is_err(), "the thread must end with its own failure");
+    assert!(
+        root.join("cfg/qex.toml").exists(),
+        "the drop deleted the directory while the process {pid} held it"
+    );
+    clean(&root, pid);
+}
+
 /// A test that deletes the pid file must still stop its coordinator.
 ///
 /// `a_socket_that_answers_stops_a_new_coordinator` unlinks that file. A later
@@ -16847,7 +17159,9 @@ impl Harness {
             } else {
                 "/bin/sh"
             };
-            std::fs::copy(shell, &wrapper).expect("the test cannot copy the shell");
+            // Not `std::fs::copy`: the test starts this file directly after
+            // the copy. See `copy_for_a_start`.
+            copy_for_a_start(Path::new(shell), &wrapper);
         }
         let mut cmd = Command::new(&wrapper);
         // The `exit` after the command forces a fork: a shell that runs one
