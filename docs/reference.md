@@ -29,7 +29,7 @@ qex clean  [<id>|completed|done|--state STATE|--older-than 7d|--all]
 qex events [--json] [--since STREAM:SEQ|start|now] [--count N] [--timeout TIME]
 qex info                    the coordinator: its pid, its budget and its load
 qex pause  [queue|lock NAME] [--reason TEXT] [--for TIME] [--drain]
-qex resume [queue|lock NAME]
+qex resume [queue|lock NAME] --pause ID
 qex version [--check] [--json]   the versions, and whether a newer one exists
 qex config show             the values that qex uses now
 qex schema job|status|pipeline|event    the JSON Schema of each format
@@ -677,8 +677,14 @@ on battery, or an interactive task needs the cores.
 qex pause queue --reason "recording a demo"   # start no new job
 qex pause queue --for 30m                     # end the pause by itself
 qex pause queue --drain                       # wait for a quiet machine
-qex resume queue                              # start the queue again
+qex resume queue --pause 4b1d22c0             # end YOUR pause request
 ```
+
+**A pause is a request, and each request has an id.** A queue is shared, so it
+holds a set of pause requests. Every `qex pause queue`, and every `qex abort`,
+adds its own request and gives its id as a receipt. The queue is paused while at
+least one request stands. A request ends at its `--for` time, or when somebody
+resumes it by its id. No request changes or removes a different request.
 
 A paused queue starts **nothing**. The jobs that operate now continue, because
 each one already holds its capacity and a stop would lose that work. A job
@@ -688,7 +694,7 @@ A lock is the better half:
 
 ```sh
 qex pause lock gpu0     # the lock goes to you, and every job that needs it waits
-qex resume lock gpu0    # the next job takes it
+qex resume lock gpu0 --pause 9c1e07aa   # end your request; the next job takes the lock
 ```
 
 `qex pause lock` never fails when a job holds the lock now. qex records the
@@ -706,21 +712,62 @@ machine. A job with `--retries` is still a job that operates: the next attempt
 starts, and the job keeps its locks, until the last attempt stops.
 
 If qex cannot read that file, it holds the queue and says so. A file that qex
-cannot read can hold a pause, and qex does not know. `qex resume queue` writes
-a new file.
+cannot read can hold a pause, and qex does not know. That hold is the request
+`fault`, and `qex resume queue --pause fault` writes a new file.
 
-A second `qex pause queue` keeps the end and the reason of the first one. To
-replace an end, run `qex resume queue` first.
+A second `qex pause queue` adds a request and changes nothing. The first request
+keeps its end and its reason, and the queue runs again when both have ended.
 
-`qex pause` with no word says what is paused now. `qex info`, `qex top`,
-`qex list` and `qex wait` say it too, and a pause with no end is reported loudly
-each time. Each line names the pid that asked for the pause: a queue is shared,
-and the second person must be able to find the owner before that person types
-`qex resume queue` over the work of somebody else.
+`qex resume` with no `--pause` ends **nothing**. qex cannot know which request
+you mean, so it prints each standing request with its id, says that it resumed
+nothing, and gives a code that is not 0. When no request stands, it says that
+the queue runs already, with the code 0. An id that does not stand gives a clear
+message and the code 0. An id that stands for a different target (the id of a lock
+with `resume queue`) ends nothing: qex says where the request stands, gives the
+command, and gives a code that is not 0.
 
-Any command on this queue can end any pause on it. A pause is not a lock on the
-queue, and qex refuses nobody: the queue belongs to one user of the machine, and
-the people and the agents that reach it already share every job in it.
+`qex pause` with no word says what is paused now: one summary line, and one line
+for each request with its id, its age, its end, the session that made it, its
+reason and what to do. `qex info`, `qex top`, `qex list` and `qex wait` give the
+same lines.
+
+**Who paused is a session, and never a pid.** The coordinator reads the
+credential of the socket and walks the chain of processes above the command that
+asked, on its own machine. Each request has one of three states: `running` (a
+process of that session still exists, which does not say that anybody remembers
+the pause), `gone` (no process of that session exists), and `unknown` (a socket
+relay, a container engine in a virtual machine, or a pause from inside a job;
+treat it as `running`). Each line also says if the request came from this
+session. Sibling agents share one session, so the id is the proof and that word
+is a hint.
+
+qex prints a command that is ready to run only for a request of this session and
+for a request of a session that is gone. For every other request: do not resume
+it unless you hold its id from your own `pause` answer, or your user tells you
+to.
+
+No line and no default JSON gives a process id. The number that a command
+reports for itself is a number of its own pid namespace: a `qex abort` that was
+the first process of a container reported 1, and a reader who ran `ps -p 1`
+found the first process of the machine alive. `qex pause --verbose` adds
+`issuer_chain` (entries with `host_pid`, `start` and `name`) and
+`caller_reported_pid`, which nobody verified and which is not a process id of
+this machine.
+
+| `qex pause --json` | Meaning |
+| --- | --- |
+| `paused` | true while one request stands |
+| `paused_at`, `paused_for_seconds` | the moment when the queue stopped running |
+| `paused_until` | the latest end; null when a request has no end, and when nothing is paused (`paused` tells the two apart) |
+| `pauses[]` | `pause_id`, `made_at`, `until`, `reason`, `issuer_session_state`, `issuer_program` (null exactly when the state is `unknown`), `issuer_is_this_session` (`yes`, `no`, `unknown`), `resume_command` (null when the text prints no command) |
+
+The answer of `qex pause queue --json` and of `qex abort --json` gives
+`pause_id`, `created`, `until`, `resume_command` (always the guarded command for
+its own id) and `other_pauses`.
+
+A pause is not a lock on the queue, and an id on a status line is public: the
+ids are a protocol between agents, and qex refuses nobody. `qex help pause`
+gives the recovery path for a queue that nobody will resume.
 
 **A pause does not expire a job.** `--max-queue-time` measures the time that a
 job waits for the QUEUE. A person who pauses the queue is not the queue, so the
@@ -778,8 +825,9 @@ the connection ends, run `qex abort` again for the rest. A record that qex
 could not write is not counted as cancelled: the job stays in the queue, the
 answer names it, and the exit code is 1.
 
-The queue **stays paused**, so nothing starts until you run `qex resume queue`.
-The pause covers the whole queue of your user, and every command that lists
+The queue **stays paused**. The abort adds a pause request of its own, with no
+end, and the answer gives its id; `qex resume queue --pause ID` ends it. The
+pause covers the whole queue of your user, and every command that lists
 jobs says so.
 
 The report counts what the coordinator did, and never what the command asked

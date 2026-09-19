@@ -449,7 +449,7 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
         jobs_queued,
         queue_state,
         paused_at,
-        paused_by_pid,
+        pauses,
         paused_reason,
         paused_until,
         paused_locks,
@@ -479,34 +479,25 @@ fn header_lines(ordered: &[JobStatus], info: Option<&Response>, unreachable: boo
                 "the qex program changed; this coordinator stops when no job operates".into(),
             );
         }
-        let now = sys::now_secs();
-        let fault = queue_state.as_deref() == Some("paused-by-fault");
-        if let (true, Some(at)) = (
-            matches!(
-                queue_state.as_deref(),
-                Some("paused") | Some("paused-by-fault")
-            ),
-            paused_at,
-        ) {
-            let record = crate::pause::PauseRecord {
-                paused_at: *at,
-                by_pid: paused_by_pid.unwrap_or(0),
-                reason: paused_reason.clone(),
-                until: *paused_until,
-                fault,
+        // The same lines as `qex pause` and `qex info` give: one summary
+        // line, and one line for each standing request.
+        let picture = crate::commands::PausePicture::from_info(
+            queue_state.as_deref(),
+            *paused_at,
+            pauses.clone(),
+            paused_reason.clone(),
+            *paused_until,
+            paused_locks.clone().unwrap_or_default(),
+        );
+        for (index, line) in picture.lines(false).into_iter().enumerate() {
+            if line == "queue: running" {
+                continue;
+            }
+            let line = match line.strip_prefix("queue: ") {
+                Some(rest) if index == 0 => format!("QUEUE PAUSED: qex starts no job. {rest}"),
+                _ => line,
             };
-            lines.push(crate::style::warning(&format!(
-                "QUEUE PAUSED: qex starts no job. {}",
-                crate::pause::queue_line(&record, now)
-            )));
-        }
-        for lock in paused_locks.iter().flatten() {
-            lines.push(crate::style::warning(&crate::pause::lock_line(
-                &lock.name,
-                &lock.record,
-                lock.held_by.as_deref(),
-                now,
-            )));
+            lines.push(crate::style::warning(&line));
         }
         if let Some(info) = info {
             let line = crate::commands::queue_line(info);
@@ -1485,7 +1476,7 @@ mod tests {
             mem_claimed: 4 << 30,
             queue_state: Some("running".into()),
             paused_at: None,
-            paused_by_pid: None,
+            pauses: Some(vec![]),
             paused_reason: None,
             paused_until: None,
             paused_locks: Some(vec![]),
@@ -1539,7 +1530,18 @@ mod tests {
             config_error: None,
             queue_state: Some("paused".into()),
             paused_at: Some(crate::sys::now_secs() - 360),
-            paused_by_pid: Some(3704694),
+            pauses: Some(vec![crate::pause::PauseView {
+                pause_id: "7f3c9a1e".into(),
+                made_at: crate::sys::now_secs() - 360,
+                until: None,
+                reason: Some("recording a demo".into()),
+                fault: false,
+                issuer_session_state: crate::pause::IssuerState::Gone,
+                issuer_program: Some("claude".into()),
+                issuer_is_this_session: crate::pause::Relation::No,
+                issuer_chain: None,
+                caller_reported_pid: Some(3704694),
+            }]),
             paused_reason: Some("recording a demo".into()),
             paused_until: None,
             paused_locks: Some(vec![]),
@@ -1566,8 +1568,16 @@ mod tests {
             "the page must say how long the pause has lasted: {page}"
         );
         assert!(
-            page.contains("NO END"),
-            "a pause with no end must be loud: {page}"
+            page.contains("until somebody resumes it"),
+            "a pause with no end must say so: {page}"
+        );
+        assert!(
+            page.contains("pause 7f3c9a1e") && page.contains("a session that is gone (claude)"),
+            "the page must give each request, with its id and its session: {page}"
+        );
+        assert!(
+            !page.contains("3704694") && !page.contains("pid"),
+            "the page must hold no process id of a pauser: {page}"
         );
     }
 
@@ -1718,7 +1728,7 @@ mod tests {
             mem_claimed,
             queue_state,
             paused_at,
-            paused_by_pid,
+            pauses,
             paused_reason,
             paused_until,
             paused_locks,
@@ -1743,7 +1753,7 @@ mod tests {
             config_error: error,
             queue_state,
             paused_at,
-            paused_by_pid,
+            pauses,
             paused_reason,
             paused_until,
             paused_locks,

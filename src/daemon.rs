@@ -562,6 +562,23 @@ impl State {
         self.jobs.values().filter(|j| f(j.status.state)).count()
     }
 
+    /// Gives the pid and the start time of the supervisor and of the process of
+    /// each job that is active. A command whose chain holds one of them ran
+    /// inside a job of this queue. See `runs_inside_a_job`.
+    pub fn job_processes(&self) -> Vec<(i32, Option<u64>)> {
+        self.jobs
+            .values()
+            .filter(|j| j.status.state.is_active())
+            .flat_map(|j| {
+                [
+                    (j.status.supervisor_pid, j.status.supervisor_start_token),
+                    (j.status.pid, j.status.pid_start_token),
+                ]
+            })
+            .filter_map(|(pid, start)| pid.map(|pid| (pid, start)))
+            .collect()
+    }
+
     /// Gives the job that holds one lock now, as `a1b2c3d4 (train)`.
     ///
     /// A person who asks for a lock that a job holds must learn which job, and
@@ -579,17 +596,41 @@ impl State {
             })
     }
 
-    /// Gives the locks that a person holds, with the job that still holds each.
-    pub fn paused_locks(&self) -> Vec<crate::proto::LockPause> {
+    /// Gives the locks that a person holds, with the job that still holds
+    /// each, as the reader with this chain sees them.
+    pub fn paused_locks(
+        &self,
+        reader: Option<&[crate::job::Ancestor]>,
+    ) -> Vec<crate::proto::LockPause> {
         self.paused
             .locks
             .iter()
-            .map(|(name, record)| crate::proto::LockPause {
-                name: name.clone(),
-                record: record.clone(),
-                held_by: self.lock_holder(name),
+            .filter_map(|(name, records)| {
+                Some(crate::proto::LockPause {
+                    name: name.clone(),
+                    record: crate::pause::for_an_earlier_cli(records)?,
+                    pauses: crate::pause::views(records, reader),
+                    held_by: self.lock_holder(name),
+                })
             })
             .collect()
+    }
+
+    /// Gives what is paused now, as the reader with this chain sees it.
+    pub fn pause_state(
+        &self,
+        reader: Option<&[crate::job::Ancestor]>,
+        receipt: Option<crate::proto::PauseReceipt>,
+        resumed: Option<Vec<crate::pause::PauseView>>,
+    ) -> Response {
+        Response::PauseState {
+            queue: crate::pause::for_an_earlier_cli(&self.paused.queue),
+            locks: self.paused_locks(reader),
+            pauses: Some(crate::pause::views(&self.paused.queue, reader)),
+            since: self.paused.since(),
+            receipt,
+            resumed,
+        }
     }
 
     /// Writes the pause file after a change.
@@ -1000,30 +1041,26 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     // `state.jobs` and `state.queue` are still empty and there is nobody to
     // credit. Hold the record, and pay it after the jobs are in the state.
     let now = sys::now_secs();
-    let ended_while_down = state
-        .paused
-        .queue
-        .clone()
-        .filter(|record| record.expired(now));
-    if state.paused.expire(now) {
+    let expired = state.paused.expire(now);
+    let ended_while_down = expired.queue_end;
+    if expired.changed {
         state.save_pause();
     }
-    match &state.paused.queue {
-        Some(record) if record.fault => {
-            // Say this in the log AND keep it in the file. The next command
-            // then reads a record that qex can parse, and the words that a
-            // person needs stay with it.
-            log(&format!(
-                "qex could not read its pause record, so it holds the queue: {}",
-                record.reason.as_deref().unwrap_or("unknown")
-            ));
-            state.save_pause();
-        }
-        Some(record) => log(&format!(
-            "the queue is paused; a person paused it at {}",
-            sys::clock_text(record.paused_at)
-        )),
-        None => {}
+    if let Some(record) = state.paused.queue.iter().find(|r| r.fault) {
+        // Say this in the log AND keep it in the file. The next command
+        // then reads a record that qex can parse, and the words that a
+        // person needs stay with it.
+        log(&format!(
+            "qex could not read its pause record, so it holds the queue: {}",
+            record.reason.as_deref().unwrap_or("unknown")
+        ));
+        state.save_pause();
+    } else if let Some(since) = state.paused.since() {
+        log(&format!(
+            "the queue is paused since {}; pause requests that stand: {}",
+            sys::clock_text(since),
+            state.paused.queue.len()
+        ));
     }
     for name in state.paused.locks.keys() {
         log(&format!(
@@ -1245,13 +1282,12 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
     // to credit. `end_queue_pause` is the same function that the other two ends
     // of a pause call, so the three cannot drift.
     //
-    // The end of the pause is the moment that the record gave, and NOT this
-    // moment: the pause stopped at its `--for`, and the time between that end
+    // The end of the pause is the moment that the last request gave (see
+    // `Paused::expire`), and NOT this moment: the pause stopped at its `--for`, and the time between that end
     // and this restart is time that the queue was free to run. To credit it
     // would give a job more time than the pause took.
-    if let Some(record) = ended_while_down {
-        let ended_at = record.until.unwrap_or(now).min(now);
-        crate::pause::end_queue_pause(&mut state, &record, ended_at);
+    if let Some(end) = ended_while_down {
+        crate::pause::end_queue_pause(&mut state, end);
         log("a pause reached its end while no coordinator operated");
     }
 
@@ -1394,6 +1430,9 @@ impl Drop for OwnedJobs {
 
 /// Answers the requests of one CLI process.
 fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
+    // The kernel wrote this number at the connection, so it is a number of
+    // THIS machine whatever the caller says about itself.
+    let peer = sys::peer_pid(&stream);
     let mut writer = stream.try_clone().context("copying the socket handle")?;
     let reader = BufReader::new(stream);
 
@@ -1436,7 +1475,7 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
                     no_such_job(id)
                 }
             }
-            Ok(request) => handle(&coord, request),
+            Ok(request) => handle(&coord, request, peer),
             Err(e) => Response::error(
                 ErrorKind::Internal,
                 format!("qex could not read this request: {e}"),
@@ -1454,7 +1493,7 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
     Ok(())
 }
 
-fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
+fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Response {
     match request {
         Request::Ping => Response::Ok,
         // `serve` answers this one, because the ownership belongs to a
@@ -1465,7 +1504,7 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
             ErrorKind::Internal,
             String::from("qex handles the ownership of a job on the connection that asks"),
         ),
-        Request::Info => handle_info(coord),
+        Request::Info => handle_info(coord, peer),
         Request::Capabilities => Response::Capabilities {
             names: crate::capabilities::ALL
                 .iter()
@@ -1516,22 +1555,126 @@ fn handle(coord: &Arc<Coordinator>, request: Request) -> Response {
             reason,
             until,
             by_pid,
-        } => handle_pause(coord, target, reason, until, by_pid),
-        Request::Resume { target } => handle_resume(coord, target),
+        } => handle_pause(coord, target, reason, until, by_pid, peer),
+        Request::Resume {
+            target,
+            pause_id,
+            all,
+        } => handle_resume(coord, target, pause_id, all, peer),
         Request::PauseState => {
+            let reader = issuer_chain(coord, peer);
             let state = coord.state.lock().unwrap();
-            Response::PauseState {
-                queue: state.paused.queue.clone(),
-                locks: state.paused_locks(),
-            }
+            state.pause_state(reader.as_deref(), None, None)
         }
         Request::Abort {
             scope,
             keep_running,
             grace_secs,
             by_pid,
-        } => crate::lifecycle::abort(coord, scope, keep_running, grace_secs, by_pid),
+        } => crate::lifecycle::abort(coord, scope, keep_running, grace_secs, by_pid, peer),
     }
+}
+
+/// Tests if the process at the other end of a socket is the qex command.
+///
+/// The chain above a process says who asked only when that process IS the
+/// command. A socket relay, a forward of a remote shell, or the proxy of a
+/// container engine that runs in a virtual machine is a different program, and
+/// the chain above it names the relay and not the person.
+fn is_the_qex_command(pid: i32, name: &str) -> bool {
+    if crate::job::safe_name(name) == "qex" {
+        return true;
+    }
+    let same_file = |a: &std::path::Path, b: &std::path::Path| {
+        a == b
+            || matches!(
+                (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    match (sys::process_exe(pid), std::env::current_exe()) {
+        (Some(theirs), Ok(ours)) => same_file(&theirs, &ours),
+        _ => false,
+    }
+}
+
+/// Gives the chain of processes above the command at the other end of a
+/// socket, from its parent upward, or `None` when qex cannot learn who asked.
+///
+/// CALL THIS BEFORE THE ANSWER GOES OUT. The command waits for the answer, so
+/// it is alive and its parent is still its parent. After the answer the
+/// command stops in milliseconds, and the machine can give its number to a
+/// stranger.
+///
+/// `None` is never a refusal: the pause is made, and its issuer is `unknown`.
+/// The cases: the system gave no peer (a pid of 0 is a process that this
+/// machine cannot see), the peer is not the qex command, the chain cannot be
+/// read, and the chain runs up through this coordinator or through a job of
+/// this queue, which is a command inside a job: the coordinator lives as long
+/// as the queue, so it says nothing about who asked. See `runs_inside_a_job`.
+/// qex never stores a guess.
+///
+/// This function takes the lock on the state for a moment, so call it BEFORE
+/// you take that lock.
+pub fn issuer_chain(coord: &Coordinator, peer: Option<i32>) -> Option<Vec<crate::job::Ancestor>> {
+    let peer = peer?;
+    let info = sys::process_info(peer)?;
+    if !is_the_qex_command(peer, &info.name) {
+        return None;
+    }
+    let chain = sys::chain_from(info.ppid);
+    let me = std::process::id() as i32;
+    let jobs = coord.state.lock().unwrap().job_processes();
+    if chain.is_empty() || runs_inside_a_job(&chain, me, &jobs) {
+        return None;
+    }
+    Some(chain)
+}
+
+/// Tests if a chain runs up through this coordinator or through a job of this
+/// queue, which says that the command ran inside a job.
+///
+/// The number of this coordinator alone is not enough. A coordinator can stop
+/// and start again while a job operates. The supervisor of that job is then a
+/// child of the first process of the machine, and the chain holds no
+/// coordinator at all. The new coordinator still knows the job: the record
+/// holds the pid and the start time of its supervisor and of its process, and
+/// recovery reads them. `jobs` holds those pairs for each job that is active.
+///
+/// The name `qex` is not the test. A job of a DIFFERENT qex queue is an
+/// ordinary session for this coordinator: its processes exist or not, and the
+/// state of that session is a fact that this coordinator can read. The test
+/// suite of qex runs as such a job.
+///
+/// A pair with a start time matches a process with the same pid AND the same
+/// start time, because the machine uses each pid again. A pair with no start
+/// time matches by the pid alone: the job is active, so a stranger with that
+/// number is improbable, and the wrong answer is only `unknown`, which is the
+/// cautious side.
+fn runs_inside_a_job(
+    chain: &[crate::job::Ancestor],
+    coordinator: i32,
+    jobs: &[(i32, Option<u64>)],
+) -> bool {
+    chain.iter().any(|p| {
+        p.pid == coordinator
+            || jobs
+                .iter()
+                .any(|(pid, start)| *pid == p.pid && (start.is_none() || *start == p.start))
+    })
+}
+
+/// Makes one pause request, with the issuer that the coordinator read.
+pub fn new_request(
+    by_pid: i32,
+    reason: Option<String>,
+    until: Option<u64>,
+    issuer: Option<Vec<crate::job::Ancestor>>,
+) -> crate::pause::PauseRecord {
+    let mut record = crate::pause::PauseRecord::new(by_pid, reason, until);
+    record.issuer_ns = issuer.as_ref().and_then(|_| sys::pid_namespace());
+    record.issuer_chain = issuer;
+    record
 }
 
 /// Gives the stored lock name that a pause or a resume should use.
@@ -1545,117 +1688,186 @@ fn resolve_paused_lock(state: &State, word: &str) -> Result<String, String> {
     crate::pause::resolve_lock_name(word, known)
 }
 
-/// Records a pause of the queue or of one lock.
+/// Adds a pause request for the queue or for one lock.
 ///
 /// A pause of a lock is never refused, whatever job holds that lock now. The
 /// request is safe to type at any moment: the job that holds the lock keeps it,
 /// no other job takes it, and the person receives it when that job stops.
+///
+/// # Why a second command ADDS a request, and changes nothing
+///
+/// `qex pause queue` looks like a command that a person can run twice. With one
+/// record for each queue, a second command had to change the first: a rule
+/// that replaced the record changed a pause of 30 minutes into a pause with no
+/// end, and every rule that merged the two let one session shorten or end
+/// what a different session asked for. Each command now adds ITS OWN request,
+/// and the answer is the receipt for that request alone.
 fn handle_pause(
     coord: &Arc<Coordinator>,
     target: crate::proto::PauseTarget,
     reason: Option<String>,
     until: Option<u64>,
     by_pid: i32,
+    peer: Option<i32>,
 ) -> Response {
     use crate::proto::PauseTarget;
 
+    // Before the lock and before the answer: see `issuer_chain`.
+    let issuer = issuer_chain(coord, peer);
+    let record = new_request(by_pid, reason, until, issuer.clone());
+
     let mut state = coord.state.lock().unwrap();
 
-    match target {
+    let (created, id) = match target {
         PauseTarget::Queue => {
-            let record = keep_the_end(state.paused.queue.take(), by_pid, reason, until);
-            state.paused.queue = Some(record);
+            let created = state.paused.add_queue(record);
             log("a person paused the queue; qex starts no job");
+            (created, state.paused.queue.last().map(|r| r.id.clone()))
         }
         PauseTarget::Lock { name } => {
             let name = match resolve_paused_lock(&state, &name) {
                 Ok(n) => n,
                 Err(msg) => return Response::error(ErrorKind::WrongState, msg),
             };
-            let record = keep_the_end(state.paused.locks.remove(&name), by_pid, reason, until);
             log(&format!(
                 "a person asked for the lock `{}`",
                 crate::job::safe_name(&name)
             ));
-            state.paused.locks.insert(name, record);
+            let created = state.paused.add_lock(&name, record);
+            let id = state
+                .paused
+                .locks
+                .get(&name)
+                .and_then(|l| l.last())
+                .map(|r| r.id.clone());
+            (created, id)
         }
-    }
+    };
     state.save_pause();
 
-    let answer = Response::PauseState {
-        queue: state.paused.queue.clone(),
-        locks: state.paused_locks(),
-    };
+    let receipt = id.map(|pause_id| crate::proto::PauseReceipt {
+        pause_id,
+        created,
+        until,
+    });
+    let answer = state.pause_state(issuer.as_deref(), receipt, None);
     drop(state);
     // Wake the scheduler, so the jobs of the queue get the new reason at once.
     coord.notify();
     answer
 }
 
-/// Makes the record of a pause, and keeps what a second command did not give.
+/// Ends ONE pause request, or every request of one target.
 ///
-/// # The fault that this function prevents
+/// # Why a resume with no id removes nothing
 ///
-/// `qex pause queue` looks like a command that a person can run twice. A second
-/// command that replaced the whole record would change a pause of 30 minutes
-/// into a pause with no end, because the second command gave no `--for`. An
-/// agent that pauses to protect itself would thus take the machine from a
-/// person for the rest of the day.
+/// qex cannot know which request the caller means. "The session of the
+/// caller" is not ownership, because sibling agents share one session, and a
+/// request of a session that is gone can still matter: its reason can be the
+/// standing instruction of the user. A command that removed everything ended
+/// the pause of a person who needed the machine, in silence. So the command
+/// gives the status lines, which carry the ids, and it says that it removed
+/// nothing. An earlier CLI sends exactly this form, and it gets the same
+/// refusal as an error, which every CLI prints.
 ///
-/// A second command therefore ADDS: it keeps the start, and it keeps the end
-/// and the reason that it does not give. To replace an end, run `qex resume`
-/// first.
-pub fn keep_the_end(
-    old: Option<crate::pause::PauseRecord>,
-    by_pid: i32,
-    reason: Option<String>,
-    until: Option<u64>,
-) -> crate::pause::PauseRecord {
-    let mut record = crate::pause::PauseRecord::new(by_pid, reason, until);
-    // A record that qex made because it could not read the file is not a pause
-    // that a person asked for, so a real pause replaces it in full.
-    if let Some(old) = old.filter(|o| !o.fault) {
-        record.paused_at = old.paused_at;
-        record.by_pid = old.by_pid;
-        record.reason = record.reason.or(old.reason);
-        record.until = record.until.or(old.until);
-    }
-    record
-}
-
-/// Removes a pause.
-fn handle_resume(coord: &Arc<Coordinator>, target: crate::proto::PauseTarget) -> Response {
+/// The refusal never names `--all`. Only the help names it.
+fn handle_resume(
+    coord: &Arc<Coordinator>,
+    target: crate::proto::PauseTarget,
+    pause_id: Option<String>,
+    all: bool,
+    peer: Option<i32>,
+) -> Response {
     use crate::proto::PauseTarget;
 
+    let reader = issuer_chain(coord, peer);
     let mut state = coord.state.lock().unwrap();
-    match target {
-        PauseTarget::Queue => {
+    let now = crate::sys::now_secs();
+
+    let lock_name = match &target {
+        PauseTarget::Queue => Ok(None),
+        PauseTarget::Lock { name } => resolve_paused_lock(&state, name).map(Some),
+    };
+
+    // An id is unique across the queue and all the locks, so qex knows where
+    // it stands. An id that stands for a DIFFERENT target must not get the
+    // answer "does not stand": the reader would believe that the queue runs,
+    // or that the lock is free, while the request holds it with no end.
+    if let (Some(id), false) = (&pause_id, all) {
+        if let Some(home) = state.paused.home_of(id) {
+            let named = lock_name.as_ref().ok().map(|n| n.as_deref());
+            if named != Some(home.as_deref()) {
+                return Response::error(
+                    ErrorKind::WrongState,
+                    crate::pause::stands_elsewhere(id, home.as_deref()),
+                );
+            }
+        }
+    }
+
+    let lock_name = match lock_name {
+        Ok(name) => name,
+        Err(msg) => return Response::error(ErrorKind::WrongState, msg),
+    };
+    let standing: Vec<crate::pause::PauseRecord> = match &lock_name {
+        None => state.paused.queue.clone(),
+        Some(name) => state.paused.locks.get(name).cloned().unwrap_or_default(),
+    };
+
+    if pause_id.is_none() && !all {
+        if standing.is_empty() {
+            return state.pause_state(reader.as_deref(), None, Some(Vec::new()));
+        }
+        let views = crate::pause::views(&standing, reader.as_deref());
+        let mut lines = match &lock_name {
+            None => crate::pause::queue_lines(&views, state.paused.since(), now),
+            Some(name) => {
+                crate::pause::lock_lines(name, &views, state.lock_holder(name).as_deref(), now)
+            }
+        };
+        lines.push(if views.len() == 1 {
+            "qex resumed nothing: say which request. 1 request stands; the line above gives \
+             its id."
+                .to_string()
+        } else {
+            format!(
+                "qex resumed nothing: say which request. {} requests stand; each line above \
+                 gives its id.",
+                views.len()
+            )
+        });
+        return Response::error(ErrorKind::WrongState, lines.join("\n"));
+    }
+
+    let which = |r: &crate::pause::PauseRecord| all || Some(&r.id) == pause_id.as_ref();
+    let leaving: Vec<crate::pause::PauseRecord> =
+        standing.iter().filter(|r| which(r)).cloned().collect();
+    let resumed = crate::pause::views(&leaving, reader.as_deref());
+
+    match &lock_name {
+        None => {
             // A `--for` that reaches its time and this command are the same
             // event. `pause::end_queue_pause` is the one place that says what
             // that event does. See it for both of the things that it does.
-            if let Some(record) = state.paused.queue.take() {
-                crate::pause::end_queue_pause(&mut state, &record, crate::sys::now_secs());
+            let (_, end) = state.paused.remove_queue(which, now);
+            if let Some(end) = end {
+                crate::pause::end_queue_pause(&mut state, end);
+                log("a person started the queue again");
             }
-            log("a person started the queue again");
         }
-        PauseTarget::Lock { name } => {
-            let name = match resolve_paused_lock(&state, &name) {
-                Ok(n) => n,
-                Err(msg) => return Response::error(ErrorKind::WrongState, msg),
-            };
-            log(&format!(
-                "a person gave the lock `{}` back",
-                crate::job::safe_name(&name)
-            ));
-            state.paused.locks.remove(&name);
+        Some(name) => {
+            state.paused.remove_lock(name, which);
+            if !state.paused.locks.contains_key(name) && !resumed.is_empty() {
+                log(&format!(
+                    "a person gave the lock `{}` back",
+                    crate::job::safe_name(name)
+                ));
+            }
         }
     }
     state.save_pause();
 
-    let answer = Response::PauseState {
-        queue: state.paused.queue.clone(),
-        locks: state.paused_locks(),
-    };
+    let answer = state.pause_state(reader.as_deref(), None, Some(resumed));
     drop(state);
     coord.notify();
     answer
@@ -1668,7 +1880,8 @@ fn no_such_job(id: uuid::Uuid) -> Response {
     )
 }
 
-fn handle_info(coord: &Arc<Coordinator>) -> Response {
+fn handle_info(coord: &Arc<Coordinator>, peer: Option<i32>) -> Response {
+    let reader = issuer_chain(coord, peer);
     let state = coord.state.lock().unwrap();
     // One word that answers "is the queue healthy".
     //
@@ -1681,14 +1894,14 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
     // `held` then says that qex keeps the capacity for the job at the front and
     // starts nothing. Each other word names the holder of the capacity, so a
     // reader learns at once whether the cause is inside this queue or outside.
-    let queue_state = match &state.paused.queue {
-        Some(record) if record.fault => "paused-by-fault".to_string(),
-        Some(_) => "paused".to_string(),
-        None => match &state.head {
+    let queue_state = match state.paused.queue.as_slice() {
+        [] => match &state.head {
             None => "running".to_string(),
             Some(h) if h.reserved => "held".to_string(),
             Some(h) => h.blocker.clone(),
         },
+        requests if requests.iter().any(|r| r.fault) => "paused-by-fault".to_string(),
+        _ => "paused".to_string(),
     };
     let held = state.claimed();
     let (cpu_claimed, mem_claimed) = (held.cpu, held.mem);
@@ -1738,6 +1951,7 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         })
         .collect();
 
+    let earlier = crate::pause::for_an_earlier_cli(&state.paused.queue);
     Response::Info {
         pools: Some(pools),
         pid: std::process::id() as i32,
@@ -1752,11 +1966,13 @@ fn handle_info(coord: &Arc<Coordinator>) -> Response {
         cpu_claimed,
         mem_claimed,
         queue_state: Some(queue_state),
-        paused_at: state.paused.queue.as_ref().map(|p| p.paused_at),
-        paused_by_pid: state.paused.queue.as_ref().map(|p| p.by_pid),
-        paused_reason: state.paused.queue.as_ref().and_then(|p| p.reason.clone()),
-        paused_until: state.paused.queue.as_ref().and_then(|p| p.until),
-        paused_locks: Some(state.paused_locks()),
+        // The three values below are for a CLI of an earlier version, which
+        // reads one record. This CLI reads `pauses`.
+        paused_at: state.paused.since(),
+        pauses: Some(crate::pause::views(&state.paused.queue, reader.as_deref())),
+        paused_reason: earlier.as_ref().and_then(|p| p.reason.clone()),
+        paused_until: earlier.as_ref().and_then(|p| p.until),
+        paused_locks: Some(state.paused_locks(reader.as_deref())),
         health: Some(Box::new(crate::proto::QueueHealth {
             last_start_at: state.last_start_at,
             peer_count: state.peer_claims.count,
@@ -1869,11 +2085,11 @@ fn handle_submit(
         // reads `queued`, waits, and looks at the budget for a cause that is
         // not there.
         let mut lines = Vec::new();
-        if let Some(record) = &state.paused.queue {
-            pause_reason = Some(crate::pause::queue_reason(record));
+        if state.paused.queue_paused() {
+            pause_reason = Some(crate::pause::queue_reason(&state.paused));
             lines.push(
-                "the queue is paused, so this job waits. Run `qex resume queue` to start the \
-                 queue again."
+                "the queue is paused, so this job waits. Run `qex pause` to read each pause \
+                 request, who made it and how it ends."
                     .to_string(),
             );
         }
@@ -1888,8 +2104,8 @@ fn handle_submit(
                 // form of it in a sentence that a terminal prints.
                 let shown = crate::job::safe_name(name);
                 lines.push(format!(
-                    "a person holds the lock `{shown}`, so this job waits. Run \
-                     `qex resume lock {shown}` to give it back."
+                    "a person holds the lock `{shown}`, so this job waits. Run `qex pause` to \
+                     read each request for it, who made it and how it ends."
                 ));
             }
         }
@@ -2230,6 +2446,47 @@ pub fn log(message: &str) {
 mod tests {
     use super::*;
     use crate::spec::JobSpec;
+
+    /// A coordinator can stop and start again while a job operates. The
+    /// supervisor of the job is then a child of the first process, and the
+    /// chain of a command inside the job holds no coordinator. The chain must
+    /// still read as "inside a job", or the pause of a job would get a
+    /// session, and later "gone" with a command that is ready to run.
+    #[test]
+    fn a_chain_through_a_job_of_an_earlier_coordinator_is_inside_a_job() {
+        let process = |pid: i32, ppid: i32, name: &str| crate::job::Ancestor {
+            pid,
+            ppid,
+            start: Some(pid as u64),
+            name: name.into(),
+            cwd: None,
+            terminal: false,
+        };
+        // The coordinator that started the job still operates.
+        let fresh = [
+            process(30, 20, "sh"),
+            process(20, 10, "qex"),
+            process(10, 1, "qex"),
+        ];
+        assert!(runs_inside_a_job(&fresh, 10, &[]));
+
+        // A new coordinator, number 99: the supervisor hangs below pid 1, and
+        // the record of the job names it.
+        let after = [process(30, 20, "sh"), process(20, 1, "qex")];
+        assert!(!runs_inside_a_job(&after, 99, &[]), "the fault");
+        assert!(runs_inside_a_job(&after, 99, &[(20, Some(20))]));
+        assert!(runs_inside_a_job(&after, 99, &[(20, None)]));
+        // A stranger took the number of a supervisor that stopped.
+        assert!(!runs_inside_a_job(&after, 99, &[(20, Some(7))]));
+
+        // A job of a DIFFERENT queue is a session like every other, whatever
+        // the name of the process above it.
+        assert!(!runs_inside_a_job(&after, 99, &[(55, Some(55))]));
+
+        // The shell of a person holds no job.
+        let person = [process(30, 20, "zsh"), process(20, 1, "tmux")];
+        assert!(!runs_inside_a_job(&person, 99, &[(55, Some(55))]));
+    }
 
     #[test]
     fn a_starting_record_with_no_job_process_returns_to_the_queue() {
@@ -2693,46 +2950,5 @@ mod tests {
         release_dedupe(&mut state, id);
         assert!(state.dedupe.is_empty());
         assert_eq!(state.dedupe_holder("k", 3600), None);
-    }
-
-    /// A second `qex pause queue` must not lose the end of the first one.
-    ///
-    /// # The fault that this test prevents
-    ///
-    /// `qex pause queue` looks like a command that a person can run twice. A
-    /// second command that replaced the whole record would change a pause of 30
-    /// minutes into a pause with no end, because the second command gave no
-    /// `--for`. An agent that pauses to protect itself would then take the
-    /// machine from a person for the rest of the day.
-    #[test]
-    fn a_second_pause_keeps_the_end_and_the_reason_of_the_first() {
-        let first = crate::pause::PauseRecord {
-            paused_at: 1_000,
-            by_pid: 11,
-            reason: Some("recording a demo".into()),
-            until: Some(2_800),
-            fault: false,
-        };
-
-        let second = keep_the_end(Some(first.clone()), 22, None, None);
-        assert_eq!(second.until, Some(2_800), "the end must stay");
-        assert_eq!(second.reason.as_deref(), Some("recording a demo"));
-        assert_eq!(second.paused_at, 1_000, "the pause began at the first one");
-
-        // A second command that GIVES a value uses it.
-        let third = keep_the_end(Some(first.clone()), 22, Some("a build".into()), Some(9_000));
-        assert_eq!(third.until, Some(9_000));
-        assert_eq!(third.reason.as_deref(), Some("a build"));
-
-        // A pause that qex made because it could not read the file is not a
-        // pause that a person asked for, so a real pause replaces it in full.
-        let fault = crate::pause::PauseRecord {
-            fault: true,
-            ..first
-        };
-        let real = keep_the_end(Some(fault), 22, None, None);
-        assert_eq!(real.until, None);
-        assert_eq!(real.by_pid, 22);
-        assert!(!real.fault);
     }
 }

@@ -192,6 +192,7 @@ pub const ALL: &[&str] = &[
     "max-queue-time",
     "own-job",
     "pause",
+    "pause-requests",
     "politeness",
     "pools",
     "retries",
