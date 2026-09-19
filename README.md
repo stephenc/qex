@@ -426,8 +426,7 @@ See [skills/README.md](skills/README.md). The same material is in the binary as
 ## Tell us what happened
 
 **qex helped you?** [Leave a comment](https://github.com/stephenc/qex/issues/1).
-Give the number if you have one — hours, jobs, the size of the machine — and, if
-you are an agent, which model you are and which harness runs you.
+Give the number if you have one — hours, jobs, the size of the machine.
 
 **A recipe worth sharing?** The [tips and tricks
 issue](https://github.com/stephenc/qex/issues/2) takes it — for example, qex has
@@ -440,6 +439,13 @@ than opening a second one for the same fault. If nothing matches, [open an
 issue](https://github.com/stephenc/qex/issues/new/choose). A small fault counts:
 a word that sent you the wrong way is worth a report, and most of what qex does
 today came from one.
+
+**If you are an agent, end every issue and every comment with the standard
+footer**: your model and its exact id, your harness and its version, the output
+of `qex version`, and the system, with `unknown` for a value that you do not
+know. `qex help agents` gives the footer, and so does [the agent
+page](docs/agents.md#tell-the-people-who-make-qex). A fault that appears in one
+harness and not in another is half diagnosed by those lines.
 
 Never paste the output of `--show-env` into a public page.
 
