@@ -49,11 +49,21 @@ pub fn kill(coord: &Arc<Coordinator>, id: uuid::Uuid, signal: i32, grace_secs: u
         // there, and this command needs that value to signal the job.
         state.refresh_active();
         state.publish_changes();
-        let Some(job) = state.jobs.get(&id) else {
-            return Response::error(
-                ErrorKind::NoSuchJob,
-                format!("there is no job with the id {id}"),
-            );
+        let job = match state.known(id) {
+            Some(crate::daemon::Known::Live(job)) => job,
+            Some(crate::daemon::Known::Stopped(job)) => {
+                let s = job.row.state;
+                return Response::error(
+                    ErrorKind::WrongState,
+                    format!("the job {id} stopped. Its state is `{s}`."),
+                );
+            }
+            None => {
+                return Response::error(
+                    ErrorKind::NoSuchJob,
+                    format!("there is no job with the id {id}"),
+                )
+            }
         };
 
         match job.status.state {
@@ -171,19 +181,19 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     // the removal.
     let mut state = coord.state.lock().unwrap();
 
-    match state.jobs.get(&id) {
+    match state.known(id) {
         None => {
             return Response::error(
                 ErrorKind::NoSuchJob,
                 format!("there is no job with the id {id}"),
             )
         }
-        Some(job) if !job.status.state.is_terminal() => {
+        Some(job) if !job.state().is_terminal() => {
             return Response::error(
                 ErrorKind::WrongState,
                 format!(
                     "the job {id} is in the state `{}`. Stop it first with `qex kill {id}`.",
-                    job.status.state
+                    job.state()
                 ),
             )
         }
@@ -249,31 +259,34 @@ pub fn clean(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
 }
 
 /// Gives the records in the form that the rule of `crate::deps` reads.
+///
+/// The jobs that stopped are in the list as well: a stage that stopped still
+/// belongs to its pipeline, and the rule counts it.
 fn dep_nodes(state: &State) -> Vec<crate::deps::Node<'_>> {
-    state
-        .jobs
-        .values()
-        .map(|j| crate::deps::Node {
-            id: j.status.id,
-            group: j.status.group,
-            terminal: j.status.state.is_terminal(),
-            needs: &j.spec.needs,
-            after: &j.spec.after,
-        })
-        .collect()
+    let live = state.jobs.values().map(|j| crate::deps::Node {
+        id: j.status.id,
+        group: j.status.group,
+        terminal: j.status.state.is_terminal(),
+        needs: &j.spec.needs,
+        after: &j.spec.after,
+    });
+    let stopped = state.stopped.values().map(|j| crate::deps::Node {
+        id: j.row.id,
+        group: j.row.group,
+        terminal: true,
+        needs: &j.needs,
+        after: &j.after,
+    });
+    live.chain(stopped).collect()
 }
 
 /// Names jobs for a sentence, as `a1b2c3d4 (train), e5f6a7b8 (test)`.
 fn named(state: &State, ids: &[uuid::Uuid]) -> String {
     ids.iter()
         .filter_map(|holder| {
-            state.jobs.get(holder).map(|j| {
-                format!(
-                    "{} ({})",
-                    &j.status.id.to_string()[..8],
-                    j.status.display_name()
-                )
-            })
+            state
+                .known(*holder)
+                .map(|j| format!("{} ({})", &holder.to_string()[..8], j.display_name()))
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -287,10 +300,15 @@ fn named(state: &State, ids: &[uuid::Uuid]) -> String {
 /// scheduler. This structure carries what the second part needs from the
 /// first.
 pub struct Removal {
-    status: JobStatus,
-    /// The jobs that named the removed job as their cause, with the record
-    /// that each one holds now.
-    dependents: Vec<(uuid::Uuid, JobStatus)>,
+    id: uuid::Uuid,
+    /// The name as the record held it, and the rest of the line that the
+    /// history keeps.
+    name: String,
+    submitted_at: u64,
+    state: JobState,
+    /// The jobs that named the removed job as their cause, with the text that
+    /// each one carries now.
+    dependents: Vec<(uuid::Uuid, String)>,
 }
 
 /// Takes one record out of the memory of the coordinator.
@@ -298,11 +316,16 @@ pub struct Removal {
 /// The caller holds the lock, and it made the checks: the job stopped, and no
 /// job needs its record. Gives `None` when there is no such job.
 fn remove_record(state: &mut State, id: uuid::Uuid) -> Option<Removal> {
-    let removed = state.jobs.remove(&id)?;
+    let (name, submitted_at, cause) = match state.known(id)? {
+        crate::daemon::Known::Live(j) => {
+            (j.status.name.clone(), j.status.submitted_at, j.status.state)
+        }
+        crate::daemon::Known::Stopped(j) => (j.row.name.clone(), j.row.submitted_at, j.row.state),
+    };
+    state.forget_job(id);
     // The SAFE name: this value goes into a sentence that a reader sees,
     // through `status.error`. See `job::safe_name`.
-    let cause_name = removed.status.display_name();
-    let cause_state = removed.status.state.to_string();
+    let cause_name = job::safe_name(&name);
 
     state.queue.retain(|q| *q != id);
 
@@ -321,23 +344,35 @@ fn remove_record(state: &mut State, id: uuid::Uuid) -> Option<Removal> {
     // would then be lost.
     //
     // Write the name and the state of the deleted job into the text of each
-    // dependent, so the record still answers the question.
+    // dependent, so the record still answers the question. A dependent is a
+    // job that qex skipped, so it stopped, and it can be in either map.
+    let text = format!(
+        "the job `{cause_name}` ({cause}) did not succeed, so this job did not run. \
+         Its record is deleted, so there is no log to read."
+    );
     let mut dependents = Vec::new();
     for job in state.jobs.values_mut() {
         if job.status.caused_by != Some(id) {
             continue;
         }
-        job.status.error = Some(format!(
-            "the job `{}` ({}) did not succeed, so this job did not run. \
-             Its record is deleted, so there is no log to read.",
-            cause_name, cause_state
-        ));
+        job.status.error = Some(text.clone());
         job.status.caused_by = None;
-        dependents.push((job.status.id, job.status.clone()));
+        dependents.push((job.status.id, text.clone()));
+    }
+    for job in state.stopped.values_mut() {
+        if job.caused_by != Some(id) {
+            continue;
+        }
+        job.row.error = Some(text.clone());
+        job.caused_by = None;
+        dependents.push((job.row.id, text.clone()));
     }
 
     Some(Removal {
-        status: removed.status,
+        id,
+        name,
+        submitted_at,
+        state: cause,
         dependents,
     })
 }
@@ -347,17 +382,30 @@ fn remove_record(state: &mut State, id: uuid::Uuid) -> Option<Removal> {
 /// Gives the fault when the directory stays. Such a record is not deleted: the
 /// next coordinator reads the directory and holds the job again.
 fn finish_removal(removal: Removal) -> Result<(), String> {
-    for (dep, status) in removal.dependents {
-        if let Ok(dir) = paths::job_dir(&dep) {
+    // The record of a dependent on the disk is the record that a reader of
+    // that job gets, so the new text goes there. The dependent stopped, so no
+    // supervisor writes its record in this moment.
+    for (dep, text) in removal.dependents {
+        let Ok(dir) = paths::job_dir(&dep) else {
+            continue;
+        };
+        if let Ok(mut status) = job::read_status(&dir) {
+            status.error = Some(text);
+            status.caused_by = None;
             job::write_status(&dir, &status).ok();
         }
     }
 
     // Record the removal before deleting the directory. A reader of history
     // can then learn that this job existed and that its work happened.
-    crate::history::record_removed(&removal.status);
+    crate::history::record_removed(
+        removal.id,
+        &removal.name,
+        removal.submitted_at,
+        removal.state,
+    );
 
-    let dir = paths::job_dir(&removal.status.id).map_err(|e| e.to_string())?;
+    let dir = paths::job_dir(&removal.id).map_err(|e| e.to_string())?;
 
     // Let a stop hook of this job end first. It writes its verdict into this
     // directory AFTER the job has its final state, and a file that arrives in
@@ -519,7 +567,7 @@ pub fn plan_abort(
                     });
                 match written {
                     Ok(()) => {
-                        job.status = next;
+                        job.status = next.into();
                         cancelled.push((job.status.id, job.status.clone()));
                     }
                     Err(why) => {
@@ -729,7 +777,7 @@ mod tests {
         status.submitter = chain;
         crate::daemon::Job {
             spec,
-            status,
+            status: status.into(),
             supervisor_pid: None,
         }
     }

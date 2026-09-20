@@ -195,7 +195,13 @@ pub const ALL: &[&str] = &[
     "pause-requests",
     "politeness",
     "pools",
+    // Three request names, and not options of a job. A CLI that finds one of
+    // them missing sends the earlier request in its place, and it says nothing,
+    // because the answer is the same and only slower.
+    "query",
+    "resolve",
     "retries",
+    "stop-many",
 ];
 
 /// Reads a version such as `0.5.1`.

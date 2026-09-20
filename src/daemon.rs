@@ -39,18 +39,169 @@ const IDLE_EXIT_VAR: &str = "QEX_IDLE_EXIT_SECS";
 /// answer that lets this process delete the socket file.
 const OWN_SOCKET_ANSWER_LIMIT: Duration = Duration::from_secs(1);
 
+/// The record of one job, behind a pointer that a reader can copy.
+///
+/// A request that gives many jobs copies the POINTER of each record while it
+/// holds the lock of the state, and it makes the text of its answer after the
+/// lock is free. A copy of each record under the lock made every other request
+/// wait for a time that grew with the number of jobs.
+///
+/// A change goes through `DerefMut`, which changes the record in place when no
+/// reader holds a pointer, and changes a copy when one does. A reader thus
+/// keeps the record of the moment of its request, and it holds no lock for it.
+///
+/// THIS TYPE HAS NO `Clone`, AND THAT IS DELIBERATE. `job.status.clone()` gives
+/// a `JobStatus`, as it did before this type existed, so no caller gets a
+/// shared pointer where it expects a record of its own. `share` gives the
+/// pointer, by name.
+pub struct SharedStatus(Arc<JobStatus>);
+
+impl SharedStatus {
+    pub fn share(&self) -> Arc<JobStatus> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl From<JobStatus> for SharedStatus {
+    fn from(status: JobStatus) -> Self {
+        Self(Arc::new(status))
+    }
+}
+
+impl std::ops::Deref for SharedStatus {
+    type Target = JobStatus;
+    fn deref(&self) -> &JobStatus {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SharedStatus {
+    fn deref_mut(&mut self) -> &mut JobStatus {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 /// One job, as the coordinator holds it.
 pub struct Job {
     pub spec: JobSpec,
-    pub status: JobStatus,
+    pub status: SharedStatus,
     /// The process id of the supervisor, while the job operates.
     pub supervisor_pid: Option<i32>,
+}
+
+/// What the coordinator keeps in memory about a job that stopped.
+///
+/// The full record of such a job is on the disk, and a request for it reads it
+/// there. This entry holds what the coordinator must answer WITHOUT that read:
+/// a line of `qex list`, the test of a filter, the test of a dependency, the
+/// test of a dedupe key, and the rule that keeps a record that a job needs.
+#[derive(Debug, Clone)]
+pub struct Stopped {
+    pub row: crate::proto::JobRow,
+    pub group_name: Option<String>,
+    pub tags: Vec<String>,
+    pub cwd: String,
+    pub caused_by: Option<uuid::Uuid>,
+    pub needs: Vec<uuid::Uuid>,
+    pub after: Vec<uuid::Uuid>,
+}
+
+impl Stopped {
+    pub fn of(s: &JobStatus) -> Self {
+        Self {
+            row: crate::proto::JobRow::of(s),
+            group_name: s.group_name.clone(),
+            tags: s.tags.clone(),
+            cwd: s.cwd.clone(),
+            caused_by: s.caused_by,
+            needs: s.needs.clone(),
+            after: s.after.clone(),
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        job::safe_name(&self.row.name)
+    }
+
+    pub fn facts(&self) -> crate::resolve::Facts<'_> {
+        crate::resolve::Facts {
+            id: self.row.id,
+            name: &self.row.name,
+            state: self.row.state,
+            tags: &self.tags,
+            cwd: &self.cwd,
+            group: self.row.group,
+            group_name: self.group_name.as_deref(),
+            finished_at: self.row.finished_at,
+        }
+    }
+
+    fn candidate(&self) -> crate::resolve::Candidate {
+        crate::resolve::Candidate {
+            id: self.row.id,
+            name: self.row.name.clone(),
+            group: self.row.group,
+            group_name: self.group_name.clone(),
+            state: self.row.state,
+            submitted_at: self.row.submitted_at,
+            sequence: self.row.sequence,
+        }
+    }
+}
+
+/// What the coordinator knows about a job, in the map that holds it.
+pub enum Known<'a> {
+    /// The job waits or operates, or it stopped a moment ago.
+    Live(&'a Job),
+    /// The job stopped, and its full record is on the disk.
+    Stopped(&'a Stopped),
+}
+
+impl Known<'_> {
+    pub fn state(&self) -> JobState {
+        match self {
+            Known::Live(j) => j.status.state,
+            Known::Stopped(s) => s.row.state,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            Known::Live(j) => j.status.display_name(),
+            Known::Stopped(s) => s.display_name(),
+        }
+    }
+
+    pub fn caused_by(&self) -> Option<uuid::Uuid> {
+        match self {
+            Known::Live(j) => j.status.caused_by,
+            Known::Stopped(s) => s.caused_by,
+        }
+    }
 }
 
 /// The data of the coordinator.
 pub struct State {
     pub cfg: Config,
+    /// The jobs that wait and the jobs that operate, and each job that stopped
+    /// until `retire_stopped` moves it to `stopped`.
+    ///
+    /// The scheduler and every request read this map in each turn, so its size
+    /// decides the cost of a turn. A queue that ran ten thousand short jobs
+    /// must not pay for them in every turn after that.
+    ///
+    /// Put a job in with `insert_job` and take it out with `forget_job`, so
+    /// that `index` holds the same jobs.
     pub jobs: BTreeMap<uuid::Uuid, Job>,
+    /// The jobs that stopped. See `Stopped` and `retire_stopped`.
+    pub stopped: BTreeMap<uuid::Uuid, Stopped>,
+    /// The jobs of `jobs` and of `stopped`, by id, by name and by group. A
+    /// request that names one job reads this and not every job.
+    pub index: crate::resolve::Index,
+    /// The jobs of `jobs` that reached a final state and that the stream
+    /// already reported. `publish_changes` writes this list, and
+    /// `retire_stopped` empties it.
+    pub retiring: Vec<uuid::Uuid>,
     /// The order of the queue. The scheduler reads this list.
     pub queue: Vec<uuid::Uuid>,
     /// The job that holds each dedupe key.
@@ -425,6 +576,9 @@ impl State {
         Self {
             cfg: Config::default(),
             jobs: BTreeMap::new(),
+            stopped: BTreeMap::new(),
+            index: crate::resolve::Index::default(),
+            retiring: Vec::new(),
             queue: Vec::new(),
             dedupe: BTreeMap::new(),
             last_contact: Instant::now(),
@@ -454,10 +608,23 @@ impl State {
     ///
     /// Gives `true` if a job changed.
     pub fn refresh_active(&mut self) -> bool {
+        // ONLY THE JOBS THAT A SUPERVISOR CAN WRITE. A job is `queued` in this
+        // map exactly while no supervisor of it lives: `start_job` makes it
+        // `starting` here BEFORE it writes the record and starts the
+        // supervisor, a job goes back to `queued` only after its supervisor
+        // stopped, and a coordinator that starts again keeps the state of a
+        // record whose supervisor lives. This coordinator is thus the one
+        // writer of the record of a queued job, and the disk can tell it
+        // nothing.
+        //
+        // Measured with 3,000 jobs behind a paused queue: a read of every
+        // record that waits took three quarters of the time of the scheduler
+        // thread, under the lock, in each turn and in each request, and every
+        // submission waited for it.
         let ids: Vec<uuid::Uuid> = self
             .jobs
             .iter()
-            .filter(|(_, j)| !j.status.state.is_terminal())
+            .filter(|(_, j)| j.status.state.is_active())
             .map(|(id, _)| *id)
             .collect();
 
@@ -472,12 +639,6 @@ impl State {
             let Some(job) = self.jobs.get_mut(&id) else {
                 continue;
             };
-
-            // The queue owns the reason that a job waits. The supervisor does
-            // not write that field, so keep the value from this process.
-            if job.status.state == JobState::Queued && disk.state == JobState::Queued {
-                continue;
-            }
 
             // Never move a job back to an earlier state.
             //
@@ -499,7 +660,7 @@ impl State {
             // earlier program does not know the chain of the submitter. The
             // copy in memory keeps it, so `qex abort` can still read it.
             let submitter = std::mem::take(&mut job.status.submitter);
-            job.status = disk;
+            job.status = disk.into();
             if job.status.submitter.is_empty() {
                 job.status.submitter = submitter;
             }
@@ -542,15 +703,17 @@ impl State {
     ///   * Every other job: the key is free.
     pub fn dedupe_holder(&self, key: &str, window: u64) -> Option<uuid::Uuid> {
         let id = *self.dedupe.get(key)?;
-        let Some(job) = self.jobs.get(&id) else {
-            return Some(id);
+        let (state, finished_at) = match self.known(id) {
+            Some(Known::Live(job)) => (job.status.state, job.status.finished_at),
+            Some(Known::Stopped(job)) => (job.row.state, job.row.finished_at),
+            None => return Some(id),
         };
 
-        if !job.status.state.is_terminal() {
+        if !state.is_terminal() {
             return Some(id);
         }
-        if window > 0 && job.status.state == JobState::Completed {
-            let finished = job.status.finished_at.unwrap_or(0);
+        if window > 0 && state == JobState::Completed {
+            let finished = finished_at.unwrap_or(0);
             if sys::now_secs().saturating_sub(finished) < window {
                 return Some(id);
             }
@@ -641,6 +804,90 @@ impl State {
     pub fn save_pause(&self) {
         if let Err(e) = self.paused.write() {
             log(&format!("qex could not write the pause record: {e:#}"));
+        }
+    }
+
+    /// Puts a job in the memory of the coordinator, and in the index.
+    pub fn insert_job(&mut self, job: Job) {
+        let id = job.status.id;
+        self.index.insert(
+            id,
+            crate::resolve::Keys {
+                name: job.status.name.clone(),
+                group: job.status.group,
+                group_name: job.status.group_name.clone(),
+            },
+        );
+        self.stopped.remove(&id);
+        self.jobs.insert(id, job);
+    }
+
+    /// Takes a job out of the memory of the coordinator, and out of the index.
+    /// Gives the state that the job had, or `None` when there is no such job.
+    pub fn forget_job(&mut self, id: uuid::Uuid) -> Option<JobState> {
+        let state = match (self.jobs.remove(&id), self.stopped.remove(&id)) {
+            (Some(job), _) => job.status.state,
+            (None, Some(job)) => job.row.state,
+            (None, None) => return None,
+        };
+        self.index.remove(id);
+        self.events.forget(&id);
+        Some(state)
+    }
+
+    /// Gives what the coordinator knows about one job.
+    pub fn known(&self, id: uuid::Uuid) -> Option<Known<'_>> {
+        if let Some(job) = self.jobs.get(&id) {
+            return Some(Known::Live(job));
+        }
+        self.stopped.get(&id).map(Known::Stopped)
+    }
+
+    /// Reads the text that a person wrote in place of a job id.
+    ///
+    /// The index gives the jobs that the text can name, and the rules of
+    /// `resolve::targets` decide. The cost is the number of those jobs, and not
+    /// the number of jobs that qex holds.
+    ///
+    /// This function gives the jobs only. The caller gives them to the rules
+    /// AFTER it frees the lock, because a text that names nothing makes the
+    /// rules read the history file.
+    pub fn candidates(&self, raw: &str) -> Vec<crate::resolve::Candidate> {
+        self.index
+            .lookup(raw)
+            .into_iter()
+            .filter_map(|id| match self.known(id)? {
+                Known::Live(job) => Some(crate::resolve::Candidate::of(&job.status)),
+                Known::Stopped(job) => Some(job.candidate()),
+            })
+            .collect()
+    }
+
+    /// Moves jobs that stopped out of the map that the scheduler reads.
+    ///
+    /// `verified` holds the jobs whose record ON THE DISK says that they
+    /// stopped. The caller read those records with no lock held. That test is
+    /// the whole safety of this step: from here a request for such a job reads
+    /// the disk, so a job whose final record did not reach the disk must stay
+    /// in memory, or `qex wait` would give the record of a job that waits as a
+    /// result. `start_job` has such a case: it fails a job BECAUSE qex could
+    /// not write its record.
+    ///
+    /// A job is final when it arrives here, and a job moves forward only, so no
+    /// later change can miss it. The stream reported its last event before
+    /// `publish_changes` named it for this step.
+    pub fn retire_stopped(&mut self, verified: &[uuid::Uuid]) {
+        for id in verified {
+            let Some(job) = self.jobs.get(id) else {
+                continue;
+            };
+            if !job.status.state.is_terminal() {
+                continue;
+            }
+            let entry = Stopped::of(&job.status);
+            self.jobs.remove(id);
+            self.events.forget(id);
+            self.stopped.insert(*id, entry);
         }
     }
 
@@ -737,6 +984,9 @@ impl Coordinator {
             state: Mutex::new(State {
                 cfg,
                 jobs: BTreeMap::new(),
+                stopped: Default::default(),
+                index: Default::default(),
+                retiring: Vec::new(),
                 queue: Vec::new(),
                 dedupe: BTreeMap::new(),
                 last_contact: Instant::now(),
@@ -1251,14 +1501,11 @@ fn recover(coord: &Arc<Coordinator>) -> Result<()> {
             queued.push((status.id, status.submitted_at, spec.priority));
         }
 
-        state.jobs.insert(
-            status.id,
-            Job {
-                spec,
-                status,
-                supervisor_pid: None,
-            },
-        );
+        state.insert_job(Job {
+            spec,
+            status: status.into(),
+            supervisor_pid: None,
+        });
         recovered += 1;
     }
 
@@ -1468,7 +1715,7 @@ fn serve(coord: Arc<Coordinator>, stream: UnixStream) -> Result<()> {
             // The ownership belongs to THIS connection, so this request cannot
             // go to `handle`, which knows nothing about the connection.
             Ok(Request::OwnJob { id }) => {
-                if coord.state.lock().unwrap().jobs.contains_key(&id) {
+                if coord.state.lock().unwrap().known(id).is_some() {
                     owned.ids.push(id);
                     Response::Ok
                 } else {
@@ -1513,24 +1760,68 @@ fn handle(coord: &Arc<Coordinator>, request: Request, peer: Option<i32>) -> Resp
         },
         Request::Submit { spec, submitter } => handle_submit(coord, *spec, submitter),
         Request::List => {
-            let mut state = coord.state.lock().unwrap();
-            state.refresh_active();
-            // Report each change that this read found. A change that a command
-            // sees and the stream does not is a change that an agent that reads
-            // the stream never learns.
-            state.publish_changes();
-            Response::Jobs {
-                jobs: state.jobs.values().map(|j| j.status.clone()).collect(),
-            }
+            // Every record, as an earlier CLI expects. The jobs that stopped
+            // come from the disk, so this answer is slow on a queue with a long
+            // history; this program asks for it only where it needs every
+            // record.
+            let (live, stopped) = {
+                let mut state = coord.state.lock().unwrap();
+                state.refresh_active();
+                // Report each change that this read found. A change that a
+                // command sees and the stream does not is a change that an
+                // agent that reads the stream never learns.
+                state.publish_changes();
+                let live: Vec<Arc<JobStatus>> =
+                    state.jobs.values().map(|j| j.status.share()).collect();
+                let stopped: Vec<uuid::Uuid> = state.stopped.keys().copied().collect();
+                (live, stopped)
+            };
+            let mut jobs: Vec<JobStatus> = live.iter().map(|j| JobStatus::clone(j)).collect();
+            jobs.extend(stopped.iter().filter_map(stopped_record));
+            // The order of the ids, which is the order that this answer always
+            // had.
+            jobs.sort_by_key(|j| j.id);
+            Response::Jobs { jobs }
         }
+        Request::Query { filter } => handle_query(coord, &filter),
+        Request::Resolve { handles } => {
+            let found = handles
+                .into_iter()
+                .map(|handle| match resolve_handle(coord, &handle) {
+                    Ok(t) => crate::proto::Resolution {
+                        handle,
+                        jobs: t.jobs,
+                        group: t.group,
+                        error: None,
+                    },
+                    Err(e) => crate::proto::Resolution {
+                        handle,
+                        jobs: Vec::new(),
+                        group: None,
+                        error: Some(e.to_string()),
+                    },
+                })
+                .collect();
+            Response::Resolved { found }
+        }
+        Request::CancelMany { handles } => handle_stop_many(coord, handles, None),
+        Request::KillMany {
+            handles,
+            signal,
+            grace_secs,
+        } => handle_stop_many(coord, handles, Some((signal, grace_secs))),
         Request::Status { id } => {
             let mut state = coord.state.lock().unwrap();
             state.refresh_active();
             state.publish_changes();
-            match state.jobs.get(&id) {
-                Some(j) => Response::Status {
+            match state.known(id) {
+                Some(Known::Live(j)) => Response::Status {
                     status: Box::new(j.status.clone()),
                 },
+                Some(Known::Stopped(_)) => {
+                    drop(state);
+                    stopped_status(id)
+                }
                 None => no_such_job(id),
             }
         }
@@ -1873,6 +2164,255 @@ fn handle_resume(
     answer
 }
 
+/// The number of jobs that one turn of the scheduler retires. A coordinator
+/// that starts on a long history thus never holds a turn for the whole of it.
+const RETIRE_BATCH: usize = 512;
+
+/// Moves the jobs that stopped out of the map that the scheduler reads.
+///
+/// The read of each record happens with NO lock held. See
+/// `State::retire_stopped` for why this step reads the disk at all.
+pub fn retire(coord: &Arc<Coordinator>) {
+    let ids: Vec<uuid::Uuid> = {
+        let mut state = coord.state.lock().unwrap();
+        let count = state.retiring.len().min(RETIRE_BATCH);
+        state.retiring.drain(..count).collect()
+    };
+    if ids.is_empty() {
+        return;
+    }
+
+    let (verified, again): (Vec<uuid::Uuid>, Vec<uuid::Uuid>) = ids
+        .into_iter()
+        .partition(|id| stopped_record(id).is_some_and(|s| s.state.is_terminal()));
+
+    let mut state = coord.state.lock().unwrap();
+    state.retire_stopped(&verified);
+    // A record that is not final on the disk yet gets a new test in the next
+    // turn. A record that `qex clean` deleted in the meantime needs none.
+    for id in again {
+        if state.jobs.contains_key(&id) {
+            state.retiring.push(id);
+        }
+    }
+}
+
+/// Reads the record of a job that stopped. The caller holds no lock.
+fn stopped_record(id: &uuid::Uuid) -> Option<JobStatus> {
+    job::read_status(&paths::job_dir(id).ok()?).ok()
+}
+
+/// Gives the record of a job that stopped, as the answer to a request.
+fn stopped_status(id: uuid::Uuid) -> Response {
+    match stopped_record(&id) {
+        Some(status) => Response::Status {
+            status: Box::new(status),
+        },
+        // Something deleted the directory, and no command of qex did. The
+        // history says what qex knows about the job.
+        None => Response::error(
+            ErrorKind::NoSuchJob,
+            format!(
+                "qex cannot read the record of the job {id}. {}",
+                crate::history::describe_missing(id)
+            ),
+        ),
+    }
+}
+
+/// Reads one text of a person through the index. See `State::candidates`.
+fn resolve_handle(coord: &Arc<Coordinator>, raw: &str) -> Result<crate::resolve::Targets> {
+    let candidates = coord.state.lock().unwrap().candidates(raw);
+    crate::resolve::targets(&candidates, raw)
+}
+
+/// Answers a `Query`: the jobs that a filter keeps.
+///
+/// The lock covers the test of the filter and a copy of one POINTER for each
+/// job that the filter keeps. The rows, the reads of the disk and the text of
+/// the answer come after the lock is free.
+fn handle_query(coord: &Arc<Coordinator>, filter: &crate::proto::JobFilter) -> Response {
+    use crate::resolve::Keep;
+
+    let state_filter = match crate::resolve::state_filter(filter) {
+        Ok(f) => f,
+        Err(e) => return Response::error(ErrorKind::Internal, format!("--state: {e}")),
+    };
+    let now = sys::now_secs();
+
+    enum Hit {
+        Live(Arc<JobStatus>),
+        Stopped(crate::proto::JobRow),
+    }
+    impl Hit {
+        fn key(&self) -> (u64, u64, uuid::Uuid) {
+            match self {
+                Hit::Live(j) => (j.submitted_at, j.sequence, j.id),
+                Hit::Stopped(r) => (r.submitted_at, r.sequence, r.id),
+            }
+        }
+    }
+
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut older = 0usize;
+    {
+        let mut state = coord.state.lock().unwrap();
+        state.refresh_active();
+        state.publish_changes();
+
+        // A group or a name goes through the index, so a reader of one
+        // pipeline does not pay for a test of every job.
+        let narrowed = match (&filter.group, &filter.name) {
+            (Some(group), _) => Some(state.index.lookup_group(group)),
+            (None, Some(name)) => Some(state.index.lookup(name)),
+            (None, None) => None,
+        };
+        let mut test = |known: Known<'_>| {
+            let keep = match &known {
+                Known::Live(j) => crate::resolve::keeps(
+                    filter,
+                    state_filter.as_ref(),
+                    &crate::resolve::Facts::of(&j.status),
+                    now,
+                ),
+                Known::Stopped(j) => {
+                    crate::resolve::keeps(filter, state_filter.as_ref(), &j.facts(), now)
+                }
+            };
+            match (keep, known) {
+                (Keep::Yes, Known::Live(j)) => hits.push(Hit::Live(j.status.share())),
+                (Keep::Yes, Known::Stopped(j)) => hits.push(Hit::Stopped(j.row.clone())),
+                (Keep::Older, _) => older += 1,
+                (Keep::No, _) => {}
+            }
+        };
+        match narrowed {
+            Some(ids) => ids
+                .into_iter()
+                .filter_map(|id| state.known(id))
+                .for_each(test),
+            None => {
+                state.jobs.values().map(Known::Live).for_each(&mut test);
+                state
+                    .stopped
+                    .values()
+                    .map(Known::Stopped)
+                    .for_each(&mut test);
+            }
+        }
+    }
+
+    // The order of submission, and the id for two jobs of one moment. This is
+    // the order that `qex list` always gave.
+    hits.sort_by_key(Hit::key);
+    let over_limit = crate::resolve::apply_limit(&mut hits, filter.limit);
+
+    let mut rows = Vec::new();
+    let mut jobs = Vec::new();
+    for hit in hits {
+        match (filter.full, hit) {
+            (false, Hit::Live(j)) => rows.push(crate::proto::JobRow::of(&j)),
+            (false, Hit::Stopped(row)) => rows.push(row),
+            (true, Hit::Live(j)) => jobs.push(JobStatus::clone(&j)),
+            // A record that something deleted from the disk gives no entry. A
+            // full record is what this reader asked for, and the entry in
+            // memory is not one.
+            (true, Hit::Stopped(row)) => jobs.extend(stopped_record(&row.id)),
+        }
+    }
+    Response::Found {
+        rows,
+        jobs,
+        over_limit,
+        older,
+    }
+}
+
+/// Answers a `CancelMany` (`kill` is `None`) or a `KillMany` (the signal and
+/// the grace time).
+///
+/// The rules are the rules that the CLI applied when it sent one request for
+/// each job, and the words of each line stay with the CLI:
+///
+///   * A text that named a PIPELINE asks for the whole of it to stop. A stage
+///     that already stopped needs nothing, and a stage that waits leaves the
+///     queue, also for `qex kill`: a stage that qex left in the queue would
+///     START after the command said that it stopped everything.
+///   * A text that named ONE job gets the refusal of that job, with its step.
+///
+/// The state of a job comes from the moment of the request and the action
+/// tests it again, because a job can start between the two.
+fn handle_stop_many(
+    coord: &Arc<Coordinator>,
+    handles: Vec<String>,
+    kill: Option<(i32, u64)>,
+) -> Response {
+    {
+        // One read of the records for the whole request. The supervisors
+        // write them, so this is how the states below are current.
+        let mut state = coord.state.lock().unwrap();
+        state.refresh_active();
+        state.publish_changes();
+    }
+
+    let mut outcomes = Vec::new();
+    for handle in handles {
+        let targets = match resolve_handle(coord, &handle) {
+            Ok(t) => t,
+            Err(e) => {
+                outcomes.push(crate::proto::StopOutcome {
+                    handle,
+                    group: None,
+                    lines: Vec::new(),
+                    error: Some(e.to_string()),
+                });
+                continue;
+            }
+        };
+        let whole_pipeline = targets.group.is_some();
+        let mut lines = Vec::new();
+        for named in &targets.jobs {
+            let id = named.id;
+            let (done, answer) = if whole_pipeline && named.state.is_terminal() {
+                ("already-stopped", Response::Ok)
+            } else {
+                match kill {
+                    Some((signal, grace_secs))
+                        if !(whole_pipeline && named.state == JobState::Queued) =>
+                    {
+                        (
+                            "signalled",
+                            crate::lifecycle::kill(coord, id, signal, grace_secs),
+                        )
+                    }
+                    _ => ("left-the-queue", handle_cancel(coord, id)),
+                }
+            };
+            lines.push(match answer {
+                Response::Error { message, kind } => crate::proto::StopLine {
+                    id,
+                    did: String::from("refused"),
+                    refusal: Some(message),
+                    kind: Some(kind),
+                },
+                _ => crate::proto::StopLine {
+                    id,
+                    did: String::from(done),
+                    refusal: None,
+                    kind: None,
+                },
+            });
+        }
+        outcomes.push(crate::proto::StopOutcome {
+            handle,
+            group: targets.group,
+            lines,
+            error: None,
+        });
+    }
+    Response::Stopped { outcomes }
+}
+
 fn no_such_job(id: uuid::Uuid) -> Response {
     Response::error(
         ErrorKind::NoSuchJob,
@@ -2015,7 +2555,7 @@ fn handle_submit(
     let warning = {
         let mut state = coord.state.lock().unwrap();
         for dep in spec.needs.iter().chain(spec.after.iter()) {
-            if !state.jobs.contains_key(dep) {
+            if state.known(*dep).is_none() {
                 return Response::error(
                     ErrorKind::NoSuchJob,
                     format!(
@@ -2042,8 +2582,8 @@ fn handle_submit(
             state.refresh_active();
 
             if let Some(other) = state.dedupe_holder(&key, spec.dedupe_window) {
-                let doing = match state.jobs.get(&other) {
-                    Some(j) => format!("is in the state `{}`", j.status.state),
+                let doing = match state.known(other) {
+                    Some(j) => format!("is in the state `{}`", j.state()),
                     // The record is not written yet, so the state is the state
                     // of every new job.
                     None => String::from("starts now"),
@@ -2221,14 +2761,11 @@ fn handle_submit(
         let mut state = coord.state.lock().unwrap();
         status.sequence = state.next_sequence;
         state.next_sequence += 1;
-        state.jobs.insert(
-            id,
-            Job {
-                spec,
-                status,
-                supervisor_pid: None,
-            },
-        );
+        state.insert_job(Job {
+            spec,
+            status: status.into(),
+            supervisor_pid: None,
+        });
 
         state.enqueue(id);
         // The admission of a job is the first event of that job.
@@ -2259,20 +2796,22 @@ pub fn release_dedupe(state: &mut State, id: uuid::Uuid) {
 fn handle_wait(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     let mut state = coord.state.lock().unwrap();
 
-    if !state.jobs.contains_key(&id) {
-        return no_such_job(id);
-    }
-
     // Sleep until the job reaches a final state. The condition variable wakes
     // this thread. This thread uses no CPU time while it waits.
     loop {
-        match state.jobs.get(&id) {
-            Some(j) if j.status.state.is_terminal() => {
+        match state.known(id) {
+            Some(Known::Live(j)) if j.status.state.is_terminal() => {
                 return Response::Status {
                     status: Box::new(j.status.clone()),
                 }
             }
-            Some(_) => {}
+            Some(Known::Live(_)) => {}
+            // The job stopped, and its record left the memory of the
+            // coordinator. The disk holds the result.
+            Some(Known::Stopped(_)) => {
+                drop(state);
+                return stopped_status(id);
+            }
             None => return no_such_job(id),
         }
 
@@ -2338,10 +2877,10 @@ fn handle_cancel(coord: &Arc<Coordinator>, id: uuid::Uuid) -> Response {
     }
 
     let state = coord.state.lock().unwrap();
-    let Some(job) = state.jobs.get(&id) else {
+    let Some(job) = state.known(id) else {
         return no_such_job(id);
     };
-    let state_now = job.status.state;
+    let state_now = job.state();
     drop(state);
 
     refusal_for_a_cancel(id, state_now)
@@ -2570,7 +3109,7 @@ mod tests {
                 id,
                 Job {
                     spec,
-                    status,
+                    status: status.into(),
                     supervisor_pid: None,
                 },
             );
@@ -2759,6 +3298,9 @@ mod tests {
         State {
             cfg: Config::default(),
             jobs: BTreeMap::new(),
+            stopped: BTreeMap::new(),
+            index: crate::resolve::Index::default(),
+            retiring: Vec::new(),
             queue: Vec::new(),
             dedupe: BTreeMap::new(),
             last_contact: Instant::now(),
@@ -2789,16 +3331,89 @@ mod tests {
         let mut status = JobStatus::new(&spec);
         status.state = job_state;
         status.finished_at = finished_at;
-        state.jobs.insert(
-            id,
-            Job {
-                spec,
-                status,
-                supervisor_pid: None,
-            },
-        );
+        state.insert_job(Job {
+            spec,
+            status: status.into(),
+            supervisor_pid: None,
+        });
         state.dedupe.insert(key.to_string(), id);
         id
+    }
+
+    /// The rules of a dedupe key must not change when the job that holds the
+    /// key leaves the map that the scheduler reads. A job with no entry in
+    /// that map reads as "a submission in progress", which holds the key for
+    /// ever.
+    #[test]
+    fn a_job_that_left_the_memory_keeps_the_rules_of_its_key() {
+        let now = sys::now_secs();
+        let mut state = empty_state();
+        let done = add(&mut state, "k", JobState::Completed, Some(now - 10));
+        state.publish_changes();
+        state.retire_stopped(&[done]);
+        assert!(state.jobs.is_empty() && state.stopped.contains_key(&done));
+
+        assert_eq!(
+            state.dedupe_holder("k", 0),
+            None,
+            "no window: the key is free"
+        );
+        assert_eq!(
+            state.dedupe_holder("k", 3600),
+            Some(done),
+            "inside the window"
+        );
+        assert_eq!(state.dedupe_holder("k", 5), None, "after the window");
+    }
+
+    /// Only a job that stopped leaves the map, and the index still finds it.
+    #[test]
+    fn only_a_job_that_stopped_leaves_the_map_and_a_name_still_finds_it() {
+        let mut state = empty_state();
+        let waits = add(&mut state, "a", JobState::Queued, None);
+        let done = add(&mut state, "b", JobState::Failed, Some(1));
+        state.publish_changes();
+        assert_eq!(
+            state.retiring,
+            vec![done],
+            "the stream names the job that stopped"
+        );
+
+        state.retire_stopped(&[waits, done]);
+        assert!(
+            state.jobs.contains_key(&waits),
+            "a job that waits must stay"
+        );
+        assert!(!state.jobs.contains_key(&done));
+
+        // Both jobs carry the name `t`, from `spec_with_key`.
+        let name = state.jobs[&waits].status.name.clone();
+        let found = state.candidates(&name);
+        assert_eq!(found.len(), 2, "the index must give the job in each map");
+        let by_id = state.candidates(&done.to_string()[..8]);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].state, JobState::Failed);
+
+        // A second report must not name the job again: it is not in the map.
+        state.retiring.clear();
+        state.publish_changes();
+        assert!(state.retiring.is_empty());
+
+        assert_eq!(state.forget_job(done), Some(JobState::Failed));
+        assert!(state.candidates(&done.to_string()).is_empty());
+        assert!(state.known(done).is_none());
+    }
+
+    /// A reader that holds the pointer of a record keeps the record of its
+    /// moment, and a change after that does not reach it.
+    #[test]
+    fn a_shared_record_does_not_change_under_its_reader() {
+        let mut state = empty_state();
+        let id = add(&mut state, "k", JobState::Queued, None);
+        let seen = state.jobs[&id].status.share();
+        state.jobs.get_mut(&id).unwrap().status.state = JobState::Running;
+        assert_eq!(seen.state, JobState::Queued);
+        assert_eq!(state.jobs[&id].status.state, JobState::Running);
     }
 
     /// A key holds the job that waits or operates. This is the rule that stops

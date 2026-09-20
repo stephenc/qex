@@ -17,7 +17,8 @@ qex submit [--cpu N] [--mem SIZE] [--gpu N] [--vram SIZE] [--claim NAME=N]
            [--wait|--follow] [--wait-timeout TIME] [--quiet] -- COMMAND...
 qex submit --each-line FILE [--max-jobs N] -- COMMAND...
 qex wait   <id>... [--timeout TIME] [--next] [--quiet] [--json]
-qex list   [--state STATE] [--tag TAG] [--json]
+qex list   [--state STATE] [--tag TAG] [--name NAME] [--group GROUP]
+           [--cwd [DIR]] [--under [DIR]] [--all] [--limit COUNT] [--json]
 qex status <id> [--wait|--follow] [--quiet] [--timeout TIME] [--json]
            [--show-env] [--no-logs]
 qex logs   <id> [--follow] [--tail N] [--stdout|--stderr] [--hook]
@@ -41,6 +42,14 @@ qex help <topic>
 `ID=$(qex submit ...)` operates correctly. A warning goes to stderr.
 
 Every command that reads data accepts `--json`.
+
+`qex list` with no option gives the jobs that wait, the jobs that operate, and
+the jobs that stopped in the last hour. It says on stderr how many older jobs it
+left out. `--all` gives every job. An option that selects jobs (`--state`,
+`--tag`, `--name`, `--group`, `--cwd`, `--under`) gives every job that it
+selects, whatever its age. `--limit COUNT` keeps the newest jobs. The
+coordinator applies these options, so the cost of a list is the cost of the jobs
+that it gives, and not of every record that qex keeps.
 
 ### Exit codes
 

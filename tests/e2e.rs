@@ -19061,3 +19061,479 @@ fn a_silent_coordinator_is_named_when_it_used_the_limit() {
         "the message must have whole lines: {stderr:?}"
     );
 }
+
+/// A coordinator of the test that records each request, and that answers like
+/// a version with the capabilities that the test gives.
+///
+/// The jobs are two records: `11111111-…` with the name `build`, and
+/// `22222222-…` with the name `test`. Both wait in the queue.
+struct ARecordingCoordinator {
+    root: PathBuf,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ARecordingCoordinator {
+    const BUILD: &'static str = "11111111-0000-4000-8000-000000000001";
+    const TEST: &'static str = "22222222-0000-4000-8000-000000000002";
+
+    fn new(name: &str, capabilities: &'static [&'static str]) -> Self {
+        use std::io::{BufRead, BufReader, Write};
+
+        let root = std::env::temp_dir().join(format!("qx{name}{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let run = root.join("state/qex/run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        std::fs::create_dir_all(root.join("peers")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(run.join("s")).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+
+        let record = |id: &str, name: &str| {
+            serde_json::json!({
+                "id": id, "name": name, "state": "queued", "submitted_at": 1,
+                "sequence": 1, "started_at": null, "finished_at": null,
+                "pid": null, "exit_code": null, "signal": null,
+                "cpu": 1, "mem": 1048576, "tags": [name],
+                "claim_source": "explicit", "cpu_source": "explicit",
+                "mem_source": "explicit", "usage": {"max_rss": 0, "cpu_secs": 0.0},
+                "forced": false, "error": null, "blocked_reason": null,
+            })
+        };
+        let jobs = vec![record(Self::BUILD, "build"), record(Self::TEST, "test")];
+
+        // The thread ends with the process of the test. Each command of a test
+        // is one connection, and each connection gets a thread of its own.
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let seen = seen.clone();
+                let jobs = jobs.clone();
+                std::thread::spawn(move || {
+                    let mut writer = stream.try_clone().unwrap();
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else { return };
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let op = request["op"].as_str().unwrap_or("").to_string();
+                        seen.lock().unwrap().push(line.clone());
+                        let can = |c: &str| capabilities.contains(&c);
+                        let answer = match op.as_str() {
+                            "info" => serde_json::json!({
+                                "result": "info", "pid": 4321,
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "jobs_running": 0, "jobs_queued": 2, "cpu_budget": 1,
+                                "mem_budget": 1, "cpu_claimed": 0, "mem_claimed": 0,
+                            }),
+                            "capabilities" => serde_json::json!({
+                                "result": "capabilities", "names": capabilities,
+                            }),
+                            "list" => serde_json::json!({ "result": "jobs", "jobs": jobs }),
+                            "status" => {
+                                let id = request["id"].as_str().unwrap_or("");
+                                match jobs.iter().find(|j| j["id"] == id) {
+                                    Some(j) => {
+                                        serde_json::json!({ "result": "status", "status": j })
+                                    }
+                                    None => serde_json::json!({
+                                        "result": "error", "kind": "no_such_job", "message": "no",
+                                    }),
+                                }
+                            }
+                            "cancel" | "kill" | "clean" => serde_json::json!({ "result": "ok" }),
+                            "resolve" if can("resolve") => {
+                                let found: Vec<serde_json::Value> = request["handles"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|h| {
+                                        let h = h.as_str().unwrap();
+                                        match jobs.iter().find(|j| {
+                                            j["name"] == h
+                                                || j["id"].as_str().unwrap().starts_with(h)
+                                        }) {
+                                            Some(j) => serde_json::json!({
+                                                "handle": h, "group": null, "error": null,
+                                                "jobs": [{"id": j["id"], "name": j["name"],
+                                                          "state": "queued"}],
+                                            }),
+                                            None => serde_json::json!({
+                                                "handle": h, "jobs": [], "group": null,
+                                                "error": format!("there is no job or pipeline \
+                                                    with the id or the name `{h}`"),
+                                            }),
+                                        }
+                                    })
+                                    .collect();
+                                serde_json::json!({ "result": "resolved", "found": found })
+                            }
+                            "cancel_many" if can("stop-many") => {
+                                let outcomes: Vec<serde_json::Value> = request["handles"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|h| {
+                                        serde_json::json!({
+                                            "handle": h, "group": null, "error": null,
+                                            "lines": [{"id": Self::BUILD, "did": "left-the-queue"}],
+                                        })
+                                    })
+                                    .collect();
+                                serde_json::json!({ "result": "stopped", "outcomes": outcomes })
+                            }
+                            "query" if can("query") => {
+                                let tag = request["filter"]["tag"].as_str().map(str::to_string);
+                                let rows: Vec<serde_json::Value> = jobs
+                                    .iter()
+                                    .filter(|j| tag.as_deref().is_none_or(|t| j["name"] == t))
+                                    .map(|j| {
+                                        serde_json::json!({
+                                            "id": j["id"], "name": j["name"], "state": "queued",
+                                            "cpu": 1, "mem": 1048576, "submitted_at": 1,
+                                        })
+                                    })
+                                    .collect();
+                                serde_json::json!({
+                                    "result": "found", "rows": rows, "jobs": [],
+                                    "over_limit": 0, "older": 0,
+                                })
+                            }
+                            "pause_state" => serde_json::json!({
+                                "result": "pause_state", "queue": null, "locks": [],
+                            }),
+                            _ => serde_json::json!({
+                                "result": "error", "kind": "internal",
+                                "message": "qex could not read this request",
+                            }),
+                        };
+                        writeln!(writer, "{answer}").ok();
+                        writer.flush().ok();
+                    }
+                });
+            }
+        });
+
+        Self { root, requests }
+    }
+
+    fn qex(&self, args: &[&str]) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qex"));
+        cmd.args(args);
+        isolate(&mut cmd, &self.root, &self.root.join("peers"));
+        cmd.output().expect("qex did not start")
+    }
+
+    /// The names of the requests that arrived, in their order.
+    fn ops(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["op"].as_str().unwrap_or("").to_string()
+            })
+            .collect()
+    }
+}
+
+impl Drop for ARecordingCoordinator {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).ok();
+    }
+}
+
+/// No command asks a coordinator of this version for the whole list to find a
+/// job, and `qex cancel` of many ids is ONE request.
+///
+/// The measured fault: every command that took an id asked for every record of
+/// every job, one time for each id. With 3,000 jobs in the queue, `qex cancel`
+/// of 100 ids took 18 seconds, and a sweep of 20,000 submissions took hours.
+///
+/// The test reads the REQUESTS, because the answer of the old path and of the
+/// new path is the same by design. Only the requests show which one ran.
+#[test]
+fn a_command_that_names_a_job_never_asks_for_the_whole_list() {
+    let c = ARecordingCoordinator::new("nolist", &["resolve", "query", "stop-many"]);
+
+    let out = c.qex(&["cancel", "11111111", "build", "nothing"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains(&format!("{} left the queue", ARecordingCoordinator::BUILD)),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    let cancels = c.ops().iter().filter(|op| *op == "cancel_many").count();
+    assert_eq!(
+        cancels,
+        1,
+        "three ids must travel in one request: {:?}",
+        c.ops()
+    );
+
+    for args in [
+        vec!["status", "build"],
+        vec!["logs", "build"],
+        vec!["wait", "--timeout", "1s", "build"],
+        vec!["kill", "build"],
+        vec!["list", "--tag", "build"],
+        vec!["submit", "--needs", "build", "--", "true"],
+        vec!["submit", "--after", "11111111", "--", "true"],
+    ] {
+        c.qex(&args);
+    }
+    // A deletion that names its records needs those records only. The whole
+    // list costs the coordinator one read of the disk for each job that
+    // stopped, so a long history made this command slow.
+    let cleaned = c.qex(&["clean", "11111111", "test"]);
+    assert_eq!(
+        String::from_utf8_lossy(&cleaned.stdout).trim(),
+        "qex deleted 2 records",
+        "stderr: {}",
+        String::from_utf8_lossy(&cleaned.stderr)
+    );
+    let ops = c.ops();
+    assert_eq!(
+        ops.iter().filter(|op| *op == "clean").count(),
+        2,
+        "each record that the reader named gets one deletion: {ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op == "list"),
+        "a command asked for the whole list: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| op == "resolve") && ops.iter().any(|op| op == "query"),
+        "the commands must use the requests of this version: {ops:?}"
+    );
+
+    let listed = c.qex(&["list", "--tag", "build"]);
+    let table = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        table.contains("11111111") && !table.contains("22222222"),
+        "the list must hold the rows that the coordinator selected: {table}"
+    );
+}
+
+/// A command of this version still works with a coordinator of an earlier
+/// version, and it says nothing about the difference.
+///
+/// A new build replaces the program while a coordinator carries jobs, so the
+/// two versions meet on every machine that updates. The earlier coordinator
+/// has no `resolve`, no `query` and no `stop-many`, and it refuses a request
+/// that it cannot read.
+#[test]
+fn an_earlier_coordinator_gets_the_earlier_requests() {
+    let c = ARecordingCoordinator::new("oldlist", &["locks", "retries"]);
+
+    let out = c.qex(&["cancel", "11111111", "test"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("{} left the queue", ARecordingCoordinator::BUILD))
+            && stdout.contains(&format!("{} left the queue", ARecordingCoordinator::TEST)),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "the answer is the same and only slower, so qex says nothing: {stderr}"
+    );
+
+    let listed = c.qex(&["list", "--tag", "test"]);
+    let table = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        table.contains("22222222") && !table.contains("11111111"),
+        "the CLI must apply the filter itself: {table}"
+    );
+
+    let cleaned = c.qex(&["clean", "11111111"]);
+    assert_eq!(
+        String::from_utf8_lossy(&cleaned.stdout).trim(),
+        "qex deleted 1 record",
+        "stderr: {}",
+        String::from_utf8_lossy(&cleaned.stderr)
+    );
+
+    let ops = c.ops();
+    assert!(
+        !ops.iter().any(|op| matches!(
+            op.as_str(),
+            "resolve" | "query" | "cancel_many" | "kill_many"
+        )),
+        "an earlier coordinator cannot read these requests: {ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| op == "list") && ops.iter().filter(|op| *op == "cancel").count() == 2,
+        "the earlier requests must do the work: {ops:?}"
+    );
+}
+
+/// A job that stopped leaves the memory of the coordinator, and every command
+/// still answers for it from the record on the disk.
+#[test]
+fn a_job_that_stopped_answers_from_its_record_on_the_disk() {
+    let h = Harness::with_default_config("retired");
+    let id = h.submit(&[
+        "submit",
+        "--name",
+        "early",
+        "--tag",
+        "old",
+        "--",
+        "sh",
+        "-c",
+        "echo out; exit 3",
+    ]);
+    h.until("the job stops", Duration::from_secs(45), || {
+        h.state_of(&id) == "failed"
+    });
+    // Two turns of the scheduler: the job leaves the map in the first turn
+    // after its record on the disk is final.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let status = h.status_json(&id);
+    assert_eq!(status["state"], "failed");
+    assert_eq!(status["exit_code"], 3);
+    assert_eq!(
+        h.status_json("early")["id"],
+        id.as_str(),
+        "a name must still find it"
+    );
+    assert_eq!(h.qex(&["wait", &id]).status.code(), Some(3));
+    assert!(h.ok(&["logs", &id, "--stdout"]).contains("out"));
+    assert!(h.ok(&["list"]).contains(&id[..8]));
+    assert!(h.ok(&["list", "--tag", "old"]).contains(&id[..8]));
+    assert_eq!(
+        h.list_json()
+            .iter()
+            .filter(|j| j["id"] == id.as_str())
+            .count(),
+        1,
+        "the JSON list must hold the full record of a job that stopped"
+    );
+
+    // A job that needs it must learn that it failed.
+    let after = h.submit(&["submit", "--needs", &id, "--", "true"]);
+    h.until("the dependent is skipped", Duration::from_secs(45), || {
+        h.state_of(&after) == "skipped"
+    });
+
+    let kill = h.qex(&["kill", &id]);
+    assert!(
+        String::from_utf8_lossy(&kill.stderr).contains("stopped. Its state is `failed`"),
+        "{}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    let cancel = h.qex(&["cancel", &id]);
+    assert!(
+        String::from_utf8_lossy(&cancel.stderr).contains("is in the state `failed`"),
+        "{}",
+        String::from_utf8_lossy(&cancel.stderr)
+    );
+
+    // The record of the cause stays while a job names it, and goes after.
+    h.ok(&["clean", &after]);
+    h.ok(&["clean", &id]);
+    let gone = h.qex(&["status", &id]);
+    assert_eq!(gone.status.code(), Some(127));
+    assert!(String::from_utf8_lossy(&gone.stderr).contains("existed"));
+}
+
+/// `qex list` with no option leaves out a job that stopped long ago, and it
+/// says how many. An option that selects jobs gives them all.
+#[test]
+fn a_list_leaves_out_old_jobs_and_says_how_many() {
+    let h = Harness::with_default_config("listold");
+    let id = h.submit(&["submit", "--tag", "sweep", "--", "true"]);
+    h.until("the job stops", Duration::from_secs(45), || {
+        h.state_of(&id) == "completed"
+    });
+    let recent = h.submit(&["submit", "--tag", "sweep", "--", "true"]);
+    h.until("the second job stops", Duration::from_secs(45), || {
+        h.state_of(&recent) == "completed"
+    });
+
+    // Make the first job two hours old. A new coordinator reads the record.
+    h.stop_coordinator();
+    let path = h.job_dir(&id).join("status.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let end = record["finished_at"].as_u64().unwrap() - 7200;
+    record["finished_at"] = serde_json::json!(end);
+    std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+
+    let plain = h.qex(&["list"]);
+    let table = String::from_utf8_lossy(&plain.stdout);
+    let note = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        table.contains(&recent[..8]) && !table.contains(&id[..8]),
+        "{table}"
+    );
+    assert!(
+        note.contains("leaves out 1 job") && note.contains("qex list --all"),
+        "the list must say what it left out, and how to see it: {note}"
+    );
+
+    for args in [
+        vec!["list", "--all"],
+        vec!["list", "--state", "done"],
+        vec!["list", "--tag", "sweep"],
+    ] {
+        let out = h.qex(&args);
+        let table = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            table.contains(&id[..8]) && table.contains(&recent[..8]),
+            "{args:?} must give both jobs: {table}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("leaves out"),
+            "{args:?} left nothing out"
+        );
+    }
+
+    let limited = h.qex(&["list", "--all", "--limit", "1"]);
+    let table = String::from_utf8_lossy(&limited.stdout);
+    assert!(
+        table.contains(&recent[..8]) && !table.contains(&id[..8]),
+        "{table}"
+    );
+    assert!(String::from_utf8_lossy(&limited.stderr).contains("`--limit` leaves out 1 job"));
+}
+
+/// `qex cancel` and `qex kill` of many ids give one line for each job, and the
+/// code of the first fault, from one request.
+#[test]
+fn a_cancel_of_many_ids_gives_a_line_for_each() {
+    let h = Harness::with_default_config("cancelmany");
+    h.ok(&["pause", "queue"]);
+    let a = h.submit(&["submit", "--name", "a", "--", "true"]);
+    let b = h.submit(&["submit", "--name", "twin", "--", "true"]);
+    let c = h.submit(&["submit", "--name", "twin", "--", "true"]);
+
+    let out = h.qex(&["cancel", &a, "twin", &b[..8], "nothing", &a]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains(&format!("{a} left the queue")), "{stdout}");
+    assert!(stdout.contains(&format!("{b} left the queue")), "{stdout}");
+    assert!(stderr.contains("`twin` names 2 jobs"), "{stderr}");
+    assert!(stderr.contains("`nothing`"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("the job {a} is in the state `cancelled`")),
+        "the second cancel of one job must get its refusal: {stderr}"
+    );
+    assert_eq!(
+        h.state_of(&c),
+        "queued",
+        "an ambiguous name must cancel nothing"
+    );
+    assert_ne!(out.status.code(), Some(0));
+
+    let kill = h.qex(&["kill", &c]);
+    assert!(
+        String::from_utf8_lossy(&kill.stderr).contains("Use `qex cancel"),
+        "a kill of one job that waits names the command that fits"
+    );
+}

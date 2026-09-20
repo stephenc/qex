@@ -16,7 +16,6 @@
 //! time of the removal. It never holds the command, because a command line can
 //! hold a token.
 
-use crate::job::JobStatus;
 use crate::paths;
 #[cfg(test)]
 use crate::spec::JobSpec;
@@ -96,13 +95,13 @@ pub fn record_submit_for(id: &uuid::Uuid, name: &str, submitted_at: u64) {
 }
 
 /// Records the removal of the record of a job.
-pub fn record_removed(status: &JobStatus) {
+pub fn record_removed(id: uuid::Uuid, name: &str, submitted_at: u64, state: crate::job::JobState) {
     append(&Entry {
-        id: status.id,
-        name: status.name.clone(),
-        submitted_at: status.submitted_at,
+        id,
+        name: name.to_string(),
+        submitted_at,
         removed_at: Some(crate::sys::now_secs()),
-        final_state: Some(status.state.to_string()),
+        final_state: Some(state.to_string()),
     });
 }
 
@@ -315,7 +314,7 @@ mod tests {
 
         let mut status = crate::job::JobStatus::new(&spec(id, "build"));
         status.state = crate::job::JobState::Completed;
-        record_removed(&status);
+        record_removed(status.id, &status.name, status.submitted_at, status.state);
 
         let text = describe_missing(id);
         assert!(text.contains("existed"), "got: {text}");

@@ -1012,6 +1012,9 @@ pub fn run(coord: Arc<Coordinator>) {
             changed
         };
 
+        // The jobs that stopped leave the map that this loop reads.
+        crate::daemon::retire(&coord);
+
         // Signal the waiters when a job started, when a supervisor wrote a new
         // status, AND when this turn moved a job to a final state on its own.
         //
@@ -1180,7 +1183,7 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
 
     // `needs`: the job must succeed.
     for dep in &job.spec.needs {
-        let Some(other) = state.jobs.get(dep) else {
+        let Some(other) = state.known(*dep) else {
             // `needs` promises success, and a missing record cannot prove it.
             // A current submission cannot create this state, and `clean`
             // cannot create it either; it remains possible in an old or
@@ -1197,33 +1200,31 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
             };
         };
 
-        if !other.status.state.is_terminal() {
+        if !other.state().is_terminal() {
             return Depends::Waiting(format!(
                 "waits for the job {} ({}), which is {}",
                 &dep.to_string()[..8],
-                other.status.display_name(),
-                other.status.state
+                other.display_name(),
+                other.state()
             ));
         }
 
-        if other.status.state != JobState::Completed {
+        if other.state() != JobState::Completed {
             // Give the first job that failed, and not the job before this one.
             //
             // In a pipeline `a -> b -> c -> d` where `a` fails, the reader of
             // `d` must learn that `a` failed. Without this step, the reader of
             // `d` learns that `c` was skipped, and must follow the chain to
             // find the cause.
-            let root = other.status.caused_by.unwrap_or(*dep);
+            let root = other.caused_by().unwrap_or(*dep);
             let root_name = state
-                .jobs
-                .get(&root)
-                .map(|j| j.status.display_name())
+                .known(root)
+                .map(|j| j.display_name())
                 .unwrap_or_else(|| "unknown".to_string());
             let root_state = state
-                .jobs
-                .get(&root)
-                .map(|j| j.status.state.to_string())
-                .unwrap_or_else(|| other.status.state.to_string());
+                .known(root)
+                .map(|j| j.state().to_string())
+                .unwrap_or_else(|| other.state().to_string());
 
             // Name the log file only when the job wrote one. A cancelled job
             // and an expired job never started, so a reader who follows that
@@ -1253,14 +1254,14 @@ fn depends(state: &crate::daemon::State, id: uuid::Uuid) -> Depends {
 
     // `after`: the job must stop. Its result is not important.
     for dep in &job.spec.after {
-        let Some(other) = state.jobs.get(dep) else {
+        let Some(other) = state.known(*dep) else {
             continue;
         };
-        if !other.status.state.is_terminal() {
+        if !other.state().is_terminal() {
             return Depends::Waiting(format!(
                 "waits for the job {} ({}) to stop, whatever its result",
                 &dep.to_string()[..8],
-                other.status.display_name()
+                other.display_name()
             ));
         }
     }
@@ -2481,7 +2482,7 @@ mod tests {
             id,
             crate::daemon::Job {
                 spec,
-                status,
+                status: status.into(),
                 supervisor_pid: None,
             },
         );
@@ -2489,6 +2490,9 @@ mod tests {
         crate::daemon::State {
             cfg: cfg_with("4", "8GB"),
             jobs,
+            stopped: Default::default(),
+            index: Default::default(),
+            retiring: Vec::new(),
             queue: vec![id],
             last_contact: Instant::now(),
             idle_since: None,
@@ -2546,7 +2550,7 @@ mod tests {
             id,
             crate::daemon::Job {
                 spec,
-                status,
+                status: status.into(),
                 supervisor_pid: None,
             },
         );

@@ -389,7 +389,8 @@ Other options
 Other commands
 --------------
 
-    qex list --json            all the jobs, their states and why they wait
+    qex list --json            the jobs, their states and why they wait
+                               (--all adds the jobs that stopped over an hour ago)
     qex status <id> --json     one job in detail, with the last error lines
     qex logs <id> --grep ERR   the lines that you want from a large log
     qex kill <id>              stop a job that operates

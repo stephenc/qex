@@ -77,6 +77,8 @@ mod pipeline;
 #[cfg(unix)]
 mod proto;
 #[cfg(unix)]
+mod resolve;
+#[cfg(unix)]
 mod sched;
 #[cfg(unix)]
 mod schema;
