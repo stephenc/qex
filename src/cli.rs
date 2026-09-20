@@ -431,6 +431,22 @@ pub struct ListArgs {
     #[arg(long, value_name = "TAG")]
     pub tag: Option<String>,
 
+    /// Show the jobs with this name only. The start of an id is also a name.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Show every job, also the jobs that stopped more than one hour ago.
+    ///
+    /// Without an option, qex leaves those jobs out and says how many they
+    /// are. An option that selects jobs, such as `--state` or `--tag`, shows
+    /// every job that it selects, whatever its age.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Show the newest jobs only, to this number.
+    #[arg(long, value_name = "COUNT")]
+    pub limit: Option<usize>,
+
     /// Show the jobs of one pipeline only. Give its id or its name.
     #[arg(long, value_name = "GROUP")]
     pub group: Option<String>,

@@ -119,9 +119,15 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
         // could not read the state at all, and the page then shows the disk
         // alone while a coordinator holds jobs that the page does not name.
         let mut reached = true;
+        // The jobs that stopped long ago, which the coordinator counts and
+        // does not send. The page adds them to the jobs that it does not show.
+        let mut older = 0usize;
         let (jobs, info) = match Client::connect_existing_result() {
             Ok(Some(mut client)) => match read_the_queue(&mut client) {
-                Ok(answer) => answer,
+                Ok((jobs, info, count)) => {
+                    older = count;
+                    (jobs, info)
+                }
                 Err(e) => {
                     say_once(&mut said_the_cause, &e);
                     reached = false;
@@ -140,9 +146,12 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             // The CPU column is the change in the CPU time between two
             // measurements, so one page needs two of them. Take the first
             // measurement, wait a short time, then write the page.
-            render(&jobs, info.as_ref(), &mut previous, !reached);
+            render_more(&jobs, older, info.as_ref(), &mut previous, !reached);
             std::thread::sleep(Duration::from_millis(400));
-            print!("{}", render(&jobs, info.as_ref(), &mut previous, !reached));
+            print!(
+                "{}",
+                render_more(&jobs, older, info.as_ref(), &mut previous, !reached)
+            );
             // THE TWO FORMS MAKE TWO PROMISES, AND THEY ARE NOT THE SAME PAGE.
             //
             // The form that a person watches is a DISPLAY: its promise is to
@@ -161,8 +170,9 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
             });
         }
 
-        let hidden;
+        let mut hidden;
         (ordered, hidden) = arrange(&jobs);
+        hidden += older;
         let page = paint(
             &ordered,
             hidden,
@@ -210,8 +220,21 @@ pub fn run(args: crate::cli::TopArgs) -> Result<i32> {
     }
 }
 
+#[cfg(test)]
 fn render(
     jobs: &[JobStatus],
+    info: Option<&Response>,
+    previous: &mut HashMap<uuid::Uuid, Previous>,
+    unreachable: bool,
+) -> String {
+    render_more(jobs, 0, info, previous, unreachable)
+}
+
+/// Makes one page. `older` is the number of jobs that stopped and that the
+/// coordinator did not send.
+fn render_more(
+    jobs: &[JobStatus],
+    older: usize,
     info: Option<&Response>,
     previous: &mut HashMap<uuid::Uuid, Previous>,
     unreachable: bool,
@@ -219,7 +242,7 @@ fn render(
     let (ordered, hidden) = arrange(jobs);
     paint(
         &ordered,
-        hidden,
+        hidden + older,
         info,
         previous,
         PageHow {
@@ -422,10 +445,10 @@ fn paint_once(
     // The singular and the plural are separate texts. ASD-STE100 does not
     // accept `job(s)`.
     if hidden == 1 {
-        out.push_str("\n1 more job that stopped is not shown. Use `qex list`.\n");
+        out.push_str("\n1 more job that stopped is not shown. Use `qex list --all`.\n");
     } else if hidden > 1 {
         out.push_str(&format!(
-            "\n{hidden} more jobs that stopped are not shown. Use `qex list`.\n"
+            "\n{hidden} more jobs that stopped are not shown. Use `qex list --all`.\n"
         ));
     }
     out.push_str(&crate::style::faint(
@@ -1388,14 +1411,42 @@ fn note_for(job: &JobStatus) -> String {
     }
 }
 
-/// Reads the queue and the state of the machine from a coordinator.
-fn read_the_queue(client: &mut Client) -> Result<(Vec<crate::job::JobStatus>, Option<Response>)> {
-    let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
-        bail!("the coordinator did not give the job list");
+/// The age of a job that stopped, above which the page does not ask for it.
+///
+/// The page shows the newest `RECENT_DONE` jobs that stopped, and a queue that
+/// keeps the records of a long sweep holds thousands more. The coordinator
+/// counts those and does not send them, so a refresh costs what the page shows.
+/// A quiet machine can show fewer than `RECENT_DONE` old jobs for this reason,
+/// and the page then says how many it left out.
+const RECENT_WINDOW: u64 = 3600;
+
+/// Reads the queue and the state of the machine from a coordinator. The last
+/// value is the number of jobs that stopped and that the coordinator left out.
+fn read_the_queue(
+    client: &mut Client,
+) -> Result<(Vec<crate::job::JobStatus>, Option<Response>, usize)> {
+    let (mut jobs, older) = if client.can("query")? {
+        let filter = crate::proto::JobFilter {
+            stopped_within: Some(RECENT_WINDOW),
+            full: true,
+            ..Default::default()
+        };
+        match client.call(&Request::Query {
+            filter: Box::new(filter),
+        })? {
+            Response::Found { jobs, older, .. } => (jobs, older),
+            _ => bail!("the coordinator did not give the job list"),
+        }
+    } else {
+        // An earlier coordinator has no filter, and it gives every record.
+        let Response::Jobs { jobs } = client.call(&Request::List)? else {
+            bail!("the coordinator did not give the job list");
+        };
+        (jobs, 0)
     };
     jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
     let info = client.call(&Request::Info)?;
-    Ok((jobs, Some(info)))
+    Ok((jobs, Some(info), older))
 }
 
 /// Writes the cause one time, whatever the number of refreshes.

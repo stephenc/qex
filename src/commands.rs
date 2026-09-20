@@ -6,6 +6,7 @@ use crate::config::{Config, EnvCapture};
 use crate::job::{safe_name, JobState, JobStatus};
 use crate::paths;
 use crate::proto::{ErrorKind, Request, Response};
+use crate::resolve::Targets;
 use crate::spec::{JobSpec, SubmitOptions};
 use crate::units::{count_of, format_duration, format_size, parse_duration, plural_directories};
 use anyhow::{bail, Context, Result};
@@ -686,46 +687,110 @@ fn partial_fan_out(what: &str, group: uuid::Uuid, submitted: &[(String, uuid::Uu
     );
 }
 
+/// The age of a job that stopped, above which `qex list` with no option leaves
+/// it out.
+///
+/// The number is the number of `AUTO_CLEAN_AGE`, for the same reason: a job of
+/// the last hour can be the job that a reader looks for now, and a job from
+/// before that is history. A queue that ran twenty thousand short jobs must
+/// not print them all for a reader who asks what operates.
+const LIST_RECENT_AGE: u64 = 3600;
+
+/// Gives the jobs that a filter keeps: the rows, or the full records when the
+/// filter asks for them, then the count that the limit left out and the count
+/// that the age left out.
+///
+/// A coordinator that gives the capability `query` applies the filter itself,
+/// and its answer holds the jobs of the filter only. An earlier coordinator
+/// gives every record, and this command applies the same rules to them.
+fn query_jobs(
+    client: &mut Client,
+    filter: crate::proto::JobFilter,
+) -> Result<(Vec<crate::proto::JobRow>, Vec<JobStatus>, usize, usize)> {
+    if client.can("query")? {
+        let response = client.call(&Request::Query {
+            filter: Box::new(filter),
+        })?;
+        return match response {
+            Response::Found {
+                rows,
+                jobs,
+                over_limit,
+                older,
+            } => Ok((rows, jobs, over_limit, older)),
+            Response::Error { message, .. } => bail!("{message}"),
+            _ => bail!("the coordinator did not give the job list"),
+        };
+    }
+
+    let Response::Jobs { mut jobs } = client.call(&Request::List)? else {
+        bail!("the coordinator did not give the job list");
+    };
+    let state =
+        crate::resolve::state_filter(&filter).map_err(|e| anyhow::anyhow!("--state: {e}"))?;
+    let now = crate::sys::now_secs();
+    let mut older = 0usize;
+    jobs.retain(|j| {
+        match crate::resolve::keeps(&filter, state.as_ref(), &crate::resolve::Facts::of(j), now) {
+            crate::resolve::Keep::Yes => true,
+            crate::resolve::Keep::Older => {
+                older += 1;
+                false
+            }
+            crate::resolve::Keep::No => false,
+        }
+    });
+    // Show the jobs in the order of submission. A pipeline then reads from the
+    // first stage to the last stage.
+    jobs.sort_by_key(|j| (j.submitted_at, j.sequence, j.id));
+    let over_limit = crate::resolve::apply_limit(&mut jobs, filter.limit);
+    if filter.full {
+        Ok((Vec::new(), jobs, over_limit, older))
+    } else {
+        let rows = jobs.iter().map(crate::proto::JobRow::of).collect();
+        Ok((rows, Vec::new(), over_limit, older))
+    }
+}
+
 pub fn list(args: cli::ListArgs) -> Result<i32> {
-    let filter = match args.state.as_deref() {
-        Some(s) => Some(StateFilter::parse(s).map_err(|e| anyhow::anyhow!("--state: {e}"))?),
-        None => None,
+    if let Some(s) = args.state.as_deref() {
+        StateFilter::parse(s).map_err(|e| anyhow::anyhow!("--state: {e}"))?;
+    }
+    let directory = |path: &Option<std::path::PathBuf>, option: &str| -> Result<Option<String>> {
+        match path {
+            Some(p) => Ok(Some(
+                resolve_directory(p, option)?.to_string_lossy().into_owned(),
+            )),
+            None => Ok(None),
+        }
+    };
+
+    // An option that selects jobs shows every job that it selects. The age
+    // applies to the list that selects nothing.
+    let selects = args.state.is_some()
+        || args.tag.is_some()
+        || args.name.is_some()
+        || args.group.is_some()
+        || args.cwd.is_some()
+        || args.under.is_some();
+    let filter = crate::proto::JobFilter {
+        state: args.state.clone(),
+        tag: args.tag.clone(),
+        cwd: directory(&args.cwd, "--cwd")?,
+        under: directory(&args.under, "--under")?,
+        group: args.group.clone(),
+        name: args.name.clone(),
+        stopped_within: (!args.all && !selects).then_some(LIST_RECENT_AGE),
+        limit: args.limit,
+        // The JSON form gives the full record of each job, as it always did.
+        // The table prints a short row, so it asks for a short row.
+        full: args.json,
     };
 
     let mut client = Client::connect()?;
-    // Report the answer that arrived. A second request would hide the first
-    // fault and could give a different answer.
-    let response = client.call(&Request::List)?;
-    let Response::Jobs { mut jobs } = response else {
-        return report(response);
-    };
+    let (rows, jobs, over_limit, older) = query_jobs(&mut client, filter)?;
 
-    if let Some(f) = &filter {
-        jobs.retain(|j| f.matches(j.state));
-    }
-    if let Some(tag) = &args.tag {
-        jobs.retain(|j| {
-            j.tags
-                .iter()
-                .any(|t| t == tag || crate::job::safe_name(t) == *tag)
-        });
-    }
-    let list_cwd = match &args.cwd {
-        Some(p) => Some(resolve_directory(p, "--cwd")?),
-        None => None,
-    };
-    let list_under = match &args.under {
-        Some(p) => Some(resolve_directory(p, "--under")?),
-        None => None,
-    };
-    if list_cwd.is_some() || list_under.is_some() {
-        jobs.retain(|j| matches_directory(&j.cwd, list_cwd.as_deref(), list_under.as_deref()));
-    }
     if let Some(group) = &args.group {
-        // A group takes its id or its name. A name is easier to type, and the
-        // names of a pipeline belong to one submission.
-        jobs.retain(|j| names_group(j, group));
-
         // Say when the word gives more than one run.
         //
         // A pipeline takes its name from its file, so a second run of that
@@ -736,7 +801,12 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         // The commands that stop or delete work REFUSE such a word. This one
         // is where a user looks after that refusal, so it must give the group
         // id of each run.
-        let mut runs: Vec<uuid::Uuid> = jobs.iter().filter_map(|j| j.group).collect();
+        let mut runs: Vec<uuid::Uuid> = rows
+            .iter()
+            .map(|j| j.group)
+            .chain(jobs.iter().map(|j| j.group))
+            .flatten()
+            .collect();
         runs.sort();
         runs.dedup();
         if runs.len() > 1 && !args.json {
@@ -752,9 +822,23 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
             );
         }
     }
-    // Show the jobs in the order of submission. A pipeline then reads from the
-    // first stage to the last stage.
-    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
+
+    // Say what the list leaves out, so that no reader takes a part of the
+    // queue for the whole of it. The text goes to stderr, as the pause does.
+    if older > 0 {
+        eprintln!(
+            "qex: this list leaves out {} that stopped more than {} ago. Run `qex list --all` \
+             to see every job, or select jobs with an option such as `--state done`.",
+            count_of(older, "job"),
+            format_duration(Duration::from_secs(LIST_RECENT_AGE))
+        );
+    }
+    if over_limit > 0 {
+        eprintln!(
+            "qex: `--limit` leaves out {} that qex submitted before the jobs of this list.",
+            count_of(over_limit, "job")
+        );
+    }
 
     // From here the records are for a READER. See `for_display`.
     let jobs = all_for_display(jobs);
@@ -771,7 +855,7 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         return Ok(0);
     }
 
-    if jobs.is_empty() {
+    if rows.is_empty() {
         println!("no jobs");
         return Ok(0);
     }
@@ -780,10 +864,19 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         "{:<8}  {:<10}  {:<16}  {:>5}  {:>8}  {:>8}  NOTE",
         "ID", "STATE", "NAME", "CPU", "MEM", "TIME"
     );
-    for j in &jobs {
+    for mut j in rows {
+        // From here the row is for a READER. See `for_display`, which gives
+        // the same three fields the same forms.
+        j.name = safe_name(&j.name);
+        j.blocked_reason = j.blocked_reason.as_deref().map(crate::job::printable);
+        j.error = j.error.as_deref().map(crate::job::printable);
+
         let elapsed = j
-            .elapsed()
-            .map(format_duration)
+            .started_at
+            .map(|start| {
+                let end = j.finished_at.unwrap_or_else(crate::sys::now_secs);
+                format_duration(Duration::from_secs(end.saturating_sub(start)))
+            })
             .unwrap_or_else(|| "-".to_string());
         let mut note = String::new();
         if j.forced {
@@ -792,7 +885,7 @@ pub fn list(args: cli::ListArgs) -> Result<i32> {
         if let Some(r) = &j.blocked_reason {
             note.push_str(r);
         } else if j.state.is_terminal() {
-            note.push_str(&describe_result(j));
+            note.push_str(&describe_row(&j));
         }
 
         println!(
@@ -2124,10 +2217,9 @@ fn reconnect(raw_id: &str, deadline: Option<Instant>) -> Reconnect {
 /// "there is no job with that id" about a job that operates is the worst answer
 /// that a wait can give.
 fn resolve_id_for_wait(client: &mut Client, raw_id: &str) -> Result<Option<uuid::Uuid>> {
-    let Response::Jobs { jobs } = client.call(&Request::List)? else {
-        bail!("the coordinator did not give the job list");
-    };
-    match resolve_targets_in(&jobs, raw_id) {
+    let raws = [raw_id.to_string()];
+    let answer = resolve_many(client, &raws)?.pop();
+    match answer.unwrap_or_else(|| Err(anyhow::anyhow!("the coordinator gave no answer"))) {
         Ok(found) if found.group.is_none() && found.ids.len() == 1 => Ok(Some(found.ids[0])),
         // A name that gives many jobs is not a fault of the transport. This
         // command takes one job, so it says so through the caller.
@@ -2855,6 +2947,14 @@ pub fn kill(args: cli::KillArgs) -> Result<i32> {
         .unwrap_or(0);
 
     let mut client = Client::connect()?;
+    // One request for every id. See `cancel`.
+    if client.can("stop-many")? {
+        return stop_many(&mut client, &args.ids, |handles| Request::KillMany {
+            handles,
+            signal,
+            grace_secs: grace,
+        });
+    }
     let mut worst = 0;
     for raw in &args.ids {
         let (found, states) = match resolve_with_states(&mut client, raw) {
@@ -3201,16 +3301,103 @@ fn resolve_with_states(
     client: &mut Client,
     raw: &str,
 ) -> Result<(Targets, std::collections::HashMap<uuid::Uuid, JobState>)> {
-    let Response::Jobs { jobs } = client.call(&Request::List)? else {
-        bail!("the coordinator did not give the job list");
-    };
-    let found = resolve_targets_in(&jobs, raw)?;
-    let states = jobs.iter().map(|j| (j.id, j.state)).collect();
+    let found = resolve_targets(client, raw)?;
+    let states = found.jobs.iter().map(|j| (j.id, j.state)).collect();
     Ok((found, states))
+}
+
+/// The number of ids that one `CancelMany` or `KillMany` request carries.
+///
+/// The coordinator writes one record to the disk for each job that leaves the
+/// queue, and the answer comes after the last of them. A request of a fixed
+/// size keeps that time far below the limit of one answer, whatever the number
+/// of ids on the command line, and the reader sees the lines of each part as
+/// it completes.
+const STOP_MANY_PART: usize = 500;
+
+/// Sends the ids of `qex cancel` or `qex kill` in parts, and gives the exit
+/// code.
+fn stop_many(
+    client: &mut Client,
+    ids: &[String],
+    request: impl Fn(Vec<String>) -> Request,
+) -> Result<i32> {
+    let mut worst = 0;
+    for part in ids.chunks(STOP_MANY_PART) {
+        let response = client.call(&request(part.to_vec()))?;
+        report_stop_many(response, &mut worst)?;
+    }
+    Ok(worst)
+}
+
+/// Writes the answer of a `CancelMany` or a `KillMany`.
+///
+/// The words and the codes are those of the path that sends one request for
+/// each job, so a script reads the same lines from both.
+fn report_stop_many(response: Response, worst: &mut i32) -> Result<()> {
+    let outcomes = match response {
+        Response::Stopped { outcomes } => outcomes,
+        other => {
+            let code = report(other)?;
+            if code != 0 && *worst == 0 {
+                *worst = code;
+            }
+            return Ok(());
+        }
+    };
+    for outcome in outcomes {
+        if let Some(text) = outcome.error {
+            eprintln!("qex: {text}");
+            *worst = EXIT_NO_SUCH_JOB;
+            continue;
+        }
+        for line in outcome.lines {
+            let id = line.id;
+            let code = match line.did.as_str() {
+                "already-stopped" => {
+                    println!("{id} already stopped");
+                    0
+                }
+                "left-the-queue" => {
+                    println!("{id} left the queue");
+                    0
+                }
+                "signalled" => {
+                    println!("{id} received the signal");
+                    0
+                }
+                // A refusal, and also a word of a later coordinator that this
+                // command does not know. A line that this command cannot read
+                // must never count as work that stopped.
+                _ => report(Response::Error {
+                    message: line.refusal.unwrap_or_else(|| {
+                        format!(
+                            "the coordinator answered `{}` for the job {id}, and this qex \
+                             does not know that word. Read `qex status {id}`.",
+                            line.did
+                        )
+                    }),
+                    kind: line.kind.unwrap_or(crate::proto::ErrorKind::Internal),
+                })?,
+            };
+            if code != 0 && *worst == 0 {
+                *worst = code;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn cancel(args: cli::CancelArgs) -> Result<i32> {
     let mut client = Client::connect()?;
+    // ONE request for every id. A request for each id made the coordinator
+    // read its whole queue for each one, so the cost of `qex cancel` with a
+    // hundred ids grew with the hundred AND with the queue.
+    if client.can("stop-many")? {
+        return stop_many(&mut client, &args.ids, |handles| Request::CancelMany {
+            handles,
+        });
+    }
     let mut worst = 0;
     for raw in &args.ids {
         let (found, states) = match resolve_with_states(&mut client, raw) {
@@ -3308,6 +3495,49 @@ pub fn clean(args: cli::CleanArgs) -> Result<i32> {
     };
 
     let mut client = Client::connect()?;
+
+    // A reader who names the records, and gives no option that selects by a
+    // property, needs those records only. The whole list costs the coordinator
+    // one read of the disk for each job that stopped, so a history of a sweep
+    // made `qex clean <id>` pay for every record to delete one.
+    //
+    // A word that is also the name of a state keeps the path below. That path
+    // must learn if the word names a job, a pipeline or a state, and the state
+    // reading needs every job.
+    let selects_by_property = args.all
+        || args.auto
+        || filter.is_some()
+        || older_than.is_some()
+        || by_directory
+        || args.ids.iter().any(|raw| StateFilter::parse(raw).is_ok());
+    if !selects_by_property && client.can("resolve")? {
+        let mut targets: Vec<uuid::Uuid> = Vec::new();
+        for answer in resolve_many(&mut client, &args.ids)? {
+            match answer {
+                Ok(found) => targets.extend(found.ids),
+                Err(e) => {
+                    eprintln!("qex: {e}");
+                    return Ok(EXIT_NO_SUCH_JOB);
+                }
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        // The coordinator holds the rule that keeps a record that other work
+        // needs. It refuses such a deletion and names the work, and that
+        // answer carries the exit code.
+        let mut deleted = 0usize;
+        let mut worst = 0;
+        for id in targets {
+            match client.call(&Request::Clean { id })? {
+                Response::Ok => deleted += 1,
+                other => worst = report(other)?,
+            }
+        }
+        println!("qex deleted {}", count_of(deleted, "record"));
+        return Ok(worst);
+    }
+
     let Response::Jobs { jobs } = client.call(&Request::List)? else {
         bail!("the coordinator did not give the job list");
     };
@@ -3549,6 +3779,11 @@ fn exit_code_for(status: &JobStatus) -> i32 {
 
 /// Writes a short text for a job result.
 fn describe_result(s: &JobStatus) -> String {
+    describe_row(&crate::proto::JobRow::of(s))
+}
+
+/// The same, from the short row of a list.
+fn describe_row(s: &crate::proto::JobRow) -> String {
     match s.state {
         JobState::Completed => "the job succeeded".to_string(),
         JobState::Failed => match (s.exit_code, s.signal) {
@@ -3579,7 +3814,7 @@ fn describe_result(s: &JobStatus) -> String {
                  while the claim is correct. Compare the two values, and give a larger \
                  `--mem` value if the usage was near the claim.",
                 format_size(s.mem),
-                format_size(s.usage.max_rss)
+                format_size(s.max_rss)
             )
         }),
         JobState::Cancelled => "the job left the queue".to_string(),
@@ -3679,184 +3914,32 @@ fn all_for_display(jobs: Vec<JobStatus>) -> Vec<JobStatus> {
     jobs.into_iter().map(for_display).collect()
 }
 
-/// Tells whether the text names this job.
-///
-/// The user can write the full id, or the start of the id, or the name. A short
-/// id is easier to copy from the output of `qex list`.
-///
-/// The name has two accepted forms: the name that the user gave, AND the safe
-/// name that qex shows. `qex list` and `qex status --json` give the safe form,
-/// so a script that reads a name from qex and gives it back must find the job.
-/// See `job::safe_name`.
+/// Tells whether the text names this job. See `resolve::names_job`.
 fn names_job(job: &JobStatus, raw: &str) -> bool {
-    job.id.to_string().starts_with(raw) || job.name == raw || safe_name(&job.name) == raw
+    crate::resolve::names_job(job.id, &job.name, raw)
 }
 
-/// Tells whether the text names the group of this job.
-///
-/// A group takes its id, the start of its id, or its name, in the same way as a
-/// job. `qex list --group` already accepts these three forms.
+/// Tells whether the text names the group of this job. See
+/// `resolve::names_group`.
 fn names_group(job: &JobStatus, raw: &str) -> bool {
-    job.group
-        .map(|g| g.to_string().starts_with(raw))
-        .unwrap_or(false)
-        // The name that the user gave, AND the name that qex shows. `qex list
-        // --json` gives the safe form, so a script that reads that value and
-        // gives it back here must find the jobs. See `job::safe_name`.
-        || job.group_name.as_deref() == Some(raw)
-        || job.group_name.as_deref().map(safe_name).as_deref() == Some(raw)
+    crate::resolve::names_group(job.group, job.group_name.as_deref(), raw)
 }
 
-/// Puts the jobs in the order of submission.
+/// Reads the text of the user against a list of full records.
 ///
-/// A pipeline then reads from the first stage to the last stage. Two stages can
-/// start in the same second, so the sequence separates them.
-fn in_submission_order(mut jobs: Vec<&JobStatus>) -> Vec<uuid::Uuid> {
-    jobs.sort_by_key(|j| (j.submitted_at, j.sequence));
-    jobs.iter().map(|j| j.id).collect()
-}
-
-/// What the text of the user named.
-///
-/// The caller needs more than the ids. A command that stops a job treats a stage
-/// that already stopped as a fault when the user named that one job, and as
-/// normal when the user named the whole pipeline. `qex status --json` also
-/// chooses its shape from this, and not from the number of jobs: a pipeline of
-/// one stage must still give an array.
-#[derive(Debug)]
-struct Targets {
-    ids: Vec<uuid::Uuid>,
-    /// The pipeline, when the text named one.
-    group: Option<uuid::Uuid>,
-}
-
-impl Targets {
-    fn one(id: uuid::Uuid) -> Self {
-        Self {
-            ids: vec![id],
-            group: None,
-        }
-    }
-}
-
-/// Makes the result for a text that named a pipeline.
-///
-/// The jobs must belong to ONE pipeline. A pipeline takes its name from its
-/// file, so a second run of the same file carries the same name, and `qex
-/// pipeline ci.toml` twice gives two pipelines that the word `ci` both names.
-/// Without this test `qex kill ci` stopped the work of two runs, and the user
-/// named one. A short group id has the same fault, because two ids can start
-/// with the same characters.
-fn group_targets(by_group: &[&JobStatus], raw: &str) -> Result<Targets> {
-    let mut groups: Vec<uuid::Uuid> = by_group.iter().filter_map(|j| j.group).collect();
-    groups.sort();
-    groups.dedup();
-
-    if groups.len() > 1 {
-        let lines: Vec<String> = groups
-            .iter()
-            .map(|g| {
-                let count = by_group.iter().filter(|j| j.group == Some(*g)).count();
-                format!("  {g}  {}", count_of(count, "stage"))
-            })
-            .collect();
-        bail!(
-            "`{raw}` names {} pipelines. A pipeline takes its name from its file, so a \
-             second run of that file has the same name. Give the group id of the run \
-             that you want:\n{}",
-            groups.len(),
-            lines.join("\n")
-        );
-    }
-
-    Ok(Targets {
-        ids: in_submission_order(by_group.to_vec()),
-        group: groups.first().copied(),
-    })
-}
-
-/// Reads one or more job ids from the text that the user wrote.
-///
-/// A value that names a job gives that job. A value that names a pipeline gives
-/// EVERY job of that pipeline, in the order of submission.
-///
-/// `qex pipeline` writes the group id to stdout, so that value is the handle
-/// that a user keeps. Before this function, every command except `qex list
-/// --group` refused it and gave "there is no job with the id ...", and the user
-/// had to find the last stage by hand.
+/// This is the path for a coordinator of an earlier version, which gives the
+/// whole list and no answer to `Resolve`. The rules are in `resolve::targets`,
+/// and the coordinator of this version applies the same rules itself.
 fn resolve_targets_in(jobs: &[JobStatus], raw: &str) -> Result<Targets> {
-    if raw.is_empty() {
-        bail!("give the id or the name of a job or a pipeline.");
-    }
-
-    let by_job: Vec<&JobStatus> = jobs.iter().filter(|j| names_job(j, raw)).collect();
-    let by_group: Vec<&JobStatus> = jobs.iter().filter(|j| names_group(j, raw)).collect();
-
-    // Test each name in the same way, including a full id.
-    //
-    // An earlier version gave back each value with the form of a UUID without
-    // a test. A `--needs` value with one incorrect character was then accepted,
-    // the dependency did not exist, and the job started immediately with no
-    // warning. `qex logs` with such a value also wrote nothing and gave the
-    // code 0, so a reader could not separate "this job wrote nothing" from
-    // "this job does not exist".
-    if let Ok(id) = raw.parse::<uuid::Uuid>() {
-        if jobs.iter().any(|j| j.id == id) {
-            return Ok(Targets::one(id));
-        }
-        if !by_group.is_empty() {
-            return group_targets(&by_group, raw);
-        }
-        // Say whether qex ever saw this id. An agent must be able to tell "the
-        // record was deleted, and the work happened" from "this job never
-        // existed, so submit it".
-        bail!("{}", crate::history::describe_missing(id));
-    }
-
-    // The two sets can hold the same one job, because a short id can be the
-    // start of the id of the job AND of the id of its group. That is not an
-    // ambiguity: both readings give the same job.
-    let same = !by_job.is_empty()
-        && by_job.len() == by_group.len()
-        && by_job.iter().all(|j| by_group.iter().any(|g| g.id == j.id));
-
-    if !by_job.is_empty() && !by_group.is_empty() && !same {
-        let mut groups: Vec<uuid::Uuid> = by_group.iter().filter_map(|j| j.group).collect();
-        groups.sort();
-        groups.dedup();
-        bail!(
-            "`{raw}` is the name of a job and the name of a pipeline. Give the \
-             full id of the one that you want.\n  job:      {}\n  pipeline: {}",
-            by_job
-                .iter()
-                .map(|j| j.id.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            groups
-                .iter()
-                .map(|g| g.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
-    if !by_group.is_empty() && by_job.is_empty() {
-        return group_targets(&by_group, raw);
-    }
-
-    match by_job.len() {
-        1 => Ok(Targets::one(by_job[0].id)),
-        0 => bail!("there is no job or pipeline with the id or the name `{raw}`"),
-        n => bail!(
-            "`{raw}` names {n} jobs. Give the id of the job that you want, or delete \
-             the old jobs with `qex clean done` and start again.\n{}",
-            by_job
-                .iter()
-                .map(|j| format!("  {} {}", j.id, j.display_name()))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-    }
+    // Keep the jobs that the text can name. The rules read nothing else, so
+    // this step changes the cost and not the answer.
+    let full_id = raw.parse::<uuid::Uuid>().ok();
+    let candidates: Vec<crate::resolve::Candidate> = jobs
+        .iter()
+        .filter(|j| names_job(j, raw) || names_group(j, raw) || Some(j.id) == full_id)
+        .map(crate::resolve::Candidate::of)
+        .collect();
+    crate::resolve::targets(&candidates, raw)
 }
 
 /// Expands each value that the user wrote into the jobs that it names.
@@ -3875,17 +3958,15 @@ fn resolve_targets_in(jobs: &[JobStatus], raw: &str) -> Result<Targets> {
 /// x" for a value that named a job AND a pipeline. The user read that the value
 /// named nothing, and it named two things.
 fn expand_ids(raws: &[String]) -> Result<Vec<String>> {
-    let jobs = Client::connect_existing().and_then(|mut c| match c.call(&Request::List) {
-        Ok(Response::Jobs { jobs }) => Some(jobs),
-        _ => None,
-    });
-    let Some(jobs) = jobs else {
+    // ONE request for every value, whatever the number of values.
+    let answers = Client::connect_existing().and_then(|mut c| resolve_many(&mut c, raws).ok());
+    let Some(answers) = answers else {
         return Ok(raws.to_vec());
     };
 
     let mut out: Vec<String> = Vec::new();
-    for raw in raws {
-        for id in resolve_targets_in(&jobs, raw)?.ids {
+    for answer in answers {
+        for id in answer?.ids {
             let text = id.to_string();
             if !out.contains(&text) {
                 out.push(text);
@@ -3895,12 +3976,51 @@ fn expand_ids(raws: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Asks the coordinator for the jobs, and reads the text of the user.
-fn resolve_targets(client: &mut Client, raw: &str) -> Result<Targets> {
-    let Response::Jobs { jobs } = client.call(&Request::List)? else {
-        bail!("the coordinator did not give the job list");
+/// Asks the coordinator what each text of the user names.
+///
+/// The outer error is a fault of the TRANSPORT: the coordinator did not answer.
+/// The inner error is the answer of the rules: the text names nothing, or it
+/// names more than one thing. A wait must keep the two apart. See
+/// `resolve_id_for_wait`.
+///
+/// A coordinator that gives the capability `resolve` reads the texts itself,
+/// from its index, in one request. An earlier coordinator gives its whole job
+/// list one time, and this command applies the same rules to it. The answer is
+/// the same, and only slower, so the reader gets no message about it.
+fn resolve_many(client: &mut Client, raws: &[String]) -> Result<Vec<Result<Targets>>> {
+    if !client.can("resolve")? {
+        let Response::Jobs { jobs } = client.call(&Request::List)? else {
+            bail!("the coordinator did not give the job list");
+        };
+        return Ok(raws
+            .iter()
+            .map(|raw| resolve_targets_in(&jobs, raw))
+            .collect());
+    }
+
+    let request = Request::Resolve {
+        handles: raws.to_vec(),
     };
-    resolve_targets_in(&jobs, raw)
+    let Response::Resolved { found } = client.call(&request)? else {
+        bail!("the coordinator did not read the ids");
+    };
+    if found.len() != raws.len() {
+        bail!("the coordinator did not give one answer for each id");
+    }
+    Ok(found
+        .into_iter()
+        .map(|one| match one.error {
+            Some(text) => Err(anyhow::anyhow!("{text}")),
+            None => Ok(Targets::from_answer(one.jobs, one.group)),
+        })
+        .collect())
+}
+
+/// Asks the coordinator what one text of the user names.
+fn resolve_targets(client: &mut Client, raw: &str) -> Result<Targets> {
+    resolve_many(client, &[raw.to_string()])?
+        .pop()
+        .unwrap_or_else(|| Err(anyhow::anyhow!("the coordinator gave no answer")))
 }
 
 /// Reads the text of the user, for a command that operates on ONE job.
@@ -3908,10 +4028,7 @@ fn resolve_targets(client: &mut Client, raw: &str) -> Result<Targets> {
 /// `qex logs` reads one job. A pipeline gives an error that names the stages,
 /// because qex must not choose a stage for the reader.
 fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
-    let Response::Jobs { jobs } = client.call(&Request::List)? else {
-        bail!("the coordinator did not give the job list");
-    };
-    let found = resolve_targets_in(&jobs, raw)?;
+    let found = resolve_targets(client, raw)?;
     if found.group.is_none() && found.ids.len() == 1 {
         return Ok(found.ids[0]);
     }
@@ -3920,11 +4037,10 @@ fn resolve_id(client: &mut Client, raw: &str) -> Result<uuid::Uuid> {
          the stage that you want:\n{}",
         count_of(found.ids.len(), "job"),
         found
-            .ids
+            .jobs
             .iter()
-            .filter_map(|id| jobs.iter().find(|j| j.id == *id))
             // qex SHOWS the safe name only. See `job::safe_name`.
-            .map(|j| format!("  {} {}", j.id, j.display_name()))
+            .map(|j| format!("  {} {}", j.id, safe_name(&j.name)))
             .collect::<Vec<_>>()
             .join("\n")
     )
@@ -6594,30 +6710,7 @@ fn require_capabilities(client: &mut Client, spec: &JobSpec) -> Result<()> {
     crate::capabilities::check(&have, &version, pid, spec).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Tests one job against a directory.
-///
-/// `exact` gives the jobs of one directory. `under` gives the jobs of that
-/// directory and of every directory below it, so a user at the top of a project
-/// reaches every job of that project.
-fn matches_directory(
-    job_cwd: &str,
-    exact: Option<&std::path::Path>,
-    under: Option<&std::path::Path>,
-) -> bool {
-    if let Some(dir) = exact {
-        if std::path::Path::new(job_cwd) != dir {
-            return false;
-        }
-    }
-    if let Some(dir) = under {
-        let path = std::path::Path::new(job_cwd);
-        // `starts_with` compares whole parts, so `/a/b` does not match `/a/bc`.
-        if !path.starts_with(dir) {
-            return false;
-        }
-    }
-    true
-}
+use crate::resolve::matches_directory;
 
 /// Reads a directory from the command line, and makes it absolute.
 ///

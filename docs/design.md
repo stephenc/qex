@@ -58,6 +58,27 @@ in one operation,
 so a reader sees the old contents or the new contents, and never a part of them.
 `qex wait` reads this file directly when no coordinator operates.
 
+### A command pays for what it asks for
+
+The coordinator holds the full record of each job that waits or operates. A job
+that stopped leaves that map one turn of the scheduler after its record on the
+disk says so, and the coordinator then keeps a short entry for it: the line of
+`qex list`, and what a filter, a dependency and a dedupe key read. A request for
+the full record of such a job reads `status.json`. The cost of a turn of the
+scheduler thus follows the queue, and not the history.
+
+The coordinator keeps an index of every job by id, by name and by pipeline. A
+command that names a job sends the text that the person wrote, and the
+coordinator reads it through the index with one set of rules. `qex cancel` and
+`qex kill` send every id in one request. `qex list` sends its options, and the
+coordinator gives the short rows of the jobs that they select. The lock of the
+coordinator covers a copy of one pointer for each job of an answer; the text of
+the answer comes after the lock is free.
+
+Each of these requests is a capability (`query`, `resolve`, `stop-many`). A
+command that meets a coordinator of an earlier version sends the request for the
+whole list in their place. The answer is the same, and only slower.
+
 ### After the machine restarts
 
 The state directory is `~/.local/state/qex`, or `$XDG_STATE_HOME/qex`. It is not

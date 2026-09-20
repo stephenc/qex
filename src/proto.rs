@@ -64,7 +64,36 @@ pub enum Request {
     /// that the system gives to a later process cannot say the same.
     OwnJob { id: uuid::Uuid },
     /// Gives the state of every job.
+    ///
+    /// The answer grows with the number of records, so no command of this
+    /// program sends it to a coordinator that can answer `Query` or `Resolve`.
+    /// The name stays, because an earlier CLI sends it.
     List,
+    /// Gives the jobs that a filter keeps, as short rows or as full records.
+    ///
+    /// The coordinator filters, so the answer holds what the reader asked for
+    /// and not every record that qex keeps. A CLI sends this request only to a
+    /// coordinator that gives the capability `query`.
+    Query { filter: Box<JobFilter> },
+    /// Reads each text that a person wrote (an id, the start of an id, a name,
+    /// a group id or a group name) and gives the jobs that it names.
+    ///
+    /// The coordinator answers from its index, so the cost does not grow with
+    /// the number of jobs. A CLI sends this request only to a coordinator that
+    /// gives the capability `resolve`.
+    Resolve { handles: Vec<String> },
+    /// Takes the jobs that each text names out of the queue, in ONE request.
+    ///
+    /// The answer holds one entry for each text, and one line for each job. A
+    /// CLI sends this request only to a coordinator that gives the capability
+    /// `stop-many`.
+    CancelMany { handles: Vec<String> },
+    /// Stops the jobs that each text names, in ONE request. See `CancelMany`.
+    KillMany {
+        handles: Vec<String>,
+        signal: i32,
+        grace_secs: u64,
+    },
     /// Gives the state of one job.
     Status { id: uuid::Uuid },
     /// Waits until a job reaches a final state.
@@ -159,6 +188,163 @@ pub enum Request {
         /// The process id that the CLI reports for itself. See `Pause`.
         by_pid: i32,
     },
+}
+
+/// What a `Query` request keeps. Every field narrows the answer, and an
+/// empty filter keeps every job.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobFilter {
+    /// The word of `--state`, as `cli::StateFilter` reads it.
+    ///
+    /// A string, because a later version adds words. The coordinator refuses a
+    /// word that it cannot read, and it never reads such a word as "every
+    /// state".
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Only the jobs that carry this tag, in the stored form or the safe form.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Only the jobs of exactly this directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Only the jobs of this directory and below it.
+    #[serde(default)]
+    pub under: Option<String>,
+    /// Only the jobs of the pipelines that this text names.
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Only the jobs that this text names: an id, the start of an id, a name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Leave out a job that stopped more than this number of seconds ago.
+    /// `None` keeps every job that stopped.
+    #[serde(default)]
+    pub stopped_within: Option<u64>,
+    /// Keep the NEWEST jobs only, to this number. `None` sets no limit.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// True for the full record of each job, and false for the short row.
+    #[serde(default)]
+    pub full: bool,
+}
+
+/// One job, as a line of `qex list` needs it.
+///
+/// A full record holds the command, the directory, the chain of the submitter
+/// and the claims. A table of ten thousand jobs prints none of those, so a row
+/// leaves them out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobRow {
+    pub id: uuid::Uuid,
+    /// The name as the record holds it. The CLI makes the safe form.
+    pub name: String,
+    pub state: crate::job::JobState,
+    pub cpu: u64,
+    pub mem: u64,
+    #[serde(default)]
+    pub forced: bool,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<i32>,
+    #[serde(default)]
+    pub max_rss: u64,
+    pub submitted_at: u64,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub group: Option<uuid::Uuid>,
+}
+
+impl JobRow {
+    pub fn of(s: &JobStatus) -> Self {
+        Self {
+            id: s.id,
+            name: s.name.clone(),
+            state: s.state,
+            cpu: s.cpu,
+            mem: s.mem,
+            forced: s.forced,
+            blocked_reason: s.blocked_reason.clone(),
+            error: s.error.clone(),
+            exit_code: s.exit_code,
+            signal: s.signal,
+            max_rss: s.usage.max_rss,
+            submitted_at: s.submitted_at,
+            sequence: s.sequence,
+            started_at: s.started_at,
+            finished_at: s.finished_at,
+            group: s.group,
+        }
+    }
+}
+
+/// One job that a text named, with what a command needs to act on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedJob {
+    pub id: uuid::Uuid,
+    /// The name as the record holds it. The CLI makes the safe form.
+    pub name: String,
+    pub state: crate::job::JobState,
+}
+
+/// What one text of a `Resolve` request named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    /// The text, as the request gave it.
+    pub handle: String,
+    /// The jobs, in the order of submission. Empty when `error` is present.
+    #[serde(default)]
+    pub jobs: Vec<NamedJob>,
+    /// The pipeline, when the text named one.
+    #[serde(default)]
+    pub group: Option<uuid::Uuid>,
+    /// Why the text names no job, or more than one thing. The sentence is
+    /// complete, and the CLI prints it as it is.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// What happened to one job of a `CancelMany` or a `KillMany` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopLine {
+    pub id: uuid::Uuid,
+    /// What the coordinator did: `left-the-queue`, `signalled`,
+    /// `already-stopped` (a stage of a pipeline that needs nothing) or
+    /// `refused`.
+    ///
+    /// A string, because a later version can add a word. A CLI that does not
+    /// know the word reports the line as a fault, and never as a success.
+    pub did: String,
+    /// The refusal, when `did` is `refused`.
+    #[serde(default)]
+    pub refusal: Option<String>,
+    /// The kind of the refusal, for the exit code.
+    #[serde(default)]
+    pub kind: Option<ErrorKind>,
+}
+
+/// What happened for one text of a `CancelMany` or a `KillMany` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopOutcome {
+    pub handle: String,
+    /// The pipeline, when the text named one.
+    #[serde(default)]
+    pub group: Option<uuid::Uuid>,
+    /// One line for each job that the text named.
+    #[serde(default)]
+    pub lines: Vec<StopLine>,
+    /// Why the text names no job. See `Resolution::error`.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// The jobs that an `Abort` request acts on.
@@ -284,6 +470,26 @@ pub enum Response {
     Jobs { jobs: Vec<JobStatus> },
     /// The state of one job.
     Status { status: Box<JobStatus> },
+    /// The answer to a `Query`.
+    ///
+    /// One of the two lists holds the jobs: `rows` for a short answer, and
+    /// `jobs` for a filter that asked for full records.
+    Found {
+        #[serde(default)]
+        rows: Vec<JobRow>,
+        #[serde(default)]
+        jobs: Vec<JobStatus>,
+        /// The jobs that the filter kept and the limit then left out.
+        #[serde(default)]
+        over_limit: usize,
+        /// The jobs that `stopped_within` left out, and nothing else did.
+        #[serde(default)]
+        older: usize,
+    },
+    /// The answer to a `Resolve`: one entry for each text, in the same order.
+    Resolved { found: Vec<Resolution> },
+    /// The answer to a `CancelMany` or a `KillMany`: one entry for each text.
+    Stopped { outcomes: Vec<StopOutcome> },
     /// The state of the coordinator.
     Info {
         pid: i32,
@@ -599,12 +805,79 @@ mod tests {
         }
     }
 
+    /// The answers that carry many jobs obey the rule of this module as well:
+    /// a field that a later coordinator adds must not break this CLI, and a
+    /// field that a coordinator leaves out must have a value.
+    #[test]
+    fn the_answers_for_many_jobs_stay_additive() {
+        let later = serde_json::json!({
+            "result": "found",
+            "rows": [{
+                "id": "00000000-0000-4000-8000-000000000000", "name": "t",
+                "state": "queued", "cpu": 1, "mem": 2, "submitted_at": 3,
+                "a_field_from_a_later_release": [1],
+            }],
+            "a_field_from_a_later_release": true,
+        });
+        match serde_json::from_value::<Response>(later).expect("an older CLI must read it") {
+            Response::Found {
+                rows, jobs, older, ..
+            } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].blocked_reason, None);
+                assert!(jobs.is_empty());
+                assert_eq!(older, 0);
+            }
+            other => panic!("the answer became {other:?}"),
+        }
+
+        let later = serde_json::json!({
+            "result": "stopped",
+            "outcomes": [{
+                "handle": "x", "later": 1,
+                "lines": [{"id": "00000000-0000-4000-8000-000000000000",
+                           "did": "a-word-of-a-later-release", "later": 1}],
+            }],
+        });
+        let Response::Stopped { outcomes } = serde_json::from_value(later).unwrap() else {
+            panic!("expected the outcomes")
+        };
+        assert_eq!(outcomes[0].lines[0].did, "a-word-of-a-later-release");
+
+        // A filter from an earlier CLI names fewer fields.
+        let Request::Query { filter } =
+            serde_json::from_str(r#"{"op":"query","filter":{"tag":"x"}}"#).unwrap()
+        else {
+            panic!("expected a query")
+        };
+        assert_eq!(filter.tag.as_deref(), Some("x"));
+        assert!(!filter.full && filter.limit.is_none() && filter.stopped_within.is_none());
+    }
+
     #[test]
     fn each_message_survives_one_line_of_json() {
         let id = uuid::Uuid::new_v4();
         let requests = [
             Request::Ping,
             Request::List,
+            Request::Query {
+                filter: Box::new(JobFilter {
+                    tag: Some("sweep".into()),
+                    limit: Some(50),
+                    ..JobFilter::default()
+                }),
+            },
+            Request::Resolve {
+                handles: vec!["a1b2c3d4".into(), "build".into()],
+            },
+            Request::CancelMany {
+                handles: vec!["a1b2c3d4".into()],
+            },
+            Request::KillMany {
+                handles: vec!["a1b2c3d4".into()],
+                signal: 15,
+                grace_secs: 10,
+            },
             Request::Status { id },
             Request::Wait { id },
             Request::Kill {

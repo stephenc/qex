@@ -289,6 +289,14 @@ impl EventLog {
         self.ring.push_back((seq, event));
     }
 
+    /// Forgets what the stream last said about one job.
+    ///
+    /// The caller took the job out of the map that `publish_changes` reads, so
+    /// no later event can arrive for it.
+    pub fn forget(&mut self, id: &uuid::Uuid) {
+        self.reported.remove(id);
+    }
+
     /// Gives the events after the number `after`, with their numbers.
     pub fn after(&self, after: u64) -> Vec<(u64, Event)> {
         self.ring
@@ -308,6 +316,7 @@ impl State {
     /// gives no repeated line.
     pub fn publish_changes(&mut self) {
         let now = sys::now_secs();
+        let mut stopped_now: Vec<uuid::Uuid> = Vec::new();
 
         for (id, job) in self.jobs.iter() {
             let state = job.status.state;
@@ -342,7 +351,14 @@ impl State {
                 job: Box::new(status),
             });
             self.events.reported.insert(*id, (state, reason));
+            // The last event of this job is in the stream now, so the job can
+            // leave the map that the scheduler reads. See
+            // `State::retire_stopped`.
+            if state.is_terminal() {
+                stopped_now.push(*id);
+            }
         }
+        self.retiring.append(&mut stopped_now);
 
         // Forget a job that `qex clean` deleted. Without this step the map
         // grows for as long as the coordinator operates.
@@ -794,13 +810,16 @@ mod tests {
             spec.id,
             crate::daemon::Job {
                 spec,
-                status,
+                status: status.into(),
                 supervisor_pid: None,
             },
         );
         State {
             cfg: Default::default(),
             jobs,
+            stopped: Default::default(),
+            index: Default::default(),
+            retiring: Vec::new(),
             queue: Vec::new(),
             last_contact: Instant::now(),
             idle_since: None,

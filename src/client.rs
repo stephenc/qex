@@ -464,9 +464,34 @@ pub struct Client {
     /// A connection that reached a limit is therefore dead. It answers every
     /// later request with the same fault, and it never reads the socket again.
     lost_its_place: bool,
+    /// What this coordinator can do, after the first question about it.
+    capabilities: Option<Vec<String>>,
 }
 
 impl Client {
+    /// Tests if the coordinator at the other end has one capability.
+    ///
+    /// A command asks before it sends a request that an earlier coordinator
+    /// cannot read, and it takes the earlier request when the answer is no.
+    /// The question goes out one time for each connection.
+    ///
+    /// A coordinator that gives no list has no capability: every version that
+    /// qex supports answers this request. A coordinator that did not ANSWER is
+    /// a different fact, and that error goes to the caller.
+    pub fn can(&mut self, capability: &str) -> Result<bool> {
+        if self.capabilities.is_none() {
+            let names = match self.call(&Request::Capabilities)? {
+                Response::Capabilities { names } => names,
+                _ => Vec::new(),
+            };
+            self.capabilities = Some(names);
+        }
+        Ok(self
+            .capabilities
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|n| n == capability)))
+    }
+
     /// Connects to the coordinator. Starts a coordinator if none operates.
     pub fn connect() -> Result<Self> {
         Self::connect_or_explain().map_err(name_the_sandbox)
@@ -581,6 +606,7 @@ impl Client {
             stream,
             reader,
             lost_its_place: false,
+            capabilities: None,
         })
     }
 

@@ -134,7 +134,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
 
         match job::read_status(&dir) {
             Ok(status) if status.state.is_terminal() => {
-                job.status = status.clone();
+                job.status = status.clone().into();
 
                 // Run the hook here as well.
                 //
@@ -160,7 +160,7 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
             // again when there is room. Without this branch the job would go
             // to `failed` with "the supervisor stopped without a result".
             Ok(status) if status.state == JobState::Queued => {
-                job.status = status;
+                job.status = status.into();
                 persist_legacy_requeue(&dir, &mut job.status);
                 let claim = job.status.mem;
                 // Use the rule of the submission, so a job that starts again
@@ -240,6 +240,21 @@ pub fn reap(coord: Arc<Coordinator>, id: uuid::Uuid, pid: i32) {
             }
         }
         state.publish_changes();
+    } else if state.stopped.contains_key(&id) {
+        // The record on the disk said that the job stopped, and the job left
+        // the map above, BEFORE this supervisor stopped: a supervisor writes
+        // the final record and then runs the hook, and a hook can run for a
+        // long time. The guard of the first branch must hold here also, or a
+        // supervisor that a signal stopped between its two steps leaves a job
+        // with a result and no notification.
+        drop(state);
+        if let Ok(status) = job::read_status(&dir) {
+            if status.state.is_terminal() {
+                crate::hook::fire_detached(&dir, &status);
+            }
+        }
+        coord.notify();
+        return;
     }
     drop(state);
 
